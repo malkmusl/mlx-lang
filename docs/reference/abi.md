@@ -43,6 +43,15 @@ caller/callee-saved sets are fixed by `spec/01-abi/mlxcc-x86_64.xml`:
 <CalleeSaved>rbx rbp r12 r13 r14 r15 rsp</CalleeSaved>
 ```
 
+A function begins at a multiple of 16 bytes (the bytes before it, after
+the function above, are never run), so a function's address is even and
+its low bits are free: a word that is a function's address or an odd
+number tells the two apart
+(`tests/442_function_alignment_runtime.mlx`). A function's address as an
+integer is `@intFromPtr(name)`, and `@ptrFromInt(fn(...) -> T, word)`
+makes the function of it again; `&name` is the address of a copy of the
+function value, not the function's.
+
 That is the same register order and stack-growth direction as the x86_64
 System V ABI, with no red zone. `136_six_register_parameters_runtime.mlx`
 exercises all six integer argument registers directly:
@@ -340,6 +349,19 @@ for direct, method, generic and indirect calls alike, and the optimizer
 checks that each direct call agrees with its callee
 (`tests/329_return_storage_runtime.mlx`).
 
+## Packed structs
+
+A `packed struct` (spec aggregates.xml, PackedLayout) is one integer:
+its fields occupy their exact bit widths from bit 0 upwards, in
+declaration order, with no padding, and the struct's size and alignment
+are those of the smallest of u8, u16, u32 and u64 that holds the bits
+(so a 27-bit struct is 4 bytes aligned to 4, as a C bit-field group in an
+`unsigned int` is). A wider struct than 64 bits is refused. As an
+argument or a result it is classified as that integer's size would be
+(the aggregate classification above). Fields are never addressed: the
+compiler loads the word, shifts and masks (`ir/lower.mlx`,
+`packedFieldLoad`/`packedFieldStore`).
+
 ## Multiple returns
 
 A source-level multiple return (`-> (T, U, ...)`) is classified exactly as
@@ -622,9 +644,14 @@ usable.
 A module-level `var` (`var counter: u32 = 0`, `pub var` for other modules,
 `export var` for C) lives in the image's data area, not in any frame: one
 slot per global after the area's fixed words, aligned to its type and at
-least 8 bytes long, with the initial value of an integer, bool, array or
-struct literal initializer written into the image byte by byte
-(`undefined` and `null` zero it). Code takes a slot's address RIP-relative
+least 8 bytes long, with the initial value of an integer, bool, float,
+array or struct literal initializer written into the image byte by byte
+(`undefined` and `null` zero it). A word of the initializer that is an
+address (a function, a string literal's bytes, another global or its
+element) is zero in the image; the function `__mlx_init_globals`, which
+the lowering makes when a program has such words, stores each one, and
+`_start` calls it before `main`. A `--shared` object or `--plugin` has no
+start of its own: such an initializer is reported there. Code takes a slot's address RIP-relative
 on x86_64 (`lea reg, [rip + disp32]` with a fixup the pipeline resolves
 against where the area lands) and with `adrp`/`add` on aarch64; reads,
 writes, `&global`, field and index access then work on that address
@@ -640,6 +667,39 @@ rather than RIP-relative: a C program linked against the object takes its
 own copy of such a variable (`R_X86_64_COPY`, as gcc does for `optind` or
 `stdout`), the dynamic linker binds the symbol to that copy, and the slot
 makes the Mlx code read and write the copy too.
+
+A module-level `const` that is a table has such a slot too (`ir/lower.mlx`,
+`constantImageFor`): an array or struct literal, every element given, of
+values known at compile time and no address among them (those would wait
+for `__mlx_init_globals`, which a constant must not). It is made the
+first time the constant is used. `TABLE[i]`, `TABLE.field`, an element of
+an element, `&TABLE[i]` (a pointer to a constant) and `TABLE.length` work
+on the slot's address; nothing the compiler emits writes there. Any other
+use of the constant is its value: an `alloca` of the type and one
+`mem_copy` from the slot, so a callee that is handed it writes into
+storage of that use's own, as when the value was built there element by
+element. A slice of it and a pointer capture over it work on such a copy
+too. Nothing that sema checks writes through them any more: they are a
+`[]const T` and a `*const T` (`sema/declarations.mlx`, the slice
+expression; `tests/443_constant_slices_runtime.mlx`). But the body of a
+generic function (an `anytype` or `comptime` parameter) is not checked,
+and one handed such a slice can still store through it: into the copy,
+which is why the copy stays until instantiated bodies are checked (the
+slot's address there would let that store change the table for
+everyone). A constant with addresses
+in it, one whose initializer is no literal, and a member of an aggregate
+are lowered as before: their initializer, where they are used
+(`tests/442_constant_table_static_runtime.mlx`,
+`tests/333_module_slices_runtime.mlx`).
+
+The address of a module-level constant, `&NAME` (a pointer to a
+constant), is the slot's for a table that has one, so `&TABLE` and
+`&TABLE[0]` are the same address and stay it (`lowerAddressOf`,
+`tests/444_constant_address_runtime.mlx`); for every other constant it
+is the address of a copy of its value in a slot of the function
+(`constantAddress`, `tests/445_constant_address_runtime.mlx`). Before,
+such an expression lowered to no address at all, and a read through it
+faulted.
 
 ## Atomics
 

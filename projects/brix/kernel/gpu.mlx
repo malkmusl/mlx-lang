@@ -1,0 +1,289 @@
+// The GPU, for real hardware: an AMD Radeon (a Supermicro H11's RX 580,
+// Polaris 10). A native amdgpu driver, built in stages. Stage 1 finds the
+// card on PCI, enables it, and records its register, VRAM and doorbell
+// apertures. Stage 2a maps the register aperture (BAR5) uncached and reads
+// the identity and memory-size registers (directly, and once through the
+// MM_INDEX/MM_DATA window to see that path alive) -- the ground the
+// memory controller, GART, microcode and command rings stand on. It
+// drives nothing yet; QEMU has no such card, so on a VM it finds none.
+// The register reads can only be seen on the real hardware (the "gpu:"
+// lines).
+//
+// What the next stages stand on here: the VRAM aperture mapped
+// write-combining (`vramView`; the firmware's picture, which the kernel's
+// console and the desktop draw on, is the part `consoleOffset`,
+// `consoleBytes` of it: nothing else may be put there) and the doorbells
+// uncached (`doorbellView`); `dma` for memory the card reads and writes
+// (rings, the interrupt ring, write-back pages: one piece set aside at
+// boot); the firmware by `archive.Archive.boot().find("firmware/amdgpu/
+// polaris10_rlc.bin")` (its bytes in one piece, whatever / is mounted
+// from); waits by clock.Deadline and clock.pause; long dumps kept off the
+// screen by console.screen(false); an interrupt by Pci.enableMsi with
+// layout.Vector.GPU and smp.localApic's id (trap.mlx calls `interrupted`
+// and ends it), though polling does until the rings run.
+//
+// The firmware's picture has to stay: there is no mode setting here, and
+// the screen is the only console on the machine. From what Linux's amdgpu
+// does (vi.c, gmc_v8_0.c, dce_v11_0.c; the register numbers are to be
+// checked against its headers before use), while the firmware's mode is
+// the console none of this may be done:
+// - a reset of the card (PCI configuration 0x7C = 0x39D5E86B, ATOM's
+//   asic_init) or of its display or memory controller (SRBM_SOFT_RESET's
+//   DC and MC bits; GRBM_SOFT_RESET's CP, GFX and RLC bits are the
+//   graphics block's alone);
+// - MC_VM_FB_LOCATION rewritten (the firmware's value is read and VRAM's
+//   start taken from it), a system aperture that does not cover all of
+//   VRAM once the GART is on, the memory controller's microcode loaded
+//   again (it runs: the picture is there);
+// - BIF_FB_EN's read and write enables cleared (the processor's way into
+//   the aperture), anything of the display engine (CRTC, GRPH, VGA
+//   registers, ATOM's encoder, transmitter and pixel clock tables);
+// - the SMU started again or DPM enabled before the rings run (a memory
+//   clock switched outside the vertical blank tears the picture).
+const layout = @import("../layout.mlx")
+const memory = @import("./memory.mlx")
+const Pci = @import("./pci.mlx").Pci
+const Bytes = @import("./bytes.mlx").Bytes
+const console = @import("./console.mlx")
+const display = @import("./display.mlx")
+const Page = memory.Page
+
+const VENDOR_AMD: usize = 0x1002
+
+// Registers (dword offsets, VI/Polaris). The register aperture (BAR5) is
+// 256 KiB; a register beyond it is reached through the MM_INDEX/MM_DATA
+// window at the start of the aperture.
+const mmMM_INDEX: usize = 0x0
+const mmMM_DATA: usize = 0x1
+const mmSCRATCH_REG0: usize = 0xC040
+const mmGRBM_STATUS: usize = 0x2004
+const mmCONFIG_MEMSIZE: usize = 0x150A
+
+pub const Gpu = struct {
+    present: bool
+    device: usize
+    revision: usize
+    // The three memory apertures (physical): the registers (BAR5), the
+    // VRAM window (BAR0) and the doorbells (BAR2), with their sizes.
+    registers: usize // in the kernel's view (mapped uncached)
+    registersPhysical: usize
+    registersSize: usize
+    vram: usize
+    vramSize: usize
+    doorbells: usize
+    // The VRAM aperture (its first VRAM_VIEW bytes at most) and the
+    // doorbells in the kernel's view (0: not mapped), and the part of
+    // the aperture the firmware's picture takes (the console's).
+    vramView: usize
+    vramViewSize: usize
+    doorbellView: usize
+    consoleOffset: usize
+    consoleBytes: usize
+    // Memory the card reads and writes, set aside at boot (physical, in
+    // one piece), and how much of it is handed out.
+    dmaBase: usize
+    dmaUsed: usize
+    // Its message-signalled interrupts taken (trap.mlx).
+    interrupts: usize
+
+    fn name(self: *const Self) -> []const u8 {
+        if self.*.device == 0x67DF || self.*.device == 0x6FDF { return "Radeon RX 580 (Polaris 10)" }
+        if self.*.device == 0x67EF { return "Radeon RX 560 (Polaris 11)" }
+        if self.*.device == 0x699F { return "Radeon RX 550 (Polaris 12)" }
+        return "Radeon (AMD)"
+    }
+
+    // A 32-bit register: directly in the aperture, or through the
+    // MM_INDEX/MM_DATA window when its byte offset is past the aperture.
+    fn at(self: *const Self, offset: usize) -> *u32 {
+        return unsafe { @ptrFromInt(*u32, self.*.registers + offset) }
+    }
+
+    fn rreg(self: *const Self, reg: usize) -> u32 {
+        const offset = reg << 2
+        if offset < self.*.registersSize { return self.at(offset).* }
+        self.at(mmMM_INDEX * 4).* = @intCast(u32, offset)
+        return self.at(mmMM_DATA * 4).*
+    }
+
+    fn wreg(self: *const Self, reg: usize, value: u32) -> void {
+        const offset = reg << 2
+        if offset < self.*.registersSize {
+            self.at(offset).* = value
+            return
+        }
+        self.at(mmMM_INDEX * 4).* = @intCast(u32, offset)
+        self.at(mmMM_DATA * 4).* = value
+    }
+
+    // Stage 2a diagnostics (read-mostly): the memory size the straps
+    // report, a scratch register written and read back (the register path
+    // is alive), and the GRBM status. All on the serial console for the
+    // real hardware.
+    fn report(self: *const Self) -> void {
+        console.out.write("gpu: config_memsize ")
+        console.out.decimal(@intCast(usize, self.rreg(mmCONFIG_MEMSIZE)))
+        console.out.write(" MiB, revision ")
+        console.out.hex(self.*.revision)
+        console.out.write("\n")
+        self.wreg(mmSCRATCH_REG0, 0xCAFEBABE)
+        const back = self.rreg(mmSCRATCH_REG0)
+        console.out.write("gpu: scratch write/read ")
+        console.out.hex(@intCast(usize, back))
+        console.out.write(if back == 0xCAFEBABE { " (register path ok)\n" } else { " (MISMATCH)\n" })
+        console.out.write("gpu: grbm_status ")
+        console.out.hex(@intCast(usize, self.rreg(mmGRBM_STATUS)))
+        console.out.write("\n")
+        // The same register through the index and data window (only the
+        // index is written): the way to what is beyond the aperture.
+        self.at(mmMM_INDEX * 4).* = @intCast(u32, mmCONFIG_MEMSIZE << 2)
+        const indirect = self.at(mmMM_DATA * 4).*
+        console.out.write(if indirect == self.rreg(mmCONFIG_MEMSIZE) { "gpu: the index and data window reads the same\n" } else { "gpu: the index and data window reads something else (MISMATCH)\n" })
+    }
+
+    // Whether the card answers as one the firmware has started (its
+    // memory size register is neither nothing nor all ones).
+    fn posted(self: *const Self) -> bool {
+        const size = self.rreg(mmCONFIG_MEMSIZE)
+        return size != 0 && size != 0xFFFFFFFF
+    }
+}
+
+var gpu: Gpu = undefined // (per run)
+
+pub fn device() -> *Gpu { return &gpu }
+
+// The size of a memory BAR (the write-all-ones probe), in bytes; 0 when it
+// is unused. Memory decoding is turned off around the probe so the card
+// does not answer at a half-written address (the picture stays: the card
+// reads its memory itself). A 64-bit BAR's upper half is probed too. The
+// command register is written without the status bits beside it (they
+// are cleared by writing them).
+fn barSize(address: usize, bar: usize) -> usize {
+    const reg = Pci.BAR0 + bar * 4
+    const command = Pci.read(address, Pci.COMMAND) & 0xFFFF
+    Pci.write(address, Pci.COMMAND, command & @intCast(usize, 0xFFFF ^ Pci.MEMORY_SPACE))
+    const original = Pci.read(address, reg)
+    Pci.write(address, reg, 0xFFFFFFFF)
+    var mask = (Pci.read(address, reg) & 0xFFFFFFF0) | 0xFFFFFFFF00000000
+    Pci.write(address, reg, original)
+    if original & 0x7 == 0x4 {
+        const high = Pci.read(address, reg + 4)
+        Pci.write(address, reg + 4, 0xFFFFFFFF)
+        mask = (mask & 0xFFFFFFFF) | (Pci.read(address, reg + 4) << 32)
+        Pci.write(address, reg + 4, high)
+    }
+    Pci.write(address, Pci.COMMAND, command)
+    if mask & 0xFFFFFFFFFFFFFFF0 == 0 || mask == 0xFFFFFFFF00000000 { return 0 }
+    return ~mask + 1
+}
+
+// How much of the VRAM aperture is put in the kernel's view (a card's
+// aperture is 256 MiB unless it was made larger), and how much memory is
+// set aside for what the card reads and writes.
+const VRAM_VIEW: usize = 256 * 1024 * 1024
+const DMA_PAGES: usize = 2048
+
+// `bytes` of memory for the card (a ring, a page it writes back to), whole
+// pages, zeroed: its physical address (what the card is told; the kernel
+// sees it at layout.Memory.virtual of that), 0 when the piece set aside is
+// used up. Never given back.
+pub fn dma(bytes: usize) -> usize {
+    const size = Page.up(bytes)
+    if gpu.dmaBase == 0 || size == 0 || gpu.dmaUsed + size > DMA_PAGES * Page.SIZE { return 0 }
+    const at = gpu.dmaBase + gpu.dmaUsed
+    gpu.dmaUsed += size
+    return at
+}
+
+// The card's message-signalled interrupt (trap.mlx, on layout.Vector.GPU).
+pub fn interrupted() -> void { gpu.interrupts += 1 }
+
+// The AMD display device number `n` of class `code` (VGA, or another
+// display's); Pci.NONE when there are no more of the class.
+fn candidate(code: usize, n: usize) -> usize { return Pci.findClass(code, 0xFFFF00, n) }
+
+// The card at `address` taken: enabled, its apertures recorded and put in
+// the kernel's view, its register path tried; whether it answers.
+fn take(address: usize) -> bool {
+    Pci.enableMemory(address)
+    gpu.device = (Pci.read(address, 0) >> 16) & 0xFFFF
+    gpu.revision = Pci.read(address, Pci.CLASS) & 0xFF
+    gpu.vram = Pci.memBase(address, 0)
+    gpu.vramSize = barSize(address, 0)
+    gpu.doorbells = Pci.memBase(address, 2)
+    gpu.registersPhysical = Pci.memBase(address, 5)
+    gpu.registersSize = barSize(address, 5)
+    gpu.vramView = 0
+    gpu.vramViewSize = 0
+    gpu.doorbellView = 0
+    gpu.consoleOffset = 0
+    gpu.consoleBytes = 0
+    gpu.dmaBase = 0
+    gpu.dmaUsed = 0
+    gpu.interrupts = 0
+    if gpu.registersPhysical == 0 || gpu.registersSize == 0 { return false }
+    gpu.registers = memory.Device.map(gpu.registersPhysical, gpu.registersSize, memory.Device.UNCACHED)
+    if gpu.registers == 0 { return false }
+    if !gpu.posted() {
+        console.out.write("gpu: an AMD display device that does not answer as a started card (left alone)\n")
+        return false
+    }
+    // The VRAM aperture write-combining, as the console's part of it is
+    // already (another caching there would change the console's pages
+    // under it), the doorbells uncached.
+    if gpu.vram != 0 && gpu.vramSize != 0 {
+        gpu.vramViewSize = if gpu.vramSize > VRAM_VIEW { VRAM_VIEW } else { gpu.vramSize }
+        gpu.vramView = memory.Device.map(gpu.vram, gpu.vramViewSize, memory.Device.WRITE_COMBINING)
+        if gpu.vramView == 0 { gpu.vramViewSize = 0 }
+    }
+    if gpu.doorbells != 0 { gpu.doorbellView = memory.Device.map(gpu.doorbells, layout.Memory.HUGE, memory.Device.UNCACHED) }
+    // The firmware's picture, when it is in this card's aperture.
+    const screen = display.screen()
+    if screen.*.present && screen.*.address >= gpu.vram && screen.*.address < gpu.vram + gpu.vramSize {
+        gpu.consoleOffset = screen.*.address - gpu.vram
+        gpu.consoleBytes = screen.size()
+    }
+    gpu.dmaBase = memory.allFrames().allocateContiguous(DMA_PAGES)
+    gpu.present = true
+    console.out.write("brixOS: gpu0, ")
+    console.out.write(gpu.name())
+    console.out.write(", ")
+    console.out.decimal(gpu.vramSize / (1024 * 1024))
+    console.out.write(" MiB VRAM aperture at ")
+    console.out.hex(gpu.vram)
+    console.out.write(", registers at ")
+    console.out.hex(gpu.registersPhysical)
+    console.out.write(", doorbells at ")
+    console.out.hex(gpu.doorbells)
+    console.out.write("\n")
+    if gpu.consoleBytes != 0 {
+        console.out.write("gpu: the firmware's picture is ")
+        console.out.decimal(gpu.consoleBytes / 1024)
+        console.out.write(" KiB at ")
+        console.out.hex(gpu.consoleOffset)
+        console.out.write(" of the aperture\n")
+    }
+    gpu.report()
+    return true
+}
+
+// The first AMD GPU, enabled, its apertures recorded, its register path
+// brought up; whether there is one. (A VGA-class PCI device whose vendor
+// is AMD, else one of another display class.)
+pub fn probe() -> bool {
+    gpu.present = false
+    var pass: usize = 0
+    while pass < 2 {
+        var n: usize = 0
+        while n < 64 {
+            const address = candidate(if pass == 0 { 0x030000 } else { 0x038000 }, n)
+            n += 1
+            if address == Pci.NONE { break }
+            if Pci.read(address, 0) & 0xFFFF != VENDOR_AMD { continue }
+            if take(address) { return true }
+        }
+        pass += 1
+    }
+    return false
+}

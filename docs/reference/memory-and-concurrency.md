@@ -189,7 +189,8 @@ const result = @cmpxchgStrong(u64, &word, 12, 1, acq_rel, acquire)
   cause, so it belongs in a loop
 - `@fence(order) -> void`
 
-`T` is an integer of 1, 2, 4 or 8 bytes, a `bool`, an enum or a pointer, and
+`T` is an integer of 1, 2, 4 or 8 bytes, a `bool`, an enum, a pointer or an
+optional pointer (`?*T`, null its zero word), and
 `pointer` points to a `T`. The orders and the operation are bare names, as
 the spec spells them (`unordered monotonic acquire release acq_rel
 seq_cst`), not values. The compiler rejects the combinations C11 rejects:

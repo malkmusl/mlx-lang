@@ -10,17 +10,32 @@
 // woken by an IPI (Vector.WAKE) when a process can run. At most
 // layout.Memory.MAX_CPUS run it; the rest stay in the trampoline,
 // halted.
+//
+// The local APICs are reached the way the firmware left them: their
+// registers in memory at 0xFEE00000 (xAPIC), or as model-specific
+// registers (x2APIC: a firmware does that on a machine whose processors'
+// ids do not fit eight bits, or when it is told to). A processor that
+// comes up in the other mode is put into the first one's.
 const layout = @import("../layout.mlx")
 const memory = @import("./memory.mlx")
 const clock = @import("./clock.mlx")
 const cpu = @import("./cpu.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
+const console = @import("./console.mlx")
+const vfs = @import("./vfs.mlx")
 
-// The local APIC's registers (its page mapped uncached at its physical
-// address in the kernel's view).
+// The local APIC's registers: offsets in its page (mapped uncached at its
+// physical address in the kernel's view); in x2APIC mode register `offset`
+// is the model-specific register X2_BASE + offset / 16.
 const LAPIC: usize = 0xFEE00000
+const X2_BASE: usize = 0x800
+// IA32_APIC_BASE's bits: the local APIC is on, and in x2APIC mode.
+const APIC_ON: usize = 0x800
+const APIC_X2: usize = 0x400
 const ID: usize = 0x20
 const EOI: usize = 0xB0
+// The interrupts raised and not yet taken: 32 vectors a register.
+const IRR: usize = 0x200
 const SPURIOUS: usize = 0xF0
 const ICR_LOW: usize = 0x300
 const ICR_HIGH: usize = 0x310
@@ -28,10 +43,14 @@ const LVT_TIMER: usize = 0x320
 const TIMER_INITIAL: usize = 0x380
 const TIMER_CURRENT: usize = 0x390
 const TIMER_DIVIDE: usize = 0x3E0
+const VERSION: usize = 0x30
 const DELIVERY_PENDING: u32 = 0x1000
 const TIMER_PERIODIC: u32 = 0x20000
 const TIMER_MASKED: u32 = 0x10000
-const MAX_LISTED: usize = 32
+// The processors the firmware may name (a board with two large ones).
+const MAX_LISTED: usize = 256
+// An ACPI table's most bytes (what is taken for one; they are a few KiB).
+const MAX_TABLE: usize = 0x100000
 // A trap stack: 64 pages (as the first processor's).
 const STACK_PAGES: usize = 64
 
@@ -64,6 +83,12 @@ pub const Processors = struct {
     // The local APIC's timer ticks in 10 ms (a time slice).
     timerTicks: usize
     mapped: bool
+    // Whether the first processor's local APIC was looked at, answers
+    // (IPIs can be sent, a device's message taken), and is in x2APIC
+    // mode.
+    looked: bool
+    usable: bool
+    x2: bool
 }
 
 var found: Processors = undefined // (per run)
@@ -77,30 +102,178 @@ pub fn processors() -> *Processors { return &found }
 // The kernel lock: the processor holding it (+ 1; 0: none) and how
 // often it took it (an interrupt while it waits inside the kernel takes
 // it again).
-var lockOwner: usize = 0 // (per run)
+//
+// A processor that waits only LOOKS at the word until it reads free, and
+// tries to take it then (a compare-and-swap asks for the word's cache
+// line for itself whether it succeeds or not: seven processors doing
+// that in a loop keep taking the line from the one that holds the lock,
+// which then waits for memory at every step of its own work, and from
+// each other). Between two looks it pauses (the processor's hint that
+// this is a wait: Cpu.relax). The word has a cache line to itself, with
+// what the holder is at beside it (a waiting processor reads that too):
+// what lies around (the depth, the processor's number, which the holder
+// reads all the time) must not travel with it.
+const Lock = struct {
+    before: [8]usize
+    owner: usize
+    // What the holder is at (Waits.SYSTEM_CALL and the call's number, an
+    // interrupt's or fault's vector, Waits.IDLE; above them the
+    // process's id, 0 where the processor idled): told by the trap path
+    // and the idle loop, read by a processor that waits.
+    work: usize
+    after: [6]usize
+}
+
+// (With values: the word is read before anything is written to it.)
+var kernel: Lock = Lock.{ .before = [8]usize{ 0, 0, 0, 0, 0, 0, 0, 0 }, .owner = 0, .work = 0, .after = [6]usize{ 0, 0, 0, 0, 0, 0 } }
 var lockDepth: usize = 0 // (per run)
 // The processor the kernel runs on (valid while it holds the lock).
 var current: usize = 0 // (per run)
 
 pub fn currentCpu() -> usize { return current }
 
+// How often the processor that holds the kernel took it (1: the entry
+// itself; more: a fault or an interrupt inside it).
+pub fn depth() -> usize { return lockDepth }
+
+pub fn at(what: usize) -> void { @atomicStore(usize, &kernel.work, what, monotonic) }
+
+// Each processor: whether it is in the idle loop's halt (set before it
+// lets the kernel go there, taken back after it has the kernel again):
+// an interrupt it takes then is an idle processor's, and so is its wait
+// for the kernel.
+var halted: PerProcessor(bool) = undefined // (per run)
+
+pub fn halts(id: usize, value: bool) -> void { halted.at(id).* = value }
+
+// Whether the processor that holds the kernel came from its idle halt.
+pub fn halting() -> bool { return halted.at(current).* }
+
+// The waits for the kernel, in the counter's ticks: those of processors
+// that had something to run summed (`total`), the longest of them since
+// the start and in the last one to two WINDOWs, each with what held the
+// kernel for the longest stretch of that wait (a wait may see several
+// holders); and the waits of processors that had nothing to run, summed
+// apart (`idle`: their ticks queue behind whoever is in the kernel and
+// delay nobody). A program that stutters while another's call holds the
+// kernel (a driver waiting for its device, a long copy) shows here, with
+// the call. Nothing is measured where the kernel is free when asked for.
+pub const Waits = struct {
+    pub const SYSTEM_CALL: usize = 0x80000000
+    // The holder was in its idle loop (looking for work, the kernel's
+    // own writes to the disk).
+    pub const IDLE: usize = 0x7FFFFFFF
+    // Seconds a window of the recent figure lasts.
+    pub const WINDOW: usize = 10
+
+    total: usize
+    idle: usize
+    longest: usize
+    longestFor: usize
+    // The longest of the window that runs and of the one before it, and
+    // when (the counter) the running one began.
+    now: usize
+    nowFor: usize
+    before: usize
+    beforeFor: usize
+    began: usize
+
+    // A new window when the running one is over (`counter`: now).
+    fn turn(self: *Self, counter: usize) -> void {
+        const window = WINDOW * clock.system().rate()
+        if counter - self.*.began < window { return }
+        // (Nothing for longer than two windows: the one before is over
+        // as well.)
+        const old = counter - self.*.began >= 2 * window
+        self.*.before = if old { 0 } else { self.*.now }
+        self.*.beforeFor = if old { 0 } else { self.*.nowFor }
+        self.*.now = 0
+        self.*.nowFor = 0
+        self.*.began = counter
+    }
+
+    // The longest wait of the last one to two windows and its holder.
+    pub fn recent(self: *Self) -> (usize, usize) {
+        self.turn(cpu.Cpu.timestamp())
+        if self.*.before > self.*.now { return -> (self.*.before, self.*.beforeFor) }
+        return -> (self.*.now, self.*.nowFor)
+    }
+}
+
+var waits: Waits = undefined // (per run)
+
+pub fn waited() -> *Waits { return &waits }
+
 // The kernel taken by processor `id` (waited for when another has it).
 pub fn lock(id: usize) -> void {
-    if lockOwner == id + 1 {
+    // (Its own number is there only while it holds the lock: a second
+    // entry.)
+    if @atomicLoad(usize, &kernel.owner, monotonic) == id + 1 {
         lockDepth += 1
         return
     }
+    // While it waits: since when, and under which word of the holder's
+    // work the longest stretch of the wait went by (the counter is read
+    // when the word changes, not at every look).
+    var since: usize = 0
+    var word: usize = 0
+    var wordSince: usize = 0
+    var stretch: usize = 0
+    var holder: usize = 0
     while true {
-        const taken = @cmpxchgWeak(usize, &lockOwner, 0, id + 1, acquire, monotonic)
-        if taken.0 { break }
+        if @atomicLoad(usize, &kernel.owner, monotonic) == 0 {
+            const taken = @cmpxchgWeak(usize, &kernel.owner, 0, id + 1, acquire, monotonic)
+            if taken.0 { break }
+        }
+        const seen = @atomicLoad(usize, &kernel.work, monotonic)
+        if since == 0 {
+            since = cpu.Cpu.timestamp()
+            wordSince = since
+            word = seen
+        } else if seen != word {
+            const counter = cpu.Cpu.timestamp()
+            if counter - wordSince > stretch {
+                stretch = counter - wordSince
+                holder = word
+            }
+            word = seen
+            wordSince = counter
+        }
+        cpu.Cpu.relax()
     }
     lockDepth = 1
     current = id
+    if since != 0 {
+        const counter = cpu.Cpu.timestamp()
+        if counter - wordSince > stretch { holder = word }
+        noteWait(id, counter - since, holder, counter)
+    }
+}
+
+// A wait of processor `id` for the kernel that took `took`, mostly behind
+// `holder`. (Not the waits of the start, before the first trap said what
+// the holder is at: the other processors wait for the first one's setup.)
+fn noteWait(id: usize, took: usize, holder: usize, counter: usize) -> void {
+    if holder == 0 { return }
+    if halted.at(id).* {
+        waits.idle += took
+        return
+    }
+    waits.total += took
+    if took > waits.longest {
+        waits.longest = took
+        waits.longestFor = holder
+    }
+    waits.turn(counter)
+    if took > waits.now {
+        waits.now = took
+        waits.nowFor = holder
+    }
 }
 
 pub fn unlock() -> void {
     lockDepth -= 1
-    if lockDepth == 0 { @atomicStore(usize, &lockOwner, 0, release) }
+    if lockDepth == 0 { @atomicStore(usize, &kernel.owner, 0, release) }
 }
 
 fn physical(address: usize) -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(address)) }
@@ -114,52 +287,187 @@ fn same(bytes: [*]const u8, text: []const u8) -> bool {
     return true
 }
 
-// The RSDP: in the EBDA's first KiB or the BIOS area (0xE0000..0xFFFFF),
-// on a 16-byte boundary, its checksum right; 0 when there is none (an EFI
-// boot keeps it in the firmware's configuration table).
-fn rsdp() -> usize {
-    const ebda = Bytes.read16(physical(0x40E), 0) << 4
-    var at = ebda
-    while ebda != 0 && at < ebda + 1024 {
-        if same(physical(at), "RSD PTR ") && sum(at, 20) { return at }
-        at += 16
-    }
-    at = 0xE0000
-    while at < 0x100000 {
-        if same(physical(at), "RSD PTR ") && sum(at, 20) { return at }
-        at += 16
-    }
-    return 0
+// The firmware's memory at `address` (`length` bytes of its ACPI tables:
+// no RAM the kernel hands out, so nothing has put it in the kernel's
+// view) where the kernel sees it; 0 when it cannot be.
+fn firmware(address: usize, length: usize) -> usize {
+    if address == 0 || length == 0 { return 0 }
+    return memory.Device.map(address, length, 0)
 }
 
-fn sum(at: usize, length: usize) -> bool {
+// Whether the `length` bytes at `at` (in the kernel's view) add up to 0,
+// as an ACPI structure's do.
+fn sums(at: usize, length: usize) -> bool {
+    const bytes = Bytes.pointer(at)
     var total: usize = 0
     var k: usize = 0
     while k < length {
-        total += @intCast(usize, physical(at)[k])
+        total += @intCast(usize, bytes[k])
         k += 1
     }
     return total & 0xFF == 0
 }
 
+// The RSDP, in the kernel's view: the one a UEFI firmware named (the EFI
+// loader passes it on: such a firmware keeps none in the BIOS area), else
+// the BIOS's, in the EBDA's first KiB or at 0xE0000..0xFFFFF on a 16-byte
+// boundary; its checksum right. 0 when there is none.
+fn rsdp() -> usize {
+    const given = cpu.BootInfo.get(layout.Info.RSDP)
+    if given != 0 {
+        const at = firmware(given, 36)
+        if at != 0 && same(Bytes.pointer(at), "RSD PTR ") && sums(at, 20) { return at }
+    }
+    const ebda = Bytes.read16(physical(0x40E), 0) << 4
+    var at = ebda
+    while ebda != 0 && at < ebda + 1024 {
+        if same(physical(at), "RSD PTR ") && sums(layout.Memory.virtual(at), 20) { return layout.Memory.virtual(at) }
+        at += 16
+    }
+    at = 0xE0000
+    while at < 0x100000 {
+        if same(physical(at), "RSD PTR ") && sums(layout.Memory.virtual(at), 20) { return layout.Memory.virtual(at) }
+        at += 16
+    }
+    return 0
+}
+
+// The ACPI table at the physical `address`, all of it in the kernel's
+// view; 0 when there is none (or its length is no table's).
+fn acpiTable(address: usize) -> usize {
+    const header = firmware(address, 36)
+    if header == 0 { return 0 }
+    const length = Bytes.read32(Bytes.pointer(header), 4)
+    if length < 36 || length > MAX_TABLE { return 0 }
+    return firmware(address, length)
+}
+
+// The MADT ("APIC") among the tables the RSDP at `root` names: the
+// XSDT's 64-bit entries when it has one (ACPI 2.0; a firmware may give
+// no RSDT then), else the RSDT's 32-bit ones. 0 when there is none.
+fn madtOf(root: usize) -> usize {
+    const pointer = Bytes.pointer(root)
+    var list: usize = 0
+    var width: usize = 8
+    if pointer[15] >= 2 { list = acpiTable(Bytes.read64(pointer, 24)) }
+    if list == 0 {
+        list = acpiTable(Bytes.read32(pointer, 16))
+        width = 4
+    }
+    if list == 0 { return 0 }
+    const entries = Bytes.pointer(list)
+    const length = Bytes.read32(entries, 4)
+    var at: usize = 36
+    while at + width <= length {
+        const address = if width == 8 { Bytes.read64(entries, at) } else { Bytes.read32(entries, at) }
+        const table = acpiTable(address)
+        if table != 0 && same(Bytes.pointer(table), "APIC") { return table }
+        at += width
+    }
+    return 0
+}
+
+// One more processor the firmware names (its local APIC's id), unless it
+// is listed already.
+fn list(id: usize) -> void {
+    var k: usize = 0
+    while k < found.count {
+        if found.apicIds[k] == id { return }
+        k += 1
+    }
+    if found.count < MAX_LISTED {
+        found.apicIds[found.count] = id
+        found.count += 1
+    }
+}
+
+// How many processors may run the kernel: /system/settings/processors
+// (a number; 1: only the first) when the image has it, else all the
+// kernel has room for. The way to start a machine on one processor when
+// the others are in doubt.
+fn allowed() -> usize {
+    const tree = vfs.fileSystem()
+    const file = tree.resolve(vfs.Vfs.ROOT, "/system/settings/processors\x00".pointer)
+    if file < 0 { return MAX_CPUS }
+    var text: [16]u8 = undefined
+    const length = tree.read(@bitCast(usize, file), 0, &text, 16)
+    var value: usize = 0
+    var k: usize = 0
+    while k < length && text[k] >= 48 && text[k] <= 57 {
+        value = value * 10 + @intCast(usize, text[k] - 48)
+        k += 1
+    }
+    if k == 0 || value == 0 { return MAX_CPUS }
+    return if value > MAX_CPUS { MAX_CPUS } else { value }
+}
+
 fn reg(offset: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, layout.Memory.virtual(LAPIC) + offset) } }
 
-// The local APIC's page in the kernel's view: a page directory for the
-// fourth GiB under the boot PDPT (which every address space shares), its
-// 2 MiB page there uncached; false when memory is out.
+// A register of this processor's local APIC read and written, by the way
+// it is reached.
+fn get(offset: usize) -> u32 {
+    if found.x2 { return @intCast(u32, cpu.Msr.read(X2_BASE + (offset >> 4)) & 0xFFFFFFFF) }
+    return reg(offset).*
+}
+
+fn put(offset: usize, value: u32) -> void {
+    if found.x2 {
+        cpu.Msr.write(X2_BASE + (offset >> 4), @intCast(usize, value))
+        return
+    }
+    reg(offset).* = value
+}
+
+// This processor's local APIC's id (all 32 bits of the register in x2APIC
+// mode, its top eight otherwise).
+fn ownId() -> usize {
+    const value = @intCast(usize, get(ID))
+    return if found.x2 { value } else { value >> 24 }
+}
+
+// The local APIC's page in the kernel's view, uncached; false when
+// memory is out.
 fn mapApic() -> bool {
     if found.mapped { return true }
-    const pdpt = physical(layout.Memory.BLOB + layout.Blob.PDPT)
-    if Bytes.read64(pdpt, 3 * 8) & 1 == 0 {
-        const directory = memory.allFrames().allocate()
-        if directory == 0 { return false }
-        Bytes.write64(pdpt, 3 * 8, directory | 0x3)
-    }
-    const directory = Bytes.read64(pdpt, 3 * 8) & memory.Page.ADDRESS
-    // Present, writable, a 2 MiB page, write-through, uncached.
-    Bytes.write64(physical(directory), ((LAPIC >> 21) & 511) * 8, LAPIC | 0x83 | 0x18)
+    if memory.Device.map(LAPIC, memory.Page.SIZE, memory.Device.UNCACHED) == 0 { return false }
     found.mapped = true
     return true
+}
+
+// The first processor's local APIC looked at, once: which way it is
+// reached, whether it answers there, and on (its spurious vector set).
+// False when it is off, not where the kernel looks, or silent.
+fn ready() -> bool {
+    if found.looked { return found.usable }
+    found.looked = true
+    found.usable = false
+    const base = cpu.Msr.read(cpu.Msr.APIC_BASE)
+    if base & APIC_ON == 0 { return false }
+    found.x2 = base & APIC_X2 != 0
+    if !found.x2 {
+        if base & 0xFFFFFF000 != LAPIC { return false }
+        if !mapApic() { return false }
+    }
+    const version = @intCast(usize, get(VERSION))
+    if version == 0 || version == 0xFFFFFFFF { return false }
+    put(SPURIOUS, 0x100 | @intCast(u32, layout.Vector.SPURIOUS))
+    found.usable = true
+    return true
+}
+
+// This processor's local APIC in the mode the first one's is in (a
+// firmware sets them all alike; one that did not would leave a processor
+// whose timer and IPIs go nowhere). From x2APIC back to its registers in
+// memory only by way of off.
+fn adopt() -> void {
+    const base = cpu.Msr.read(cpu.Msr.APIC_BASE)
+    if found.x2 && base & APIC_X2 == 0 {
+        if base & APIC_ON == 0 { cpu.Msr.write(cpu.Msr.APIC_BASE, base | APIC_ON) }
+        cpu.Msr.write(cpu.Msr.APIC_BASE, base | APIC_ON | APIC_X2)
+    } else if !found.x2 && base & APIC_X2 != 0 {
+        cpu.Msr.write(cpu.Msr.APIC_BASE, base & ~(APIC_ON | APIC_X2))
+        cpu.Msr.write(cpu.Msr.APIC_BASE, (base & ~APIC_X2) | APIC_ON)
+    }
 }
 
 fn wait(nanoseconds: usize) -> void {
@@ -167,7 +475,15 @@ fn wait(nanoseconds: usize) -> void {
     while clock.system().monotonic() < until {}
 }
 
+// An IPI to the processor whose local APIC's id is `apic`. In memory: the
+// id's eight bits, then the command, waited for until it is delivered; in
+// x2APIC mode one register takes both (all 32 bits of the id) and there
+// is nothing to wait for.
 fn send(apic: usize, command: u32) -> void {
+    if found.x2 {
+        cpu.Msr.write(X2_BASE + (ICR_LOW >> 4), (apic << 32) | @intCast(usize, command))
+        return
+    }
     reg(ICR_HIGH).* = @intCast(u32, apic << 24)
     reg(ICR_LOW).* = command
     var tries: usize = 0
@@ -177,13 +493,13 @@ fn send(apic: usize, command: u32) -> void {
 // The local APIC's timer ticks in 10 ms, measured on this processor
 // (the timer counts the bus clock, the same on every one).
 fn measureTimer() -> void {
-    reg(SPURIOUS).* = 0x100 | @intCast(u32, layout.Vector.SPURIOUS)
-    reg(TIMER_DIVIDE).* = 0xB
-    reg(LVT_TIMER).* = TIMER_MASKED | @intCast(u32, layout.Vector.LAPIC_TIMER)
-    reg(TIMER_INITIAL).* = 0xFFFFFFFF
+    put(SPURIOUS, 0x100 | @intCast(u32, layout.Vector.SPURIOUS))
+    put(TIMER_DIVIDE, 0xB)
+    put(LVT_TIMER, TIMER_MASKED | @intCast(u32, layout.Vector.LAPIC_TIMER))
+    put(TIMER_INITIAL, 0xFFFFFFFF)
     wait(10000000)
-    const left = @intCast(usize, reg(TIMER_CURRENT).*)
-    reg(TIMER_INITIAL).* = 0
+    const left = @intCast(usize, get(TIMER_CURRENT))
+    put(TIMER_INITIAL, 0)
     found.timerTicks = 0xFFFFFFFF - left
 }
 
@@ -191,14 +507,151 @@ fn measureTimer() -> void {
 // every 10 ms, its time slice.
 pub fn startTimer() -> void {
     if found.timerTicks == 0 { return }
-    reg(SPURIOUS).* = 0x100 | @intCast(u32, layout.Vector.SPURIOUS)
-    reg(TIMER_DIVIDE).* = 0xB
-    reg(LVT_TIMER).* = TIMER_PERIODIC | @intCast(u32, layout.Vector.LAPIC_TIMER)
-    reg(TIMER_INITIAL).* = @intCast(u32, found.timerTicks)
+    put(SPURIOUS, 0x100 | @intCast(u32, layout.Vector.SPURIOUS))
+    put(TIMER_DIVIDE, 0xB)
+    put(LVT_TIMER, TIMER_PERIODIC | @intCast(u32, layout.Vector.LAPIC_TIMER))
+    put(TIMER_INITIAL, @intCast(u32, found.timerTicks))
 }
 
-// The end of a local APIC interrupt (its timer's).
-pub fn endOfInterrupt() -> void { reg(EOI).* = 0 }
+// The end of a local APIC interrupt (its timer's, a device's message).
+pub fn endOfInterrupt() -> void { put(EOI, 0) }
+
+// A time slice, in the clock's nanoseconds (what timerTicks counts).
+const SLICE: usize = 10000000
+// The shortest wait a timer is set for (what setting it takes).
+const SHORTEST: usize = 20000
+
+// The processor whose timer is set for a wait's deadline (+ 1; 0: none),
+// and that deadline: one processor wakes for it, not every idle one (seven
+// that wake for one process's frame only queue for the kernel to find it
+// taken).
+var waker: usize = 0 // (per run)
+// Each processor: a fire of its timer set for a deadline is still to be
+// taken (disarm).
+var stale: PerProcessor(bool) = undefined // (per run)
+var wakerDeadline: usize = 0 // (per run)
+
+// This processor, about to halt with nothing to run, woken at `deadline`
+// (the clock's nanoseconds; 0: none): its local APIC's timer set for the
+// time until then when that is sooner than its next tick, and no other
+// processor's is set for as soon. A process that waits with a deadline (a
+// frame's, a sleep's) is found by a processor looking for work, and an
+// idle one looks when an interrupt wakes it: the tick alone made every
+// such wait a hundredth of a second coarse (thirty frames a second came
+// out as 30, 30, 40 ms at best, with one processor as 25 a second).
+// Whether the timer was set: then `disarm` after the halt puts it back.
+// The first processor's time slices are the PIT's, its local APIC's timer
+// is free for this; another's counts its slices, and is set to fire once
+// for the deadline instead until disarm starts its slices again.
+pub fn arm(deadline: usize) -> bool {
+    if deadline == 0 || !found.usable || found.timerTicks == 0 { return false }
+    const now = clock.system().monotonic()
+    if covered(deadline, now) { return false }
+    var left: usize = if deadline > now { deadline - now } else { 0 }
+    if left >= SLICE { return false }
+    if left < SHORTEST { left = SHORTEST }
+    const ticks = left * found.timerTicks / SLICE
+    if current != 0 {
+        // (Its tick is on its way and comes sooner: it looks then, and
+        // sets the timer for what is left. The deadline is this
+        // processor's all the same, or each switch of a busy one would
+        // wake it to ask again.)
+        const coming = @intCast(usize, get(TIMER_CURRENT))
+        if ticks >= coming {
+            waker = current + 1
+            wakerDeadline = now + coming * SLICE / found.timerTicks
+            return false
+        }
+    } else {
+        put(TIMER_DIVIDE, 0xB)
+    }
+    // (Once, not again and again: a timer left periodic with this short
+    // a period fired anew while its first interrupt still waited for the
+    // kernel, trap after trap.)
+    put(LVT_TIMER, @intCast(u32, layout.Vector.LAPIC_TIMER))
+    put(TIMER_INITIAL, @intCast(u32, if ticks == 0 { 1 } else { ticks }))
+    waker = current + 1
+    wakerDeadline = deadline
+    return true
+}
+
+// Whether another processor's timer is set for a time no later than
+// `deadline` and still to come (`now`: the clock): then that one wakes
+// and looks, this one need not. (One whose time has passed has woken, or
+// went on with a process without its timer: it counts no more.)
+fn covered(deadline: usize, now: usize) -> bool {
+    return waker != 0 && waker != current + 1 && wakerDeadline <= deadline && wakerDeadline + SLICE > now
+}
+
+// After the halt: the deadline is this processor's no more (it looks now,
+// and arms again when it halts again), and where `arm` set the timer
+// (`armed`) the first processor's is off again, another's back to its
+// slices.
+pub fn disarm(armed: bool) -> void {
+    if armed {
+        if current != 0 {
+            put(LVT_TIMER, TIMER_PERIODIC | @intCast(u32, layout.Vector.LAPIC_TIMER))
+            put(TIMER_INITIAL, @intCast(u32, found.timerTicks))
+        } else {
+            put(TIMER_INITIAL, 0)
+        }
+        // A fire that came after the processor woke (by something else,
+        // or while it waited for the kernel) is still to be taken: it is
+        // no time slice's end (staleTick).
+        const vector = layout.Vector.LAPIC_TIMER
+        if get(IRR + (vector / 32) * 0x10) & (@intCast(u32, 1) << @intCast(u5, vector % 32)) != 0 { stale.at(current).* = true }
+    }
+    if waker == current + 1 { waker = 0 }
+}
+
+// Whether this processor's timer interrupt, taken now, is one left over
+// from a timer set for a deadline (asked once: it is taken note of).
+pub fn staleTick() -> bool {
+    const was = stale.at(current).*
+    stale.at(current).* = false
+    return was
+}
+
+// This processor goes on with a process while a wait's `deadline` (0:
+// none) is less than a time slice away and no processor's timer is set
+// for it (this one's was, or the wait is new): an idle one is woken, which
+// sets its own on its way back to the halt.
+pub fn cover(deadline: usize) -> void {
+    if deadline == 0 || !found.usable || found.timerTicks == 0 { return }
+    if waker == current + 1 { waker = 0 }
+    const now = clock.system().monotonic()
+    if covered(deadline, now) || deadline >= now + SLICE { return }
+    const other = idleProcessor()
+    if other.0 { wake(other.1) }
+}
+
+// Whether the devices may raise their interrupts as messages:
+// /system/settings/interrupts saying "polled" keeps them looked at on the
+// timer tick alone (the way to start a machine whose messages are in
+// doubt: they are new on every board).
+fn messagesAllowed() -> bool {
+    const tree = vfs.fileSystem()
+    const file = tree.resolve(vfs.Vfs.ROOT, "/system/settings/interrupts\x00".pointer)
+    if file < 0 { return true }
+    var text: [8]u8 = undefined
+    const length = tree.read(@bitCast(usize, file), 0, &text, 8)
+    return !(length >= 6 && same(&text, "polled"))
+}
+
+// This processor's local APIC made ready to take a device's interrupt (a
+// message-signalled one: Pci.enableMsi, Pci.enableMsix): on (its
+// spurious vector set) and answering; whether it is, and its id for the
+// message's address. Also on a machine where one processor runs (the
+// others' start does as much on the way). A message's address has eight
+// bits for the id: a processor whose id does not fit takes none. None
+// either when the settings say the devices are to be polled.
+pub fn localApic() -> (bool, usize) {
+    if !messagesAllowed() { return -> (false, 0) }
+    if !ready() { return -> (false, 0) }
+    const id = ownId()
+    if id >= 255 { return -> (false, 0) }
+    return -> (true, id)
+}
 
 // Processor `k`'s block and TSS: a trap stack of its own, its share of
 // the arena, its number; false when memory is out.
@@ -225,44 +678,94 @@ fn prepare(k: usize) -> bool {
 // the kernel (brix_ap) once the first processor lets go of it.
 pub fn start() -> void {
     idle.fill(false)
+    halted.fill(false)
+    stale.fill(false)
+    waits = Waits.{ .total = 0, .idle = 0, .longest = 0, .longestFor = 0, .now = 0, .nowFor = 0, .before = 0, .beforeFor = 0, .began = cpu.Cpu.timestamp() }
     apic.fill(0)
     found.count = 1
     found.started = 0
     found.running = 1
     found.timerTicks = 0
-    found.mapped = false
-    const pointer = rsdp()
-    if pointer == 0 { return }
-    const rsdt = Bytes.read32(physical(pointer), 16)
-    if rsdt == 0 || rsdt >= layout.Memory.MAPPED_LIMIT { return }
-    const length = Bytes.read32(physical(rsdt), 4)
-    var madt: usize = 0
-    var at: usize = 36
-    while at + 4 <= length {
-        const table = Bytes.read32(physical(rsdt), at)
-        if table != 0 && table < layout.Memory.MAPPED_LIMIT && same(physical(table), "APIC") { madt = table }
-        at += 4
+    const out = console.out
+    // The local APIC's timer measured where there is one, also on a
+    // machine where one processor runs: waits with a deadline are woken
+    // by it (arm).
+    if ready() { measureTimer() }
+    const root = rsdp()
+    if root == 0 {
+        out.write("brixOS: no ACPI tables found (one processor runs)\n")
+        return
     }
-    if madt == 0 { return }
-    const madtLength = Bytes.read32(physical(madt), 4)
+    const madt = madtOf(root)
+    if madt == 0 {
+        out.write("brixOS: the ACPI tables name no processors (one runs)\n")
+        return
+    }
+    // How the local APICs are reached decides which processors can be
+    // (below), so it is looked at first.
+    const answering = ready()
+    // The MADT's entries (a type, a length): a processor's local APIC
+    // (type 0: an 8-bit id) or its x2APIC (type 9: a 32-bit id), each
+    // enabled. An id of 255 or more is reached in x2APIC mode only: when
+    // the firmware left the other, such a processor is counted and left.
+    const table = Bytes.pointer(madt)
+    const madtLength = Bytes.read32(table, 4)
     found.count = 0
-    at = 44
+    var beyond: usize = 0
+    var at: usize = 44
     while at + 2 <= madtLength {
-        const kind = physical(madt)[at]
-        const size = @intCast(usize, physical(madt)[at + 1])
-        if size < 2 { break }
-        // A processor's local APIC, enabled.
-        if kind == 0 && Bytes.read32(physical(madt), at + 4) & 1 != 0 && found.count < MAX_LISTED {
-            found.apicIds[found.count] = @intCast(usize, physical(madt)[at + 3])
-            found.count += 1
+        const kind = table[at]
+        const size = @intCast(usize, table[at + 1])
+        if size < 2 || at + size > madtLength { break }
+        if kind == 0 && size >= 8 && Bytes.read32(table, at + 4) & 1 != 0 {
+            list(@intCast(usize, table[at + 3]))
+        } else if kind == 9 && size >= 16 && Bytes.read32(table, at + 8) & 1 != 0 {
+            const id = Bytes.read32(table, at + 4)
+            if id < 255 || found.x2 { list(id) } else { beyond += 1 }
         }
         at += size
     }
-    if found.count < 2 || !mapApic() { return }
-    measureTimer()
+    if beyond != 0 {
+        out.write("brixOS: ")
+        out.decimal(beyond)
+        out.write(" processors are reached by x2APIC only (left alone)\n")
+    }
+    if found.count < 2 {
+        if found.count == 0 { found.count = 1 }
+        return
+    }
+    const limit = allowed()
+    if limit < 2 {
+        out.write("brixOS: ")
+        out.decimal(found.count)
+        out.write(" processors; /system/settings/processors lets one run\n")
+        return
+    }
+    // The local APICs on, where the kernel looks for them (in memory, or
+    // as model-specific registers), and answering there.
+    const base = cpu.Msr.read(cpu.Msr.APIC_BASE)
+    if base & APIC_ON == 0 {
+        out.write("brixOS: the local APIC is off (one processor runs)\n")
+        return
+    }
+    if !found.x2 && (Bytes.read32(table, 36) != LAPIC || base & 0xFFFFFF000 != LAPIC) {
+        out.write("brixOS: the local APICs are at ")
+        out.hex(base & 0xFFFFFF000)
+        out.write(", not where the kernel looks (one processor runs)\n")
+        return
+    }
+    if !answering {
+        out.write("brixOS: the local APIC does not answer (one processor runs)\n")
+        return
+    }
+    if found.x2 { out.write("brixOS: the local APICs are in x2APIC mode\n") }
+    if found.timerTicks == 0 {
+        out.write("brixOS: the local APIC's timer does not count (one processor runs)\n")
+        return
+    }
     // The blocks of those that will run the kernel.
     var k: usize = 1
-    while k < found.count && k < MAX_CPUS {
+    while k < found.count && k < limit {
         if !prepare(k) { return }
         k += 1
     }
@@ -270,11 +773,11 @@ pub fn start() -> void {
     Bytes.copy(physical(layout.Ap.START), physical(layout.Memory.BLOB + layout.Blob.AP), layout.Ap.SIZE)
     const counter = unsafe { @ptrFromInt(*u32, layout.Memory.virtual(layout.Ap.START + layout.Ap.STARTED)) }
     counter.* = 0
-    const own = @intCast(usize, reg(ID).* >> 24)
+    const own = ownId()
     apic.at(0).* = own
     k = 0
     var others: usize = 0
-    while k < found.count && others < MAX_CPUS - 1 {
+    while k < found.count && others < limit - 1 {
         const apic = found.apicIds[k]
         if apic != own {
             others += 1
@@ -316,7 +819,8 @@ pub fn arenaRelease(mark: usize) -> void {
 // Processor `id` runs the kernel from now on (its first entry).
 pub fn joined(id: usize) -> void {
     if id + 1 > found.running { found.running = id + 1 }
-    apic.at(id).* = @intCast(usize, reg(ID).* >> 24)
+    adopt()
+    apic.at(id).* = ownId()
 }
 
 // Processor `id` idles from now on (`resting`), or no more.
@@ -337,7 +841,7 @@ pub fn idleProcessor() -> (bool, usize) {
 // process to run). It counts as awake from now on: one wake-up at a
 // time.
 pub fn wake(id: usize) -> void {
-    if !found.mapped { return }
+    if !found.usable { return }
     idle.at(id).* = false
     send(apic.at(id).*, 0x4000 | @intCast(u32, layout.Vector.WAKE))
 }

@@ -1,6 +1,10 @@
 // PCI: the configuration space by the I/O ports 0xCF8/0xCFC (mechanism
-// #1), the devices of bus 0 found by their vendor and device.
+// #1), devices found by their vendor and device across every bus. Memory
+// BARs, the capability list, MSI and MSI-X are here too, for the devices
+// of real hardware (AHCI, NVMe, the Intel NIC, xHCI) that virtio on bus 0
+// did not need.
 const Port = @import("./cpu.mlx").Port
+const memory = @import("./memory.mlx")
 
 pub const Pci = struct {
     const ADDRESS: usize = 0xCF8
@@ -10,14 +14,33 @@ pub const Pci = struct {
     // Configuration registers.
     pub const VENDOR_DEVICE: usize = 0x00
     pub const COMMAND: usize = 0x04
+    pub const CLASS: usize = 0x08
     pub const HEADER_TYPE: usize = 0x0C
     pub const BAR0: usize = 0x10
-    // COMMAND's bits: I/O space, bus mastering (the device's DMA).
+    pub const SECONDARY_BUS: usize = 0x18
+    pub const INTERRUPT_LINE: usize = 0x3C
+    pub const CAPABILITIES: usize = 0x34
+    pub const STATUS: usize = 0x06
+    // COMMAND's bits: I/O space, memory space, bus mastering (DMA).
     pub const IO_SPACE: usize = 0x1
+    pub const MEMORY_SPACE: usize = 0x2
     pub const BUS_MASTER: usize = 0x4
+    // Capability ids.
+    pub const CAP_MSI: usize = 0x05
+    pub const CAP_MSIX: usize = 0x11
+    // A message-signalled interrupt's address: the local APICs'.
+    const MESSAGE_ADDRESS: usize = 0xFEE00000
+    // MSI-X: a table entry's bytes, and the capability's control bits (on,
+    // every entry masked).
+    const MSIX_ENTRY: usize = 16
+    const MSIX_ENABLE: usize = 0x8000
+    const MSIX_MASK_ALL: usize = 0x4000
 
-    // The configuration address of bus 0's `device`, `function`.
-    pub fn at(device: usize, function: usize) -> usize { return ENABLE | (device << 11) | (function << 8) }
+    // The configuration address of `bus`:`device`.`function`.
+    pub fn atBus(bus: usize, device: usize, function: usize) -> usize { return ENABLE | (bus << 16) | (device << 11) | (function << 8) }
+
+    // Bus 0 (what virtio and findNth use).
+    pub fn at(device: usize, function: usize) -> usize { return atBus(0, device, function) }
 
     pub fn read(address: usize, register: usize) -> usize {
         Port.out32(ADDRESS, address | (register & 0xFC))
@@ -28,6 +51,10 @@ pub const Pci = struct {
         Port.out32(ADDRESS, address | (register & 0xFC))
         Port.out32(DATA, value)
     }
+
+    // The 24-bit class code (class, subclass, programming interface) of the
+    // device at `address`.
+    pub fn classCode(address: usize) -> usize { return read(address, CLASS) >> 8 & 0xFFFFFF }
 
     // The device `vendor`:`device` on bus 0: its configuration address,
     // NONE when there is none.
@@ -55,6 +82,36 @@ pub const Pci = struct {
         return NONE
     }
 
+    // The `n`-th (from 0) device of class `code` (its class, subclass and
+    // programming interface, as classCode gives), across every bus; NONE
+    // when there is none. `mask` narrows the match (0xFFFFFF: exact,
+    // 0xFFFF00: class and subclass, any interface).
+    pub fn findClass(code: usize, mask: usize, n: usize) -> usize {
+        var seen: usize = 0
+        var bus: usize = 0
+        while bus < 256 {
+            var slot: usize = 0
+            while slot < 32 {
+                var function: usize = 0
+                while function < 8 {
+                    const address = atBus(bus, slot, function)
+                    const id = read(address, VENDOR_DEVICE)
+                    if id & 0xFFFF != 0xFFFF {
+                        if classCode(address) & mask == code & mask {
+                            if seen == n { return address }
+                            seen += 1
+                        }
+                    }
+                    if function == 0 && (id & 0xFFFF == 0xFFFF || read(address, HEADER_TYPE) & 0x800000 == 0) { break }
+                    function += 1
+                }
+                slot += 1
+            }
+            bus += 1
+        }
+        return NONE
+    }
+
     // The I/O port base of an I/O BAR; 0 when it is a memory BAR.
     pub fn ioBase(address: usize, bar: usize) -> usize {
         const value = read(address, BAR0 + bar * 4)
@@ -62,6 +119,110 @@ pub const Pci = struct {
         return value & 0xFFFC
     }
 
+    // The physical address of a memory BAR (a 64-bit BAR's high half is the
+    // next register); 0 when it is an I/O BAR.
+    pub fn memBase(address: usize, bar: usize) -> usize {
+        const value = read(address, BAR0 + bar * 4)
+        if value & 1 != 0 { return 0 }
+        var base = value & 0xFFFFFFF0
+        // Bits 2:1 == 0b10: a 64-bit BAR, its top 32 bits in the next one.
+        if value & 0x6 == 0x4 { base = base | (read(address, BAR0 + (bar + 1) * 4) << 32) }
+        return base
+    }
+
     // I/O space and bus mastering on (the device may then do DMA).
     pub fn enable(address: usize) -> void { write(address, COMMAND, (read(address, COMMAND) & 0xFFFF) | IO_SPACE | BUS_MASTER) }
+
+    // Memory space and bus mastering on, for an MMIO device (AHCI, NVMe,
+    // the NIC).
+    pub fn enableMemory(address: usize) -> void { write(address, COMMAND, (read(address, COMMAND) & 0xFFFF) | MEMORY_SPACE | BUS_MASTER) }
+
+    // The offset of the capability `id` in the device's capability list, or
+    // 0 when it has none. (The list is there only when STATUS bit 4 is set.)
+    pub fn capability(address: usize, id: usize) -> usize {
+        if read(address, STATUS) & 0x100000 == 0 { return 0 }
+        var at_offset = read(address, CAPABILITIES) & 0xFC
+        var guard: usize = 0
+        while at_offset != 0 && guard < 48 {
+            const header = read(address, at_offset)
+            if header & 0xFF == id { return at_offset }
+            at_offset = (header >> 8) & 0xFC
+            guard += 1
+        }
+        return 0
+    }
+
+    // Routes the device's MSI (if it has one) to `vector` on the local APIC
+    // with the id `apic` (smp.localApic gives this processor's, made ready
+    // to take it), and enables it; true when done. MSI needs no IOAPIC or
+    // ACPI interrupt routing and works the same on QEMU and real hardware.
+    // (trap.mlx's handle has to know the vector and end the interrupt at
+    // the local APIC: layout.Vector's device vectors are the ones it
+    // knows.)
+    pub fn enableMsi(address: usize, vector: usize, apic: usize) -> bool {
+        const cap = capability(address, CAP_MSI)
+        if cap == 0 { return false }
+        const control = read(address, cap) >> 16 & 0xFFFF
+        // The message address: the local APIC's, the processor's id (bits
+        // 19:12), no redirection. The data: the vector, edge, fixed
+        // delivery.
+        write(address, cap + 0x4, MESSAGE_ADDRESS | ((apic & 0xFF) << 12))
+        if control & 0x80 != 0 {
+            // A 64-bit capability: the data is two registers further.
+            write(address, cap + 0x8, 0)
+            write(address, cap + 0xC, vector)
+        } else {
+            write(address, cap + 0x8, vector)
+        }
+        // Enable bit, one vector (bits 6:4 and 22:20 left 0).
+        write(address, cap, (read(address, cap) & 0xFF8E0000) | (control << 16) | 0x10000)
+        return true
+    }
+
+    // A 32-bit word of a device's memory at `at` (in the kernel's view).
+    fn word(at: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, at) } }
+
+    // The same by MSI-X (a device that has only that, or serves it
+    // better): every entry of its table (in one of its memory BARs, mapped
+    // here) sends `vector` to the local APIC `apic`, unmasked; then the
+    // capability is enabled, its mask for the whole function off. True
+    // when done.
+    pub fn enableMsix(address: usize, vector: usize, apic: usize) -> bool {
+        const cap = capability(address, CAP_MSIX)
+        if cap == 0 { return false }
+        const control = read(address, cap) >> 16 & 0xFFFF
+        const entries = (control & 0x7FF) + 1
+        const where = read(address, cap + 0x4)
+        const base = memBase(address, where & 0x7)
+        if base == 0 { return false }
+        const table = memory.Device.map(base + (where & 0xFFFFFFF8), entries * MSIX_ENTRY, memory.Device.UNCACHED)
+        if table == 0 { return false }
+        // On, the whole function masked while its table is written.
+        write(address, cap, (read(address, cap) & 0xFFFF) | ((control | MSIX_ENABLE | MSIX_MASK_ALL) << 16))
+        var k: usize = 0
+        while k < entries {
+            const entry = table + k * MSIX_ENTRY
+            // The message's address (low, high), its data, the entry's
+            // control (bit 0: masked).
+            word(entry).* = @intCast(u32, MESSAGE_ADDRESS | ((apic & 0xFF) << 12))
+            word(entry + 4).* = 0
+            word(entry + 8).* = @intCast(u32, vector)
+            word(entry + 12).* = 0
+            k += 1
+        }
+        write(address, cap, (read(address, cap) & 0xFFFF) | (((control | MSIX_ENABLE) & ~MSIX_MASK_ALL) << 16))
+        return true
+    }
+
+    // A device's interrupt as a message to `vector` on the local APIC
+    // `apic`, by MSI when it has that, else by MSI-X; 0 when it has
+    // neither, else which (for the driver to say).
+    pub const BY_MSI: usize = 1
+    pub const BY_MSIX: usize = 2
+
+    pub fn enableMessages(address: usize, vector: usize, apic: usize) -> usize {
+        if enableMsi(address, vector, apic) { return BY_MSI }
+        if enableMsix(address, vector, apic) { return BY_MSIX }
+        return 0
+    }
 }

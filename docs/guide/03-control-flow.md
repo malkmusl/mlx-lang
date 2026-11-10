@@ -91,6 +91,24 @@ pub fn main() void {
 
 (`tests/47_break_outside_loop.mlx`)
 
+A `while true` that no `break` ends never completes, so a function may
+end with it: every way out of the loop is a `return`. A `break` of a loop
+inside it does not end it, nor does one that names a loop around it; a
+`break` of its own, or one that names its label, does, and the function
+then needs its `return` after the loop.
+
+```mlx
+fn firstAbove(limit: u32) -> u32 {
+    var n: u32 = 0
+    while true {
+        n += 2
+        if n > limit { return n }
+    }
+}
+```
+
+(`tests/440_endless_loop_ends_function_runtime.mlx` → 13)
+
 ## `for`
 
 `for` iterates a range, an array, or a slice. `for value in <range|container>`
@@ -179,6 +197,14 @@ pub fn main() u8 {
 ```
 
 (`tests/66_pointer_deref_runtime.mlx` → 8, see also `tests/57_array_pointer_capture_runtime.mlx`)
+
+The pointer is a `*T` where the elements may be written (a `var` array, a
+`[]T`) and a `*const T` where they may not (a constant, an array
+parameter, a `[]const T`), as the array's slice would be a `[]T` or a
+`[]const T` ([Arrays and slices](05-types-and-aggregates.md#arrays-and-slices)):
+`for *item in TABLE { item.* = 0 }` over a `const TABLE` is refused
+(`tests/443_constant_slices_runtime.mlx`,
+`tests/support/constant_slices_invalid/constant_captured.mlx`).
 
 ## Labels
 

@@ -6,6 +6,13 @@
 // mean of 4x4 samples spread over the part of the crop it covers, as the
 // Vulkan renderer's shrink shader takes them (vulkan.mlx), so both show
 // the same pixels.
+//
+// The CPU renderer's copy is brought up to date only where the client
+// says its buffer changed (wl_surface.damage, damage_buffer) when the
+// buffer is the size of the one before: a terminal that printed a line
+// has a line copied, not its window. The copy is what the client may not
+// touch: it is released its buffer at once and draws its next frame into
+// it while this one is composed, any number of times.
 const wl = @import("std.wayland")
 const ui = @import("std.ui")
 const state = @import("./state.mlx")
@@ -14,8 +21,11 @@ const shell = @import("./shell.mlx")
 
 const Surface = state.Surface
 
-// The viewport state of a new surface: none.
+// The buffer and viewport state of a new surface: none.
 pub fn initSurface(surface: *Surface) -> void {
+    surface.*.copied = false
+    surface.*.translucentRow = 0
+    surface.*.transformed = false
     surface.*.viewport = 0
     surface.*.pendingCrop = [4]i32{ -256, -256, -256, -256 }
     surface.*.pendingViewWidth = -1
@@ -39,16 +49,24 @@ pub fn releaseSurface(surface: *Surface) -> void {
 }
 
 // The buffer a commit attaches (a null one windows.mlx handles: the
-// surface is unmapped), then the viewport state it carries.
-pub fn commitContent(surface: *Surface) -> void {
+// surface is unmapped), then the viewport state it carries. True when all
+// that did to the surface's pixels was to replace `part` of them (the CPU
+// renderer's copy brought up to date where the client said its buffer
+// changed; no viewport): the rest of them, and their size, are as before.
+pub fn commitContent(surface: *Surface, part: *ui.Rect) -> bool {
     const compositor = surface.*.compositor
     var attached = false
+    var partial = false
+    // What a client that set a buffer scale or transform calls surface
+    // coordinates is not the buffer's pixels (neither is applied here): it
+    // counts as not having said what changed.
+    if surface.*.transformed { surface.*.pendingDamage = ui.rect(0, 0, 0, 0) }
     if surface.*.hasPendingAttach && surface.*.pendingBuffer != 0 {
         surface.*.fpsFrames +%= 1
         if compositor.*.renderer != 0 {
             holdBuffer(surface, surface.*.pendingBuffer)
         } else {
-            copyBuffer(surface, shell.bufferAt(surface.*.pendingBuffer))
+            partial = copyBuffer(surface, shell.bufferAt(surface.*.pendingBuffer), surface.*.pendingDamage, part)
             compositor.*.commits += 1
             surface.*.contentSerial = compositor.*.commits
         }
@@ -57,6 +75,8 @@ pub fn commitContent(surface: *Surface) -> void {
     surface.*.hasPendingAttach = false
     surface.*.pendingBuffer = 0
     applyView(surface, attached)
+    // (A viewport set with this commit made other pixels of all of them.)
+    return partial && !surface.*.scaledCopy
 }
 
 // The crop and size asked for, applied: checked against the buffer as the
@@ -220,88 +240,192 @@ fn showView(surface: *Surface) -> void {
     surface.*.pixelHeight = height
 }
 
-// Copies an attached shm buffer into the surface and releases it.
-fn copyBuffer(surface: *Surface, buffer: *shell.Buffer) -> void {
-    const compositor = surface.*.compositor
-    surface.*.bufferWidth = buffer.*.width
-    surface.*.bufferHeight = buffer.*.height
-    surface.*.scaledCopy = false
+// Copies an attached shm buffer into the surface and releases it: all of
+// it, or only what `damage` says changed (takePixels; true then, with
+// `part` what was replaced).
+fn copyBuffer(surface: *Surface, buffer: *shell.Buffer, damage: ui.Rect, part: *ui.Rect) -> bool {
     const width = @intCast(usize, buffer.*.width)
     const height = @intCast(usize, buffer.*.height)
-    const needed = width * height * 4
-    if needed > surface.*.pixelCapacity {
-        if surface.*.pixelCapacity > 0 { state.release(compositor, surface.*.pixels, surface.*.pixelCapacity) }
-        surface.*.pixels = state.allocate(compositor, needed)
-        surface.*.pixelCapacity = needed
-    }
+    var partial = false
     if buffer.*.pool.*.memory.address == 0 {
         // A dma-buf the CPU cannot map (only the Vulkan renderer reads
         // those): black instead.
-        var index: usize = 0
-        while index < needed {
-            surface.*.pixels[index] = if index % 4 == 3 { 255 } else { 0 }
-            index += 1
-        }
+        surface.*.scaledCopy = false
+        reserve(surface, width * height * 4)
+        state.fillPixels(@intFromPtr(surface.*.pixels), width * height, 4278190080)
         surface.*.pixelWidth = width
         surface.*.pixelHeight = height
         surface.*.hasContent = true
         surface.*.opaque = true
-        wl.wl_buffer.Resource.fromObject(buffer.*.resource).sendRelease()
-        return
-    }
-    const source = buffer.*.pool.*.memory.bytes()
-    const offset = @intCast(usize, buffer.*.offset)
-    const stride = @intCast(usize, buffer.*.stride)
-    const xrgb = buffer.*.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
-    // XRGB: the alpha byte is set to 255 on the way. All alpha bytes seen
-    // are ANDed to find out whether an ARGB buffer is opaque throughout.
-    const alpha_or: u32 = if xrgb { 4278190080 } else { 0 }
-    var alpha_and: u32 = 4278190080
-    if offset % 4 == 0 && stride % 4 == 0 {
-        var from: [*]const u32 = undefined
-        var to: [*]u32 = undefined
-        unsafe {
-            from = @ptrFromInt([*]const u32, @intFromPtr(source) + offset)
-            to = @ptrCast([*]u32, surface.*.pixels)
-        }
-        const stride_pixels = stride / 4
-        var row: usize = 0
-        while row < height {
-            const from_row = row * stride_pixels
-            const to_row = row * width
-            var column: usize = 0
-            while column < width {
-                const pixel = from[from_row + column] | alpha_or
-                alpha_and = alpha_and & pixel
-                to[to_row + column] = pixel
-                column += 1
-            }
-            row += 1
-        }
+        surface.*.copied = false
     } else {
-        var row: usize = 0
-        while row < height {
-            var column: usize = 0
-            const from = offset + row * stride
-            const to = row * width * 4
-            while column < width * 4 {
-                surface.*.pixels[to + column] = source[from + column]
-                column += 1
-            }
-            column = 3
-            while column < width * 4 {
-                if xrgb { surface.*.pixels[to + column] = 255 }
-                alpha_and = alpha_and & (@intCast(u32, surface.*.pixels[to + column]) << 24)
-                column += 4
-            }
-            row += 1
+        const xrgb = buffer.*.format == @intFromEnum(wl.wl_shm.Format.xrgb8888)
+        partial = takePixels(surface, buffer.*.pool.*.memory.address + @intCast(usize, buffer.*.offset), width, height, @intCast(usize, buffer.*.stride), xrgb, damage, part)
+    }
+    surface.*.bufferWidth = buffer.*.width
+    surface.*.bufferHeight = buffer.*.height
+    wl.wl_buffer.Resource.fromObject(buffer.*.resource).sendRelease()
+    return partial
+}
+
+// Room in `pixels` for `needed` bytes (what it held is gone when it grows).
+fn reserve(surface: *Surface, needed: usize) -> void {
+    if needed <= surface.*.pixelCapacity { return }
+    const compositor = surface.*.compositor
+    if surface.*.pixelCapacity > 0 { state.release(compositor, surface.*.pixels, surface.*.pixelCapacity) }
+    surface.*.pixels = state.allocate(compositor, needed)
+    surface.*.pixelCapacity = needed
+    surface.*.copied = false
+}
+
+// A buffer's pixels (`width` x `height` at `source`, rows `stride` bytes
+// apart; of an XRGB one the alpha bytes are set to 255) into the surface's
+// copy of them. All of them; or, when the copy is of a buffer of this size
+// and `damage` (buffer pixels: what the client said changed since; empty:
+// it did not say) is a part of it, that part only: the rest of the copy
+// stays as it is and the buffer is not read there. True for the latter,
+// `part` being what was replaced (all of it otherwise).
+//
+// Whether the copy is opaque (rows of it are then copied, not blended) is
+// read from the copy, as it is stored: all of it, or the part replaced,
+// and when that part is opaque now and held the row known not to be
+// (`translucentRow`), that row and then the others until one is not. It
+// is the answer a whole copy gives.
+pub fn takePixels(surface: *Surface, source: usize, width: usize, height: usize, stride: usize, xrgb: bool, damage: ui.Rect, part: *ui.Rect) -> bool {
+    const whole = ui.rect(0, 0, @intCast(i32, width), @intCast(i32, height))
+    const needed = width * height * 4
+    var area = whole
+    var partial = false
+    if surface.*.hasContent && surface.*.copied && !surface.*.scaledCopy && surface.*.pixelWidth == width && surface.*.pixelHeight == height && surface.*.pixelCapacity >= needed {
+        const inside = ui.intersect(damage, whole)
+        if !ui.isEmpty(inside) && (inside.width < whole.width || inside.height < whole.height) {
+            area = inside
+            partial = true
         }
+    }
+    surface.*.scaledCopy = false
+    reserve(surface, needed)
+    const left = @intCast(usize, area.x)
+    const top = @intCast(usize, area.y)
+    const bottom = top + @intCast(usize, area.height)
+    const count = @intCast(usize, area.width)
+    const pixels = @intFromPtr(surface.*.pixels)
+    // Rows are looked at until one is not opaque; the others are copied.
+    var opaque = true
+    var translucent: usize = 0
+    var row = top
+    while row < bottom {
+        const to = pixels + (row * width + left) * 4
+        const from = source + row * stride + left * 4
+        if xrgb {
+            state.copyPixels(to, from, count)
+            state.setAlpha(to, count)
+        } else if !opaque {
+            state.copyPixels(to, from, count)
+        } else if !copyOpaque(to, from, count) {
+            opaque = false
+            translucent = row
+        }
+        row += 1
     }
     surface.*.pixelWidth = width
     surface.*.pixelHeight = height
     surface.*.hasContent = true
-    surface.*.opaque = alpha_and == 4278190080
-    wl.wl_buffer.Resource.fromObject(buffer.*.resource).sendRelease()
+    surface.*.copied = true
+    if !partial || !opaque {
+        surface.*.opaque = opaque
+        surface.*.translucentRow = translucent
+    } else if !surface.*.opaque && surface.*.translucentRow >= top && surface.*.translucentRow < bottom {
+        findTranslucent(surface)
+    }
+    part.* = ui.rect(area.x, area.y, area.width, area.height)
+    return partial
+}
+
+// Copies `count` pixels from `from` (a client's buffer) to `to` (the
+// surface's copy, 4-byte aligned) and says whether all of them are opaque.
+// Where both lie alike in 64-bit words, two pixels are copied and their
+// alpha bytes ANDed at a time, each word read once (what is judged is what
+// was stored); else the row is copied and the copy looked through.
+fn copyOpaque(to: usize, from: usize, count: usize) -> bool {
+    if (to ^ from) & 7 != 0 {
+        state.copyPixels(to, from, count)
+        return state.opaquePixels(to, count)
+    }
+    var target = to
+    var origin = from
+    var left = count
+    var single: u32 = 4278190080
+    var one_from: [*]const u32 = undefined
+    var one_to: [*]u32 = undefined
+    if target % 8 != 0 && left > 0 {
+        unsafe {
+            one_from = @ptrFromInt([*]const u32, origin)
+            one_to = @ptrFromInt([*]u32, target)
+        }
+        single = one_from[0]
+        one_to[0] = single
+        target += 4
+        origin += 4
+        left -= 1
+    }
+    var read: [*]const u64 = undefined
+    var write: [*]u64 = undefined
+    unsafe {
+        read = @ptrFromInt([*]const u64, origin)
+        write = @ptrFromInt([*]u64, target)
+    }
+    const pair_count = left / 2
+    var both: u64 = state.ALPHA_PAIR
+    var index: usize = 0
+    while index + 4 <= pair_count {
+        const a = read[index]
+        const b = read[index + 1]
+        const c = read[index + 2]
+        const d = read[index + 3]
+        write[index] = a
+        write[index + 1] = b
+        write[index + 2] = c
+        write[index + 3] = d
+        both = both & a & b & c & d
+        index += 4
+    }
+    while index < pair_count {
+        const a = read[index]
+        write[index] = a
+        both = both & a
+        index += 1
+    }
+    if left % 2 != 0 {
+        unsafe {
+            one_from = @ptrFromInt([*]const u32, origin + pair_count * 8)
+            one_to = @ptrFromInt([*]u32, target + pair_count * 8)
+        }
+        const last = one_from[0]
+        one_to[0] = last
+        single = single & last
+    }
+    return both & state.ALPHA_PAIR == state.ALPHA_PAIR && single & 4278190080 == 4278190080
+}
+
+// The copy was not opaque, and the row known to hold a translucent pixel
+// has opaque ones where it was replaced: whether the copy still is not
+// (by that row outside the part replaced, or by any other), and by which
+// row.
+fn findTranslucent(surface: *Surface) -> void {
+    const width = surface.*.pixelWidth
+    const pixels = @intFromPtr(surface.*.pixels)
+    if !state.opaquePixels(pixels + surface.*.translucentRow * width * 4, width) { return }
+    var row: usize = 0
+    while row < surface.*.pixelHeight {
+        if !state.opaquePixels(pixels + row * width * 4, width) {
+            surface.*.translucentRow = row
+            return
+        }
+        row += 1
+    }
+    surface.*.opaque = true
+    surface.*.translucentRow = 0
 }
 
 // Vulkan: shows an attached buffer in place, releasing the one it replaces.
@@ -337,7 +461,8 @@ pub fn adoptCpuRenderer(compositor: *shell.Compositor) -> void {
         if surface.*.current != 0 {
             const address = surface.*.current
             surface.*.current = 0
-            copyBuffer(surface, shell.bufferAt(address))
+            var all: ui.Rect = undefined
+            _ = copyBuffer(surface, shell.bufferAt(address), ui.rect(0, 0, 0, 0), &all)
             if surface.*.viewWidth > 0 { showView(surface) }
         }
         index += 1

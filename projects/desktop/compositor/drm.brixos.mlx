@@ -6,9 +6,24 @@
 // - Output: /devices/framebuffer (its geometry read: width, height, pitch,
 //   format; its pixels mapped by node_map). Frames are composed on the
 //   CPU into memory of our own (entries.composeCpu) and the changed rows
-//   copied into the framebuffer (red and blue swapped when it is RGBX).
-//   There is no vertical blank to wait for: frame callbacks go out as
-//   the copy is done.
+//   copied into the framebuffer (red and blue swapped when it is RGBX;
+//   framebuffer.mlx has the loops). The framebuffer is only ever written:
+//   it is video memory mapped write-combining, and reading it back takes
+//   seconds.
+// - Frame pacing: there is no vertical blank to wait for, so a clock of
+//   our own stands in for it (framebuffer.frameWait, nextDue). A frame,
+//   and with it the clients' frame callbacks, goes out no sooner than a
+//   frame's time after the one before was due; what is damaged meanwhile
+//   waits and is composed as one frame (the loop sleeps until then:
+//   frameWait). On a desktop at rest nothing is held back: the first
+//   change, a pointer move, is shown at once.
+// - The handover: the first frames are blended over the picture the
+//   program before left on the screen (the splash, the greeter's
+//   compositor, a session's), which that program handed on in a file
+//   (../splash/picture.mlx); without one the first frame is simply drawn.
+//   When this compositor ends (stop, also on the terminate event: sentinel
+//   ending the greeter's, the init a service), it leaves its last frame
+//   the same way.
 // - Input: /devices/keyboard (PS/2 scancodes, set 1: the main block's
 //   codes are evdev's key codes, the extended ones (0xE0) are mapped) and
 //   /devices/mouse (PS/2 packets: buttons, dx, dy). The keymap is
@@ -17,6 +32,7 @@
 //   layout).
 // - No sessions, no VTs: switchTo does nothing.
 const std = @import("std")
+const events = @import("std.events")
 const brix = std.os.brix
 const evdev = std.linux.evdev
 const wl = @import("std.wayland")
@@ -24,8 +40,10 @@ const ui = @import("std.ui")
 const state = @import("./state.mlx")
 const entries = @import("./entries.mlx")
 const scene = @import("./scene.mlx")
+const framebuffer = @import("./framebuffer.mlx")
 const kms = @import("./kms.mlx")
 const xkb = @import("./xkb.mlx")
+const picture = @import("../splash/picture.mlx")
 
 const Compositor = state.Compositor
 
@@ -39,6 +57,19 @@ pub const Backend = struct {
     swap: bool
     // Our frame (width * height * 4), composed on the CPU.
     frame: [*]u8
+    // The previous program's last frame while `fading` (width * height *
+    // 4, in our frame's byte order), taken at start from the file that
+    // program left (picture.take), not from the framebuffer: the opening
+    // crossfade blends the first frames over it, so the splash fades into
+    // the greeter and the greeter into the session with no hard cut. Given
+    // back when the fade is done.
+    previous: [*]u8
+    fading: bool
+    fadeStart: usize
+    // The frame clock (microseconds): a frame's time, and when the next
+    // frame may go out (0: none was shown yet).
+    frameMicros: usize
+    frameDue: usize
     // (For display.mlx, which describes the monitor from it.)
     output: kms.Output
     keyboardState: xkb.Keyboard
@@ -100,6 +131,15 @@ fn openDisplay(backend: *Backend) -> bool {
     return true
 }
 
+// Set by the terminate event (in the upcall): told to end, the loop ends
+// at its next turn (dispatch) and stop() runs.
+var terminated: bool = false // (per run)
+
+fn onTerminate(record: events.Record) -> void {
+    _ = record
+    terminated = true
+}
+
 pub fn start(compositor: *Compositor) -> usize {
     const memory = state.allocate(compositor, @sizeOf(Backend))
     const backend: *Backend = unsafe { @ptrCast(*Backend, memory) }
@@ -112,11 +152,37 @@ pub fn start(compositor: *Compositor) -> usize {
         state.say("brix: no display (/devices/framebuffer)\n")
         return 0
     }
+    backend.*.frameMicros = 1000000000 / @intCast(usize, outputOf(backend).*.millihertz)
+    backend.*.frameDue = 0
     compositor.*.width = outputOf(backend).*.width
     compositor.*.height = outputOf(backend).*.height
     backend.*.frame = state.allocate(compositor, compositor.*.width * compositor.*.height * 4)
     compositor.*.lastFrame = backend.*.frame
     compositor.*.lastFrameStride = compositor.*.width * 4
+    // The previous program left its last frame on the display (the splash
+    // told to keep its picture, the greeter's compositor, a session's) and
+    // handed it on in a file: that is what the first frames fade in from.
+    // With no file, or one that is not this display's, there is no fade:
+    // the first frame is drawn as it is. (The framebuffer is not read.)
+    // (Room for it, as large as the screen, only when one is waiting; a
+    // file that is none of ours is removed all the same.)
+    backend.*.fading = false
+    if picture.waiting(compositor.*.width, compositor.*.height) {
+        const previous = state.allocate(compositor, compositor.*.width * compositor.*.height * 4)
+        backend.*.fading = picture.take(@intFromPtr(previous), compositor.*.width, compositor.*.height, picture.BLUE_FIRST)
+        if backend.*.fading {
+            backend.*.previous = previous
+        } else {
+            state.release(compositor, previous, compositor.*.width * compositor.*.height * 4)
+        }
+    } else {
+        picture.discard()
+    }
+    if compositor.*.verbose { state.say(if backend.*.fading { "brix: fading in from the picture the program before left\n" } else { "brix: no picture left by a program before\n" }) }
+    // Timed from the first composited frame, not here: the compositor's
+    // own start-up (Wayland, the first client) can take longer than the
+    // fade, which would use up the whole window before anything is drawn.
+    backend.*.fadeStart = 0
     compositor.*.pointerX = @intCast(i32, compositor.*.width / 2)
     compositor.*.pointerY = @intCast(i32, compositor.*.height / 2)
     compositor.*.pointerInside = true
@@ -128,6 +194,11 @@ pub fn start(compositor: *Compositor) -> usize {
     const mouse = brix.open(0, "/devices/mouse", brix.Open.READ, 0)
     backend.*.mouse = if mouse < 0 { 0 } else { @intCast(u32, mouse) }
     if mouse < 0 { state.say("brix: no mouse (/devices/mouse)\n") }
+    // Told to end (sentinel ending the greeter's compositor before the
+    // session's starts, the init stopping the service), the loop ends and
+    // stop() runs, which leaves the picture; the event's default would end
+    // the program where it stands.
+    _ = events.handle(events.Event.TERMINATE, onTerminate)
     return @intFromPtr(memory)
 }
 
@@ -139,6 +210,15 @@ pub fn backendAt(address: usize) -> *Backend {
 pub fn output(backend: *Backend) -> *kms.Output { return outputOf(backend) }
 
 pub fn stop(backend: *Backend) -> void {
+    // Our last frame stays on the screen: it is handed to the program that
+    // takes the screen next, from our own memory. Not before a frame of
+    // ours was shown, nor while the opening fade runs (the screen is
+    // between two pictures then): the next program then starts without one.
+    const compositor = backend.*.compositor
+    if backend.*.presented > 0 && !backend.*.fading {
+        const left = picture.leave(@intFromPtr(backend.*.frame), compositor.*.width, compositor.*.height, compositor.*.width * 4, picture.BLUE_FIRST)
+        if compositor.*.verbose { state.say(if left { "brix: the last frame left for the next program\n" } else { "brix: the last frame could not be left for the next program\n" }) }
+    }
     if backend.*.keyboard != 0 { _ = brix.close(backend.*.keyboard) }
     if backend.*.mouse != 0 { _ = brix.close(backend.*.mouse) }
     _ = brix.unmap(backend.*.address, backend.*.pitch * outputOf(backend).*.height)
@@ -162,9 +242,10 @@ pub fn handles(backend: *Backend, list: [*]wl.Handle, capacity: usize) -> usize 
     return count
 }
 
+// (Told to end: the loop does not wait before dispatch sees it.)
 pub fn hasBufferedData(backend: *Backend) -> bool {
     _ = backend
-    return false
+    return terminated
 }
 
 fn now() -> u32 { return @intCast(u32, std.time.milliseconds() & 4294967295) }
@@ -297,47 +378,84 @@ fn readMouse(backend: *Backend) -> void {
 }
 
 pub fn dispatch(backend: *Backend) -> void {
+    if terminated { backend.*.compositor.*.running = false }
     if backend.*.keyboard != 0 && readable(backend.*.keyboard) { readKeyboard(backend) }
     if backend.*.mouse != 0 && readable(backend.*.mouse) { readMouse(backend) }
 }
 
-// Composes and shows a frame when something changed.
+// How long the opening crossfade from the previous program's frame runs.
+const FADE_MS: usize = 300
+
+// How long the loop may wait for a frame's sake, in milliseconds: until
+// the frame that is held back for its time is due (present), a second
+// when none is.
+pub fn frameWait(backend: *Backend) -> isize {
+    if !backend.*.compositor.*.needsRedraw { return 1000 }
+    return @intCast(isize, (framebuffer.frameWait(backend.*.frameDue, state.microseconds()) + 999) / 1000)
+}
+
+// Composes and shows a frame when something changed and its time has
+// come.
 pub fn present(backend: *Backend) -> void {
     const compositor = backend.*.compositor
     if !compositor.*.needsRedraw { return }
     const start = state.microseconds()
+    // Not sooner than a frame's time after the one before was due: what is
+    // damaged until then goes into the same frame (the loop wakes when it
+    // is due: frameWait).
+    if framebuffer.frameWait(backend.*.frameDue, start) != 0 { return }
+    backend.*.frameDue = framebuffer.nextDue(backend.*.frameDue, start, backend.*.frameMicros)
+    // The opening crossfade: the frame is blended over the previous
+    // program's on its way to the screen, the composed weight rising to
+    // full over FADE_MS, so a new compositor fades in instead of cutting.
+    var weight: usize = 256
+    if backend.*.fading {
+        const nowMs = std.time.milliseconds()
+        if backend.*.fadeStart == 0 { backend.*.fadeStart = nowMs }
+        const elapsed = nowMs - backend.*.fadeStart
+        if elapsed >= FADE_MS {
+            // The fade's last frame is the whole picture at full weight:
+            // what the blended frames left on the screen (the previous
+            // program's picture, all of it when the first frame after the
+            // fade's start comes this late) is drawn over, not only where
+            // something changes later. The previous frame has done its
+            // part.
+            backend.*.fading = false
+            state.release(compositor, backend.*.previous, compositor.*.width * compositor.*.height * 4)
+            scene.damageAll(compositor)
+        } else {
+            weight = elapsed * 256 / FADE_MS
+        }
+    }
+    // Our frame is composed in what changed since the last one, also while
+    // the fade runs: its memory holds the rest (the first frame is the
+    // whole screen's: start damages it).
     var changed: ui.Rect = undefined
     const region = scene.takeDamage(compositor, 0, &changed)
     entries.composeCpu(compositor, backend.*.frame, changed)
-    // The changed rows into the framebuffer.
-    var row = region.y
-    while row < ui.bottom(region) {
-        const at = @intCast(usize, row)
-        const left = @intCast(usize, region.x)
-        const count = @intCast(usize, region.width)
-        const target = backend.*.address + at * backend.*.pitch + left * 4
-        const source = @intFromPtr(backend.*.frame) + (at * compositor.*.width + left) * 4
-        if backend.*.swap {
-            const from: [*]const u32 = unsafe { @ptrFromInt([*]const u32, source) }
-            const to: [*]u32 = unsafe { @ptrFromInt([*]u32, target) }
-            var column: usize = 0
-            while column < count {
-                const pixel = from[column]
-                to[column] = (pixel & 4278255360) | ((pixel & 255) << 16) | ((pixel >> 16) & 255)
-                column += 1
-            }
-        } else {
-            state.copyPixels(target, source, count)
-        }
-        row += 1
+    // Into the framebuffer: the changed rows as they are or, while the
+    // fade runs, the whole frame at its new weight over the previous
+    // picture.
+    const composed = state.microseconds()
+    const stride = compositor.*.width * 4
+    if weight < 256 {
+        framebuffer.fadeRows(backend.*.address, backend.*.pitch, @intFromPtr(backend.*.frame), @intFromPtr(backend.*.previous), stride, scene.outputRect(compositor), weight, backend.*.swap)
+    } else {
+        framebuffer.copyRows(backend.*.address, backend.*.pitch, @intFromPtr(backend.*.frame), stride, region, backend.*.swap)
     }
+    compositor.*.deviceMicros += state.microseconds() - composed
     compositor.*.lastFrame = backend.*.frame
-    compositor.*.lastFrameStride = compositor.*.width * 4
+    compositor.*.lastFrameStride = stride
     if backend.*.presented == 0 && compositor.*.verbose { state.say("brix: first frame on screen\n") }
     backend.*.presented += 1
     compositor.*.frames += 1
-    entries.frameDone(compositor, now())
+    // Keep the frames coming until the crossfade is done.
+    if backend.*.fading { compositor.*.needsRedraw = true }
+    // Counted before the frame is told done: frameDone is where a second's
+    // statistics are said and begun again, and this frame's composing and
+    // copying are in them already.
     state.countPresent(compositor, start)
+    entries.frameDone(compositor, now())
 }
 
 // Ctrl+Alt+F<number>: no virtual terminals here.

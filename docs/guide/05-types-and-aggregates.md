@@ -11,7 +11,7 @@
 `104_optional_pointer_null_runtime.mlx`, `174_aggregate_functions_runtime.mlx`,
 `176_pointer_struct_fields_runtime.mlx`, `212_aggregate_index_runtime.mlx`,
 `319_array_pointer_runtime.mlx`, `320_array_pointer_const_mismatch.mlx`,
-`321_slice_pointer_runtime.mlx`
+`321_slice_pointer_runtime.mlx`, `443_constant_slices_runtime.mlx`
 
 ## Structs
 
@@ -122,6 +122,39 @@ pub fn main() u8 {
 ```
 
 (`tests/15_aggregate_builtins.mlx`)
+
+### Packed structs
+
+A `packed struct` has no padding: each field takes exactly the bits of
+its type (`u9` nine, `i4` four, a `bool` its byte), one after the other
+from bit 0, and the struct is the integer that holds them all, 1, 2, 4 or
+8 bytes (a packed struct holds at most 64 bits; a wider one is refused).
+It is how a register, a wire format or a C bit-field group is spelled:
+
+```mlx
+const Color = packed struct {
+    r: u9
+    g: u9
+    b: u9
+    e: u5
+}
+
+pub fn main() u8 {
+    var c: Color = undefined
+    c.r = 300
+    c.e = 31
+    c.e -= 1
+    const word = @bitCast(u32, c) // 300 | 30 << 27
+    const back = @bitCast(Color, word)
+    return @intCast(u8, back.e)
+}
+```
+
+A field is read and written with shifts and masks on the whole word; a
+signed field comes back with its sign. A literal, a module-level
+constant and `@bitCast` to and from an integer of the struct's width all
+work; what a packed field has not got is an address: `&c.r` is not
+allowed (`tests/434_packed_struct_runtime.mlx`).
 
 ## Methods
 
@@ -353,6 +386,41 @@ pub fn main() u8 {
 ```
 
 (`tests/65_index_slice_runtime.mlx`)
+
+The slice of an array is as writable as the array is. Of a `var`, of a
+field or an element of one and of what a `*T` points to it is a `[]T`,
+and what is written through it is written in the array. Of a constant (a
+module's or a local `const`: `tail` above), of a parameter, of a field or
+an element of one, of what a `*const T` points to, of a call's result and
+of an optional's payload (`held.?[0..]`: bind the payload to a `var`
+first to change it) it is a `[]const T`: it reads the array, no element
+is assigned through it, and it does not go where a `[]T` is taken. An array parameter is
+taken by value, but its bytes are the caller's (aggregates are passed by
+address): a callee that wants to change them makes its own copy first.
+
+```mlx
+fn fill(into: []u8, value: u8) -> void {
+    var k: usize = 0
+    while k < into.length {
+        into[k] = value
+        k += 1
+    }
+}
+
+fn scrubbed(values: [6]u8) -> usize {
+    var own = values            // a copy, the callee's to change
+    fill(own[0..], 1)           // own[0..] is a []u8
+    return sum(own[0..]) * 1000 + sum(values[0..])   // values[0..] is a []const u8
+}
+```
+
+(`tests/443_constant_slices_runtime.mlx`. `fill(values[0..], 1)` there, and
+`fill(TABLE[0..4], 1)` or `TABLE[0..4][1] = 9` on a `const TABLE`, are
+refused: "expected `[]u8`, found `[]const u8`", "this place cannot be
+written". Such programs are in `tests/support/constant_slices_invalid`,
+and `tests/run_constant_slices.sh` runs both. Older compilers made every
+array's slice a `[]T`: the callee wrote into its caller's variable, and
+writes through a constant's slice went into a copy.)
 
 A slice has two fields: `.length`, a `usize`, and `.pointer`, its first
 word, a many-item pointer to the elements (`[*]T`, or `[*]const T` for a

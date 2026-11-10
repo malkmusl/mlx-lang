@@ -260,6 +260,100 @@ pub const Frames = struct {
     }
 }
 
+// A device's memory (a controller's registers, the framebuffer) in the
+// kernel's view: the 2 MiB pages that hold it, in a page directory for
+// their GiB under the boot PDPT (which every address space shares). Memory
+// below 511 GiB is at Memory.virtual(physical), as RAM is; memory beyond
+// (a 64-bit BAR the firmware put high: above what the PDPT reaches at
+// that offset) is given pages of a window, the PDPT's last GiB. The
+// drivers map their registers uncached; the framebuffer is written
+// through a write-combining mapping (page-attribute entry 1, which
+// `Device.attributes` makes so on each processor): without it every pixel
+// is a bus write of its own, and a screen of them takes a noticeable part
+// of a second on a real machine.
+pub const Device = struct {
+    // An entry's caching bits: PWT | PCD (page-attribute entry 3,
+    // uncached), PWT alone (entry 1, write-combining).
+    pub const UNCACHED: usize = 0x18
+    pub const WRITE_COMBINING: usize = 0x08
+    const HUGE_PAGE: usize = 0x83 // present, writable, a 2 MiB page
+    const PAT: usize = 0x277
+    // The table at reset but for entry 1 (write-through, which nothing
+    // here uses): write-combining (01).
+    const PAT_VALUE: usize = 0x0007040600070106
+    // The window: the boot PDPT's last GiB, 512 pages of 2 MiB.
+    const WINDOW_GIB: usize = 511
+    const WINDOW_PAGES: usize = 512
+
+    // This processor's page-attribute table (each one has its own: the
+    // first at boot, the others as they come into the kernel).
+    pub fn attributes() -> void { cpu.Msr.write(PAT, PAT_VALUE) }
+
+    fn pdpt() -> [*]u8 { return Bytes.pointer(layout.Memory.virtual(layout.Memory.BLOB + layout.Blob.PDPT)) }
+
+    // The page directory of `gib` under the boot PDPT, made when there is
+    // none; 0 when memory is out.
+    fn directory(gib: usize) -> usize {
+        const entry = Bytes.read64(pdpt(), gib * 8)
+        if entry & Page.PRESENT != 0 { return layout.Memory.virtual(entry & Page.ADDRESS) }
+        const made = frames.allocate()
+        if made == 0 { return 0 }
+        Bytes.write64(pdpt(), gib * 8, made | Page.PRESENT | Page.WRITABLE)
+        return layout.Memory.virtual(made)
+    }
+
+    // The 2 MiB page at `physical` in the entry `slot` of the directory
+    // at `table`, seen at `address`.
+    fn enter(table: usize, slot: usize, physical: usize, caching: usize, address: usize) -> void {
+        const entries = Bytes.pointer(table)
+        const wanted = physical | HUGE_PAGE | caching
+        const now = Bytes.read64(entries, slot * 8)
+        if now == wanted { return }
+        Bytes.write64(entries, slot * 8, wanted)
+        // (An entry that was there may be in this processor's translation
+        // cache.)
+        if now & Page.PRESENT != 0 { cpu.Cpu.invalidatePage(address) }
+    }
+
+    // Maps [physical, physical + bytes) with `caching`: where `physical`
+    // is in the kernel's view, 0 when memory or the window is out.
+    pub fn map(physical: usize, bytes: usize, caching: usize) -> usize {
+        if bytes == 0 { return 0 }
+        const first = physical & ~(layout.Memory.HUGE - 1)
+        const end = physical + bytes
+        if end <= WINDOW_GIB * layout.Memory.GIB {
+            var page = first
+            while page < end {
+                const gib = page / layout.Memory.GIB
+                // (A GiB that is one 1 GiB page is in view already; its
+                // entry is no directory's.)
+                if Bytes.read64(pdpt(), gib * 8) & (Page.PRESENT | 0x80) != (Page.PRESENT | 0x80) {
+                    const table = directory(gib)
+                    if table == 0 { return 0 }
+                    enter(table, (page / layout.Memory.HUGE) % 512, page, caching, layout.Memory.virtual(page))
+                }
+                page += layout.Memory.HUGE
+            }
+            return layout.Memory.virtual(physical)
+        }
+        const pages = (end - first + layout.Memory.HUGE - 1) / layout.Memory.HUGE
+        if windowUsed + pages > WINDOW_PAGES { return 0 }
+        const table = directory(WINDOW_GIB)
+        if table == 0 { return 0 }
+        const start = layout.Memory.virtual(WINDOW_GIB * layout.Memory.GIB + windowUsed * layout.Memory.HUGE)
+        var k: usize = 0
+        while k < pages {
+            enter(table, windowUsed + k, first + k * layout.Memory.HUGE, caching, start + k * layout.Memory.HUGE)
+            k += 1
+        }
+        windowUsed += pages
+        return start + (physical - first)
+    }
+}
+
+// The window's pages handed out.
+var windowUsed: usize = 0 // (per run)
+
 var frames: Frames = undefined // (per run)
 // The space each processor has loaded (its root; 0: unknown, the boot
 // tables), for Space.activate.
@@ -359,11 +453,18 @@ pub const Space = struct {
     // The page at `address` unmapped and its frame freed (when it had
     // one).
     pub fn release(self: Self, address: usize) -> void {
+        if self.drop(address) { cpu.Cpu.invalidatePage(address) }
+    }
+
+    // The same without the processor told: whether there was a page (the
+    // caller then has the processor forget it, or all of the space's:
+    // flush).
+    pub fn drop(self: Self, address: usize) -> bool {
         const slot = self.entry(address, false)
-        if slot == null || slot.?.* & Page.PRESENT == 0 { return }
+        if slot == null || slot.?.* & Page.PRESENT == 0 { return false }
         if slot.?.* & Page.DEVICE == 0 { frames.free(slot.?.* & Page.ADDRESS) }
         slot.?.* = 0
-        cpu.Cpu.invalidatePage(address)
+        return true
     }
 
     // `length` bytes from `from` into the space at `address`, pages made as

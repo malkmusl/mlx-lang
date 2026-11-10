@@ -166,6 +166,42 @@ tests/335_type_mismatches.mlx:33:11: error: MLX-E4001: invalid local declaration
 their types compiling: each type's least and greatest value through the
 same places, on x86_64 and aarch64.
 
+An assignment to what cannot be written says so at the place it writes
+(`sema/mismatch.mlx`, `unwritable`; it said only "expression type could
+not be resolved"): a constant, a parameter, a field or an element of one,
+what a `*const` pointer points to, an element of a `[]const` slice. The
+slice of an array that cannot be written is such a slice, a `[]const T`,
+and a pointer capture over the array a `*const T`
+(`sema/declarations.mlx`, `sema/control_flow.mlx`: the array is asked
+`isMutable`, as `&array[i]` asks it), so a write through either is
+refused, and the slice where a `[]T` is taken. Older compilers typed
+every array's slice `[]T`: `poke` below changed its caller's array (an
+array parameter is the caller's storage), and a write through a
+constant's slice went into a copy. `tests/support/constant_slices_invalid`
+holds the programs (`tests/run_constant_slices.sh` expects each one's
+message, and runs `tests/443_constant_slices_runtime.mlx` for the slices
+that stay writable); `parameter_written.mlx` and `parameter_to_callee.mlx`
+of them:
+
+```mlx
+fn poke(taken: [8]u8) -> void {
+    const part = taken[0..4]
+    part[1] = 9
+}
+```
+
+```mlx
+fn clear(taken: [8]u8) -> void { fill(taken[0..]) }
+```
+
+```text
+tests/support/constant_slices_invalid/parameter_written.mlx:6:5: error: MLX-E4001: this place cannot be written: it is a constant, a parameter, a call's result or an optional's payload, or is reached through a `*const` pointer or a `[]const` slice
+tests/support/constant_slices_invalid/parameter_written.mlx:6:13: error: MLX-E4001: expression type could not be resolved
+...
+tests/support/constant_slices_invalid/parameter_to_callee.mlx:11:39: error: MLX-E4001: expected `[]u8`, found `[]const u8`
+tests/support/constant_slices_invalid/parameter_to_callee.mlx:11:38: error: MLX-E4001: expression type could not be resolved
+```
+
 ## `MLX-E4001` (`TypeMismatch`): failures that said nothing of their own
 
 A module-level declaration that did not resolve was said only as

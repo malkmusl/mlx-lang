@@ -219,9 +219,11 @@ bytes), in the order the lowering first meets them. The code reaches a slot
 RIP-relative (`lea`, a `data_rel32` fixup resolved against the area's place,
 so the same code runs in a static executable, a dynamic one, a `--shared`
 object and a `--plugin`); loads and stores go through that address like any
-other memory, and `&NAME` is it. An integer or bool initializer (comptime
-evaluable, as `spec/00-language/modules.xml` asks) writes the slot's
-initial bytes, and so does an array or struct literal of such values
+other memory, and `&NAME` is it. An integer, bool or float initializer
+(comptime evaluable, as `spec/00-language/modules.xml` asks) writes the
+slot's initial bytes, and so does an array or struct literal of such values
+(an address among them, a function's or a string's or another global's,
+is written by `__mlx_init_globals` before `main`: see the ABI reference)
 (element by element at the type's layout, `writeInitialBytes` in
 `ir/lower.mlx`; `var table: [3]u16 = [3]u16{ 7, 8, 9 }`); `undefined` and
 `null` leave it zeroed. Other initializers (strings, floats) are not

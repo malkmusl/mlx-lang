@@ -74,7 +74,7 @@ sed -e 's/^exec = kepler$/exec = kepler --verbose/' -e '/^disabled = yes$/d' -e 
 grep -q '^exec = kepler --verbose$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
 entries=()
 for service in "$work"/services/*.service; do entries+=("settings/init/services/$(basename "$service")=$service"); done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "share/applications/vector.desktop=projects/desktop/terminal/vector.desktop" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "share/apps/Vector.app/app.ini=projects/desktop/apps/Vector.app/app.ini" "share/apps/Vector.app/icon.png=projects/desktop/apps/Vector.app/icon.png" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
 echo "ok   the kernel, impulse, ignition, kepler, vector, the launcher, the dock, the top bar$([[ ${#keymap[@]} -gt 0 ]] && echo ", the us keymap") and a boot image with the desktop service build"
 
 # The QEMU monitor on a socket: screen dumps, keys, the mouse.
@@ -144,6 +144,12 @@ wait_for '^root@brix:[^#]*# '
 wait_for '^ignition: told to quit, the picture stays$'
 wait_for '^settings: border #5aa0ff'
 echo "ok   impulse starts the desktop as the screen service after the splash; kepler is up on the framebuffer"
+# The splash handed its last frame on in a file (/temporary/screen-picture,
+# projects/desktop/splash/picture.mlx): the compositor's first frames fade
+# in from that, and the framebuffer is never read back. (Not anchored:
+# the serial shell's prompt may stand before it.)
+wait_for 'brix: fading in from the picture the program before left$'
+echo "ok   the compositor fades in from the picture the splash left in /temporary (the framebuffer is not read back)"
 if [[ ${#keymap[@]} -gt 0 ]]; then
     wait_for '^keyboard: keymap from /system/settings/keyboard$'
     echo "ok   the compositor hands its clients the keymap of /system/settings/keyboard/us.xkb (brix-keymap, from the host's XKB data)"
@@ -207,9 +213,12 @@ echo "ok   the dock's apps button (a message on its channel) shows the launcher,
 monitor "sendkey esc"
 printf 'impulsectl poweroff\r' >&3
 wait_for '^impulse: poweroff$'
+# Told to end (the terminate event), the compositor leaves its last frame
+# for whoever takes the screen next.
+wait_for 'brix: the last frame left for the next program$'
 wait_for '^brixOS: powering off$'
 for (( i = 0; i < 100; i++ )); do kill -0 "$qemu_pid" 2> /dev/null || break; sleep 0.1; done
 kill -0 "$qemu_pid" 2> /dev/null && fail "QEMU did not power off"
 qemu_pid=
-echo "ok   impulsectl poweroff stops the desktop and the machine powers off"
+echo "ok   impulsectl poweroff stops the desktop (which leaves its last frame for the next program) and the machine powers off"
 echo PASS

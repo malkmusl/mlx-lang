@@ -204,7 +204,14 @@ it lowers, the build runner the step it checks, starts or finishes.
 such a failure (`tools/check_crash_report.sh` holds every client to it).
 The handler's own values come from the compiler's value arena too: when a
 program crashed because that arena is full, it takes room of its own and
-says so ("the values' arena is full").
+says so ("the values' arena is full"). In brixOS, which has no
+`/proc/self/maps` and no `/proc/self/comm` and maps no files through its
+Linux layer, the report is the same: the program's own file (the one
+`/proc/self/exe` links to) says where its segments are and what it is
+called, and is read into memory for its tables; `std.turns` finds the
+arena by asking the kernel of each page (`mincore`); and `fail` needs no
+signal on any system, it calls the handler itself
+(`tools/check_brix_crash.sh` runs the host's crashes there).
 
 `std.diagnostics` (`std/src/diagnostics.mlx`) is the one closed interface
 the runtime's diagnostics write through, for the processor and the GPU

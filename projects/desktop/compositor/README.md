@@ -110,8 +110,23 @@ mode described below), `--launcher PROGRAM|none` (what Super starts),
 X programs), `--run PROGRAM`
 (repeatable), `--screenshot FILE`, `--timeout SECONDS`, `--no-fps` (no
 frames-per-second counters in the title bars), `--verbose` (which also
-logs, once a second, `perf:` lines with the frame rate and how long a
-frame takes to compose and present).
+logs, once a second while frames are shown, a `perf:` line).
+
+The `perf:` line says the frames shown since the last one, how long a
+frame took on average and at most, and of that the composing and the
+frame's way into the output's memory:
+
+```
+perf: 60 fps (60 frames in 1003 ms), a frame takes 6337 us on average: composing 4379 us (uploading 0, GPU 0, copying out 0), to the screen 1958 us; 7027 us at most
+```
+
+`composing` is the renderer's work (in brackets its parts with Vulkan),
+`to the screen` the copy of the composed rows into a dumb buffer or, on
+brixOS, into the framebuffer; what is left of a frame's time is the
+bookkeeping around the two. The line comes with the first frame a second
+or more after the last line's, so it can span a rest; past five seconds
+it gives no rate (`perf: 3 frames in 12034 ms with a rest, a frame takes
+...`).
 
 Each title bar shows the window's frames per second (the buffers it
 committed) and the desktop's (frames shown). Shown frames follow the
@@ -608,8 +623,45 @@ brix-keymap into the boot image). Programs and the helpers start with
 process_spawn ([`children.brixos.mlx`](children.brixos.mlx), the
 helper's channel end as its own role; [`children.mlx`](children.mlx) is
 the Linux side of the same interface, fork, execve and socket pairs).
-No logind, VT, D-Bus, Vulkan or Xwayland there, and no greeter yet.
-tools/check_brix_desktop.sh runs it in QEMU.
+Its first frames fade in from the picture the program before left on the
+screen (the splash, the greeter's compositor, a session's). That picture
+is never read back from the framebuffer (video memory, mapped
+write-combining: fast to write, seconds to read): the program that
+leaves the screen hands its last frame on in a file,
+/temporary/screen-picture ([`../splash/picture.mlx`](../splash/picture.mlx):
+the width, the height and the pixels' order, then the pixels; in memory
+when the system runs from its boot archive, on the disk's /temporary when
+it runs from a disk), which the next one reads and removes; without one, or with one of another size,
+the first frame is simply drawn. The compositor leaves its own when it
+ends, also when it is told to (the terminate event, which sentinel sends
+the greeter's before the session starts and the init a service it
+stops); one that is killed or crashes leaves none, and the next starts
+without a fade.
+Every pixel there is made on the CPU, on one processor, so the frame's
+way to the screen ([`framebuffer.mlx`](framebuffer.mlx)) is kept short:
+the changed rows are copied whole (`state.copyPixels`; red and blue
+swapped two pixels to a 64-bit word for a red-first framebuffer), and
+nothing is read from the device. While the fade runs the frame is still
+composed only in what changed, and the whole of it is blended over the
+previous picture on its way out, four channels to a word (the same
+pixels as a blend a pixel at a time:
+`tests/446_compositor_framebuffer_runtime.mlx` compares them over every
+value); the fade's last frame is the whole screen at full weight.
+There is no vertical blank to wait for, so the backend paces its frames
+by a clock of its own: a frame, and with it the clients' frame
+callbacks, goes out no sooner than a frame's time (16.7 ms at 60 a
+second) after the one before was due, the loop sleeps until then, and
+what is damaged meanwhile is composed as one frame. A client that draws as
+fast as it is allowed thus gets 60 frames a second, not as many as the
+processor can compose; on a desktop at rest nothing is held back, and a
+pointer move is on the screen at once. On the machine the `perf:` lines
+of `--verbose` tell where a frame's time goes: `composing` is our own
+memory, `to the screen` the copy (or the fade's blend) into the
+framebuffer.
+No logind, VT, D-Bus, Vulkan or Xwayland there; the login is sentinel's,
+with aurora as the greeter on a compositor of its own
+(tools/check_brix_login.sh). tools/check_brix_desktop.sh runs the desktop
+in QEMU.
 
 ## Desktop session (GDM, SDDM)
 
@@ -873,7 +925,65 @@ buffer). Moving the pointer thus redraws a few hundred pixels rather than
 the screen, and the frame after a client's commit only that window. The
 Vulkan renderer redraws everything, which costs the GPU little.
 `tests/268_compositor_damage_runtime.mlx` checks the bookkeeping against
-frames composed from scratch. Composition itself works on whole pixels
+frames composed from scratch.
+
+The blur behind a surface (the top bar, the dock, a sidebar) is kept from
+frame to frame by the CPU renderer: the picture below the surface within
+the blur's reach, and that picture blurred. A frame that draws the surface
+compares what it drew below it with the kept picture and blurs again only
+what lies within reach (18 pixels) of a difference; where nothing below
+changed (the pointer moving over the bar, the bar's own commit, a window
+under it committing what it showed there, the whole screen drawn again)
+the kept blur is copied. So damage near a blurred surface takes in the
+blurred pixels within reach of it rather than the whole blur, and the
+pointer's takes in nothing. A surface that moved, was raised or is new is
+blurred anew, all of it, out of the frame that draws it (`damageSurface`
+says so; a commit's new content is reported with `damageContent`, which
+leaves the blur as it is). The blur is made a tile at a time, a pixel's
+four channels summed in one 64-bit word and divided with a multiplication:
+the same pixels as the plain passes give (the test holds them against each
+other), in about a sixth of the time. On a 3840x1080 output, composed on
+one core of a 2.1 GHz Xeon: the pointer moving in the top bar 0.03 ms a
+frame where it took 21, the top bar committing 1.3 ms where it took 22, a
+maximized window committing 16 ms where it took 42, the whole screen 6 ms
+where it took 32, the bar's blur made anew 4.4 ms where it took 21.
+
+A client says what its commit changed (`wl_surface.damage`,
+`damage_buffer`), and the CPU renderer takes it at its word when the
+buffer is the size of the one before and no viewport scales it: only that
+part of the buffer is copied into the surface's own pixels
+(`buffers.mlx`, `takePixels`), and only that part of the scene is damaged,
+where the surface is (`windows.mlx`, `applyCommit`; `scene.damagePart`),
+not the window with its frame. A terminal that printed a line has that
+line copied and composed: on a 3840x1080 screen a maximized window's
+commit of one text line moves about 1 MiB (copied in, composed, copied
+out) in under 0.2 ms where the whole window moved 68 MiB in 15 ms. The
+rest of the copy stays as it is and the buffer is not read there, so a
+client may name less than it drew but never less than it changed. A
+whole buffer is copied two pixels to a 64-bit word, their alpha bytes
+ANDed on the way (15 MiB in about 3 ms where a pixel at a time took 5.6).
+Whether the surface is opaque (its rows are then copied, not blended) is
+read from the copy: all of it on a whole commit, the part replaced on one
+in part, and the rest only when the row known to be translucent was
+replaced by opaque pixels. A commit that names no damage or all of the
+buffer, a buffer of another size, a viewport, a client that set a buffer
+scale or transform (neither is applied, so what it calls surface
+coordinates are not buffer pixels): all of the buffer is copied and the
+window damaged, as before. The window is damaged whole, though only the
+part is copied, while it grows open or slides with its workspace (its
+buffer is not drawn pixel for pixel in its place then), and when the
+damage lies off the output, so that a frame comes and with it the
+client's frame callback. The copy is kept rather than the client's buffer
+shown in place, as the Vulkan renderer does it: the buffer is released
+with the commit, so a std.ui client draws every frame into the same one,
+which holds the frame before (what makes drawing and naming a part
+possible), and what the compositor composes from is never memory a client
+is writing. `tests/290_compositor_commit_damage_runtime.mlx` holds
+commits in part against whole ones (pixels and opacity), and
+`tools/check_compositor_commit.sh` the screen of the nested compositor
+with a client that fills its buffer with other pixels around its damage.
+
+Composition itself works on whole pixels
 and 64-bit words (`state.copyPixels`, `fillPixels`), copies opaque
 windows' rows outright and blends the three channels of a translucent
 pixel at once; a full 1920x1080 frame with an opaque window takes about 6
@@ -1719,7 +1829,8 @@ finished`.
   xdg-shell. Its parts: `protocols.mlx` (layer shell, the window list for
   docks, decorations, blur regions), `windows.mlx` (focus, window states,
   resizing, input delivery, mapping), `buffers.mlx` (what a commit does
-  with the buffer: copied or held, cropped and scaled by a viewport),
+  with the buffer: copied, where the client says it changed, or held;
+  cropped and scaled by a viewport),
   `viewport.mlx` (viewporter, fractional-scale, single-pixel-buffer),
   `presentation.mlx` (presentation feedback), `data_control.mlx`
   (clipboard tools), `dialogs.mlx` (windows of windows, modal dialogs),

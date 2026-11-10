@@ -116,8 +116,39 @@ if cLength(pointer) != 14 || pointer[3] != 75 { return 3 }
 
 A module-level `var` is a global: one slot in the program's data area that
 every function sees, with its initial value (`spec/00-language/modules.xml`
-asks that it be comptime evaluable; an integer or bool, or `undefined` and
-`null` for a zeroed slot, an aggregate among them). `pub var` opens it to
+asks that it be comptime evaluable; an integer, bool or float, or
+`undefined` and `null` for a zeroed slot, an aggregate among them). An
+initializer may also name addresses: a function, a string's bytes
+(`"text".pointer`), another global or an element of one (`&table[2]`), in
+a pointer of its own or inside an array or struct literal. The global's
+bytes are static data, at one address wherever it is named (a table of
+functions other objects point into); the addresses in them are written
+when the program starts, before `main`
+(`tests/438_global_address_initializers_runtime.mlx`). The function
+named may be declared further down the module, as any module-level
+declaration may (`tests/439_function_before_declaration_runtime.mlx`). A
+`const` aggregate, by contrast, is a value: where it is handed to a
+function or copied into a variable it is storage of that use's own, and
+nothing written there shows in the constant; a slice of it is a `[]const
+T` and a pointer capture over it a `*const T`, which read it and write
+nothing ([Arrays and slices](05-types-and-aggregates.md#arrays-and-slices)).
+A table (an array or struct literal of values known at compile time, no
+addresses among them) is not built anew for that: it has one image in the
+data area, as a `var` has; `TABLE[i]`, `TABLE.field` and `TABLE.length`
+read it there, and a use of the whole value is one copy of it
+(`tests/442_constant_table_static_runtime.mlx`; before, every `TABLE[i]`
+of a `const TABLE = [1520]u8{ ... }` stored all of its bytes first, a
+table over what a frame takes in the aggregate arena, which is not freed:
+brixOS's console drew its font so and filled the kernel's arena in 173
+characters). A constant that holds addresses (strings, functions) or
+values not known until the program runs is still built where it is used.
+No module-level `const` has storage of its own: `&LIMIT` (or
+`&module.LIMIT`) is the address of a copy of its value in the function
+that takes it, good for a `*const T` parameter and no identity of the
+constant (`tests/445_constant_address_runtime.mlx`); of a table that has
+an image it is the image's address, the same as `&TABLE[0]`
+(`tests/444_constant_address_runtime.mlx`).
+`pub var` opens a global to
 other modules, which read and write it as `module.name` and may take its
 address:
 
@@ -140,6 +171,35 @@ globals.cursor = &scratch
 (`tests/297_module_globals_runtime.mlx`, globals in
 `tests/support/module_globals.mlx`; `export var` makes one a data symbol C
 code shares, see [Formats](../reference/formats.md#globals))
+
+Modules may import one another, and name one another's types in their
+own: a struct of one with a pointer to a struct of the other and that one
+with a pointer back, a struct of one inside a struct of the other.
+Whichever module's declarations are worked out first, a declaration of a
+module whose turn has not come is resolved when it is named, in its own
+module:
+
+```mlx
+// a.mlx
+const b = @import("./b.mlx")
+pub const A = extern struct {
+    next: ?*b.B
+    pair: b.Pair
+}
+
+// b.mlx
+const a = @import("./a.mlx")
+pub const B = extern struct {
+    back: ?*a.A
+}
+pub const Pair = extern struct {
+    n: u32
+}
+```
+
+(`tests/441_types_across_import_ring_runtime.mlx` → 13, three modules in
+`tests/support/type_ring`.) Two structs that hold one another by value
+have no layout, in one module or in two.
 
 ## Visibility
 

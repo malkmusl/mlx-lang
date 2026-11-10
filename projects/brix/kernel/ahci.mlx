@@ -1,0 +1,559 @@
+// AHCI (SATA) disks, for real hardware (a Supermicro H11's on-board SATA,
+// or QEMU's q35 ich9-ahci) where virtio-blk is not there. A controller is
+// a PCI device of class 01:06:01; its registers are a memory BAR (ABAR,
+// BAR5), mapped uncached. Every controller's ports are looked at (the H11
+// has two controllers of eight ports). One command slot per port is used,
+// one request at a time, polled (the controller's interrupts are turned
+// off): a command list, a received-FIS area and a command table in memory
+// of our own, a bounce buffer the data passes through, as virtio does.
+//
+// Every wait is bounded in real time (clock.Deadline), and each step that
+// fails says so with the registers it saw: on a machine with no serial
+// line the screen (fbcon) is all there is to go by. A port whose device
+// does not answer is reset once (COMRESET) and then left alone; nothing
+// here can keep the boot from going on.
+const Pci = @import("./pci.mlx").Pci
+const memory = @import("./memory.mlx")
+const layout = @import("../layout.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
+const Status = @import("./status.mlx").Status
+const console = @import("./console.mlx")
+const clock = @import("./clock.mlx")
+const Page = memory.Page
+const Deadline = clock.Deadline
+
+// A transfer's most bytes (the bounce buffer: BUFFER_PAGES pages).
+const BUFFER_PAGES: usize = 8
+const BUFFER_BYTES: usize = BUFFER_PAGES * Page.SIZE
+
+// HBA (generic host control) registers.
+const CAP: usize = 0x00
+const GHC: usize = 0x04
+const IS: usize = 0x08
+const PI: usize = 0x0C
+const CAP2: usize = 0x24
+const BOHC: usize = 0x28
+const CAP_S64A: usize = 0x80000000
+const CAP_SSS: usize = 0x08000000
+const GHC_AE: usize = 0x80000000
+const GHC_IE: usize = 0x00000002
+const CAP2_BOH: usize = 0x1
+const BOHC_BOS: usize = 0x01
+const BOHC_OOS: usize = 0x02
+const BOHC_BB: usize = 0x10
+// The registers a controller has: the generic ones and 32 ports'.
+const REGISTERS: usize = 0x1100
+// A port's registers (0x100 + port * 0x80).
+const PORT_BASE: usize = 0x100
+const PORT_SIZE: usize = 0x80
+const P_CLB: usize = 0x00
+const P_CLBU: usize = 0x04
+const P_FB: usize = 0x08
+const P_FBU: usize = 0x0C
+const P_IS: usize = 0x10
+const P_IE: usize = 0x14
+const P_CMD: usize = 0x18
+const P_TFD: usize = 0x20
+const P_SIG: usize = 0x24
+const P_SSTS: usize = 0x28
+const P_SCTL: usize = 0x2C
+const P_SERR: usize = 0x30
+const P_CI: usize = 0x38
+// PxCMD bits.
+const CMD_ST: usize = 0x0001
+const CMD_SUD: usize = 0x0002
+const CMD_POD: usize = 0x0004
+const CMD_FRE: usize = 0x0010
+const CMD_FR: usize = 0x4000
+const CMD_CR: usize = 0x8000
+const CMD_ICC: usize = 0xF0000000
+const CMD_ICC_ACTIVE: usize = 0x10000000
+// PxTFD bits (and PxIS's task file error).
+const TFD_BSY: usize = 0x80
+const TFD_DRQ: usize = 0x08
+const TFD_ERR: usize = 0x01
+const IS_TFES: usize = 0x40000000
+// PxSSTS's device detection: a device there and the link up.
+const DET_MASK: usize = 0xF
+const DET_NONE: usize = 0
+const DET_LINK: usize = 3
+// ATA commands.
+const ATA_IDENTIFY: usize = 0xEC
+const ATA_READ_DMA_EXT: usize = 0x25
+const ATA_WRITE_DMA_EXT: usize = 0x35
+const ATA_FLUSH_EXT: usize = 0xEA
+// PxSIG: a SATA disk, a SATAPI device (an optical drive).
+const SIG_SATA: usize = 0x00000101
+const SIG_ATAPI: usize = 0xEB140101
+
+// How long each wait may take, in milliseconds. The specification gives a
+// port 500 ms to stop; a disk may hold BSY for seconds while it spins up,
+// and a command on a disk that was asleep waits for it to spin up too.
+const STOP_MS: usize = 500
+const HANDOFF_MS: usize = 2000
+const LINK_MS: usize = 100
+const RESET_MS: usize = 1000
+const READY_MS: usize = 5000
+const IDENTIFY_MS: usize = 5000
+const TRANSFER_MS: usize = 30000
+const FLUSH_MS: usize = 60000
+
+pub const AhciDisk = struct {
+    present: bool
+    index: usize
+    // The ABAR in the kernel's view, and this disk's port.
+    abar: usize
+    port: usize
+    // Its sectors, and the bytes of one (512, or 4096 on a 4Kn disk).
+    capacity: usize
+    sectorSize: usize
+    readOnly: bool
+    // The command list, received FIS and command table (one frame each),
+    // and the bounce buffer, all physical (the device does DMA to them).
+    clb: usize
+    fb: usize
+    ctba: usize
+    buffer: usize
+
+    fn get(self: *const Self, offset: usize) -> usize {
+        return @intCast(usize, unsafe { @ptrFromInt(*u32, self.*.abar + PORT_BASE + self.*.port * PORT_SIZE + offset) }.*)
+    }
+
+    fn set(self: *const Self, offset: usize, value: usize) -> void {
+        const register = unsafe { @ptrFromInt(*u32, self.*.abar + PORT_BASE + self.*.port * PORT_SIZE + offset) }
+        register.* = @intCast(u32, value & 0xFFFFFFFF)
+    }
+
+    // "ahci: port N: TEXT", then the registers that say why.
+    fn say(self: *const Self, text: []const u8) -> void {
+        const out = console.out
+        out.write("ahci: port ")
+        out.decimal(self.*.port)
+        out.write(": ")
+        out.write(text)
+        out.write(" (SSTS ")
+        out.hex(self.get(P_SSTS))
+        out.write(" TFD ")
+        out.hex(self.get(P_TFD))
+        out.write(" IS ")
+        out.hex(self.get(P_IS))
+        out.write(" SERR ")
+        out.hex(self.get(P_SERR))
+        out.write(" CMD ")
+        out.hex(self.get(P_CMD))
+        out.write(")\n")
+    }
+
+    // The command list stopped, then the FIS receive (each waited for, as
+    // the specification asks before the port's memory is changed); false
+    // when the port keeps running.
+    fn stop(self: *const Self) -> bool {
+        self.set(P_CMD, self.get(P_CMD) & ~CMD_ST)
+        var deadline = Deadline.after(STOP_MS)
+        while self.get(P_CMD) & CMD_CR != 0 {
+            if deadline.passed() { return false }
+        }
+        self.set(P_CMD, self.get(P_CMD) & ~CMD_FRE)
+        deadline = Deadline.after(STOP_MS)
+        while self.get(P_CMD) & CMD_FR != 0 {
+            if deadline.passed() { return false }
+        }
+        return true
+    }
+
+    // A link reset (COMRESET: PxSCTL.DET 1 for a millisecond, then 0),
+    // the command list stopped: what brings back a device that hangs.
+    // The link is waited for; whether it came up.
+    fn reset(self: *const Self) -> bool {
+        self.set(P_CMD, self.get(P_CMD) & ~CMD_ST)
+        var deadline = Deadline.after(STOP_MS)
+        while self.get(P_CMD) & CMD_CR != 0 && !deadline.passed() {}
+        self.set(P_SCTL, (self.get(P_SCTL) & ~DET_MASK) | 1)
+        clock.pause(1500)
+        self.set(P_SCTL, self.get(P_SCTL) & ~DET_MASK)
+        deadline = Deadline.after(RESET_MS)
+        while self.get(P_SSTS) & DET_MASK != DET_LINK {
+            if deadline.passed() { return false }
+        }
+        self.set(P_SERR, 0xFFFFFFFF)
+        return true
+    }
+
+    // The device no longer busy (BSY and DRQ clear) within `milliseconds`.
+    fn ready(self: *const Self, milliseconds: usize) -> bool {
+        const deadline = Deadline.after(milliseconds)
+        while self.get(P_TFD) & (TFD_BSY | TFD_DRQ) != 0 {
+            if deadline.passed() { return false }
+        }
+        return true
+    }
+
+    // The command list running (after the FIS receive, which has to be on
+    // first).
+    fn run(self: *const Self) -> void {
+        self.set(P_CMD, self.get(P_CMD) | CMD_FRE)
+        self.set(P_CMD, self.get(P_CMD) | CMD_ST)
+    }
+
+    // The port made ours: stopped, its interrupts off, our structures in
+    // place, powered and spun up, the device waited for and identified;
+    // false when there is no disk on it or it does not answer (said).
+    fn start(self: *Self, wide: bool) -> bool {
+        // Nothing detected: an empty port (not said: most ports of a
+        // board are), left as it is.
+        if self.get(P_SSTS) & DET_MASK == DET_NONE {
+            // (One the firmware never spun up shows its device once it
+            // is asked to; one that is spun up has none.)
+            if self.get(P_CMD) & CMD_SUD != 0 { return false }
+            self.set(P_CMD, (self.get(P_CMD) & ~CMD_ICC) | CMD_POD | CMD_SUD | CMD_ICC_ACTIVE)
+            const appears = Deadline.after(LINK_MS)
+            while self.get(P_SSTS) & DET_MASK == DET_NONE && !appears.passed() {}
+            if self.get(P_SSTS) & DET_MASK == DET_NONE { return false }
+        }
+        if !self.stop() {
+            self.say("does not stop")
+            return false
+        }
+        self.set(P_IE, 0)
+        const frames = memory.allFrames()
+        self.*.clb = frames.allocate()
+        self.*.fb = frames.allocate()
+        self.*.ctba = frames.allocate()
+        self.*.buffer = frames.allocateContiguous(BUFFER_PAGES)
+        if self.*.clb == 0 || self.*.fb == 0 || self.*.ctba == 0 || self.*.buffer == 0 {
+            self.say("no memory for it")
+            return false
+        }
+        // (A controller without 64-bit addressing takes memory below
+        // 4 GiB only: the frames handed out at boot are, unless the
+        // machine has next to none there.)
+        const highest = self.*.buffer + BUFFER_BYTES
+        if !wide && (highest >> 32 != 0 || self.*.clb >> 32 != 0 || self.*.fb >> 32 != 0 || self.*.ctba >> 32 != 0) {
+            self.say("its controller addresses 32 bits and our memory is above")
+            return false
+        }
+        self.set(P_CLB, self.*.clb & 0xFFFFFFFF)
+        self.set(P_CLBU, self.*.clb >> 32)
+        self.set(P_FB, self.*.fb & 0xFFFFFFFF)
+        self.set(P_FBU, self.*.fb >> 32)
+        // Powered, spun up, the link active (a port the firmware left
+        // asleep; nothing changes on one that runs), the FIS receive on:
+        // the device's first answer, its signature, needs it.
+        self.set(P_CMD, (self.get(P_CMD) & ~CMD_ICC) | CMD_POD | CMD_SUD | CMD_ICC_ACTIVE)
+        self.set(P_CMD, self.get(P_CMD) | CMD_FRE)
+        // The link: there already on a port the firmware started;
+        // otherwise waited for a little, then asked for by a reset.
+        const linked = Deadline.after(LINK_MS)
+        while self.get(P_SSTS) & DET_MASK != DET_LINK && !linked.passed() {}
+        if self.get(P_SSTS) & DET_MASK != DET_LINK {
+            if !self.reset() {
+                self.say("a device without a link")
+                return false
+            }
+            self.set(P_CMD, self.get(P_CMD) | CMD_FRE)
+        }
+        self.set(P_SERR, 0xFFFFFFFF)
+        self.set(P_IS, 0xFFFFFFFF)
+        if !self.ready(READY_MS) {
+            self.say("the device stays busy, resetting the link")
+            if !self.reset() {
+                self.say("no link after the reset")
+                return false
+            }
+            self.set(P_CMD, self.get(P_CMD) | CMD_FRE)
+            if !self.ready(READY_MS) {
+                self.say("the device stays busy")
+                return false
+            }
+        }
+        const signature = self.get(P_SIG)
+        if signature == SIG_ATAPI {
+            self.say("an optical drive (not driven)")
+            return false
+        }
+        if signature != SIG_SATA {
+            self.say("no disk's signature")
+            console.out.write("ahci:   signature ")
+            console.out.hex(signature)
+            console.out.write("\n")
+            return false
+        }
+        self.run()
+        return self.identify()
+    }
+
+    // After a command that failed: the port stopped and started again
+    // (what clears its error state; the specification wants it before the
+    // next command), the link reset when the device still hangs.
+    fn recover(self: *const Self) -> void {
+        self.set(P_CMD, self.get(P_CMD) & ~CMD_ST)
+        const deadline = Deadline.after(STOP_MS)
+        while self.get(P_CMD) & CMD_CR != 0 && !deadline.passed() {}
+        self.set(P_SERR, 0xFFFFFFFF)
+        self.set(P_IS, 0xFFFFFFFF)
+        if self.get(P_CMD) & CMD_CR != 0 || self.get(P_TFD) & (TFD_BSY | TFD_DRQ) != 0 {
+            _ = self.reset()
+            _ = self.ready(READY_MS)
+        }
+        self.run()
+    }
+
+    // Builds the one command (slot 0): `count` sectors at `sector` to or
+    // from the bounce buffer (`bytes` of it), and waits for it for
+    // `milliseconds`. Whether the device did it.
+    fn command(self: *const Self, ata: usize, sector: usize, count: usize, bytes: usize, writing: bool, milliseconds: usize) -> bool {
+        const list = Bytes.pointer(layout.Memory.virtual(self.*.clb))
+        // Command header 0: a 5-DWORD command FIS, the PRDs, a write flag.
+        const prds: usize = if bytes > 0 { 1 } else { 0 }
+        var header0: usize = 5 | (prds << 16)
+        if writing { header0 = header0 | 0x40 }
+        Bytes.write32(list, 0, header0)
+        Bytes.write32(list, 4, 0)
+        Bytes.write32(list, 8, self.*.ctba & 0xFFFFFFFF)
+        Bytes.write32(list, 12, self.*.ctba >> 32)
+        const table = Bytes.pointer(layout.Memory.virtual(self.*.ctba))
+        Bytes.fill(table, 0x90, 0)
+        // The command FIS (host to device, register): the command, the
+        // 48-bit LBA, the sector count.
+        table[0] = 0x27
+        table[1] = 0x80
+        table[2] = @intCast(u8, ata)
+        table[3] = 0
+        table[4] = @intCast(u8, sector & 0xFF)
+        table[5] = @intCast(u8, (sector >> 8) & 0xFF)
+        table[6] = @intCast(u8, (sector >> 16) & 0xFF)
+        table[7] = 0x40
+        table[8] = @intCast(u8, (sector >> 24) & 0xFF)
+        table[9] = @intCast(u8, (sector >> 32) & 0xFF)
+        table[10] = @intCast(u8, (sector >> 40) & 0xFF)
+        table[11] = 0
+        table[12] = @intCast(u8, count & 0xFF)
+        table[13] = @intCast(u8, (count >> 8) & 0xFF)
+        // The one PRD (at 0x80 in the table): the bounce buffer, its bytes.
+        if bytes > 0 {
+            Bytes.write32(table, 0x80, self.*.buffer & 0xFFFFFFFF)
+            Bytes.write32(table, 0x84, self.*.buffer >> 32)
+            Bytes.write32(table, 0x88, 0)
+            Bytes.write32(table, 0x8C, (bytes - 1) & 0x3FFFFF)
+        }
+        // A clean slate, then issue the command on slot 0 and wait.
+        self.set(P_IS, 0xFFFFFFFF)
+        self.set(P_SERR, 0xFFFFFFFF)
+        if !self.ready(READY_MS) {
+            self.recover()
+            if !self.ready(READY_MS) { return false }
+        }
+        self.set(P_CI, 1)
+        const deadline = Deadline.after(milliseconds)
+        while self.get(P_CI) & 1 != 0 {
+            if self.get(P_IS) & IS_TFES != 0 {
+                self.recover()
+                return false
+            }
+            if deadline.passed() {
+                self.say("a command got no answer")
+                self.recover()
+                return false
+            }
+        }
+        if self.get(P_IS) & IS_TFES != 0 || self.get(P_TFD) & TFD_ERR != 0 {
+            self.recover()
+            return false
+        }
+        return true
+    }
+
+    // Reads the disk's size (IDENTIFY: the 48-bit sector count at words
+    // 100..103 when word 83 says so, else the 28-bit one at words 60..61)
+    // and its sector's size (512 bytes unless word 106 says the logical
+    // sector is longer: words 117..118, in 16-bit words).
+    fn identify(self: *Self) -> bool {
+        self.*.sectorSize = 512
+        if !self.command(ATA_IDENTIFY, 0, 1, 512, false, IDENTIFY_MS) {
+            self.say("does not identify itself")
+            return false
+        }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        var sectors: usize = 0
+        if Bytes.read16(data, 83 * 2) & 0x0400 != 0 { sectors = Bytes.read64(data, 100 * 2) }
+        if sectors == 0 { sectors = Bytes.read32(data, 60 * 2) }
+        const word106 = Bytes.read16(data, 106 * 2)
+        if word106 & 0xC000 == 0x4000 && word106 & 0x1000 != 0 {
+            const size = Bytes.read32(data, 117 * 2) * 2
+            // (A power of two the bounce buffer holds.)
+            if size >= 512 && size <= BUFFER_BYTES && size & (size - 1) == 0 { self.*.sectorSize = size }
+        }
+        // (More than 2^48 sectors is no disk's.)
+        if sectors == 0 || sectors >> 48 != 0 {
+            self.say("no size in what it says of itself")
+            return false
+        }
+        self.*.capacity = sectors
+        self.*.readOnly = false
+        self.*.present = true
+        return true
+    }
+
+    pub fn sizeInBytes(self: *const Self) -> usize { return self.*.capacity * self.*.sectorSize }
+
+    pub fn flush(self: *Self) -> bool { return self.command(ATA_FLUSH_EXT, 0, 0, 0, false, FLUSH_MS) }
+
+    pub fn read(self: *Self, offset: usize, into: [*]u8, length: usize) -> isize {
+        const size = self.sizeInBytes()
+        if offset >= size { return 0 }
+        const total = if length > size - offset { size - offset } else { length }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        const sectorSize = self.*.sectorSize
+        const most = BUFFER_BYTES / sectorSize
+        var done: usize = 0
+        while done < total {
+            const at = offset + done
+            const sector = at / sectorSize
+            const within = at % sectorSize
+            var count = (within + total - done + sectorSize - 1) / sectorSize
+            if count > most { count = most }
+            if !self.command(ATA_READ_DMA_EXT, sector, count, count * sectorSize, false, TRANSFER_MS) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            var chunk = count * sectorSize - within
+            if chunk > total - done { chunk = total - done }
+            Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(into) + done) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(data) + within) }, chunk)
+            done += chunk
+        }
+        return @intCast(isize, done)
+    }
+
+    pub fn write(self: *Self, offset: usize, from: [*]const u8, length: usize) -> isize {
+        if self.*.readOnly { return Status.read_only }
+        const size = self.sizeInBytes()
+        if offset >= size { return if length == 0 { 0 } else { Status.no_space } }
+        const total = if length > size - offset { size - offset } else { length }
+        const data = Bytes.pointer(layout.Memory.virtual(self.*.buffer))
+        const sectorSize = self.*.sectorSize
+        const most = BUFFER_BYTES / sectorSize
+        var done: usize = 0
+        while done < total {
+            const at = offset + done
+            const sector = at / sectorSize
+            const within = at % sectorSize
+            var count = (within + total - done + sectorSize - 1) / sectorSize
+            if count > most { count = most }
+            var chunk = count * sectorSize - within
+            if chunk > total - done { chunk = total - done }
+            // A sector written in part keeps the rest of its bytes.
+            if (within != 0 || chunk % sectorSize != 0) && !self.command(ATA_READ_DMA_EXT, sector, count, count * sectorSize, false, TRANSFER_MS) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            Bytes.copy(unsafe { @ptrFromInt([*]u8, @intFromPtr(data) + within) }, unsafe { @ptrFromInt([*]const u8, @intFromPtr(from) + done) }, chunk)
+            if !self.command(ATA_WRITE_DMA_EXT, sector, count, count * sectorSize, true, TRANSFER_MS) { return if done > 0 { @intCast(isize, done) } else { Status.io_error } }
+            done += chunk
+        }
+        return @intCast(isize, done)
+    }
+}
+
+pub const MAX_DISKS: usize = 8
+// The controllers looked at (a board has one or two; a few more with
+// cards).
+const MAX_CONTROLLERS: usize = 8
+var disks: [MAX_DISKS]AhciDisk = undefined // (per run)
+var diskCount: usize = 0 // (per run)
+
+pub fn count() -> usize { return diskCount }
+pub fn diskAt(index: usize) -> *AhciDisk { return &disks[index] }
+
+fn hbaGet(abar: usize, offset: usize) -> usize { return @intCast(usize, unsafe { @ptrFromInt(*u32, abar + offset) }.*) }
+
+fn hbaSet(abar: usize, offset: usize, value: usize) -> void {
+    const register = unsafe { @ptrFromInt(*u32, abar + offset) }
+    register.* = @intCast(u32, value & 0xFFFFFFFF)
+}
+
+// The controller taken from the firmware when it says it has it (the
+// BIOS/OS handoff: our ownership asked for, the firmware's waited to go;
+// a firmware that keeps it is left behind after two seconds).
+fn handoff(abar: usize) -> void {
+    if hbaGet(abar, CAP2) & CAP2_BOH == 0 { return }
+    if hbaGet(abar, BOHC) & BOHC_BOS == 0 { return }
+    hbaSet(abar, BOHC, hbaGet(abar, BOHC) | BOHC_OOS)
+    const deadline = Deadline.after(HANDOFF_MS)
+    while hbaGet(abar, BOHC) & (BOHC_BOS | BOHC_BB) != 0 {
+        if deadline.passed() {
+            console.out.write("ahci: the firmware keeps the controller (taken anyway)\n")
+            return
+        }
+    }
+}
+
+// One controller's SATA disks made ready, added to `disks`.
+fn probeController(address: usize) -> void {
+    const out = console.out
+    Pci.enableMemory(address)
+    const abarPhysical = Pci.memBase(address, 5)
+    out.write("ahci: controller ")
+    out.hexByte((address >> 16) & 0xFF)
+    out.write(":")
+    out.hexByte((address >> 11) & 0x1F)
+    out.write(".")
+    out.decimal((address >> 8) & 0x7)
+    if abarPhysical == 0 {
+        out.write(", no registers (BAR5 is not set)\n")
+        return
+    }
+    const abar = memory.Device.map(abarPhysical, REGISTERS, memory.Device.UNCACHED)
+    if abar == 0 {
+        out.write(", no room to map its registers at ")
+        out.hex(abarPhysical)
+        out.write("\n")
+        return
+    }
+    handoff(abar)
+    // AHCI mode on, its interrupts off (the ports are polled; one the
+    // firmware left on would be raised with no one to take it), what is
+    // pending cleared.
+    hbaSet(abar, GHC, hbaGet(abar, GHC) | GHC_AE)
+    hbaSet(abar, GHC, (hbaGet(abar, GHC) | GHC_AE) & ~GHC_IE)
+    hbaSet(abar, IS, 0xFFFFFFFF)
+    const capabilities = hbaGet(abar, CAP)
+    const implemented = hbaGet(abar, PI)
+    const wide = capabilities & CAP_S64A != 0
+    out.write(", registers at ")
+    out.hex(abarPhysical)
+    out.write(", CAP ")
+    out.hex(capabilities)
+    out.write(", ports ")
+    out.hex(implemented)
+    out.write(if capabilities & CAP_SSS != 0 { ", staggered spin-up\n" } else { "\n" })
+    // (A controller that is not there reads as all ones.)
+    if capabilities == 0xFFFFFFFF { return }
+    var port: usize = 0
+    while port < 32 && diskCount < MAX_DISKS {
+        if implemented & (@intCast(usize, 1) << @intCast(u6, port)) != 0 {
+            const disk = &disks[diskCount]
+            disk.*.present = false
+            disk.*.index = diskCount
+            disk.*.abar = abar
+            disk.*.port = port
+            if disk.start(wide) {
+                out.write("ahci: port ")
+                out.decimal(port)
+                out.write(": a disk of ")
+                out.decimal(disk.*.capacity)
+                out.write(" sectors of ")
+                out.decimal(disk.*.sectorSize)
+                out.write(" bytes\n")
+                diskCount += 1
+            }
+        }
+        port += 1
+    }
+}
+
+// Every AHCI controller's SATA disks, made ready: how many.
+pub fn probeAll() -> usize {
+    diskCount = 0
+    var n: usize = 0
+    while n < MAX_CONTROLLERS && diskCount < MAX_DISKS {
+        const address = Pci.findClass(0x010601, 0xFFFFFF, n)
+        if address == Pci.NONE { break }
+        probeController(address)
+        n += 1
+    }
+    return diskCount
+}

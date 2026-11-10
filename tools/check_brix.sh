@@ -140,7 +140,7 @@ type_to_program() {
 
 wait_for '^brixOS: kernel at 0x200000'
 wait_for '^brixOS: [0-9]* MiB ([0-9]* free), [0-9]* MHz$'
-wait_for '^brixOS: /devices/disk0, 4096 KiB (virtio, IRQ [0-9]*)$'
+wait_for '^brixOS: /devices/disk0, 4096 KiB (virtio)$'
 wait_for '^brixOS: disk0 answers by interrupt$'
 echo "ok   the kernel boots and says itself on the serial line"
 
@@ -198,7 +198,7 @@ echo "ok   the umask, /devices/null, /devices/zero"
 type_line 'echo linux > /temporary/l; linux-cat /tmp/l; linux-cat /dev/null; linux-cat /etc/passwd; linux-ls /dev'
 wait_for '^linux$'
 wait_for '^root:x:0:0:root:/users/root:/system/programs/flux$'
-wait_for '^console  disk0[[:space:]]*framebuffer  keyboard  mouse  null  tty  zero$'
+wait_for '^console  disk0[[:space:]]*framebuffer  keyboard  klog  mouse  null  tty  zero$'
 echo "ok   Linux programs' /tmp, /dev and /etc/passwd"
 
 type_line 'cat /system/programs/flux > big; before=$(stat -f -c %f .); cp big copy; after=$(stat -f -c %f .); echo shared $(( before - after < 64 )) $(wc -c < copy)'
@@ -289,7 +289,7 @@ native calls
 output kind (session) 6
 output writable
 pipe kind (stream) 4
-system info words 7
+system info words 14
 memory, free and processors make sense
 wait now (timed out) 5
 wait 50 ms (timed out) 5

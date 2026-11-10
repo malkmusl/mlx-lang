@@ -1,0 +1,190 @@
+// What a backend needs that shows its frames in a framebuffer of the
+// firmware's (the brixOS backend, drm.brixos.mlx): video memory mapped
+// write-combining, with no GPU behind it and no vertical blank to wait for.
+//
+// - The frame's rows on their way there: copied as they are (copyRows:
+//   whole rows by state.copyPixels), with red and blue swapped for a
+//   red-first framebuffer, or blended over the picture the program before
+//   left (fadeRows: the opening crossfade). Every pixel is made on the
+//   CPU, so the loops take two pixels to a 64-bit word and call nothing;
+//   they read the compositor's own memory only and write the device's
+//   (reading that back takes seconds).
+// - The frame clock that stands in for the vertical blank (frameWait,
+//   nextDue): frames, and with them the clients' frame callbacks, go out
+//   no sooner than a frame's time after the one before was due.
+//
+// Apart from the backend, and on plain addresses and numbers, so that
+// tests and measurements run it against ordinary memory
+// (tests/446_compositor_framebuffer_runtime.mlx: the same pixels as the
+// blend a pixel at a time, over every value; and
+// tests/268_compositor_damage_runtime.mlx: against frames composed from
+// scratch).
+const ui = @import("std.ui")
+const state = @import("./state.mlx")
+
+// Two pixels in a 64-bit word: the bytes at even places (blue and red, or
+// red and blue, of both), one byte of each pixel, the two green bytes and
+// the two high ones (X).
+const EVEN: u64 = 0x00FF00FF00FF00FF
+const LOW: u64 = 0x000000FF000000FF
+const GREEN: u64 = 0x0000FF000000FF00
+const HIGH: u64 = 0xFF000000FF000000
+const ODD: u64 = 0xFF00FF00FF00FF00
+
+// ---------------------------------------------------------------------------
+// Rows
+
+// `count` pixels at `frame` to `device`, red and blue swapped.
+fn swapRun(device: usize, frame: usize, count: usize) -> void {
+    var to = device
+    var from = frame
+    const pairs = device + (count / 2) * 8
+    const fours = device + (count / 4) * 16
+    while to < fours {
+        const first = unsafe { @ptrFromInt(*const u64, from).* }
+        const second = unsafe { @ptrFromInt(*const u64, from + 8).* }
+        const one: *u64 = unsafe { @ptrFromInt(*u64, to) }
+        const two: *u64 = unsafe { @ptrFromInt(*u64, to + 8) }
+        one.* = (first & ODD) | ((first & LOW) << 16) | ((first >> 16) & LOW)
+        two.* = (second & ODD) | ((second & LOW) << 16) | ((second >> 16) & LOW)
+        to += 16
+        from += 16
+    }
+    if to < pairs {
+        const pair = unsafe { @ptrFromInt(*const u64, from).* }
+        const target: *u64 = unsafe { @ptrFromInt(*u64, to) }
+        target.* = (pair & ODD) | ((pair & LOW) << 16) | ((pair >> 16) & LOW)
+        to += 8
+        from += 8
+    }
+    if count & 1 != 0 {
+        const pixel = @intCast(u64, unsafe { @ptrFromInt(*const u32, from).* })
+        const target: *u32 = unsafe { @ptrFromInt(*u32, to) }
+        target.* = @intCast(u32, (pixel & 0xFF00FF00) | ((pixel & 255) << 16) | ((pixel >> 16) & 255))
+    }
+}
+
+// `count` pixels of `frame` at weight `weight` (0..256) over those of
+// `previous`, into `device`: each of the three low channels (previous *
+// (256 - weight) + frame * weight) >> 8, the high byte the frame's. The
+// channels are worked out four at a time, in 16-bit lanes of a word (a
+// product is at most 255 * 256, so nothing carries from one lane into the
+// next): the even bytes of two pixels as they stand, the green ones
+// shifted down.
+fn fadeRun(device: usize, previous: usize, frame: usize, count: usize, weight: usize) -> void {
+    const share: u64 = weight
+    const rest: u64 = 256 - weight
+    var to = device
+    var before = previous
+    var from = frame
+    const pairs = device + (count / 2) * 8
+    while to < pairs {
+        const a = unsafe { @ptrFromInt(*const u64, before).* }
+        const b = unsafe { @ptrFromInt(*const u64, from).* }
+        const target: *u64 = unsafe { @ptrFromInt(*u64, to) }
+        target.* = (b & HIGH) | ((((a & EVEN) * rest + (b & EVEN) * share) >> 8) & EVEN) | ((((a >> 8) & LOW) * rest + ((b >> 8) & LOW) * share) & GREEN)
+        to += 8
+        before += 8
+        from += 8
+    }
+    if count & 1 != 0 {
+        const a = @intCast(u64, unsafe { @ptrFromInt(*const u32, before).* })
+        const b = @intCast(u64, unsafe { @ptrFromInt(*const u32, from).* })
+        const target: *u32 = unsafe { @ptrFromInt(*u32, to) }
+        target.* = @intCast(u32, (b & 0xFF000000) | ((((a & 0xFF00FF) * rest + (b & 0xFF00FF) * share) >> 8) & 0xFF00FF) | ((((a >> 8) & 255) * rest + ((b >> 8) & 255) * share) & 0xFF00))
+    }
+}
+
+// fadeRun for a red-first device: the blended red and blue change places
+// (the even lanes, 16 bits up and down).
+fn fadeRunSwapped(device: usize, previous: usize, frame: usize, count: usize, weight: usize) -> void {
+    const share: u64 = weight
+    const rest: u64 = 256 - weight
+    var to = device
+    var before = previous
+    var from = frame
+    const pairs = device + (count / 2) * 8
+    while to < pairs {
+        const a = unsafe { @ptrFromInt(*const u64, before).* }
+        const b = unsafe { @ptrFromInt(*const u64, from).* }
+        const target: *u64 = unsafe { @ptrFromInt(*u64, to) }
+        const even = ((a & EVEN) * rest + (b & EVEN) * share) >> 8
+        target.* = (b & HIGH) | ((even & LOW) << 16) | ((even >> 16) & LOW) | ((((a >> 8) & LOW) * rest + ((b >> 8) & LOW) * share) & GREEN)
+        to += 8
+        before += 8
+        from += 8
+    }
+    if count & 1 != 0 {
+        const a = @intCast(u64, unsafe { @ptrFromInt(*const u32, before).* })
+        const b = @intCast(u64, unsafe { @ptrFromInt(*const u32, from).* })
+        const target: *u32 = unsafe { @ptrFromInt(*u32, to) }
+        const even = ((a & 0xFF00FF) * rest + (b & 0xFF00FF) * share) >> 8
+        target.* = @intCast(u32, (b & 0xFF000000) | ((even & 255) << 16) | ((even >> 16) & 255) | ((((a >> 8) & 255) * rest + ((b >> 8) & 255) * share) & 0xFF00))
+    }
+}
+
+// The rows of `area` (output coordinates, inside the output) from the
+// frame at `frame` (its rows `stride` bytes apart) into the device at
+// `device` (its rows `pitch` bytes apart), as the device wants them: red
+// and blue swapped when `swap` (a red-first framebuffer).
+pub fn copyRows(device: usize, pitch: usize, frame: usize, stride: usize, area: ui.Rect, swap: bool) -> void {
+    if ui.isEmpty(area) { return }
+    const left = @intCast(usize, area.x) * 4
+    const count = @intCast(usize, area.width)
+    var to = device + @intCast(usize, area.y) * pitch + left
+    var from = frame + @intCast(usize, area.y) * stride + left
+    var rows = @intCast(usize, area.height)
+    while rows > 0 {
+        if swap { swapRun(to, from, count) } else { state.copyPixels(to, from, count) }
+        to += pitch
+        from += stride
+        rows -= 1
+    }
+}
+
+// copyRows with the frame blended over the picture at `previous` (laid
+// out as the frame is) on its way: the frame's share `weight` of 256 (0:
+// the picture before alone; 256: the frame alone, as copyRows gives it).
+pub fn fadeRows(device: usize, pitch: usize, frame: usize, previous: usize, stride: usize, area: ui.Rect, weight: usize, swap: bool) -> void {
+    if ui.isEmpty(area) { return }
+    const left = @intCast(usize, area.x) * 4
+    const count = @intCast(usize, area.width)
+    var to = device + @intCast(usize, area.y) * pitch + left
+    var at = @intCast(usize, area.y) * stride + left
+    var rows = @intCast(usize, area.height)
+    while rows > 0 {
+        if swap { fadeRunSwapped(to, previous + at, frame + at, count, weight) } else { fadeRun(to, previous + at, frame + at, count, weight) }
+        to += pitch
+        at += stride
+        rows -= 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The frame clock
+
+// How late a frame may go out and still count as on time, as a part of a
+// frame's time (a quarter: 4 ms at 60 a second). A frame held back for its
+// time goes out a little after it: the loop waits whole milliseconds, and
+// another program may hold the processor when the wait ends.
+pub const LATE_PART: usize = 4
+
+// How long a frame has to wait at `now` when the next one is due at `due`
+// (microseconds; 0: it may go out).
+pub fn frameWait(due: usize, now: usize) -> usize {
+    if now >= due { return 0 }
+    return due - now
+}
+
+// When the frame after the one going out at `now` is due, that one having
+// been due at `due` (0: none before) and frames `interval` apart. On time,
+// the next is due a frame's time after this one was, not after it went
+// out, as on a display's vertical blanks: the frames keep the display's
+// rate instead of falling short of it by every wait's lateness, and two
+// are never closer than a frame's time less that lateness. Late (the first
+// frame of a desktop that was at rest, a frame after one that took longer
+// than its time), the clock starts again with this frame.
+pub fn nextDue(due: usize, now: usize, interval: usize) -> usize {
+    if due != 0 && now >= due && now - due <= interval / LATE_PART { return due + interval }
+    return now + interval
+}

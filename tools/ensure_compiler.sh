@@ -45,6 +45,21 @@ writes_shared_objects() {
     return $ok
 }
 
+# Whether a program $1 builds for brixOS that names a C function leaves by
+# brixOS's own process_exit when main returns (no import of the C
+# library's exit, which nothing there would fill).
+leaves_brixos_by_process_exit() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet --target=x86_64-brixos tests/support/brixos_linked_exit/main.mlx -o "$probe/probe" > /dev/null 2>&1 \
+        && tr '\0' '\n' < "$probe/probe" | grep -qx 'getpid' && ! tr '\0' '\n' < "$probe/probe" | grep -qx 'exit'; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 names the functions in a symbol table (.symtab), which the
 # crash reports of the desktop programs read.
 writes_symbol_tables() {
@@ -477,6 +492,208 @@ resolves_recursive_types() {
     return $ok
 }
 
+# Whether $1 lays a packed struct out in bits (spec aggregates.xml
+# PackedLayout: tests/434_packed_struct_runtime.mlx exits 13); older
+# compilers read `packed` and laid the fields out byte by byte.
+lays_out_packed_structs() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/434_packed_struct_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 negates a float by its sign bit (tests/435_float_negative_zero_runtime.mlx
+# exits 13); older compilers computed 0 - x, which makes -(0.0) a +0.0.
+negates_floats_by_sign() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/435_float_negative_zero_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 types a function named in a module-level initializer above
+# its declaration (tests/439_function_before_declaration_runtime.mlx
+# exits 13).
+types_functions_named_ahead() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/439_function_before_declaration_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 lets a function end with a `while true` no `break` ends
+# (tests/440_endless_loop_ends_function_runtime.mlx exits 13).
+ends_functions_with_endless_loops() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/440_endless_loop_ends_function_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 keeps a function type's parameters when one of them is a
+# function type itself (tests/443_function_type_parameters_runtime.mlx
+# exits 13).
+nests_function_types() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/443_function_type_parameters_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 ends a statement at a line's last `.*` or `.?`
+# (tests/444_statement_after_postfix_runtime.mlx exits 13).
+ends_statements_after_postfix() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/444_statement_after_postfix_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 gives a module-level constant an address (a copy of its
+# value in the function; tests/445_constant_address_runtime.mlx exits 13).
+addresses_constants() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/445_constant_address_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether functions $1 builds begin at multiples of 16
+# (tests/442_function_alignment_runtime.mlx exits 13).
+aligns_functions() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/442_function_alignment_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 resolves the records of modules that import one another and
+# name one another (tests/441_types_across_import_ring_runtime.mlx exits
+# 13).
+resolves_types_across_import_rings() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/441_types_across_import_ring_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 gives a module-level var its floats and addresses
+# (tests/438_global_address_initializers_runtime.mlx exits 13).
+initializes_globals_with_addresses() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/438_global_address_initializers_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 reads a module-level const table from static data
+# (tests/442_constant_table_static_runtime.mlx exits 13: an element or the
+# length of a large table takes nothing from the aggregate arena, and the
+# table's value is still a value).
+reads_constant_tables_from_static_data() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/442_constant_table_static_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 takes an optional pointer as an atomic's type
+# (tests/437_atomic_optional_pointer_runtime.mlx exits 13).
+atomics_take_optional_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/437_atomic_optional_pointer_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 reads a function type where a builtin takes a type
+# (tests/436_function_type_in_builtin_runtime.mlx exits 13): `@ptrCast(
+# fn(u8) -> u8, raw)`, `?fn(...)`, `[*]?fn(...)`.
+parses_function_types_in_builtins() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/436_function_type_in_builtin_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 rejects an integer written out that its type cannot hold
 # (tests/335_type_mismatches.mlx); older compilers kept its low bits.
 checks_literal_ranges() {
@@ -620,15 +837,18 @@ tests_equality_chains() {
     grep -q "equality chains tested as one bit mask: [1-9]" <<< "$output"
 }
 
-# Whether $1's arena has room for the largest programs here: 1 GiB of
-# address space (projects/observatory took 252 MiB of the former 256 MiB,
-# and the arena running full showed as a symbol never defined).
+# Whether $1's arena has room for the largest programs here: 8 GiB of
+# address space asked for, less where the system gives less
+# (projects/observatory took 252 MiB of the former 256 MiB, ANGLE
+# translated to one Mlx program filled the 1 GiB after it; the arena
+# running full showed as a symbol never defined, later as an analysis
+# cut short).
 holds_large_programs() {
     local probe output
     probe=$(mktemp -d mlx-out/probe.XXXXXX)
     output=$("$1" tests/01_basic.mlx -o "$probe/probe" 2>&1) || true
     rm -rf -- "$probe"
-    grep -q "compiler arena capacity: 1073741824" <<< "$output"
+    grep -q "compiler arena request: 8589934592" <<< "$output"
 }
 
 # Whether $1 writes the files it read with --depfile (what `mlx build`
@@ -744,6 +964,70 @@ resolves_local_module_aliases() {
     [[ $status -eq 13 ]]
 }
 
+# Whether $1 gives the slice of an array that cannot be written (a
+# constant, a parameter taken by value) the type `[]const T`: the slice
+# of an array parameter is refused where a `[]u8` is taken
+# (tests/support/constant_slices_invalid/parameter_to_callee.mlx). Older
+# compilers made it a `[]u8`, through which the callee wrote into its
+# caller's array.
+types_slices_of_constants() {
+    local probe status=0 output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    output=$("$1" --quiet tests/support/constant_slices_invalid/parameter_to_callee.mlx -o "$probe/probe" 2>&1) || status=$?
+    rm -rf -- "$probe"
+    [[ $status -ne 0 ]] && grep -qF 'expected `[]u8`, found `[]const u8`' <<< "$output"
+}
+
+# Whether $1 gives the address of a module-level constant
+# (tests/444_constant_address_runtime.mlx exits 13: `&TABLE` is the
+# table's image, `&WORD` a slot holding it; earlier compilers lowered
+# either to no address, and a read through it faulted).
+takes_addresses_of_constants() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/444_constant_address_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 takes a place with a `try` among its parts for as writable
+# as it is without one (tests/445_tried_places_runtime.mlx compiles and
+# ends with 0; earlier compilers typed such a place's parts without the
+# function's return type and refused its slice where a `[]T` was wanted).
+writes_places_through_try() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/445_tried_places_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 shifts and masks where a divisor or a factor is a constant
+# power of two instead of dividing or multiplying (x86_64
+# codegen/arithmetic.mlx), and the program still runs right
+# (tests/448_power_of_two_division_runtime.mlx exits 13).
+shifts_powers_of_two() {
+    local probe output
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    output=$("$1" tests/448_power_of_two_division_runtime.mlx -o "$probe/probe" 2>&1) || true
+    if grep -q "divisions and products by a power of two shifted: [1-9]" <<< "$output"; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -797,6 +1081,24 @@ probes=(
     "lets_locals_shadow_members|locals shadowing their struct's members and module declarations"
     "names_unresolved_symbols|the unresolved backend symbol named (MLX-E3004)"
     "resolves_local_module_aliases|a module's declarations through a local bound to it"
+    "lays_out_packed_structs|packed structs laid out in bits"
+    "negates_floats_by_sign|floats negated by their sign bit (-0.0)"
+    "parses_function_types_in_builtins|function types as a builtin's type argument"
+    "atomics_take_optional_pointers|atomics on optional pointers"
+    "initializes_globals_with_addresses|module-level vars initialized with floats and addresses"
+    "types_functions_named_ahead|a function named in an initializer above its declaration"
+    "ends_functions_with_endless_loops|a function ending with a while true no break ends"
+    "resolves_types_across_import_rings|records of modules that import one another naming one another"
+    "leaves_brixos_by_process_exit|a linked brixOS program leaving by process_exit"
+    "reads_constant_tables_from_static_data|module-level const tables read from static data"
+    "aligns_functions|functions at multiples of 16"
+    "types_slices_of_constants|slices of constants and of by-value parameters as []const T"
+    "takes_addresses_of_constants|the address of a module-level constant"
+    "writes_places_through_try|places with a try among their parts as writable as without"
+    "nests_function_types|function types with function types among their parameters"
+    "ends_statements_after_postfix|a statement ended by a line's last .* or .?"
+    "addresses_constants|the address of a module-level constant"
+    "shifts_powers_of_two|divisions and products by a constant power of two as shifts and masks"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

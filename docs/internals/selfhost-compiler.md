@@ -121,15 +121,19 @@ when the bound is hit.
 
 `main.mlx` delegates everything to `driver/pipeline.mlx`'s `Pipeline.compile`,
 which runs inside one `unsafe` block and drives the whole compilation
-through an arena allocator (`arena_allocator.init(pages, 1073741824)` — a
-1&nbsp;GiB arena of address space, whose pages are touched only as it fills)
+through an arena allocator — 8&nbsp;GiB of address space asked for
+(`ARENA_REQUEST`), half as much again and again down to 1&nbsp;GiB where
+the system does not give it, whose pages are touched only as it fills —
 that is freed in one shot at the end. `projects/observatory` takes 252&nbsp;MiB
-of it, which was all but the whole of the former 256&nbsp;MiB; a request the
+of it, which was all but the whole of the first 256&nbsp;MiB; ANGLE
+translated to one Mlx program (66&nbsp;MiB of source in 341 modules,
+`projects/webkit/LATTICE.md`) filled the 1&nbsp;GiB that followed. A request the
 arena cannot hold ends the compile with "the compiler's arena is full"
 (status 9) instead of a null its caller would unwrap into a trap, or turn
 into a symbol never defined (`compilerAlloc` and `compilerRemap` wrap the
-arena's functions). The metric "compiler arena capacity" names the size,
-which `tools/ensure_compiler.sh` probes. The compile in outline:
+arena's functions). The metrics "compiler arena capacity" and "compiler
+arena request" name what the arena has and what was asked for;
+`tools/ensure_compiler.sh` probes the request. The compile in outline:
 
 ```mlx
 pub const Pipeline = struct {
@@ -359,7 +363,24 @@ struct or union naming a field twice is rejected with `MLX-E3002`
 (`tests/313_duplicate_field.mlx`). `&place` is as writable as the place:
 `&value.field` of a variable, `&pointer.*.field` through a mutable pointer
 and `&array[i]` are `*T`, through a constant `*const T`
-(`tests/307_field_address_runtime.mlx`).
+(`tests/307_field_address_runtime.mlx`). The slice of an array and a
+pointer capture over one ask the same question (`isMutable`), because an
+array's type carries no constness: `array[a..b]` is a `[]T` and `for
+*item in array` binds a `*T` where the array is a variable, a field or
+an element of one or what a mutable pointer points to; a `[]const T` and
+a `*const T` where it is a constant, a parameter (taken by value, but the
+caller's storage) or no place at all, a call's result or an optional's
+payload (`tests/443_constant_slices_runtime.mlx`; the programs this
+refuses are in `tests/support/constant_slices_invalid`). `isMutable` types
+a place's parts with the function's return type, as the expression
+around it is typed, so a `try` among them has its type
+(`tests/445_tried_places_runtime.mlx`: without it such a place counted
+as not writable), and follows a module's member through any number of
+modules (`a.b.table`). The body of a generic function
+(an `anytype` or `comptime` parameter) is not analyzed here
+(`functions.isGeneric`), so this, like every rule about what may be
+written, does not reach into one; the lowering's own `expressionType`
+still gives every array's slice the type `[]T`.
 
 ## Comptime evaluation (`sema/comptime/evaluate.mlx`)
 
@@ -793,6 +814,37 @@ displacement (`mov rax, [rbx + 0x18]`, `mov [rcx + 8], rax`), and a frame
 slot narrower than a word is read and written in place (`movzx rax, byte
 [rbp - 0x88]`). With single-store promotion this brought the compiler's
 own build to 3.08 billion instructions and its binary to 1.45 MB.
+
+**Powers of two without the divide** (x86_64,
+`Arithmetic.emitPowerOfTwoDivision`, `emitPowerOfTwoMultiplication`,
+`Memory.emitScale`). A division or a remainder whose divisor is a
+constant 2^n does not reach the processor's `div` (14 to 46 cycles on a
+Zen 1). An unsigned quotient is `shr` by n, its remainder an `and` with
+2^n - 1 (`mov r32, r32` for 2^32, a shift left and back for a wider mask,
+which is no 32-bit immediate). A signed one adds 2^n - 1 to a negative
+dividend first (`mov rcx, x`, `sar rcx, 63`, `shr rcx, 64 - n`, `add x,
+rcx`), so that `sar` rounds toward zero as `idiv` does, and takes it off
+again after the mask for the remainder, which keeps the dividend's sign.
+A product by a constant 2^n, on either side, and an index scaled by an
+element of 2^n bytes are `shl`. Each is the word the 64-bit `div`, `idiv`
+or `imul` left for every operand, so narrow types and mlx-cc's C and C++
+(the same back end) need no case of their own, and a checked product
+traps as before: the check compares the product with the type's largest
+value (`emitArithmeticPolicy` in `ir/lower.mlx`), no code reads a
+multiplication's flags. The constant is read from the operand's `const_i`
+(`State.constantPowerOfTwo`), wherever its value is kept. Left as they
+were: divisors and factors that are no power of two, the lowest i64 as a
+signed divisor (its bits are 2^63's), and the aarch64 back end. brixOS's
+kernel went from 222 `div` to 75 and from 643 `imul` by an immediate to
+245, kepler built for brixOS from 265 `div` and 190 `idiv` to 119 and 75
+and from 1,892 such `imul` to 346 (`backend divisions and products by a
+power of two shifted` counts them); a loop with `/ 8` in its condition
+takes 0.29 ns a turn instead of 2.4.
+`tests/448_power_of_two_division_runtime.mlx` holds every integer type
+and divisor against the same divisor read at run time,
+`tests/449_power_of_two_multiplication_runtime.mlx` the products, a
+checked one that does not fit still trapping, and elements reached by an
+index; `compiler/cc/tests/powertwo.c` is the same for C.
 
 Between Mlx functions a value of several words comes back a word per
 register: `rax`, `rdx`, `rcx`, `r8`, `r9`, `r10`, `r11`, `rsi`, `rdi`

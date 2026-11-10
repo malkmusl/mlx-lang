@@ -139,7 +139,7 @@ wait_for '^impulse: brixOS.s init$'
 wait_for '^impulse: services defined: 3$'
 echo "ok   impulse defines the bus, the login and the serial shell"
 # The bus listens, the login owns its names and starts the greeter.
-wait_for '^ipc: listening at unix:path=/temporary/bus$'
+wait_for 'ipc: listening at unix:path=/temporary/bus$'
 wait_for '^login: org.mlx.Login and org.freedesktop.login1 on the system bus'
 wait_for '^login: greeter started$'
 # sentinel is itself a native (mlx) bus client: it speaks MLXIPC's native
@@ -180,6 +180,18 @@ printf 'ls -1 /system/share/apps/Vector.app\r' >&3
 wait_for '^app.ini$'
 wait_for '^icon.png$'
 echo "ok   Vector ships as an app bundle (/system/share/apps/Vector.app) for the launcher and dock"
+
+# The screen's picture goes from the program that leaves the framebuffer
+# to the one that takes it in a file (/temporary/screen-picture,
+# projects/desktop/splash/picture.mlx), so nobody reads the framebuffer
+# back: sentinel ended the greeter's compositor (the terminate event),
+# which left its last frame there as its own user; the session's, as
+# brix, faded in from it and removed it (its log says so).
+printf 'cat /users/brix/.config/mlx/compositor.log\r' >&3
+wait_for 'brix: fading in from the picture the program before left$'
+printf 'ls /temporary/screen-picture\r' >&3
+wait_for "^ls: cannot access '/temporary/screen-picture'"
+echo "ok   the session's compositor fades in from the picture the greeter's left in /temporary (another user's file, taken and removed; the framebuffer is not read back)"
 
 # A clean power off.
 printf 'poweroff\r' >&3 2> /dev/null || true

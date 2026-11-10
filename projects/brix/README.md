@@ -123,7 +123,9 @@ are named for what they hold:
     /system/fonts      the fonts of the boot archive (DejaVu Sans Mono)
     /users/root        the user's home (the shell starts there)
     /temporary         scratch space (init/control, the init's FIFO;
-                       logs/NAME.log, the services' output)
+                       logs/NAME.log, the services' output;
+                       screen-picture, the last frame of the program
+                       that left the screen, for the one that takes it)
     /volumes           each disk's volume (diskN: brixfs, or ext2
                        read-only) and the brixfs volumes' snapshots
 
@@ -132,6 +134,14 @@ of Unix's paths. The system call layer, not the tree, maps them:
 `/tmp` → /temporary, `/dev` → /devices, `/etc/passwd` and `/etc/group`
 → /system/settings/users and groups, `/proc/self/exe` → the program the
 process runs. `ls /` shows only brixOS's own directories.
+
+A program's crash report (std.crash) is the host's there: with no
+/proc/self/maps and no /proc/self/comm, the program's own file (what
+/proc/self/exe links to) says where its segments are and what it is
+called, and is read into memory for its symbol and line tables; mincore
+says which of the stack's and the arena's pages are there
+(tools/check_brix_crash.sh runs the host's crashing program under flux
+and holds its reports to the host's).
 
 Besides files and directories the tree holds symbolic links (a link's
 target is its data; `Vfs.walk` follows links in the middle of a path,
@@ -184,12 +194,26 @@ runtime says "out of memory" on stderr before the program's own report.
 machine has and what the kernel did: the memory and what is free of it,
 the processors running the kernel, the uptime, and the kernel's counts
 since the boot (page faults served, system calls, switches between
-processes). `sysinfo` prints them:
+processes, the interrupts the devices sent as messages), and how long
+processors waited for the kernel while another held it. `sysinfo`
+prints them:
 
     memory: 2047 MiB, 1938 free
     processors: 2
     uptime: 6.0 s
     page faults: 3229, system calls: 822, switches: 14
+    device interrupts: 57
+    waits for the kernel: 41.220 ms in all; the longest 2.104 ms (behind process 7 in brixOS call 17); in the last 10 to 20 s 0.310 ms (behind process 3 at fault 14)
+    idle processors' waits for the kernel: 12.007 ms
+
+The waits are those of processors that had something to run: a program
+that stutters behind another's call (a driver waiting for its device, a
+long copy) shows there, with the process and the call that held the
+kernel for most of the wait. The second line sums the waits of
+processors that had nothing to run (their ticks queue behind whoever is
+in the kernel and delay nobody). Nothing is measured where the kernel is
+free when asked for; tools/check_brix_smp.sh runs `sysinfo` on four
+processors.
 
 std.build's runner takes its memory figures from it on brixOS (on Linux
 from /proc/meminfo), and build.mlx says what the big compiles take
@@ -256,6 +280,112 @@ done ("brixOS: disk0 answers by interrupt" at boot). The process that
 asked still waits inside the kernel meanwhile: no other one runs until
 the request is done.
 While a volume is mounted from it, a /devices/diskN is not writable.
+
+## On a real machine
+
+Beside virtio, the kernel drives what a board has (a Supermicro H11 with
+an EPYC is the one it is brought up on; QEMU's q35 machine with `-device
+ahci`, `nvme`, `igb` and `qemu-xhci` stands in for it,
+tools/check_brix_q35.sh, check_brix_usb.sh, check_brix_net_igb.sh):
+SATA disks on every AHCI controller (ahci.mlx), NVMe namespaces
+(nvme.mlx), an Intel igb network controller (igb.mlx), USB boot keyboards
+and mice on every xHCI controller, also behind hubs (usb.mlx: there is no
+PS/2 there). Each wait is a deadline on the clock (clock.Deadline), never
+a count of register reads, which is a blink on one machine and minutes
+on another, and each step that fails says so with what it saw ("ahci:
+port 4: the device stays busy (SSTS ... TFD ...)", "usb: port 3.2: the
+device takes no address (completion code 4)"). A controller is taken
+from the firmware first where it says it holds it (AHCI's BOHC, xHCI's
+USB Legacy Support). A device's registers are mapped by
+`memory.Device.map`: below 511 GiB at the kernel's direct offset, beyond
+(a 64-bit BAR the firmware put high, as OVMF does with the xHCI's) in a
+window of the kernel's own.
+
+The network controller and the USB controllers raise their interrupts as
+messages (MSI, or MSI-X where a controller has only that: `Pci.enableMsi`,
+`Pci.enableMsix`) to vectors of their own on the first processor's local
+APIC (layout.Vector.NET, USB; trap.mlx ends each at the local APIC): a
+received frame and a keyboard's report are served when they come. The
+timer tick looks at both as well, so a machine where no message arrives
+(no MSI capability, a local APIC that is off) works as before, a
+hundredth of a second later at most; `sysinfo`'s "device interrupts" says
+which it is, and /system/settings/interrupts with the word `polled` in it
+keeps every device to the tick (for a board whose messages are in
+doubt). The disks' commands are waited for where they are issued
+(the kernel runs a call to its end), as before.
+
+USB devices may be plugged in and pulled out while the system runs. Every
+port, a controller's or a hub's, goes through the same states a step at a
+time (usb.mlx `Port`: settling, reset, recovery, bring-up); the boot runs
+these steps until every port rests, afterwards the tick and the
+controller's interrupt do, and the waits in between are deadlines a step
+looks at, so the kernel is held only for a command's or a request's round
+trip. A hub says which of its ports changed on its status endpoint. A
+device that goes gives its slot and its memory back, a hub's devices
+with it, and a keyboard's held keys are released. What the kernel has
+to say about it afterwards is in its log (/devices/klog), not on the
+console.
+
+The picture's mode is the monitor's own where the firmware can set it:
+the loader (image/efi.mlx) reads what the monitor says of itself (its
+EDID, the firmware's EDID Active protocol: the first timing is the mode
+it prefers), finds that size among the firmware's modes and sets it,
+instead of taking the mode the firmware was left in (often a smaller
+one, or one of another shape that the monitor stretches). An image may
+name a mode itself: a file settings/display in the archive, "3840x2160"
+(that mode, when the firmware has it) or "firmware" (the firmware's,
+come what may); brix-image builds the loader for it. The kernel says
+the display it got, and when that is not the monitor's own mode
+("brixOS: the monitor's own mode is 3840x2160, which the firmware did
+not set").
+
+The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
+often has no serial line, so the kernel's messages are also drawn on the
+firmware's framebuffer (fbcon.mlx: an 8x16 font, a grid of characters so
+that a scroll never reads the adapter's memory back, the framebuffer
+mapped write-combining) until a graphical program maps it, and kept in a
+log (/devices/klog; klogsave writes it to boot.log on the brixfs
+volumes). `console.screen(false)` keeps a long dump off the screen (in
+the log and on the serial line only). A fault of the kernel's own stops
+it with a report on the screen (trap.mlx `stop`: what, where, the
+registers, the callers), drawn over whatever is there.
+
+The loader hands the kernel the ACPI tables' root from the firmware's
+configuration table (a UEFI firmware keeps none in the BIOS area), so the
+other processors are found and started there too (smp.mlx: the XSDT, the
+MADT's local APIC and x2APIC entries). The local APICs are reached the
+way the firmware left them: their registers in memory, or, in x2APIC
+mode, as model-specific registers (IPIs with 32-bit ids, the timer, the
+end of an interrupt); this second way is written to the manuals and has
+not run anywhere yet (QEMU's emulation here has no x2APIC).
+/system/settings/processors (a number) limits how many run the kernel.
+
+    tools/brix-diag-efi.sh
+
+writes two images for such a machine beside the build's: BOOTX64-diag.EFI
+(no graphical session: the kernel's log stays on the screen to be read or
+photographed) and BOOTX64-console.EFI (mlx-console on the screen: a
+shell with the USB keyboard; `cat /devices/klog` shows the log). Both
+run on one processor and carry the GPU's firmware.
+
+The GPU (gpu.mlx: an AMD Radeon, Polaris) is found and its register path
+tried; its driver is built in stages, and what the next ones stand on is
+there: its apertures in the kernel's view, memory in one piece for what
+the card reads and writes (`gpu.dma`), its firmware from the boot
+archive by name (`Archive.find`), a vector for its interrupt
+(layout.Vector.GPU, `Pci.enableMsi`, `smp.localApic`). The firmware's
+picture is the console and the desktop's screen: the file's head says
+what must not be done to the card while it is.
+
+What is not there yet: disks served by their interrupts (AHCI, NVMe: a
+command is waited for), USB devices other than boot keyboards, mice and
+hubs, a network controller's link going down and up said to the stack.
+
+(The font's glyphs were a `const` array, a value built where it was
+used: each row of each character drawn built all 1520 bytes of it in the
+kernel's arena, which was full after 173 characters. That, not a driver,
+was the freeze after "probing storage". The table is a `var` now, and
+mlx4 reads a `const` table from static data as well.)
 
 ## The network
 
@@ -603,7 +733,11 @@ view of these (linux/signals.mlx): a signal number is an event with the
 number as its detail, so it comes back as sent; handlers, masks and
 rt_sigframes are the Linux layer's, and wait4's status words its
 encoding. A process that has claimed nothing and set no upcall sees its
-events that way. projects/brix/tools/events shows the native side.
+events that way; and a fault a process has not claimed still goes to a
+handler it has there for the fault's signal, so a program that takes
+some kinds itself (the compositor its terminate event) keeps the crash
+report std.crash installed (tools/check_brix_crash.sh).
+projects/brix/tools/events shows the native side.
 
 std on brixOS: a program built with --target=x86_64-brixos reads and
 writes its files by brixOS's own calls (std/bootstrap/fs.mlx and

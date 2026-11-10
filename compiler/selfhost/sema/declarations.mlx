@@ -147,7 +147,7 @@ pub fn isAddressable(nodes: *NodeStore, node_index: usize) -> bool {
     return false
 }
 
-pub fn isMutable(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, node_index: usize) -> bool {
+pub fn isMutable(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, node_index: usize, return_type: TypeId) -> bool {
     const node = ast_store.Store.get(nodes, node_index)
     if node.tag == ast.Tag.identifier {
         const token = lexer.tokenAt(tokens, node.mainToken)
@@ -161,19 +161,19 @@ pub fn isMutable(source: []const u8, path: []const u8, tokens: Buffer, nodes: *N
         // writable although the module binding itself is a constant).
         const member = moduleMemberSymbol(source, path, tokens, nodes, types, symbols, scope, node)
         if member.0 { return symbols_module.symbolAt(symbols, member.1).*.flags & symbols_module.FLAG_CONSTANT == 0 }
-        return isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs)
+        return isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type)
     }
     if node.tag == ast.Tag.index_expression {
-        const container = expression(source, path, tokens, nodes, types, symbols, scope, node.lhs)
+        const container = expressionWithReturn(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type)
         if container.0 == 0 { return false }
         const container_type = types_module.get(types, container.0)
         if container_type.*.kind == types_module.Kind.slice || container_type.*.kind == types_module.Kind.many_pointer { return container_type.*.flags & types_module.FLAG_CONSTANT == 0 }
-        return isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs)
+        return isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type)
     }
     if node.tag == ast.Tag.unary_expression {
         const operator = lexer.tokenAt(tokens, node.mainToken).kind
         if operator != lexer.Kind.dot_asterisk { return false }
-        const pointer = expression(source, path, tokens, nodes, types, symbols, scope, node.lhs)
+        const pointer = expressionWithReturn(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type)
         if pointer.0 == 0 { return false }
         const pointer_type = types_module.get(types, pointer.0)
         return (pointer_type.*.kind == types_module.Kind.pointer || pointer_type.*.kind == types_module.Kind.many_pointer) && pointer_type.*.flags & types_module.FLAG_CONSTANT == 0
@@ -185,10 +185,20 @@ pub fn isMutable(source: []const u8, path: []const u8, tokens: Buffer, nodes: *N
 // a module binding: (true, symbol index), else (false, 0).
 fn moduleMemberSymbol(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, node: Node) -> (bool, usize) {
     const base_node = ast_store.Store.get(nodes, node.lhs)
-    if base_node.tag != ast.Tag.identifier { return -> (false, 0) }
-    const base = expression(source, path, tokens, nodes, types, symbols, scope, node.lhs)
-    if base.0 == 0 { return -> (false, 0) }
-    const base_type = types_module.get(types, base.0)
+    if base_node.tag != ast.Tag.identifier && base_node.tag != ast.Tag.named_type && base_node.tag != ast.Tag.field_expression { return -> (false, 0) }
+    var base_type_id: TypeId = 0
+    if base_node.tag == ast.Tag.named_type {
+        // (`module.Type` where a type is written: the base is a name.)
+        const base_token = lexer.tokenAt(tokens, base_node.mainToken)
+        const base_symbol = symbols_module.lookup(scope, tokenPointer(source, tokens, base_node.mainToken), base_token.length)
+        if !base_symbol.0 { return -> (false, 0) }
+        analyzeAhead(source, path, tokens, nodes, types, symbols, scope, base_symbol.1)
+        base_type_id = symbols_module.symbolAt(symbols, base_symbol.1).*.typeId
+    } else {
+        base_type_id = expression(source, path, tokens, nodes, types, symbols, scope, node.lhs).0
+    }
+    if base_type_id == 0 { return -> (false, 0) }
+    const base_type = types_module.get(types, base_type_id)
     if base_type.*.kind != types_module.Kind.module { return -> (false, 0) }
     const field_token = lexer.tokenAt(tokens, node.mainToken)
     const field_pointer = tokenPointer(source, tokens, node.mainToken)
@@ -485,6 +495,11 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
         return aggregate_id
     }
 
+    // A packed struct (spec aggregates.xml PackedLayout): no padding, each
+    // field exactly its bit width, the offsets in bits; the whole within one
+    // word (64 bits), the struct's size that of the integer holding it.
+    const is_packed = kind == types_module.Kind.struct_type && lexer.tokenAt(tokens, node.mainToken).kind == lexer.Kind.keyword_packed
+    var bit_offset: usize = 0
     while field_node != ast.NONE && visited < node.rhs {
         const member = ast_store.Store.get(nodes, field_node)
         if member.tag == ast.Tag.function_declaration || member.tag == ast.Tag.constant_declaration {
@@ -513,7 +528,10 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
         const field_size = types_module.sizeOf(types, field_type)
         if field_alignment > alignment { alignment = field_alignment }
         var offset: usize = 0
-        if kind == types_module.Kind.struct_type {
+        if is_packed {
+            offset = bit_offset
+            bit_offset += types_module.bitSizeOf(types, field_type)
+        } else if kind == types_module.Kind.struct_type {
             size = alignForward(size, field_alignment)
             offset = size
             size += field_size
@@ -551,12 +569,31 @@ fn resolveAggregate(source: []const u8, path: []const u8, tokens: Buffer, nodes:
         size = payload_offset + size
         if tag_alignment > alignment { alignment = tag_alignment }
     }
+    if is_packed {
+        if bit_offset > 64 {
+            reportOwnership(source, path, tokens, node, diagnostic.Code.type_mismatch, "a packed struct holds at most 64 bits")
+            symbols_module.deinitScope(&aggregate_scope)
+            return 0
+        }
+        size = packedBytes(bit_offset)
+        alignment = size
+        types_module.get(types, aggregate_id).*.flags = types_module.get(types, aggregate_id).*.flags | types_module.FLAG_PACKED
+    }
     size = alignForward(size, alignment)
     types_module.completeAggregate(types, aggregate_id, fields_start, count, size, alignment, copyability)
     const members_valid = analyzeAggregateConstants(source, path, tokens, nodes, types, symbols, &aggregate_scope, node) && analyzeAggregateFunctionTypes(source, path, tokens, nodes, types, symbols, &aggregate_scope, node)
     symbols_module.deinitScope(&aggregate_scope)
     if !members_valid { return 0 }
     return aggregate_id
+}
+
+// The bytes of the integer that holds `bits` bits of a packed struct: 1,
+// 2, 4 or 8 (as C lays a group of bit-fields in one unit).
+fn packedBytes(bits: usize) -> usize {
+    if bits <= 8 { return 1 }
+    if bits <= 16 { return 2 }
+    if bits <= 32 { return 4 }
+    return 8
 }
 
 // The aggregate a binding `const A = struct { ... }` is making, while its
@@ -678,13 +715,21 @@ pub fn resolveType(source: []const u8, path: []const u8, tokens: Buffer, nodes: 
     }
     if node.tag == ast.Tag.function_type || node.tag == ast.Tag.tuple_type {
         analyzeTypeAhead(source, path, tokens, nodes, types, symbols, scope, node_index)
+        // (The places are taken before the parts are resolved: a part
+        // that is a function or tuple type itself lists its own parts
+        // behind them, not between them.)
         const extra_start = types.*.extraIds.*.length
+        var reserved: usize = 0
+        while reserved < node.rhs {
+            types_module.appendExtra(types, 0)
+            reserved += 1
+        }
         var child = node.lhs
         var count: usize = 0
         while child != ast.NONE && count < node.rhs {
             const child_type = resolveType(source, path, tokens, nodes, types, symbols, scope, child)
             if child_type == 0 { return 0 }
-            types_module.appendExtra(types, child_type)
+            types_module.setExtra(types, extra_start + count, child_type)
             child = ast_store.Store.get(nodes, child).next
             count += 1
         }
@@ -1383,6 +1428,9 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
             const base_token = lexer.tokenAt(tokens, base_node.mainToken)
             const base_symbol = symbols_module.lookup(scope, tokenPointer(source, tokens, base_node.mainToken), base_token.length)
             if base_symbol.0 {
+                // (The module's own binding of an import, when this
+                // declaration is analyzed before its module's turn.)
+                analyzeAhead(source, path, tokens, nodes, types, symbols, scope, base_symbol.1)
                 const symbol = symbols_module.symbolAt(symbols, base_symbol.1)
                 base_type = symbol.*.typeId
                 base_value_type = symbol.*.valueTypeId
@@ -1403,6 +1451,15 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
                 const declaration = symbols_module.symbolAt(symbols, symbol_index)
                 if sameName(declaration.*.namePointer, declaration.*.nameLength, field_pointer, field_token.length) {
                     if declaration.*.flags & symbols_module.FLAG_PUBLIC == 0 { return -> (0, 0) }
+                    if declaration.*.typeId == 0 {
+                        // (A module in an import ring whose turn has not
+                        // come: this declaration of it now.)
+                        analyzeAheadElsewhere(types, symbols, symbol_index)
+                        const pending = pendingElsewhere(types, symbols, symbol_index)
+                        if pending != 0 { return -> (types_module.primitive(types, types_module.Kind.type_type), pending) }
+                        const analyzed = symbols_module.symbolAt(symbols, symbol_index)
+                        return -> (analyzed.*.typeId, analyzed.*.valueTypeId)
+                    }
                     return -> (declaration.*.typeId, declaration.*.valueTypeId)
                 }
                 declaration_index += 1
@@ -1456,12 +1513,17 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
     }
     if node.tag == ast.Tag.tuple_literal {
         const extra_start = types.*.extraIds.*.length
+        var reserved: usize = 0
+        while reserved < node.rhs {
+            types_module.appendExtra(types, 0)
+            reserved += 1
+        }
         var child = node.lhs
         var count: usize = 0
         while child != ast.NONE && count < node.rhs {
             const value = expressionWithReturn(source, path, tokens, nodes, types, symbols, scope, child, return_type)
             if value.0 == 0 { return -> (0, 0) }
-            types_module.appendExtra(types, value.0)
+            types_module.setExtra(types, extra_start + count, value.0)
             child = ast_store.Store.get(nodes, child).next
             count += 1
         }
@@ -1562,7 +1624,16 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
         const child_type = predicates.elementType(types, container.0)
         if child_type == 0 { return -> (0, 0) }
         const container_type = types_module.get(types, container.0)
-        return -> (types_module.slice(types, child_type, container_type.*.flags & types_module.FLAG_CONSTANT != 0), 0)
+        // A slice or a many-item pointer says in its type whether its
+        // elements may be written. An array's type says nothing: its
+        // elements are as writable as the place it is (isMutable), so the
+        // slice of a constant, of a parameter taken by value, of a field or
+        // an element of one, or of a value that is no place at all (a
+        // call's result) is a slice of constants. (A parameter's array is
+        // the caller's own storage: a `[]T` of it would write there.)
+        var is_const = container_type.*.flags & types_module.FLAG_CONSTANT != 0
+        if container_type.*.kind == types_module.Kind.array { is_const = !isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type) }
+        return -> (types_module.slice(types, child_type, is_const), 0)
     }
     if node.tag == ast.Tag.range_expression {
         const lower = expressionWithReturn(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type)
@@ -1594,7 +1665,7 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
             if !isAddressable(nodes, node.lhs) { return -> (0, 0) }
             // A field or element is as writable as the place it is in (a
             // variable, or what a mutable pointer points to).
-            const is_const = !isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs)
+            const is_const = !isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type)
             return -> (types_module.pointer(types, operand.0, is_const, false, false), 0)
         }
         if operator == lexer.Kind.bang {
@@ -1630,7 +1701,7 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
         if left.0 == 0 || right.0 == 0 { return -> (0, 0) }
         if predicates.isAssignment(operator) {
             const stepping = predicates.isPointerStep(types, operator, left.0, right.0)
-            if !isAddressable(nodes, node.lhs) || !isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs) || (!stepping && (!types_module.isCoercible(types, right.0, left.0) || literal_fit.misfit(source, tokens, nodes, types, node.rhs, left.0))) { return -> (0, 0) }
+            if !isAddressable(nodes, node.lhs) || !isMutable(source, path, tokens, nodes, types, symbols, scope, node.lhs, return_type) || (!stepping && (!types_module.isCoercible(types, right.0, left.0) || literal_fit.misfit(source, tokens, nodes, types, node.rhs, left.0))) { return -> (0, 0) }
             if operator != lexer.Kind.equal && !stepping && !predicates.isNumeric(types, left.0) && !predicates.isInteger(types, left.0) { return -> (0, 0) }
             if operator == lexer.Kind.equal {
                 const target = ast_store.Store.get(nodes, node.lhs)
@@ -1695,7 +1766,7 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
             // it has one (as `&value` would be typed).
             if !types_module.isCoercible(types, actual_receiver.0, expected_receiver) {
                 if !isAddressable(nodes, receiver) { return -> (0, 0) }
-                const address = types_module.pointer(types, actual_receiver.0, !isMutable(source, path, tokens, nodes, types, symbols, scope, receiver), false, false)
+                const address = types_module.pointer(types, actual_receiver.0, !isMutable(source, path, tokens, nodes, types, symbols, scope, receiver, return_type), false, false)
                 if !types_module.isCoercible(types, address, expected_receiver) { return -> (0, 0) }
             }
         }
@@ -1779,7 +1850,7 @@ pub fn expressionWithReturn(source: []const u8, path: []const u8, tokens: Buffer
 // part of a cycle and stays unresolved.
 fn analyzeAhead(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeStore, types: *TypeStore, symbols: *SymbolStore, scope: *Scope, symbol_index: usize) -> void {
     const symbol = symbols_module.symbolAt(symbols, symbol_index)
-    if symbol.*.typeId != 0 || symbol.*.state != symbols_module.State.declared || symbol.*.flags & (symbols_module.FLAG_FUNCTION | symbols_module.FLAG_PARAMETER) != 0 { return }
+    if symbol.*.typeId != 0 || symbol.*.state != symbols_module.State.declared || symbol.*.flags & symbols_module.FLAG_PARAMETER != 0 { return }
     var module_scope = scope
     while module_scope.*.parentAddress != 0 {
         unsafe { module_scope = @ptrFromInt(*Scope, module_scope.*.parentAddress) }
@@ -1787,11 +1858,68 @@ fn analyzeAhead(source: []const u8, path: []const u8, tokens: Buffer, nodes: *No
     const own = symbols_module.lookupCurrent(module_scope, symbol.*.namePointer, symbol.*.nameLength)
     if !own.0 || own.1 != symbol_index || symbol.*.declaration == ast.NONE { return }
     const node = ast_store.Store.get(nodes, symbol.*.declaration)
+    if symbol.*.flags & symbols_module.FLAG_FUNCTION != 0 {
+        // A function named before `root` reached it (a module-level
+        // table of functions declared above them): its signature typed
+        // now. A failure stays `initializing`, for `root` to count.
+        if node.tag == ast.Tag.function_declaration { const typed = analyzeFunction(source, path, tokens, nodes, types, symbols, module_scope, symbol.*.declaration) }
+        return
+    }
     if node.tag != ast.Tag.constant_declaration && node.tag != ast.Tag.variable_declaration { return }
     // A failure stays `initializing`, for `root` to count.
     if analyzeBinding(source, path, tokens, nodes, types, symbols, module_scope, symbol.*.declaration) != 0 {
         symbols_module.symbolAt(symbols, symbol_index).*.state = symbols_module.State.initializing
     }
+}
+
+// A declaration of another module named before that module's turn: the
+// two import one another, or stand in a ring of imports, and one of them
+// is analyzed first (`A { b: ?*other.B }` here, `B { a: ?*this.A }`
+// there). It is analyzed now, in its own module's text and scope, as
+// analyzeAhead does inside one module; what that makes belongs to its
+// module.
+fn analyzeAheadElsewhere(types: *TypeStore, symbols: *SymbolStore, symbol_index: usize) -> void {
+    const symbol = symbols_module.symbolAt(symbols, symbol_index)
+    if symbol.*.typeId != 0 || symbol.*.state != symbols_module.State.declared || symbol.*.flags & symbols_module.FLAG_PARAMETER != 0 { return }
+    if symbol.*.flags & symbols_module.FLAG_MODULE_ASSIGNED == 0 { return }
+    const module_id = symbol.*.moduleId
+    const context = symbols_module.moduleContext(symbols, module_id)
+    if context.nodesAddress == 0 || context.tokensAddress == 0 || context.scopeAddress == 0 { return }
+    var module_nodes: *NodeStore = undefined
+    var module_tokens: Buffer = undefined
+    var module_scope: *Scope = undefined
+    unsafe {
+        module_nodes = @ptrFromInt(*NodeStore, context.nodesAddress)
+        module_tokens = @ptrFromInt(*Buffer, context.tokensAddress).*
+        module_scope = @ptrFromInt(*Scope, context.scopeAddress)
+    }
+    const module_source = context.sourcePointer[0..context.sourceLength]
+    const module_path = context.pathPointer[0..context.pathLength]
+    const made_from = symbols.*.length
+    analyzeAhead(module_source, module_path, module_tokens, module_nodes, types, symbols, module_scope, symbol_index)
+    var made = made_from
+    while made < symbols.*.length {
+        const new_symbol = symbols_module.symbolAt(symbols, made)
+        if new_symbol.*.flags & symbols_module.FLAG_MODULE_ASSIGNED == 0 {
+            new_symbol.*.moduleId = module_id
+            new_symbol.*.flags = new_symbol.*.flags | symbols_module.FLAG_MODULE_ASSIGNED
+        }
+        made += 1
+    }
+}
+
+// The aggregate another module's declaration is, while it is still being
+// worked out (named again from a module it names): pendingAggregate with
+// that module's nodes. 0 when it is no aggregate being worked out.
+fn pendingElsewhere(types: *TypeStore, symbols: *SymbolStore, symbol_index: usize) -> TypeId {
+    const symbol = symbols_module.symbolAt(symbols, symbol_index)
+    if symbol.*.typeId != 0 || symbol.*.state != symbols_module.State.initializing { return 0 }
+    if symbol.*.flags & symbols_module.FLAG_MODULE_ASSIGNED == 0 { return 0 }
+    const context = symbols_module.moduleContext(symbols, symbol.*.moduleId)
+    if context.nodesAddress == 0 { return 0 }
+    var module_nodes: *NodeStore = undefined
+    unsafe { module_nodes = @ptrFromInt(*NodeStore, context.nodesAddress) }
+    return pendingAggregate(module_nodes, types, symbol.*.declaration)
 }
 
 // What the type written at `node_index` names, analyzed ahead before an
@@ -1803,6 +1931,10 @@ fn analyzeTypeAhead(source: []const u8, path: []const u8, tokens: Buffer, nodes:
     if node.tag == ast.Tag.named_type || node.tag == ast.Tag.identifier {
         const found = symbolFor(source, path, tokens, scope, node)
         if found.0 { analyzeAhead(source, path, tokens, nodes, types, symbols, scope, found.1) }
+    } else if node.tag == ast.Tag.field_expression {
+        // (`other.Type`, of a module whose turn has not come.)
+        const member = moduleMemberSymbol(source, path, tokens, nodes, types, symbols, scope, node)
+        if member.0 { analyzeAheadElsewhere(types, symbols, member.1) }
     } else if node.tag == ast.Tag.array_type || node.tag == ast.Tag.error_union_type {
         analyzeTypeAhead(source, path, tokens, nodes, types, symbols, scope, node.rhs)
     } else if node.tag == ast.Tag.function_type || node.tag == ast.Tag.tuple_type {
@@ -2055,7 +2187,17 @@ pub fn root(source: []const u8, path: []const u8, tokens: Buffer, nodes: *NodeSt
             }
         }
         if node.tag == ast.Tag.function_declaration {
-            errors += analyzeFunction(source, path, tokens, nodes, types, symbols, scope, declaration)
+            // (One typed ahead, analyzeAhead, is not typed again; one that
+            // failed there is counted.)
+            const found = symbolFor(source, path, tokens, scope, node)
+            const state = if found.0 { symbols_module.symbolAt(symbols, found.1).*.state } else { symbols_module.State.declared }
+            const typed = found.0 && symbols_module.symbolAt(symbols, found.1).*.typeId != 0 && symbols_module.symbolAt(symbols, found.1).*.declaration == declaration
+            if typed && state == symbols_module.State.initialized {
+            } else if found.0 && state == symbols_module.State.initializing && symbols_module.symbolAt(symbols, found.1).*.declaration == declaration {
+                errors += 1
+            } else {
+                errors += analyzeFunction(source, path, tokens, nodes, types, symbols, scope, declaration)
+            }
         }
         declaration = node.next
         count += 1

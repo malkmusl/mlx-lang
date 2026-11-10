@@ -14,6 +14,8 @@
 const counters = @import("./counters.mlx")
 const cpu = @import("./cpu.mlx")
 const smp = @import("./smp.mlx")
+const memory = @import("./memory.mlx")
+const Bytes = @import("./bytes.mlx").Bytes
 const layout = @import("../layout.mlx")
 const console = @import("./console.mlx")
 const scheduler = @import("./scheduler.mlx")
@@ -33,22 +35,70 @@ const Ending = events.Ending
 const terminal = @import("./terminal.mlx")
 const keyboard = @import("./keyboard.mlx")
 const virtio = @import("./virtio.mlx")
-const virtionet = @import("./virtionet.mlx")
+const netdev = @import("./netdev.mlx")
+const usb = @import("./usb.mlx")
+const gpu = @import("./gpu.mlx")
 const stack = @import("./net/stack.mlx")
 const Irq = @import("./interrupts.mlx").Irq
 const signals = @import("./linux/signals.mlx")
 const Signal = signals.Signal
 const Signals = signals.Signals
 
+// The kernel stopped by a fault of its own: said once, on the serial line
+// and on the screen, then this processor stays here with interrupts off
+// (the others wait for the kernel, which it keeps). Nothing returns from
+// here, so the processor's arena is emptied first: a full arena is one of
+// the faults (a failed runtime check), and the report must not fail the
+// same way. A second fault while the report is being made only stops.
+var stopped = false // (per run)
+
+fn stop(frame: *const Frame) -> void {
+    if stopped {
+        while true {}
+    }
+    stopped = true
+    smp.resetArena(cpu.Cpu.id())
+    console.showOnScreen()
+    frame.report()
+    console.out.write("brixOS: the kernel stopped (a fault of its own)\n")
+    while true {}
+}
+
 export fn brix_trap(address: usize) -> void {
     const frame = Frame.at(address)
+    // The kernel's own fault that is no page fault (those may be a
+    // process's page, written by the kernel for a system call: handle
+    // looks) and no interrupt: nothing of the kernel is to be trusted,
+    // not even its lock.
+    if !frame.fromUser() && frame.*.vector < Exception.COUNT && frame.*.vector != Exception.PAGE_FAULT && frame.*.vector != Exception.NMI { stop(frame) }
     const id = cpu.Cpu.id()
+    // From user mode: nothing of the kernel was under way on this
+    // processor, so what its earlier entries made in its arena (a bump
+    // that is never freed: the buffers and records of the calls it
+    // handled) is let go. Without this every such record stayed, and the
+    // arena's 4 MiB ran out after enough calls or packets: a failed
+    // runtime check in the kernel. (A trap from the kernel itself, an
+    // interrupt while it waits or a page it writes for a call, keeps
+    // what is in use.)
+    if frame.fromUser() { smp.resetArena(id) }
+    // A non-maskable interrupt that met the kernel itself is only taken
+    // note of, without the kernel's lock: it may have met this processor
+    // between taking the lock and writing down that it has it, and to
+    // take it "again" there and let it go would free the kernel under
+    // its holder.
+    if !frame.fromUser() && frame.*.vector == Exception.NMI {
+        nmiMet = true
+        return
+    }
     smp.lock(id)
     handle(frame)
     // Back to user mode: the events the process can take now.
     deliver(frame)
-    // A process another processor could run: an idle one woken.
-    scheduler.processes().kickIdle()
+    // A process another processor could run: an idle one woken. (Not
+    // from an interrupt this processor took in its own idle halt: it
+    // looks for the process itself next, and when it takes it, the entry
+    // it idles in comes by here for a second one.)
+    if !smp.halting() { scheduler.processes().kickIdle() }
     smp.unlock()
 }
 
@@ -59,6 +109,9 @@ export fn brix_trap(address: usize) -> void {
 // until there is one.
 export fn brix_ap(id: usize) -> void {
     smp.lock(id)
+    // (Its page-attribute table as the first processor's: the
+    // framebuffer's write-combining mapping means the same on each.)
+    memory.Device.attributes()
     smp.joined(id)
     console.out.write("brixOS: processor ")
     console.out.decimal(id)
@@ -67,9 +120,12 @@ export fn brix_ap(id: usize) -> void {
     const top = cpu.BootInfo.perCpu(layout.PerCpu.TRAP_STACK)
     const frame = Frame.at(top - @sizeOf(Frame))
     const table = scheduler.processes()
+    smp.at(smp.Waits.IDLE)
     while true {
         if table.switchTo(frame) {
             deliver(frame)
+            // (Another that can run: an idle processor woken for it.)
+            table.kickIdle()
             // This path's arena allocations go with it (nothing of them
             // is used from here on).
             smp.resetArena(id)
@@ -84,9 +140,25 @@ export fn brix_ap(id: usize) -> void {
     }
 }
 
+var nmiSaid = false // (per run)
+// A non-maskable interrupt met the kernel itself (brix_trap).
+var nmiMet = false // (per run)
+
 fn handle(frame: *Frame) -> void {
     const table = scheduler.processes()
     const p = table.running()
+    // For a processor that waits for the kernel meanwhile (smp.Waits):
+    // what this entry is, and whose. A fault or an interrupt inside an
+    // entry leaves the entry's word; an idle processor's interrupt is
+    // nobody's (the process it ran last may run elsewhere by now).
+    if smp.depth() == 1 {
+        const whose = if smp.halting() { 0 } else { p.*.pid }
+        smp.at((whose << 32) | (if frame.isSystemCall() { smp.Waits.SYSTEM_CALL | (frame.*.rax & 0x7FFFFFFF) } else { frame.*.vector & 0x7FFFFFFF }))
+    }
+    if nmiMet && !nmiSaid {
+        nmiSaid = true
+        console.out.write("brixOS: a non-maskable interrupt (ignored)\n")
+    }
     if frame.isSystemCall() {
         counters.all().*.systemCalls += 1
         const number = frame.*.rax
@@ -112,6 +184,9 @@ fn handle(frame: *Frame) -> void {
     // This processor's local APIC timer: its time slice is over.
     if frame.*.vector == layout.Vector.LAPIC_TIMER {
         smp.endOfInterrupt()
+        // (One left over from a timer set for a wait's deadline ends no
+        // time slice: smp.disarm.)
+        if smp.staleTick() { return }
         if frame.fromUser() { next(frame, table.preempt(frame)) }
         return
     }
@@ -120,14 +195,53 @@ fn handle(frame: *Frame) -> void {
         smp.endOfInterrupt()
         return
     }
+    // The GPU's message-signalled interrupt: its driver takes note, the
+    // local APIC is told the interrupt is over (without that it sends no
+    // other of this or a lower priority).
+    if frame.*.vector == layout.Vector.GPU {
+        counters.all().*.deviceInterrupts += 1
+        gpu.interrupted()
+        smp.endOfInterrupt()
+        return
+    }
+    // The network device's (its received frames to the stack) and the USB
+    // controllers' (a keyboard's or mouse's report, a port that changed).
+    if frame.*.vector == layout.Vector.NET {
+        counters.all().*.deviceInterrupts += 1
+        netdev.message()
+        smp.endOfInterrupt()
+        return
+    }
+    if frame.*.vector == layout.Vector.USB {
+        counters.all().*.deviceInterrupts += 1
+        usb.interrupted()
+        smp.endOfInterrupt()
+        return
+    }
     if frame.*.vector >= Exception.COUNT { return }
+    // A non-maskable interrupt (a board's watchdog or its management
+    // controller): no fault of the code it interrupted. Said once.
+    if frame.*.vector == Exception.NMI {
+        if !nmiSaid {
+            nmiSaid = true
+            console.out.write("brixOS: a non-maskable interrupt (ignored)\n")
+        }
+        return
+    }
     // A fault of the program: the fault event (its detail the processor's
     // exception), which its upcall may take, or, in the Linux layer's
     // view, its signal (SIGSEGV, SIGILL, SIGFPE, ...) for a handler; a
     // report on the console when it ends the program.
     if frame.fromUser() {
         const address = if frame.*.vector == Exception.PAGE_FAULT { cpu.Cpu.faultAddress() } else { frame.*.rip }
-        if p.*.events.native {
+        const number = signals.ofException(frame.*.vector)
+        // A program that takes its events itself: the fault to its upcall
+        // when it claimed that kind. One it did not claim still goes to a
+        // handler the program has in the Linux layer's view (std.crash's
+        // report is installed there: a program that claims other kinds,
+        // the compositor its terminate event, keeps it); with neither, the
+        // kernel's own report and the end.
+        if p.*.events.native && (p.*.events.isClaimed(Event.FAULT) || !p.*.signals.caught(number)) {
             if p.*.events.isClaimed(Event.FAULT) && p.*.events.upcallEntry != 0 && !p.*.events.inUpcall {
                 p.*.events.add(events.Record.{ .kind = Event.FAULT, .detail = @intCast(u32, frame.*.vector), .sender = 0, .reserved = @intCast(u32, address & 0xFFFFFFFF) })
                 return
@@ -136,13 +250,47 @@ fn handle(frame: *Frame) -> void {
             end(frame, p, Ending.event(Event.FAULT, @intCast(u32, frame.*.vector)))
             return
         }
-        const number = signals.ofException(frame.*.vector)
         p.*.signals.force(number, address)
-        if !p.*.signals.caught(number) { frame.report() }
+        if p.*.signals.caught(number) { sayFault(frame, p, address) } else { frame.report() }
         return
     }
-    frame.report()
-    while true { cpu.Cpu.wait() }
+    stop(frame)
+}
+
+// A program's fault that its own handler takes (std.crash's report, a
+// program's own recovery): a line in the kernel's log (/devices/klog; not
+// on the console, where the program's own output is), so it can be found
+// which process it was and where. (The handler's report may say less, or
+// go where nobody reads it.)
+var faultName: [64]u8 = undefined // (per run)
+
+fn sayFault(frame: *const Frame, p: *Process, address: usize) -> void {
+    const out = console.out
+    const was = console.logOnly(true)
+    out.write("brixOS: process ")
+    out.decimal(@intCast(usize, p.*.pid))
+    const length = p.programLeaf(&faultName, 64)
+    if length != 0 {
+        out.write(" (")
+        out.writeBytes(&faultName, length)
+        out.write(")")
+    }
+    out.write(": ")
+    out.write(Exception.name(frame.*.vector))
+    out.write(" at ")
+    out.hex(frame.*.rip)
+    if frame.*.vector == Exception.PAGE_FAULT {
+        out.write(", address ")
+        out.hex(address)
+    }
+    // (Nowhere a program's code is: a call through a pointer that holds
+    // no function. What called is on its stack.)
+    if frame.*.rip < memory.Page.SIZE && p.prepare(frame.*.rsp, 8) {
+        out.write(", called from ")
+        out.hex(Bytes.read64(Bytes.pointer(frame.*.rsp), 0))
+    }
+    out.write(" (its handler takes it)\n")
+    _ = console.logOnly(was)
 }
 
 // What follows a system call: the process goes on, waits (the next one
@@ -166,7 +314,10 @@ fn deliver(frame: *Frame) -> void {
     const table = scheduler.processes()
     while frame.fromUser() {
         const p = table.running()
-        const goOn = if p.*.events.native { deliverNative(frame, p) } else { deliverLinux(frame, p) }
+        // (A fault that goes to a handler of the Linux layer's view is
+        // delivered there, whatever view the process's other events have:
+        // see handle.)
+        const goOn = if p.*.events.native && p.*.signals.faulted() == 0 { deliverNative(frame, p) } else { deliverLinux(frame, p) }
         if !goOn {
             p.*.inCall = false
             return
@@ -257,11 +408,17 @@ fn interrupt(frame: *Frame, irq: usize) -> void {
     if irq == Irq.TIMER {
         Irq.acknowledge(irq)
         stack.tick()
+        // The network device and the USB controllers looked at on the
+        // tick as well: where they raise no interrupt of their own that is
+        // all they get, and USB's waits (a port's reset, a device's time
+        // to recover) are counted here.
+        netdev.receive()
+        usb.poll()
         if frame.fromUser() { next(frame, table.preempt(frame)) }
         return
     }
-    // The network device's.
-    if virtionet.device().*.present && virtionet.device().*.irq == irq && virtionet.device().interrupted() {
+    // The network device's (one that raises an interrupt: virtio).
+    if netdev.present() && netdev.irq() == irq && netdev.interrupted() {
         Irq.acknowledge(irq)
         return
     }

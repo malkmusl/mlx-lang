@@ -66,7 +66,7 @@ echo "ok   the kernel, wget, tar, brixfs, mlx4 for brixOS and a boot image build
 # What the brix group needs of the repository, as an archive (our tar),
 # and the same files built on the host for comparison.
 parts=(build.mlx VERSION mlx-out/version.mlx compiler/selfhost compiler/cc/asm.mlx compiler/cc/base.mlx std/src std/bootstrap
-    projects/brix projects/shell projects/coreutils projects/wget projects/ping projects/tar projects/console projects/init projects/desktop/splash projects/desktop/shared projects/desktop/compositor projects/desktop/terminal projects/desktop/launcher projects/desktop/dock projects/desktop/topbar projects/desktop/ipc projects/desktop/login projects/desktop/greeter projects/desktop/apps tools/build-number)
+    projects/brix projects/shell projects/coreutils projects/wget projects/ping projects/tar projects/console projects/init projects/desktop/splash projects/desktop/shared projects/desktop/compositor projects/desktop/terminal projects/desktop/launcher projects/desktop/dock projects/desktop/topbar projects/desktop/ipc projects/desktop/login projects/desktop/greeter projects/desktop/files projects/desktop/settings projects/filemanager-shared projects/desktop/apps tools/build-number)
 for list in projects/webkit/*.mlx; do parts+=("$list"); done
 "$work/tar-host" -czf "$work/www/mlx.tar.gz" "${parts[@]}"
 members=$("$work/tar-host" -tzf "$work/www/mlx.tar.gz" | wc -l)

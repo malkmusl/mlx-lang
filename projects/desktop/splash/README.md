@@ -68,8 +68,14 @@ init starts it on two streams and sends Plymouth's requests on its
 input ("U" a service starting, "u" the progress in percent, "C", "M",
 "m", "Q" with its first argument byte set to keep the picture), each
 answered with ACK or NAK on its output; when the input ends, the splash
-quits. The init starts it again in shutdown or reboot mode when the
-system goes down, and `impulsectl message TEXT` reaches it as "M".
+quits. Told to quit keeping its picture, it writes its last frame to
+/temporary/screen-picture (`picture.mlx`: a header and the pixels, from
+the frame's own memory; the init removes one an earlier boot left) for
+the program that takes the screen: the
+compositor fades in from it and removes it, the console removes it;
+nobody reads the framebuffer back. The init starts it again in shutdown
+or reboot mode when the system goes down, and `impulsectl message TEXT`
+reaches it as "M".
 What it is told it notes on its errors (the serial console). `--mode`,
 `--fps N` and `--snapshot PNG` (the last frame when it quits) are its
 options. projects/init/brixos.mlx says when it is shown;

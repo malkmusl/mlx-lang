@@ -64,6 +64,7 @@ pub const Arithmetic = struct {
     // one of a commutative operation too).
     fn emitSimple(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> void {
         if Self.emitInPlace(state, index, instruction) { return }
+        if instruction.opcode == lir_module.Opcode.mul && Self.emitPowerOfTwoMultiplication(state, index, instruction) { return }
         const immediate = state_module.State.takeImmediate32(state, instruction.arg1)
         var left = instruction.arg0
         var right = instruction.arg1
@@ -125,6 +126,42 @@ pub const Arithmetic = struct {
         return opcode == lir_module.Opcode.add || opcode == lir_module.Opcode.mul || opcode == lir_module.Opcode.bit_and || opcode == lir_module.Opcode.bit_or || opcode == lir_module.Opcode.bit_xor
     }
 
+    // A multiplication by the constant 2^n, on either side: the other
+    // operand shifted left by n, in the result's register. The word is the
+    // product's (its low 64 bits, whatever the operand's sign), and the
+    // product is all that is read: an overflow check compares it with the
+    // type's largest value (ir/lower.mlx, emitArithmeticPolicy), no code
+    // reads the multiplication's flags.
+    fn emitPowerOfTwoMultiplication(state: *state_module.State, index: usize, instruction: lir_module.Inst) -> bool {
+        var value = instruction.arg0
+        var factor = instruction.arg1
+        var bits = state_module.State.constantPowerOfTwo(state, factor)
+        if bits == 64 {
+            value = instruction.arg1
+            factor = instruction.arg0
+            bits = state_module.State.constantPowerOfTwo(state, factor)
+        }
+        if bits == 64 { return false }
+        const destination = Self.takeOperand(state, index, value)
+        state_module.State.dropConstant(state, factor)
+        if bits > 0 { encoder.emitShiftImm(state.*.enc, destination, true, false, @intCast(u8, bits)) }
+        state_module.State.storeResult(state, index, destination)
+        state.*.powerOfTwoCount += 1
+        return true
+    }
+
+    // The register an instruction works on its operand in, with the
+    // operand in it: the operand's own when it is read last here, else the
+    // result's register loaded with it. The result is stored with
+    // State.storeResult.
+    fn takeOperand(state: *state_module.State, index: usize, operand: usize) -> target.Register {
+        const taken = state_module.State.takeOperandRegister(state, index, operand)
+        if taken.0 { return taken.1 }
+        const destination = state_module.State.resultRegister(state, index)
+        state_module.State.loadOp(state, destination, operand)
+        return destination
+    }
+
     // `x = x <op> y` with x kept in a register: the operation is done on
     // that register (add rbx, 1) and the store after it is left out. The
     // left operand is a lazy load of x, and the store right after is the
@@ -152,8 +189,14 @@ pub const Arithmetic = struct {
         state_module.State.spillLazy(state, index, home)
         if !state_module.State.isLazy(state, instruction.arg0) { return false }
         const register = left.1
+        const bits = if instruction.opcode == lir_module.Opcode.mul { state_module.State.constantPowerOfTwo(state, instruction.arg1) } else { 64 }
         const immediate = state_module.State.takeImmediate32(state, instruction.arg1)
-        if immediate.0 {
+        if bits != 64 {
+            // x = x * 2^n: shifted where it is (emitPowerOfTwoMultiplication).
+            state_module.State.dropConstant(state, instruction.arg1)
+            if bits > 0 { encoder.emitShiftImm(state.*.enc, register, true, false, @intCast(u8, bits)) }
+            state.*.powerOfTwoCount += 1
+        } else if immediate.0 {
             if instruction.opcode == lir_module.Opcode.mul {
                 encoder.emitIMulImm(state.*.enc, register, register, immediate.1)
             } else {
@@ -224,12 +267,69 @@ pub const Arithmetic = struct {
     }
 
     fn emitDivision(state: *state_module.State, index: usize, instruction: lir_module.Inst, signed: bool, remainder: bool) -> void {
+        if Self.emitPowerOfTwoDivision(state, index, instruction, signed, remainder) { return }
         state_module.State.loadOp(state, target.Register.rcx, instruction.arg1)
         state_module.State.loadOp(state, target.Register.rax, instruction.arg0)
         if signed { encoder.emitCqo(state.*.enc) } else { encoder.emitMovRegImm64(state.*.enc, target.Register.rdx, 0) }
         encoder.emitDivide(state.*.enc, target.Register.rcx, signed)
         if remainder { encoder.emitMovRegReg(state.*.enc, target.Register.rax, target.Register.rdx) }
         state_module.State.storeRaxResult(state, index)
+    }
+
+    // A division by the constant 2^n, or its remainder, without the
+    // processor's divide: in the result's register, the very word the
+    // 64-bit div or idiv leaves in rax or in rdx for every dividend,
+    // whatever the width of the type the word holds a value of (and a
+    // divisor that is not 0 or -1 never trapped).
+    // Unsigned: the dividend shifted right by n, or its low n bits.
+    // Signed (n up to 62; 2^63 is no positive i64): idiv rounds toward
+    // zero and its remainder has the dividend's sign, where a shift right
+    // alone rounds a negative dividend down. So 2^n - 1 is added to a
+    // negative dividend first (rcx: the sign spread over the word, then
+    // its low n bits; the sum cannot overflow, rcx being 0 unless the
+    // dividend is negative): the quotient is (x + rcx) >> n, the floor of
+    // (x + 2^n - 1) / 2^n, which for a negative x is x / 2^n rounded up;
+    // the remainder is ((x + rcx) & (2^n - 1)) - rcx, for a negative x
+    // the low bits of x - 1 less 2^n - 1, which is -((-x) mod 2^n).
+    fn emitPowerOfTwoDivision(state: *state_module.State, index: usize, instruction: lir_module.Inst, signed: bool, remainder: bool) -> bool {
+        const bits = state_module.State.constantPowerOfTwo(state, instruction.arg1)
+        if bits == 64 || (signed && bits == 63) { return false }
+        const destination = Self.takeOperand(state, index, instruction.arg0)
+        state_module.State.dropConstant(state, instruction.arg1)
+        const biased = signed && bits > 0
+        if biased {
+            encoder.emitMovRegReg(state.*.enc, target.Register.rcx, destination)
+            if bits > 1 { encoder.emitShiftImm(state.*.enc, target.Register.rcx, false, true, 63) }
+            encoder.emitShiftImm(state.*.enc, target.Register.rcx, false, false, @intCast(u8, 64 - bits))
+            encoder.emitAdd(state.*.enc, destination, target.Register.rcx)
+        }
+        if remainder {
+            Self.emitLowBits(state, destination, bits)
+            if biased { encoder.emitSub(state.*.enc, destination, target.Register.rcx) }
+        } else if bits > 0 {
+            encoder.emitShiftImm(state.*.enc, destination, false, signed, @intCast(u8, bits))
+        }
+        state_module.State.storeResult(state, index, destination)
+        state.*.powerOfTwoCount += 1
+        return true
+    }
+
+    // register = its low `bits` bits (0 to 63 of them): an and with the
+    // mask while that is a 32-bit immediate (sign-extended, so up to 31
+    // bits), the low half moved onto itself for 32, and for more the bits
+    // above shifted out and zeros back in.
+    fn emitLowBits(state: *state_module.State, register: target.Register, bits: usize) -> void {
+        if bits == 0 {
+            encoder.emitMovRegImm64(state.*.enc, register, 0)
+        } else if bits < 32 {
+            encoder.emitAluImm(state.*.enc, register, @intCast(i32, (@intCast(usize, 1) << @intCast(u6, bits)) - 1), 4, 0x25)
+        } else if bits == 32 {
+            encoder.emitExtend(state.*.enc, register, 32, false)
+        } else {
+            const shift = @intCast(u8, 64 - bits)
+            encoder.emitShiftImm(state.*.enc, register, true, false, shift)
+            encoder.emitShiftImm(state.*.enc, register, false, false, shift)
+        }
     }
 
     // By a constant count as an immediate, else by cl.

@@ -262,6 +262,10 @@ pub const Connection = struct {
             self.*.sndNxt = mask(seq + chunk)
             if !self.segment(ACK | (if chunk == left { PSH } else { 0 }), seq, chunk) {
                 self.*.sndNxt = seq
+                // (It could not go: the neighbour's address is being
+                // asked for, or the device is busy. The timer tries
+                // again: nothing else would.)
+                self.arm()
                 break
             }
             self.arm()
@@ -277,6 +281,7 @@ pub const Connection = struct {
                 self.*.finSent = false
                 self.*.sndNxt = seq
                 self.*.state = if self.*.state == State.last_ack { State.close_wait } else { State.established }
+                self.arm()
             }
         }
         self.*.pushing = false
@@ -326,6 +331,8 @@ pub const Connection = struct {
         self.*.rtoDeadline = 0
         sockets.sockets().changed(self.*.socket)
         if sockets.sockets().holdersOf(self.*.socket) == 0 {
+            // (Nobody's yet: a listener may hold it as pending.)
+            forget(self.*.socket)
             self.deinit()
             sockets.sockets().drop(self.*.socket)
         }
@@ -367,9 +374,12 @@ pub const Connection = struct {
     fn take(self: *Self, seq: usize, ack: usize, flags: usize, peerWindow: usize, data: [*]const u8, length: usize, options: [*]const u8, optionsLength: usize) -> void {
         if flags & RST != 0 {
             if self.*.state == State.syn_sent {
-                if ack == self.*.sndNxt { self.fail(ECONNREFUSED) }
+                if flags & ACK != 0 && ack == self.*.sndNxt { self.fail(ECONNREFUSED) }
                 return
             }
+            // Only a reset within what we take counts (anyone can send one
+            // for a pair of ports).
+            if mask(seq -% self.*.rcvNxt) > limits.RING { return }
             self.fail(ECONNRESET)
             return
         }
@@ -400,6 +410,13 @@ pub const Connection = struct {
                     sockets.sockets().drop(self.*.socket)
                     return
                 }
+            } else if sockets.sockets().holdersOf(self.*.socket) == 0 {
+                // (Its listener closed meanwhile: nobody could accept it
+                // or close it, and its slot would stay.)
+                self.abort()
+                self.deinit()
+                sockets.sockets().drop(self.*.socket)
+                return
             }
             sockets.Sockets.established(self.*.socket)
             // (The data of this segment, below.)
@@ -411,6 +428,13 @@ pub const Connection = struct {
         }
         self.acknowledged(ack, peerWindow)
         if self.*.state == State.closed { return }
+        // Data for a socket its program has let go of: nobody reads it, the
+        // ring would fill and the socket stay for good. Reset.
+        if length > 0 && self.*.finQueued && sockets.sockets().holdersOf(self.*.socket) == 0 {
+            self.abort()
+            self.finishedNow()
+            return
+        }
         // Data in order, into the socket; otherwise the acknowledgement
         // says what is wanted.
         var consumed: usize = 0
@@ -487,12 +511,45 @@ pub const Connection = struct {
             self.copyOut(0, chunk)
             _ = self.segment(ACK | PSH, self.*.sndUna, chunk)
         } else if self.*.finSent {
-            _ = self.segment(FIN | ACK, mask(self.*.sndNxt - 1), 0)
+            _ = self.segment(FIN | ACK, mask(self.*.sndNxt -% 1), 0)
+        } else {
+            // Nothing in flight: what could not go when it was pushed.
+            self.*.rtoDeadline = 0
+            self.push()
         }
     }
 }
 
 var connections: [limits.MAX_SOCKETS]Connection = undefined // (per run)
+// The reset for a segment of no connection is made in this one (static:
+// a local Connection took 200 bytes of the aggregate arena a segment).
+var stray: Connection = undefined // (per run)
+
+// Socket `index` out of every listener's pending connections (it goes
+// before it was accepted: accept must not hand out a slot that is free,
+// or someone else's by then).
+fn forget(index: usize) -> void {
+    var l: usize = 0
+    while l < limits.MAX_SOCKETS {
+        const c = &connections[l]
+        if c.*.state == State.listen {
+            var k: usize = 0
+            while k < c.*.pendingCount {
+                if c.*.pending[k] == index {
+                    var j = k + 1
+                    while j < c.*.pendingCount {
+                        c.*.pending[j - 1] = c.*.pending[j]
+                        j += 1
+                    }
+                    c.*.pendingCount -= 1
+                } else {
+                    k += 1
+                }
+            }
+        }
+        l += 1
+    }
+}
 
 pub fn connectionAt(index: usize) -> *Connection { return &connections[index] }
 
@@ -532,6 +589,15 @@ pub fn receive(source: stack.Ip, destination: stack.Ip, bytes: [*]const u8, leng
     }
     const listener = sockets.Sockets.listenerFor(port)
     if listener != sockets.MAX && flags & SYN != 0 && flags & ACK == 0 {
+        // No more half-open connections than the listener can hold (each
+        // takes a socket of the table's 32 for over a minute).
+        var half: usize = connections[listener].pendingCount
+        var j: usize = 0
+        while j < sockets.MAX {
+            if connections[j].state == State.syn_received && connections[j].localPort == port { half += 1 }
+            j += 1
+        }
+        if half >= MAX_PENDING { return }
         const made = table.openAccepted(port, source, sourcePort)
         if made < 0 { return }
         const c = &connections[@bitCast(usize, made)]
@@ -555,7 +621,6 @@ pub fn receive(source: stack.Ip, destination: stack.Ip, bytes: [*]const u8, leng
     }
     // Nobody's: a reset (unless it was one).
     if flags & RST == 0 {
-        var stray: Connection = undefined
         stray.localPort = port
         stray.remote = source
         stray.remotePort = sourcePort

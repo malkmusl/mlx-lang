@@ -176,6 +176,22 @@ run 410_crypto_rsa_sizes_runtime "RSA keys of any size: a 64-bit modulus, 512 bi
 run 431_tar_runtime "tar headers written and read back: short and split names, a directory's slash, a link's target, the checksum, a name that cannot be stored; an archive in memory"
 run 432_local_module_alias_runtime "a module bound to a local constant in a body: calls, values and types through it"
 run 433_narrow_integers_runtime "narrow integers canonical after left shifts, complements and narrowing casts"
+run 434_packed_struct_runtime "packed structs: fields at bit offsets in one word of 1, 2, 4 or 8 bytes, read and written with shifts and masks, signed fields with their sign, literals and constants, @bitCast to and from the word's integer"
+run 435_float_negative_zero_runtime "a float's negation flips its sign bit: -(0.0) is -0.0, in f32 and f64"
+run 436_function_type_in_builtin_runtime "a function type where a builtin takes a type: fn, ?fn and [*]?fn in @ptrCast"
+run 437_atomic_optional_pointer_runtime "atomics on an optional pointer: load, store and exchange of ?*T and ?[*]T"
+run 438_global_address_initializers_runtime "module-level vars initialized with floats and addresses: functions, strings, another global's element; one address for a table wherever it is named"
+run 439_function_before_declaration_runtime "a function named in a module-level initializer above its declaration: a table and a pointer before their functions"
+run 440_endless_loop_ends_function_runtime "a function ending with a while true that no break ends; breaks of inner and outer loops, a continue that names it"
+run 442_function_alignment_runtime "functions begin at multiples of 16: an address through an integer and back, its low bits free"
+run 443_function_type_parameters_runtime "a function type with a function type or a tuple among its parameters keeps its own parameters"
+run 444_statement_after_postfix_runtime "a line ending in .* or .? ends its statement: the next line's ( begins one"
+run 445_constant_address_runtime "the address of a module-level constant, of this module or an imported one: a copy of its value in the function"
+run 448_power_of_two_division_runtime "a division by a constant power of two and its remainder, shifted and masked: every integer type and divisor against the divisor read at run time, signed ones toward zero"
+run 449_power_of_two_multiplication_runtime "a product by a constant power of two, shifted: every integer type and factor against the factor read at run time, a checked product that does not fit still trapping, elements reached by an index"
+run 450_mem_block_moves_runtime "std's mem.copy and mem.set by blocks: the bytes a byte loop gives at the lengths where words, half-KiB blocks and pages hand over, sixteen alignments, overlapping copies both ways"
+run 451_kernel_bytes_runtime "the kernel's Bytes.fill and Bytes.copy (block moves, words, bytes) built for the host: the bytes a byte loop gives at the hand-over lengths, sixteen alignments"
+run 441_types_across_import_ring_runtime "records of three modules that import one another naming one another: pointers, records inside, a function type, sizes"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
 run 422_h264_cpu_decode_runtime "WebKit's test.mp4 (Main profile, B frames) decoded on the CPU through std.mp4 and std.h264: every picture, in presentation order, the planes' CRC-32 the reference decoding's"
@@ -184,6 +200,17 @@ run 424_h265_cpu_decode_runtime "a 64x64 H.265 Main 10 stream (weighted B frames
 run 425_vp9_header_runtime "a 48x32 VP9 stream's uncompressed headers (profile, depth, subsampling, size, frame types, references and their slots, refresh flags, the compressed header's place), a superframe's index split, a broken frame marker refused"
 run 417_aac_decode_runtime "AAC-LC decoded from an MP4 and an ADTS stream, each within 15 dB of the WAV it was encoded from; damaged blocks refused; reset"
 run 416_mp4_demux_runtime "MP4 files read: a plain file's sample tables (chunks, composition offsets, sync samples, an edit list, seeking), fragments (trex defaults, tfdt, trun flags, one without tfdt), avcC parameter sets and Annex B, AudioSpecificConfig, a fragment cut short, damage"
+
+# A packed struct wider than a word is refused with the message that says
+# so (tests/support/packed_too_wide).
+too_wide=$("$compiler" --quiet tests/support/packed_too_wide/main.mlx -o "$work/too_wide" 2>&1 || true)
+if grep -q 'MLX-E4001: a packed struct holds at most 64 bits' <<< "$too_wide"; then
+    echo "ok   packed_too_wide: a packed struct of 80 bits refused"
+else
+    echo "FAIL packed_too_wide: expected the 64-bit message, got:"
+    echo "$too_wide" | head -3
+    failures=$((failures + 1))
+fi
 
 if [[ $failures -ne 0 ]]; then
     echo "$failures standard module checks failed"
