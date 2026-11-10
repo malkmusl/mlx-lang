@@ -265,15 +265,15 @@ ahci`, `nvme`, `igb` and `qemu-xhci` stands in for it,
 tools/check_brix_q35.sh, check_brix_usb.sh, check_brix_net_igb.sh):
 SATA disks on every AHCI controller (ahci.mlx), NVMe namespaces
 (nvme.mlx), an Intel igb network controller (igb.mlx), USB boot keyboards
-and mice on an xHCI controller (usb.mlx: there is no PS/2 there). The
-drivers are polled; each wait is a deadline on the clock
+and mice on every xHCI controller, also behind hubs (usb.mlx: there is no
+PS/2 there). The drivers are polled; each wait is a deadline on the clock
 (clock.Deadline), never a count of register reads, which is a blink on
 one machine and minutes on another, and each step that fails says so
 with what it saw ("ahci: port 4: the device stays busy (SSTS ... TFD
-...)", "usb: port 3: the device takes no address (completion code 4)").
-A controller is taken from the firmware first where it says it holds it
-(AHCI's BOHC, xHCI's USB Legacy Support). A device's registers are
-mapped by `memory.Device.map`: below 511 GiB at the kernel's direct
+...)", "usb: port 3.2: the device takes no address (completion code
+4)"). A controller is taken from the firmware first where it says it
+holds it (AHCI's BOHC, xHCI's USB Legacy Support). A device's registers
+are mapped by `memory.Device.map`: below 511 GiB at the kernel's direct
 offset, beyond (a 64-bit BAR the firmware put high, as OVMF does with
 the xHCI's) in a window of the kernel's own.
 
@@ -283,21 +283,38 @@ firmware's framebuffer (fbcon.mlx: an 8x16 font, a grid of characters so
 that a scroll never reads the adapter's memory back, the framebuffer
 mapped write-combining) until a graphical program maps it, and kept in a
 log (/devices/klog; klogsave writes it to boot.log on the brixfs
-volumes). A fault of the kernel's own stops it with a report on the
-screen (trap.mlx `stop`: what, where, the registers, the callers), drawn
-over whatever is there.
+volumes). `console.screen(false)` keeps a long dump off the screen (in
+the log and on the serial line only). A fault of the kernel's own stops
+it with a report on the screen (trap.mlx `stop`: what, where, the
+registers, the callers), drawn over whatever is there.
+
+The loader hands the kernel the ACPI tables' root from the firmware's
+configuration table (a UEFI firmware keeps none in the BIOS area), so the
+other processors are found and started there too (smp.mlx: the XSDT, the
+MADT's local APIC and x2APIC entries; not when the firmware left the
+local APICs in x2APIC mode, which is said). /system/settings/processors
+(a number) limits how many run the kernel.
 
     tools/brix-diag-efi.sh
 
 writes two images for such a machine beside the build's: BOOTX64-diag.EFI
 (no graphical session: the kernel's log stays on the screen to be read or
 photographed) and BOOTX64-console.EFI (mlx-console on the screen: a
-shell with the USB keyboard; `cat /devices/klog` shows the log).
+shell with the USB keyboard; `cat /devices/klog` shows the log). Both
+run on one processor and carry the GPU's firmware.
 
-What is not there yet: the other processors when started by UEFI (the
-ACPI tables' root is looked for in the BIOS area, where a UEFI firmware
-does not keep it: one processor runs), keyboards behind a USB hub, more
-than the first xHCI controller, interrupts for these devices.
+The GPU (gpu.mlx: an AMD Radeon, Polaris) is found and its register path
+tried; its driver is built in stages, and what the next ones stand on is
+there: its apertures in the kernel's view, memory in one piece for what
+the card reads and writes (`gpu.dma`), its firmware from the boot
+archive by name (`Archive.find`), a vector for its interrupt
+(layout.Vector.GPU, `Pci.enableMsi`, `smp.localApic`). The firmware's
+picture is the console and the desktop's screen: the file's head says
+what must not be done to the card while it is.
+
+What is not there yet: a device plugged in after the boot, interrupts
+for these devices (they are polled), the x2APIC's way of reaching
+processors.
 
 (A table read by index is a `var`: the font's glyphs were a `const`
 array, a value built where it is used, and each row of each character
