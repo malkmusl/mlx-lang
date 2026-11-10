@@ -350,6 +350,16 @@ firmware's was ("brixOS: the loader set this mode, the nearest the
 firmware has to the monitor's own; the firmware's was 1024x768"), what
 the monitor says when the picture is another, a mode the firmware
 refused, the firmware's modes, and how many graphics outputs it offers.
+The shape of the screen goes on to the programs: /devices/framebuffer's
+geometry ends with it as a width and a height (the monitor's own mode
+when it says one, else the mode the loader looked for, else the
+picture's own size), and where the picture is of another shape the kernel
+says so ("brixOS: the picture is shown on a screen of the shape
+3840:1080 (the monitor's own mode); ..."). The boot screen draws for that
+shape and is round on a monitor that stretches the mode
+(projects/desktop/splash, tools/check_brix_shape.sh); the desktop does
+not yet (text brought together would not be readable: it waits for the
+monitor's own mode).
 
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the
@@ -388,6 +398,44 @@ archive by name (`Archive.find`), a vector for its interrupt
 (layout.Vector.GPU, `Pci.enableMsi`, `smp.localApic`). The firmware's
 picture is the console and the desktop's screen: the file's head says
 what must not be done to the card while it is.
+
+Its display controller (DCE 11.2) is read, not yet set
+(gpu_display.mlx; the register numbers are those of Linux's
+dce_11_2_d.h, vid.h and gmc_8_1_d.h, looked up there; only a Polaris
+card's is read, on another AMD card the same numbers are other
+registers and the log says that it is not read). For every
+controller that is on the log says the timing (the size shown, the
+totals, blanking and sync), the primary surface (its address in the
+card's memory, pitch, extent, control word), the viewport and what it
+is to fill, the scaler (mode, taps, ratios, borders) with the line
+buffer before it, the encoder it goes out by (DisplayPort with its
+lanes, or TMDS) and the frames it counts in a second with the pixel
+clock that follows (measured: the PLL's dividers are not read). Then
+one line says what it shows:
+
+    gpu: controller 0 shows 3840x1080 from a picture of 1280x960: the card scales
+    gpu: controller 0 shows a picture of 1280x960 as it is: the monitor is sent 1280x960
+
+In the first case a picture of the size shown needs only a surface of
+that size, the viewport, the scaler and the line buffer set on the
+running controller, and "gpu: would set" lines say with what (the
+surface in the aperture after the firmware's picture and surface); that
+is the monitor's own size only if the firmware runs the monitor's own
+timing, which the kernel cannot tell (it does not read the EDID). In the
+second the pixel clock, the timing and the link have to be set, which
+is not there yet. Numbers that do not fit together (a total smaller
+than what is shown, a viewport that is not the firmware's picture, an
+address outside the aperture) are not concluded from: "gpu: the
+read-out is not plausible (...): the register map needs correcting".
+The registers themselves
+("gpu: raw 1b80: 00000f9f ...": a register's number, then its value and
+those of the registers after it) are in the log only
+(/devices/klog); a shell shows them by themselves with
+
+    while read l; do case "$l" in "gpu: raw"*) echo "$l";; esac; done < /devices/klog
+
+tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
+numbers on the host.
 
 What is not there yet: disks served by their interrupts (AHCI, NVMe: a
 command is waited for), USB devices other than boot keyboards, mice and
@@ -448,11 +496,37 @@ The kernel's stack (kernel/net) runs on it:
 - ping (projects/ping): `ping HOST [COUNT]` on a datagram socket of
   IPPROTO_ICMP (the kernel sets the identifier; Linux's ping sockets
   work the same).
+- link.mlx: the link's state for programs. /devices/net0 is a node of a
+  kind of its own (as /devices/framebuffer is the display's): a read
+  gives the link's record as things are at that moment (spec
+  `<NetworkLink>`, 64 bytes with its length first: whether the cable is
+  in (igb's status register, virtio-net's status word), DHCP still
+  asking, where the address is from (nowhere yet, DHCP, the settings
+  file), the speed where the card says it, the hardware address, the
+  driver's name, the address, netmask, gateway and name server, the
+  frames received and sent). std.os.brix's `networkLink(index, &link)`
+  reads it into a struct. A machine without a network device has no
+  such node. Until DHCP has answered the record has no address, and the
+  boot line is "brixOS: net0 has no address yet (DHCP is asking)".
+
+The settings app's Network page (projects/desktop/settings,
+network.brixos.mlx) shows that record for every link, read again every
+two seconds: connected or no cable, the address with its prefix length
+and "by DHCP" or "from the settings", gateway, name server, hardware
+address, driver, the frames; and how to give a fixed address
+(/system/settings/network, read at boot). Nothing is changed from the
+page yet.
 
 tools/check_brix_net.sh boots with the user network: DHCP, ping to the
 gateway, wget fetching files (a small one, a 400 KiB one, a missing one)
-from an HTTP server on the host, and the native calls (a stream to
-ourselves, a datagram, an echo). Not yet: IPv6, a lease's renewal.
+from an HTTP server on the host, the native calls (a stream to
+ourselves, a datagram, an echo), and the link's record as netcalls reads
+it; then again on a wire without a DHCP server (no address yet), on
+another network (192.168.76.0/26: the record has what that DHCP server
+answered, not what the stack starts with) and with a fixed address in
+the settings file. tools/check_brix_desktop.sh opens
+the Network page and pulls the cable. Not yet: IPv6, a lease's renewal,
+a second link, the configuration changed while the system runs.
 
 ## brixfs: the disk's format
 
@@ -668,8 +742,26 @@ The pieces:
     report for the rest: a faulting program ends with SIGSEGV), and
     the first process (impulse, or flux without it), started again
     (every other process ending) when it exits or faults; power.mlx:
-    system_power (the volumes committed, then halt, ACPI's power-off or
-    the reset line).
+    system_power (the volumes committed, the other processors stopped,
+    then halt, power off or restart); acpi.mlx: the firmware's tables
+    read (never run), for smp.mlx's processors and for the system's end.
+
+The machine is powered off by ACPI's soft off (S5): the sleep type the
+DSDT's `\_S5` names, written with the sleep enable bit to the PM1 control
+register the FADT names, ACPI mode turned on first where the firmware
+left it off. There is no AML interpreter: `\_S5` is a name with a
+package of small constants in every table seen, and that one form is
+read, inside the table's own length. A restart is the FADT's reset
+register where there is one, then port 0xCF9, then the keyboard
+controller's reset line where there is a controller, last a fault the
+processor cannot take. The kernel says at boot what it found:
+
+    brixOS: power off by ACPI: PM1a control at 0x604, S5 type 0 (ACPI mode is off: turned on first, 0x2 to port 0xb2); reset by ACPI's reset register (port 0xcf9, value 0xf)
+
+and at the end each step it takes. A machine whose tables give no S5 (the
+line says why) gets the ports of QEMU's chipsets tried, which are also
+the last attempt everywhere; one that is still on afterwards says so on
+the screen and stays halted.
 
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
@@ -841,7 +933,23 @@ halt, poweroff or reboot; QEMU exits with -no-reboot).
 `impulsectl status | start NAME | stop NAME | restart NAME | reload |
 poweroff | reboot | halt` asks over the FIFO /temporary/init/control
 (one line: the asker's own FIFO, the request); the answer comes on the
-asker's FIFO, the text Linux's impulse answers.
+asker's FIFO, the text Linux's impulse answers. Only the system may
+write that FIFO.
+
+The desktop ends the system through the login service. The top bar's
+session menu (under the mark at its left) has Log Out, Restart and Shut
+Down, each asking first; the greeter has Restart and Shut Down under its
+card. A log out ends the session, and sentinel starts the greeter again.
+For the other two the compositor (once the windows were asked to close)
+or the greeter calls org.mlx.Login.Restart or PowerOff on the system bus;
+sentinel asks the bus who calls (the kernel names the caller's program and
+user to the bus: channel_peer) and does it only for the user who holds
+the seat, the person logged in or, while nobody is, the greeter's. Then
+it ends the seat's compositor and writes `reboot` or `poweroff` to the
+init's FIFO. tools/check_brix_session.sh does all of it in QEMU with the
+pointer: a refusal (root on the serial console does not hold the seat), a
+log out and a second login, a restart into a second boot, a shut down
+that ends QEMU, and the kernel's lines about ACPI on q35 and pc.
 
 With a display and ignition in the programs (projects/desktop/splash/
 brixos.mlx: the same picture as MLX/Linux's boot splash, drawn by this
@@ -956,14 +1064,17 @@ opens the terminal with Alt+Enter (its window on the display, the blue
 of its title bar counted), types a command through the compositor into
 its shell (a file read back from the serial shell), moves the mouse
 through QEMU's monitor (the cursor's white counted right of the window),
-clicks the dock's apps button (the launcher comes up) and powers off.
-Xwayland is not on brixOS.
+clicks the dock's apps button (the launcher comes up), starts the
+settings app on its Network page (`control network`: what the kernel
+says of net0 on QEMU's user network, then "no cable" once QEMU's monitor
+pulls it) and powers off. Xwayland is not on brixOS.
 
 The programs carry their product names (projects/desktop and the system
 programs): the compositor is `kepler`, the terminal `vector`, the shell
 `flux`, the dock `orbit`, the launcher `launch`, the top bar `horizon`,
-the login `sentinel`, the greeter `aurora`, the bus `synapse`, init
-`impulse` and the boot screen `ignition` (the MLX toolchain -- mlx4,
+the login `sentinel`, the greeter `aurora`, the screen lock `umbra`, the
+bus `synapse`, init `impulse` and the boot screen `ignition` (the MLX
+toolchain -- mlx4,
 mlx-cc and the rest -- keeps its name, and so do the MLXIPC protocol and
 the MLX_* environment).
 
@@ -974,6 +1085,24 @@ directory NAME.app under /system/share/apps holding app.ini (the
 projects/desktop/apps). The image ships Vector.app (the terminal), its
 icon a dark window with a green prompt. (The boot archive's names were
 widened to 72 bytes to hold the bundle paths.)
+
+An app is one thing to the launcher, the dock and the top bar: all three
+ask apps.mlx's `find` which entry a name stands for. An entry is found by
+its **id**, the app id its program gives its windows (`Id=org.mlx.files`
+in Polaris.app's app.ini; a desktop entry's file name), by its own file
+name (`Polaris`) and by its StartupWMClass (`polaris`, the program). So
+the top bar names a window by its entry's Name, the dock shows it with
+the bundle's icon.png (the terminal too: Vector's icon as in the
+launcher, no sign of the dock's own), and "Pin to Dock" (the dock's menu,
+the launcher's, or the app dragged from the launcher onto the dock) writes
+the id into the user's settings, /users/NAME/.config/mlx/dock, where the
+next dock finds it. tools/check_brix_apps.sh starts Polaris, Control and
+Vector from the launcher and looks at the bar's names, the dock's icons
+and the pins (pinned by the dock's menu, there again after the desktop is
+started again, unpinned; pinned and unpinned by the launcher's menu, the
+latter from a pins file of before that names the app twice; pinned by
+dragging); tests/run_desktop_apps.sh asks the same of apps.mlx on the
+host.
 
 ## The login
 
@@ -1006,6 +1135,16 @@ decides the few calls that differ):
   replace itself with their session (the desktop, from
   /system/share/wayland-sessions) in their home /users/NAME, made at the
   first login and given to them.
+- **umbra** (projects/desktop/lock) is the session's lock: Super+L (the
+  compositor's lock hotkey; `lock-command` in compositor.conf names
+  another program) or the top bar's session menu starts it. It takes the
+  session through ext-session-lock-v1, so only its card is on the
+  screen, and asks sentinel org.mlx.Login.Unlock on the bus in MLXIPC's
+  native format. The bus lets the program umbra use login.session and
+  tells sentinel which user the caller is (channel_peer again: the
+  kernel's word, not a name the caller gives); sentinel checks the
+  password only for the person who holds the seat. A wrong password, no
+  answer or no service leaves the session locked.
 
 The accounts, the session entry and the services are in the image;
 desktop.service is shipped disabled (the login has the screen; enable it
@@ -1013,7 +1152,13 @@ and disable the login for the desktop as root without a login).
 tools/check_brix_login.sh boots the image, sees the bus listen and
 sentinel start the greeter, the kernel name it aurora so the policy
 allows login.session, the password accepted and the session start as
-`brix` in /users/brix.
+`brix` in /users/brix. tools/check_brix_lock.sh logs in the same way,
+locks the session with Super+L, sees the lock card on the display, types
+a wrong password while another user's program on the bus answers "yes"
+in sentinel's place (still locked, the card says so) and the right one
+(the desktop is back), has another user ask with the right password
+(refused), has a locker die without unlocking (still locked; Super+L
+starts umbra again) and finds neither password in a log.
 
 ## Next
 

@@ -18,13 +18,17 @@
 //                                       true when the session began
 //     Unlock(s user, s password) -> b   checks the password of the user
 //                                       who already has the seat (the lock
-//                                       screen asks this); never starts
-//                                       anything
+//                                       screen asks this), for that user
+//                                       alone; never starts anything
 //
-// Login and Unlock first ask MLXIPC for login.session. Password hashes
-// are checked in authentication.mlx without libc and every copied
-// password is wiped. session.mlx starts the process only after dropping
-// every root credential and reports exec failure to the parent.
+// Login and Unlock first ask MLXIPC for login.session. Unlock then asks
+// the bus who the caller is: the user the kernel named when the caller
+// connected (the channel's peer on brixOS, the socket's credentials on
+// Linux), never a name the caller gives. Only the person who holds the
+// seat (or root) has their password checked. Password hashes are checked
+// in authentication.mlx without libc and every copied password is wiped.
+// session.mlx starts the process only after dropping every root
+// credential and reports exec failure to the parent.
 const std = @import("std")
 const builtin = @import("builtin")
 const brix = @import("std").os.brix
@@ -33,6 +37,7 @@ const crash = @import("std.crash")
 const authentication = @import("./authentication.mlx")
 const greeter_module = @import("./greeter.mlx")
 const login1 = @import("./login1.mlx")
+const power = @import("./power.mlx")
 const session_module = @import("./session.mlx")
 const spawn_module = @import("std.spawn")
 const users_module = @import("./users.mlx")
@@ -62,17 +67,24 @@ const ALLOWED: u8 = 1
 
 const LOGIN_CALL: u8 = 1
 const UNLOCK_CALL: u8 = 2
+// What a waiting call asked the bus last: whether its app may
+// (org.mlx.IPC.Check), then, for Unlock, who its caller is.
+const ASKED_PERMISSION: u8 = 1
+const ASKED_CALLER: u8 = 2
 const PENDING_MOST: usize = 8
 const PASSWORD_MOST: usize = 1024
 const SESSION_MOST: usize = 256
 const SENDER_MOST: usize = 128
 
-// A protected call waits here while MLXIPC decides login.session. Its
-// password is a bounded copy because the bus receive buffer may be reused
-// before Check answers; release wipes every byte on every outcome.
+// A protected call waits here while MLXIPC decides login.session (and,
+// for Unlock, names the caller's user). Its password is a bounded copy
+// because the bus receive buffer may be reused before the bus answers;
+// release wipes every byte on every outcome.
 const Pending = struct {
     used: bool
+    // The serial of the question the bus has now, and which one it is.
     check: u32
+    asked: u8
     kind: u8
     serial: u32
     flags: u8
@@ -99,9 +111,10 @@ const Login = struct {
     verbose: bool
     running: bool
     // Who holds the seat now (empty: nobody logged in). Unlock checks the
-    // password of this user only.
+    // password of this user only, and only for a caller who is this user.
     active: [users_module.NAME_MOST]u8
     activeLength: usize
+    activeUid: u32
     // The session (Linux: its pid; brixOS: its process handle).
     session: spawn_module.Child
     // The compositor that owns the seat while no person is logged in.
@@ -245,9 +258,10 @@ fn authenticate(login: *Login, user: []const u8, password: []const u8) -> u8 {
 fn startSession(login: *Login, index: usize, session: []const u8) -> u8 {
     if login.*.activeLength > 0 { return DENIED }
     const user = users_module.userAt(usersOf(login), index)
-    const child = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, busAddress(login), login.*.environment)
+    const child = session_module.start(user, session, login.*.groupPath, login.*.runtimeRoot, busAddress(login), login.*.environment, ipc.descriptorOfClient(clientOf(login)))
     if !child.started() { return DENIED }
     login.*.activeLength = std.text.append(unsafe { @ptrCast([*]u8, &login.*.active) }, 0, users_module.NAME_MOST, users_module.nameOf(user))
+    login.*.activeUid = user.*.uid
     login.*.session = child
     say(login, "login: session started\n")
     return ALLOWED
@@ -298,8 +312,9 @@ fn listUsers(login: *Login, call: *const ipc.Message) -> void {
     std.heap.allocator().free(memory.?, ipc.MAX_MESSAGE, 16)
 }
 
-// Performs a call only after MLXIPC allowed login.session.
-fn perform(login: *Login, call: *const ipc.Message, pending: *Pending) -> void {
+// Performs a call only after MLXIPC allowed login.session. `caller` is
+// the user the bus says an Unlock's caller is (Login does not ask).
+fn perform(login: *Login, call: *const ipc.Message, pending: *Pending, caller: u32) -> void {
     const user = pendingUser(pending)
     if pending.*.kind == LOGIN_CALL {
         if login.*.activeLength > 0 {
@@ -326,6 +341,9 @@ fn perform(login: *Login, call: *const ipc.Message, pending: *Pending) -> void {
         replyBool(login, call, started == ALLOWED)
         return
     }
+    // Unlock: the caller must name the person who holds the seat and be
+    // that person (root may ask for them). Anyone else gets the slow "no"
+    // of a wrong password, and no password is checked for them.
     var active: [*]const u8 = undefined
     unsafe { active = @ptrCast([*]const u8, &login.*.active) }
     if login.*.activeLength == 0 || !std.text.same(active[0..login.*.activeLength], user) {
@@ -333,14 +351,22 @@ fn perform(login: *Login, call: *const ipc.Message, pending: *Pending) -> void {
         replyBool(login, call, false)
         return
     }
+    if caller != 0 && caller != login.*.activeUid {
+        sleep(FAILURE_DELAY_MS)
+        say(login, "login: unlock refused: the caller is not the session's user\n")
+        replyBool(login, call, false)
+        return
+    }
     const checked = authenticate(login, user, pendingPassword(pending))
     if checked != ALLOWED { sleep(FAILURE_DELAY_MS) }
+    say(login, if checked == ALLOWED { "login: unlock allowed\n" } else { "login: unlock refused\n" })
     replyBool(login, call, checked == ALLOWED)
 }
 
 fn sessionGone(login: *Login) -> void {
     wipe(unsafe { @ptrCast([*]u8, &login.*.active) }, users_module.NAME_MOST)
     login.*.activeLength = 0
+    login.*.activeUid = 0
     login.*.session = spawn_module.Child.none()
     login1.sessionEnded(login1Of(login))
     say(login, "login: session ended; the seat is free\n")
@@ -420,6 +446,7 @@ fn askPermission(login: *Login, call: *const ipc.Message, body: [*]const u8, kin
     ipc.putString(&writing, senderOf(pending))
     ipc.putString(&writing, "login.session")
     pending.*.check = ipc.call(clientOf(login), BUS_NAME, IPC_PATH, IPC_INTERFACE, "Check", "ss", unsafe { @ptrCast([*]const u8, &message) }, writing.length)
+    pending.*.asked = ASKED_PERMISSION
     if pending.*.check == 0 {
         release(pending)
         sendError(login, call, "org.freedesktop.DBus.Error.AccessDenied", "the bus could not authorize login.session")
@@ -428,24 +455,65 @@ fn askPermission(login: *Login, call: *const ipc.Message, body: [*]const u8, kin
     pending.*.used = true
 }
 
+// Asks the bus which user the waiting Unlock's caller is. The bus knows
+// from the kernel (the peer of the caller's channel on brixOS, its
+// socket's credentials on Linux), so no name the caller gives and no
+// variable of its environment decides whose password is checked. False
+// when the question could not be sent.
+fn askCaller(login: *Login, pending: *Pending) -> bool {
+    var message: [160]u8 = undefined
+    var writing: ipc.Writer = undefined
+    unsafe { ipc.begin(&writing, @ptrCast([*]u8, &message), 160) }
+    ipc.putString(&writing, senderOf(pending))
+    pending.*.check = ipc.call(clientOf(login), BUS_NAME, BUS_PATH, BUS_NAME, "GetConnectionUnixUser", "s", unsafe { @ptrCast([*]const u8, &message) }, writing.length)
+    pending.*.asked = ASKED_CALLER
+    return pending.*.check != 0
+}
+
+// The bus answered a waiting call's question: whether its app may use
+// login.session, then (Unlock) who its caller is. Anything but a plain
+// answer from the bus itself refuses the call.
 fn permissionAnswered(login: *Login, reply: *const ipc.Message) -> bool {
     var slot: usize = 0
     while slot < PENDING_MOST {
         const pending = pendingAt(login, slot)
         if pending.*.used && pending.*.check == reply.*.replySerial {
-            var allowed = false
-            if reply.*.kind == ipc.REPLY && std.text.same(reply.*.sender, BUS_NAME) && std.text.same(reply.*.signature, "b") {
-                var reading = ipc.reader(ipc.bodyOf(clientOf(login), reply), reply.*.bodyLength)
-                allowed = ipc.readBool(&reading) && !reading.failed
-            }
+            const fromBus = reply.*.kind == ipc.REPLY && std.text.same(reply.*.sender, BUS_NAME)
             var call = ipc.newMessage(ipc.CALL, pending.*.serial)
             call.flags = pending.*.flags
             call.sender = senderOf(pending)
-            if allowed {
-                perform(login, &call, pending)
-            } else {
+            if pending.*.asked == ASKED_CALLER {
+                var known = false
+                var caller: u32 = 0
+                if fromBus && std.text.same(reply.*.signature, "u") {
+                    var reading = ipc.reader(ipc.bodyOf(clientOf(login), reply), reply.*.bodyLength)
+                    caller = ipc.readU32(&reading)
+                    known = !reading.failed
+                }
+                if known {
+                    perform(login, &call, pending, caller)
+                } else {
+                    sendError(login, &call, "org.freedesktop.DBus.Error.AccessDenied", "the bus could not name the caller's user")
+                    say(login, "login: unlock refused: the caller's user is not known\n")
+                }
+                release(pending)
+                return true
+            }
+            var allowed = false
+            if fromBus && std.text.same(reply.*.signature, "b") {
+                var reading = ipc.reader(ipc.bodyOf(clientOf(login), reply), reply.*.bodyLength)
+                allowed = ipc.readBool(&reading) && !reading.failed
+            }
+            if !allowed {
                 sendError(login, &call, "org.freedesktop.DBus.Error.AccessDenied", "this app may not start or unlock a session (login.session)")
                 say(login, "login: login.session refused\n")
+            } else if pending.*.kind == UNLOCK_CALL {
+                // The call waits on, now for its caller's user.
+                if askCaller(login, pending) { return true }
+                sendError(login, &call, "org.freedesktop.DBus.Error.AccessDenied", "the bus could not name the caller's user")
+                say(login, "login: unlock refused: the caller's user is not known\n")
+            } else {
+                perform(login, &call, pending, 0)
             }
             release(pending)
             return true
@@ -455,10 +523,53 @@ fn permissionAnswered(login: *Login, reply: *const ipc.Message) -> bool {
     return false
 }
 
+// Who holds the seat: the person logged in, else the greeter's user while
+// the greeter runs (-1: nobody). The one user who may have the machine
+// restarted or shut down (power.mlx).
+fn seatUser(login: *Login) -> isize {
+    if login.*.activeLength > 0 {
+        var active: [*]const u8 = undefined
+        unsafe { active = @ptrCast([*]const u8, &login.*.active) }
+        const index = users_module.find(usersOf(login), active[0..login.*.activeLength])
+        return if index < login.*.users.count { @intCast(isize, users_module.userAt(usersOf(login), index).*.uid) } else { -1 }
+    }
+    return if login.*.greeter.started() { @intCast(isize, login.*.greeterUid) } else { -1 }
+}
+
+// The machine restarted or shut down, as power.mlx allowed: the seat's
+// compositor ends first (told to, it leaves its last frame for the
+// shutdown's screen), then the init is asked. The init stops this service
+// with the others; when it does not take the request the seat is the
+// greeter's again.
+fn endSystem(login: *Login, kind: u8) -> void {
+    stopGreeter(login)
+    if login.*.session.started() {
+        const child = login.*.session
+        login.*.session = spawn_module.Child.none()
+        wipe(unsafe { @ptrCast([*]u8, &login.*.active) }, users_module.NAME_MOST)
+        login.*.activeLength = 0
+        login.*.activeUid = 0
+        login1.sessionEnded(login1Of(login))
+        greeter_module.stop(child)
+        say(login, "login: session stopped\n")
+    }
+    if power.request(kind, login.*.environment) {
+        say(login, if kind == power.RESTART { "login: the init restarts the machine\n" } else { "login: the init powers the machine off\n" })
+    } else {
+        say(login, "login: the init did not take the request\n")
+        if !startGreeter(login) { login.*.running = false }
+    }
+}
+
 fn dispatch(login: *Login) -> void {
     reapSession(login)
     var header: ipc.Message = undefined
     while ipc.next(clientOf(login), &header, 0) {
+        // Restart and power off (power.mlx): the two calls and the bus's
+        // answers about who called. An allowed one ends the system.
+        const asked = power.message(clientOf(login), &header, seatUser(login), login.*.environment, login.*.verbose)
+        if asked == power.RESTART || asked == power.POWER_OFF { endSystem(login, asked) }
+        if asked != power.NOT_MINE { continue }
         const body = ipc.bodyOf(clientOf(login), &header)
         if header.kind == ipc.CALL && std.text.same(header.path, LOGIN_PATH) && std.text.same(header.interface, LOGIN_INTERFACE) {
             if std.text.same(header.member, "ListUsers") {
@@ -685,6 +796,7 @@ fn run(arguments: [][*]const u8) -> !void {
     login.*.verbose = verbose
     login.*.running = true
     login.*.activeLength = 0
+    login.*.activeUid = 0
     login.*.session = spawn_module.Child.none()
     login.*.greeterCompositor = greeterCompositor
     login.*.greeterProgram = greeterProgram

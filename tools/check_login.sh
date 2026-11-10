@@ -14,7 +14,7 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
 compiler=${1:-$(tools/ensure_compiler.sh)}
 command -v gdbus > /dev/null || { echo "check_login.sh: needs gdbus (glib2.0-bin)" >&2; exit 2; }
-command -v unshare > /dev/null || { echo "check_login.sh: needs unshare (util-linux)" >&2; exit 2; }
+command -v unshare > /dev/null && command -v setpriv > /dev/null || { echo "check_login.sh: needs unshare and setpriv (util-linux)" >&2; exit 2; }
 # The login1 bridge hands out seat devices through /dev/char/MAJOR:MINOR
 # (the test takes 1:3, /dev/null); a container's minimal /dev has no
 # /dev/char, and the check cannot run there.
@@ -86,7 +86,7 @@ cat > "$work/session.sh" <<SESSION
     printf 'XDG_RUNTIME_DIR=%s XDG_SESSION_TYPE=%s XDG_SEAT=%s XDG_VTNR=%s\n' "\$XDG_RUNTIME_DIR" "\$XDG_SESSION_TYPE" "\$XDG_SEAT" "\$XDG_VTNR"
 } > "$work/home/session.out"
 touch "$work/home/ready"
-while [[ ! -e "$work/home/finish" ]]; do sleep 0.1; done
+while [ ! -e "$work/home/finish" ]; do sleep 0.1; done
 SESSION
 chmod 755 "$work/session.sh"
 
@@ -305,6 +305,19 @@ unlock_out=$(gdbus call --address "$address" --dest org.mlx.Login --object-path 
     --method org.mlx.Login.Unlock mlx-test wrong-password 2>&1 || true)
 grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL Unlock accepted a wrong password:" >&2; echo "$unlock_out" >&2; exit 1; }
 echo "ok   Unlock refuses a wrong password"
+
+# Unlock is for the person who holds the seat (root, as above, may ask
+# for them): the bus names the caller's user to sentinel (the socket's
+# credentials), so the right password from another user is refused and
+# from the session's own user allowed.
+unlock_out=$(setpriv --reuid 1001 --regid 1001 --clear-groups gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
+    --method org.mlx.Login.Unlock mlx-test test-password 2>&1 || true)
+grep -q "(false,)" <<< "$unlock_out" || { echo "FAIL Unlock checked the password for another user's caller:" >&2; echo "$unlock_out" >&2; exit 1; }
+grep -q "^login: unlock refused: the caller is not the session's user$" "$work/login.log" || { echo "FAIL sentinel did not say why it refused another user's caller" >&2; cat "$work/login.log" >&2; exit 1; }
+unlock_out=$(setpriv --reuid 1000 --regid 1000 --clear-groups gdbus call --address "$address" --dest org.mlx.Login --object-path /org/mlx/Login \
+    --method org.mlx.Login.Unlock mlx-test test-password 2>&1 || true)
+grep -q "(true,)" <<< "$unlock_out" || { echo "FAIL Unlock refused the session's own user:" >&2; echo "$unlock_out" >&2; exit 1; }
+echo "ok   Unlock checks a password only for a caller who is the session's user"
 
 # No bus request wakes the daemon here. SIGCHLD itself must reap the
 # child and release the seat, or a greeter could never be restarted.

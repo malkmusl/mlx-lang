@@ -208,6 +208,12 @@ that stays shows at once (a second click closes it). Both look every few
 seconds (the launcher also whenever it is shown) whether apps were
 installed or removed (the application directories' modification times)
 and the dock whether `~/.config/mlx/dock` changed, and take the changes in.
+Which app a window's app id or a pin stands for, the launcher, the dock
+and the top bar ask in one place (projects/desktop/shared/apps.mlx,
+`find`: an entry's `Id=` or file name, its StartupWMClass), so its name
+and its icon are the same in all three; with `--verbose` the helpers say
+in the log what they show for each app (the compositor hands that on as
+`MLX_DESKTOP_VERBOSE=1`).
 It shows an apps button, the pinned apps,
 and after a separator the apps that have windows but are not pinned; a dot
 marks an app that runs. Icons grow under the pointer, which shows the
@@ -311,8 +317,12 @@ macOS: maximized windows start below it and windows placed under it are
 moved down. It is translucent over a blur and shows a mark and the name
 of the active window's app on the left (its desktop entry's name, else
 its app id or title; a click on the mark opens the session menu: the
-settings, Lock Screen and Log Out, which asks first; see Locking and
-logging out), the workspaces in the middle (see Snapping,
+settings, Lock Screen, Log Out, Restart and Shut Down, the last three
+asking first; see Locking and logging out; a restart or a shut down is a
+log out after which the compositor asks the login service to end the
+system, which it does for the user who holds the seat:
+[`../login/README.md`](../login/README.md)), the workspaces in the middle
+(see Snapping,
 workspaces and tiling), and the date and time on the right ("So. 27. Sep.
 16:05" when `LC_ALL`, `LC_TIME` or `LANG` is German, else "Sun 27 Sep
 16:05"). The time zone comes from `$TZ` (a zone name looked up in
@@ -1290,8 +1300,9 @@ still switches terminals when freestanding). The locker unlocks once its
 user has authenticated; the compositor itself knows nothing of
 passwords. A locker that goes without unlocking (it crashed, it was
 killed) leaves the session locked and the screen blank until a new
-locker locks and unlocks it; a second locker while one lives is refused
-(`finished`).
+locker locks and unlocks it: the lock hotkey, the one hotkey that works
+then, starts `lock-command` again. A second locker while one lives is
+refused (`finished`).
 
 The lock hotkey (`key-lock`, Super+L) and the top bar's session menu run
 the program `lock-command` names in the settings file (`umbra` by

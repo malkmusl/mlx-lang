@@ -1,11 +1,31 @@
 // The system's end, asked for by the first process (system_power, call
-// 50): every volume committed, then the machine halted (0), powered off
-// (1: ACPI's sleep register as QEMU's and the PIIX4/ICH9 chipsets have it)
-// or restarted (2: the keyboard controller's reset line, else the reset
-// control register). Only the first process may ask (the init).
+// 50): every volume committed, every other processor stopped, then the
+// machine halted (0), powered off (1) or restarted (2). Only the first
+// process may ask (the init).
+//
+// Power off is ACPI's soft off (S5): the sleep type the DSDT's \_S5 names,
+// written with the sleep enable bit to the PM1 control register the FADT
+// names (acpi.mlx reads both), ACPI mode turned on first where the
+// firmware left it off. Until that moment the kernel leaves ACPI mode as
+// it found it: it takes no ACPI events, and a firmware that still owns
+// the power button answers it itself. A machine whose tables give no S5
+// gets the ports of QEMU's chipsets tried, which are also the last
+// attempt everywhere.
+//
+// A restart is the FADT's reset register where the table has one, then
+// the reset control register at port 0xCF9, then the keyboard
+// controller's reset line where there is a controller, and last a fault
+// the processor cannot take.
+//
+// What will be done is said in the log at boot (look), and each step as
+// it is taken; a machine that is still on afterwards says so on the
+// screen and stays halted.
 const cpu = @import("./cpu.mlx")
 const smp = @import("./smp.mlx")
+const acpi = @import("./acpi.mlx")
+const clock = @import("./clock.mlx")
 const console = @import("./console.mlx")
+const keyboard = @import("./keyboard.mlx")
 const volume = @import("./volume.mlx")
 const scheduler = @import("./scheduler.mlx")
 const Process = @import("./process.mlx").Process
@@ -15,16 +35,139 @@ pub const HALT: usize = 0
 pub const POWEROFF: usize = 1
 pub const REBOOT: usize = 2
 
-// PM1a_CNT of the PIIX4 (QEMU's pc) and the ICH9 (q35): PM base 0x600.
-const PM1A_CONTROL: usize = 0x604
-// SLP_EN with SLP_TYP 0 (S5 in QEMU's tables).
-const SLEEP: usize = 0x2000
-// The old Bochs/QEMU port as well.
-const BOCHS_PM1A_CONTROL: usize = 0xB004
-const KEYBOARD_COMMAND: usize = 0x64
-const KEYBOARD_RESET: usize = 0xFE
+// PM1 control: ACPI mode is on (SCI_EN), the sleep type's three bits, and
+// the bit that makes the machine take it (SLP_EN).
+const ACPI_MODE: usize = 0x0001
+const SLEEP_TYPE_SHIFT: usize = 10
+const SLEEP_TYPE: usize = 0x1C00
+const SLEEP_ENABLE: usize = 0x2000
+// PM1 status: the machine woke (written as 1 to clear it).
+const WOKE: usize = 0x8000
+// A hardware-reduced platform's sleep control register: the type from
+// bit 2, the enable bit.
+const REDUCED_TYPE_SHIFT: usize = 2
+const REDUCED_ENABLE: usize = 0x20
+// PM1a control of QEMU's chipsets (the PIIX4 of its pc, the ICH9 of its
+// q35: PM base 0x600) and the old Bochs/QEMU port; their S5 is type 0.
+const QEMU_CONTROL: usize = 0x604
+const BOCHS_CONTROL: usize = 0xB004
+// The reset control register: a hard reset asked for (bit 1), done (bit
+// 2), with the power cycled (bit 3).
 const RESET_CONTROL: usize = 0xCF9
-const FULL_RESET: usize = 0x06
+const RESET_ASK: usize = 0x02
+const RESET_HARD: usize = 0x06
+const RESET_FULL: usize = 0x0E
+// The keyboard controller: its command port (status bit 1: it still has a
+// byte to take) and the command that pulses the reset line.
+const KEYBOARD_COMMAND: usize = 0x64
+const KEYBOARD_BUSY: usize = 0x02
+const KEYBOARD_RESET: usize = 0xFE
+// How long ACPI mode may take to come on, and how long the machine has to
+// go off or reset after a write before the next thing is tried
+// (milliseconds).
+const MODE_WAIT: usize = 3000
+const OFF_WAIT: usize = 2000
+const RESET_WAIT: usize = 500
+
+// What the tables say (look), kept for the end.
+const Ways = struct {
+    fixed: acpi.Fixed
+    // Whether power off by ACPI is known: a control register and the S5
+    // types for it (a: PM1a's, b: PM1b's).
+    off: bool
+    typeA: usize
+    typeB: usize
+}
+
+var ways: Ways = undefined // (per run)
+var looked = false // (per run)
+
+// Where a register is, for the log.
+fn sayRegister(register: acpi.Register) -> void {
+    const out = console.out
+    out.write(if register.space == acpi.Space.PORT { "port " } else if register.space == acpi.Space.MEMORY { "memory " } else { "PCI configuration " })
+    out.hex(register.address)
+}
+
+// Whether ACPI mode is on: PM1a control says so; a machine without the
+// command port has no other mode.
+fn acpiMode() -> bool {
+    const fixed = ways.fixed
+    if fixed.command == 0 { return true }
+    return fixed.control.read() & ACPI_MODE != 0
+}
+
+// The tables read once, and what they come to said in the log (at boot,
+// after the processors: the tables are in the kernel's view then). Where
+// the tables give no power off the line says why.
+pub fn look() -> void {
+    const out = console.out
+    looked = true
+    ways.off = false
+    ways.typeA = 0
+    ways.typeB = 0
+    const root = acpi.root()
+    ways.fixed = acpi.Fixed.read(root)
+    const fixed = ways.fixed
+    var why: []const u8 = ""
+    if root == 0 {
+        why = "no ACPI tables"
+    } else if !fixed.found {
+        why = "the tables have no FADT"
+    } else if !fixed.control.present() && !fixed.sleep.present() {
+        why = "the FADT names no PM1 control register"
+    } else {
+        const types = acpi.sleepTypes(root, fixed.dsdt, "_S5_")
+        if types.0 {
+            ways.off = true
+            ways.typeA = types.1
+            ways.typeB = types.2
+        } else {
+            why = "the DSDT and the SSDTs give no _S5 of constants"
+        }
+    }
+    if !ways.off {
+        out.write("brixOS: no power off by ACPI (")
+        out.write(why)
+        out.write("): the ports of QEMU's chipsets are tried")
+    } else if fixed.reduced && fixed.sleep.present() {
+        out.write("brixOS: power off by ACPI: sleep control at ")
+        sayRegister(fixed.sleep)
+        out.write(", S5 type ")
+        out.decimal(ways.typeA)
+    } else {
+        out.write("brixOS: power off by ACPI: PM1a control at ")
+        out.hex(fixed.control.address)
+        if fixed.control.space != acpi.Space.PORT { out.write(" (memory)") }
+        out.write(", S5 type ")
+        out.decimal(ways.typeA)
+        if fixed.controlB.present() {
+            out.write(", PM1b control at ")
+            out.hex(fixed.controlB.address)
+            out.write(", S5 type ")
+            out.decimal(ways.typeB)
+        }
+        if !acpiMode() && fixed.enable != 0 {
+            out.write(" (ACPI mode is off: turned on first, ")
+            out.hex(fixed.enable)
+            out.write(" to port ")
+            out.hex(fixed.command)
+            out.write(")")
+        } else if !acpiMode() {
+            out.write(" (ACPI mode is off, and the FADT names no command to turn it on)")
+        }
+    }
+    out.write("; reset by ")
+    if fixed.reset.present() {
+        out.write("ACPI's reset register (")
+        sayRegister(fixed.reset)
+        out.write(", value ")
+        out.hex(fixed.resetValue)
+        out.write(")\n")
+    } else {
+        out.write("port 0xcf9 (the tables name no reset register)\n")
+    }
+}
 
 // (The timer's work goes on at each interrupt, from inside the kernel:
 // what a round of it makes in the arena is let go, as the idle loop does.)
@@ -36,20 +179,153 @@ fn stop() -> void {
     }
 }
 
+// Waits `milliseconds` (the processor busy): the time a machine has to go
+// off or to reset.
+fn wait(milliseconds: usize) -> void { clock.pause(milliseconds * 1000) }
+
+// The sleep type into a PM1 control register and its second (where there
+// is one), then again with the enable bit, as ACPI asks: the type first,
+// taken with the second write. What else the register holds stays.
+fn sleep(first: acpi.Register, typeA: usize, second: acpi.Register, typeB: usize) -> void {
+    const kept = first.read() & ~(SLEEP_TYPE | SLEEP_ENABLE)
+    const a = kept | ((typeA << SLEEP_TYPE_SHIFT) & SLEEP_TYPE)
+    const b = kept | ((typeB << SLEEP_TYPE_SHIFT) & SLEEP_TYPE)
+    first.write(a)
+    if second.present() { second.write(b) }
+    first.write(a | SLEEP_ENABLE)
+    if second.present() { second.write(b | SLEEP_ENABLE) }
+}
+
+// ACPI mode on, where the firmware left it off: the command the FADT
+// names to its command port (the firmware takes it, in system management
+// mode), then PM1a control looked at until it says so.
+fn enterAcpiMode() -> void {
+    const out = console.out
+    const fixed = ways.fixed
+    if acpiMode() { return }
+    if fixed.enable == 0 {
+        out.write("brixOS: ACPI mode is off and the FADT names no command to turn it on\n")
+        return
+    }
+    out.write("brixOS: ACPI mode on: ")
+    out.hex(fixed.enable)
+    out.write(" to port ")
+    out.hex(fixed.command)
+    out.write("\n")
+    cpu.Port.out8(fixed.command, fixed.enable)
+    const deadline = clock.Deadline.after(MODE_WAIT)
+    while !acpiMode() && !deadline.passed() { clock.pause(1000) }
+    if !acpiMode() { out.write("brixOS: ACPI mode did not come on (PM1a control does not say so); S5 is written all the same\n") }
+}
+
+// The machine powered off. Back only when it is still on.
+fn powerOff() -> void {
+    const out = console.out
+    if !looked { look() }
+    const fixed = ways.fixed
+    if ways.off && fixed.reduced && fixed.sleep.present() {
+        out.write("brixOS: power off by ACPI: S5 type ")
+        out.decimal(ways.typeA)
+        out.write(" to the sleep control at ")
+        sayRegister(fixed.sleep)
+        out.write("\n")
+        fixed.sleep.write(((ways.typeA << REDUCED_TYPE_SHIFT) & 0x1C) | REDUCED_ENABLE)
+        wait(OFF_WAIT)
+    } else if ways.off {
+        enterAcpiMode()
+        out.write("brixOS: power off by ACPI: S5 type ")
+        out.decimal(ways.typeA)
+        out.write(" to PM1a control at ")
+        out.hex(fixed.control.address)
+        if fixed.controlB.present() {
+            out.write(", type ")
+            out.decimal(ways.typeB)
+            out.write(" to PM1b control at ")
+            out.hex(fixed.controlB.address)
+        }
+        out.write("\n")
+        // (A wake that is still noted would bring the machine straight
+        // back.)
+        if fixed.event.present() { fixed.event.write(WOKE) }
+        sleep(fixed.control, ways.typeA, fixed.controlB, ways.typeB)
+        wait(OFF_WAIT)
+        // Still on: the register as the FADT's older field names it,
+        // where its extended field named another.
+        if fixed.controlOld.present() {
+            out.write("brixOS: still on; PM1a control as the FADT's older field has it, at ")
+            out.hex(fixed.controlOld.address)
+            out.write("\n")
+            sleep(fixed.controlOld, ways.typeA, acpi.Register.none(), 0)
+            wait(OFF_WAIT)
+        }
+    }
+    // QEMU's chipsets, whatever the tables said.
+    out.write(if ways.off { "brixOS: still on; the ports of QEMU's chipsets (0x604, 0xb004)\n" } else { "brixOS: power off by the ports of QEMU's chipsets (0x604, 0xb004)\n" })
+    cpu.Port.out16(QEMU_CONTROL, SLEEP_ENABLE)
+    cpu.Port.out16(BOCHS_CONTROL, SLEEP_ENABLE)
+    wait(OFF_WAIT)
+}
+
+// The machine restarted. It does not come back: the last attempt is a
+// fault the processor cannot take.
+fn restart() -> void {
+    const out = console.out
+    if !looked { look() }
+    const fixed = ways.fixed
+    if fixed.reset.present() {
+        out.write("brixOS: reset by ACPI's reset register (")
+        sayRegister(fixed.reset)
+        out.write(", value ")
+        out.hex(fixed.resetValue)
+        out.write(")\n")
+        fixed.reset.write(fixed.resetValue)
+        wait(RESET_WAIT)
+    }
+    out.write("brixOS: reset by port 0xcf9\n")
+    cpu.Port.out8(RESET_CONTROL, RESET_ASK)
+    clock.pause(100)
+    cpu.Port.out8(RESET_CONTROL, RESET_HARD)
+    wait(RESET_WAIT)
+    cpu.Port.out8(RESET_CONTROL, RESET_FULL)
+    wait(RESET_WAIT)
+    if keyboard.ps2().*.present {
+        out.write("brixOS: reset by the keyboard controller\n")
+        const deadline = clock.Deadline.after(100)
+        while cpu.Port.in8(KEYBOARD_COMMAND) & KEYBOARD_BUSY != 0 && !deadline.passed() {}
+        cpu.Port.out8(KEYBOARD_COMMAND, KEYBOARD_RESET)
+        wait(RESET_WAIT)
+    }
+    out.write("brixOS: reset by a fault the processor cannot take\n")
+    cpu.Cpu.tripleFault()
+}
+
 pub fn act(p: *Process, kind: usize) -> isize {
     if p.*.pid != scheduler.Scheduler.FIRST_PID { return Status.no_right }
     if kind > REBOOT { return Status.invalid }
+    const out = console.out
     _ = volume.commitAll()
+    // From here on this processor keeps the kernel; the others stop.
+    const others = smp.processors().*.running - 1
+    const running = smp.stopOthers()
+    if others != 0 {
+        out.write("brixOS: the other processors stopped (")
+        out.decimal(others - running)
+        out.write(" of ")
+        out.decimal(others)
+        out.write(")\n")
+    }
     if kind == POWEROFF {
-        console.out.write("brixOS: powering off\n")
-        cpu.Port.out16(PM1A_CONTROL, SLEEP)
-        cpu.Port.out16(BOCHS_PM1A_CONTROL, SLEEP)
+        out.write("brixOS: powering off\n")
+        powerOff()
+        console.showOnScreen()
+        out.write("brixOS: the machine did not power off; it is halted and can be switched off\n")
     } else if kind == REBOOT {
-        console.out.write("brixOS: restarting\n")
-        cpu.Port.out8(KEYBOARD_COMMAND, KEYBOARD_RESET)
-        cpu.Port.out8(RESET_CONTROL, FULL_RESET)
+        out.write("brixOS: restarting\n")
+        restart()
+        console.showOnScreen()
+        out.write("brixOS: the machine did not restart; it is halted\n")
     } else {
-        console.out.write("brixOS: halted\n")
+        out.write("brixOS: halted\n")
     }
     stop()
     return 0

@@ -30,6 +30,12 @@ are overwritten. `sentinel` performs authentication and session setup;
 after a successful `Login` reply the greeter closes so its compositor can
 release the seat.
 
+Under the card are Restart and Shut Down: a click asks first, then calls
+`org.mlx.Login.Restart` or `PowerOff` (`projects/desktop/shared/system_end.mlx`).
+`sentinel` does it for the user who holds the seat, which is the
+greeter's while nobody is logged in; no password is asked for, as whoever
+sits at the login screen has the power button too.
+
 ```sh
 mlx4 projects/desktop/greeter/main.mlx -o aurora
 tools/check_greeter.sh

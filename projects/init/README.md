@@ -189,6 +189,9 @@ the kernel to power off, reboot or halt.
 - `linux.mlx`: the system calls (processes, signals, mounts, reboot, Unix
   sockets, epoll).
 - `tool.mlx`: impulsectl.
+- `request.mlx`: one request on the control and its answer, for impulsectl
+  and for the login service (which has the machine restarted or powered
+  off for the desktop): the socket on Linux, the FIFO on brixOS.
 
 ## Checks
 
