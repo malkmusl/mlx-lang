@@ -38,11 +38,18 @@ services=$(mktemp -d)
 trap 'rm -rf -- "$services"' EXIT
 echo 1 > "$services/processors"
 
+# The GPU's firmware, as the build's image has it (a driver's bring-up is
+# what these images are looked at for).
+firmware=()
+for blob in projects/brix/firmware/amdgpu/*.bin; do
+    [ -f "$blob" ] && firmware+=("firmware/amdgpu/$(basename "$blob")=$blob")
+done
+
 efi="$out/BOOTX64-diag.EFI"
 mlx-out/bin/brix-image "$out/kernel" "$efi" \
     flux="$out/flux" sysinfo="$out/sysinfo" brixfs="$out/brixfs" klogsave="$out/klogsave" \
     impulse="$out/impulse" impulsectl="$out/impulsectl" \
-    "settings/processors=$services/processors" \
+    "settings/processors=$services/processors" "${firmware[@]}" \
     settings/init/services/serial-shell.service=projects/brix/settings/init/services/serial-shell.service \
     settings/init/services/klogsave.service=projects/brix/settings/init/services/klogsave.service \
     settings/users=projects/brix/settings/users \
@@ -76,7 +83,7 @@ mlx-out/bin/brix-image "$out/kernel" "$console" \
     settings/init/services/serial-shell.service=projects/brix/settings/init/services/serial-shell.service \
     settings/init/services/klogsave.service=projects/brix/settings/init/services/klogsave.service \
     "settings/init/services/console.service=$services/console.service" \
-    "settings/processors=$services/processors" \
+    "settings/processors=$services/processors" "${firmware[@]}" \
     settings/users=projects/brix/settings/users \
     settings/groups=projects/brix/settings/groups \
     settings/shadow=projects/brix/settings/shadow \
