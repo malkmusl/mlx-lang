@@ -122,4 +122,5 @@ feature virtual shapes "virtual functions: overriding, a pure virtual, deletion 
 feature bits bits "bit-fields in words of their own, an anonymous union, two bases with table pointers"
 feature idioms idioms "pointers stepped through members, std::array members, same-named static locals, a class beside a function of its name, references from pointers, an object in storage, an atomic pointer"
 feature values values "a class with a copy constructor taken by value, an empty base, a base assigned through the derived object, a reference from a virtual call"
+feature overflow overflow "the overflow builtins over 32 and 64 bits, signed and unsigned, and with operands and a result of different types"
 echo "check_lattice_emit.sh: all checks passed"
