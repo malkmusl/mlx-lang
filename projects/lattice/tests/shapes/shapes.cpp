@@ -310,9 +310,47 @@ static unsigned rows()
     }
     return sum;
 }
+// std::array's fill is the loop.
+struct Caps
+{
+    int a;
+    int b;
+};
+struct Table
+{
+    std::array<unsigned, 6> counts;
+    std::array<Caps, 3> caps;
+    void reset(unsigned n)
+    {
+        counts.fill(n);
+        Caps c{2, 3};
+        caps.fill(c);
+    }
+};
+static unsigned filled()
+{
+    Table t;
+    t.reset(7);
+    std::array<bool, 4> flags;
+    flags.fill(true);
+    unsigned sum = 0;
+    for (unsigned c : t.counts)
+    {
+        sum += c;
+    }
+    for (const Caps &c : t.caps)
+    {
+        sum += (unsigned)(c.a * 10 + c.b);
+    }
+    for (bool f : flags)
+    {
+        sum += f ? 100 : 0;
+    }
+    return sum;
+}
 static unsigned made()
 {
-    unsigned sum = kStart;
+    unsigned sum = kStart + filled();
     sum += once() ? 1 : 0;
     sum += once() ? 1 : 0;
     return (sum * 10 + calls) * 1000 + rows();

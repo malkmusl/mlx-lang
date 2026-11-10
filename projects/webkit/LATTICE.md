@@ -313,7 +313,7 @@ Three levels, and where each is:
 1. **Proven** (the differential test prints the same from the Mlx and
    the C++): eight units of `src/common`, 3,091 lines, and the feature
    and program tests of the translator itself (projects/lattice/tests,
-   twenty-two of them: virtual calls, bit-fields, variadics, jumps,
+   twenty of them: virtual calls, bit-fields, variadics, jumps,
    objects made before main, two units as one program, the shapes the
    whole program showed).
 2. **Compiles**: all of ANGLE, as one program. This is what the work
