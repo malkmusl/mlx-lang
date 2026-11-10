@@ -328,16 +328,24 @@ console.
 
 The picture's mode is the monitor's own where the firmware can set it:
 the loader (image/efi.mlx) reads what the monitor says of itself (its
-EDID, the firmware's EDID Active protocol: the first timing is the mode
-it prefers), finds that size among the firmware's modes and sets it,
+EDID: the firmware's EDID Active protocol on the very handle the
+Graphics Output Protocol in use is on; the first timing is the mode it
+prefers), finds that size among the firmware's modes and sets it,
 instead of taking the mode the firmware was left in (often a smaller
-one, or one of another shape that the monitor stretches). An image may
-name a mode itself: a file settings/display in the archive, "3840x2160"
-(that mode, when the firmware has it) or "firmware" (the firmware's,
-come what may); brix-image builds the loader for it. The kernel says
-the display it got, and when that is not the monitor's own mode
-("brixOS: the monitor's own mode is 3840x2160, which the firmware did
-not set").
+one, or one of another shape that the monitor stretches). Only the
+EDID of the display in use counts (a server board's management
+controller has a display of its own, whose "monitor" says 1024x768),
+and on the monitor's word the loader never goes to a picture of fewer
+pixels than the firmware's. An image may name a mode itself: a file
+settings/display in the archive, "3840x2160" (that mode, when the
+firmware has it) or "firmware" (the firmware's, come what may);
+brix-image builds the loader for it. The kernel's log says what
+happened: the display it got, whose mode the loader set and what the
+firmware's was ("brixOS: the loader set this mode, the monitor's own;
+the firmware's was 1024x768"), what the monitor says when the picture is
+another ("brixOS: the monitor's own mode is 3840x2160, which was not
+set ...") or that it says nothing, and how many graphics outputs the
+firmware offers.
 
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the

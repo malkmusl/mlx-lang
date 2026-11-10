@@ -99,12 +99,15 @@ mode_with() {
     "$work/brix-image" "$work/kernel" "$work/esp/EFI/BOOT/BOOTX64.EFI" "flux=$work/flux" "settings/display=$work/display" "$work/bin/"
     start 1G
     wait_for '^brixOS: display [0-9]*x[0-9]* '
+    wait_for '^brixOS: [0-9]* MiB'
     stop
     got=$(output | grep -a '^brixOS: display [0-9]*x[0-9]* ' | head -1 | grep -ao '[0-9][0-9]*x[0-9][0-9]*' | head -1)
 }
 mode_with 1920x1080
 [[ $got == 1920x1080 ]] || fail "an image built for 1920x1080 came up in $got (the firmware's own was $default)"
+output | grep -aq "^brixOS: the loader set this mode, the one the image names (settings/display); the firmware's was $default\$" || fail "the kernel does not say that the loader set the image's mode and what the firmware's was"
 mode_with 1234x567
 [[ $got == "$default" ]] || fail "an image built for a mode the firmware lacks came up in $got, not the firmware's $default"
-echo "ok   the loader sets the display mode the image names when the firmware has it (1920x1080 instead of $default), and leaves the firmware's otherwise"
+output | grep -aq '^brixOS: the loader set this mode' && fail "the kernel says the loader set a mode where the firmware's stayed"
+echo "ok   the loader sets the display mode the image names when the firmware has it (1920x1080 instead of $default) and the kernel says so, and leaves the firmware's otherwise"
 echo PASS
