@@ -554,6 +554,52 @@ ends_functions_with_endless_loops() {
     return $ok
 }
 
+# Whether $1 keeps a function type's parameters when one of them is a
+# function type itself (tests/443_function_type_parameters_runtime.mlx
+# exits 13).
+nests_function_types() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/443_function_type_parameters_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 ends a statement at a line's last `.*` or `.?`
+# (tests/444_statement_after_postfix_runtime.mlx exits 13).
+ends_statements_after_postfix() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/444_statement_after_postfix_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 gives a module-level constant an address (a copy of its
+# value in the function; tests/445_constant_address_runtime.mlx exits 13).
+addresses_constants() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/445_constant_address_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether functions $1 builds begin at multiples of 16
 # (tests/442_function_alignment_runtime.mlx exits 13).
 aligns_functions() {
@@ -791,15 +837,18 @@ tests_equality_chains() {
     grep -q "equality chains tested as one bit mask: [1-9]" <<< "$output"
 }
 
-# Whether $1's arena has room for the largest programs here: 1 GiB of
-# address space (projects/observatory took 252 MiB of the former 256 MiB,
-# and the arena running full showed as a symbol never defined).
+# Whether $1's arena has room for the largest programs here: 8 GiB of
+# address space asked for, less where the system gives less
+# (projects/observatory took 252 MiB of the former 256 MiB, ANGLE
+# translated to one Mlx program filled the 1 GiB after it; the arena
+# running full showed as a symbol never defined, later as an analysis
+# cut short).
 holds_large_programs() {
     local probe output
     probe=$(mktemp -d mlx-out/probe.XXXXXX)
     output=$("$1" tests/01_basic.mlx -o "$probe/probe" 2>&1) || true
     rm -rf -- "$probe"
-    grep -q "compiler arena capacity: 1073741824" <<< "$output"
+    grep -q "compiler arena request: 8589934592" <<< "$output"
 }
 
 # Whether $1 writes the files it read with --depfile (what `mlx build`
@@ -1028,6 +1077,9 @@ probes=(
     "types_slices_of_constants|slices of constants and of by-value parameters as []const T"
     "takes_addresses_of_constants|the address of a module-level constant"
     "writes_places_through_try|places with a try among their parts as writable as without"
+    "nests_function_types|function types with function types among their parameters"
+    "ends_statements_after_postfix|a statement ended by a line's last .* or .?"
+    "addresses_constants|the address of a module-level constant"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

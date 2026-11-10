@@ -136,24 +136,26 @@ feature casts casts "a cast that keeps the element under an address taken again,
 # make the manifest (a thing's home, its name), each unit is translated
 # with it. The modules are kept beside their C++; the test module calls
 # the main unit's `run`, as the C++ reference does.
-program() { # DIRECTORY "UNITS" WORDS
+program() { # DIRECTORY "UNITS" WORDS [c: the units are C]
     local name=$1 directory=projects/lattice/tests/$1 units=$2 words=$3 unit sources=()
+    local ext=cpp standard=c++23
+    if [[ ${4:-} == c ]]; then ext=c; standard=c11; fi
     : > "$work/$name.units"
     for unit in $units; do
-        "$work/mlx-cc" -std=c++23 --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-unit="$unit" --emit-mlx-index="$work/$name.$unit.idx" --emit-mlx=/dev/null "$directory/$unit.cpp" 2> "$work/$name.$unit.err" || fail "$name: $unit.cpp does not translate: $(head -5 "$work/$name.$unit.err")"
+        "$work/mlx-cc" -std=$standard --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-unit="$unit" --emit-mlx-index="$work/$name.$unit.idx" --emit-mlx=/dev/null "$directory/$unit.$ext" 2> "$work/$name.$unit.err" || fail "$name: $unit.$ext does not translate: $(head -5 "$work/$name.$unit.err")"
         printf '%s\t%s\n' "$unit" "$work/$name.$unit.idx" >> "$work/$name.units"
-        sources+=("$directory/$unit.cpp")
+        sources+=("$directory/$unit.$ext")
     done
     "$work/mlx-cc" --lattice-units="$work/$name.units" --lattice-manifest="$work/$name.manifest" > "$work/$name.manifest.log" 2>&1 || fail "$name: the manifest was not made: $(head -3 "$work/$name.manifest.log")"
     for unit in $units; do
-        "$work/mlx-cc" -std=c++23 --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-unit="$unit" --emit-mlx-manifest="$work/$name.manifest" --emit-mlx="$work/$name.$unit.mlx" "$directory/$unit.cpp" 2> "$work/$name.$unit.err" || fail "$name: $unit.cpp does not translate with the manifest: $(head -5 "$work/$name.$unit.err")"
+        "$work/mlx-cc" -std=$standard --emit-mlx-runtime=../../runtime/c.mlx --emit-mlx-unit="$unit" --emit-mlx-manifest="$work/$name.manifest" --emit-mlx="$work/$name.$unit.mlx" "$directory/$unit.$ext" 2> "$work/$name.$unit.err" || fail "$name: $unit.$ext does not translate with the manifest: $(head -5 "$work/$name.$unit.err")"
         if [[ $update -eq 1 ]]; then
             cp "$work/$name.$unit.mlx" "$directory/$unit.mlx"
         elif ! cmp -s "$work/$name.$unit.mlx" "$directory/$unit.mlx"; then
             fail "$directory/$unit.mlx is not what the translator writes now (tools/check_lattice_emit.sh --update): $(diff "$directory/$unit.mlx" "$work/$name.$unit.mlx" | head -12)"
         fi
     done
-    "$work/mlx-cc" -std=c++23 -o "$work/${name}_ref" "$directory/${name}_ref.cpp" "${sources[@]}" 2> "$work/${name}_ref.err" || fail "$name: the C++ reference does not build: $(head -5 "$work/${name}_ref.err")"
+    "$work/mlx-cc" -std=$standard -o "$work/${name}_ref" "$directory/${name}_ref.$ext" "${sources[@]}" 2> "$work/${name}_ref.err" || fail "$name: the C++ reference does not build: $(head -5 "$work/${name}_ref.err")"
     (env -i LD_LIBRARY_PATH="$work/libc" timeout 60 "$loader" "$work/${name}_ref" > "$work/${name}_ref.out" 2> "$work/${name}_ref.run") || fail "$name: the C++ reference does not run on mlxlibc: $(head -3 "$work/${name}_ref.run")"
     "$compiler" --quiet "$directory/${name}_test.mlx" -o "$work/${name}_test" 2> "$work/${name}.err" || fail "${name}_test.mlx does not compile: $(head -5 "$work/${name}.err")"
     "$work/${name}_test" > "$work/${name}_mlx.out" || fail "$name: the Mlx test does not run"
@@ -166,5 +168,8 @@ program program "main shapes" "two units as one program: a header's record, temp
 program incomplete "user maker" "records only declared in one unit and defined in the other: references to them kept, returned and handed on"
 program lists "lists" "an initializer_list of records, an array of records as a pointer, a vector of pairs and a map from braced lists, a table's rows, references to arrays of char"
 program statics "statics" "objects made before main: constant ones as data (bit-fields in their words, a pointer into an array, a table of pointers to them, an empty record), one with a constructor through the unit's start, static locals behind their guards"
+program casts2 "casts2" "const cast away, a function kept as a data pointer and called again, a std::array by reference, this handed to a template by reference"
+program shapes "shapes" "operators outside a class and an assignment through a converting constructor, a parameter named as a class, the address of one of two strings, arrays or variables, one object's address indexed, an array of arrays as its bytes, const dropped below the first pointer, the library's math of an integer, a function pointer taking a function pointer, a temporary moved into an element, a base class's part returned by reference, a constant pointer by reference, a pointer made of an integer"
+program cshapes "cshapes" "a C unit: comparisons used as numbers, a pointer stepped back more than once and read, const void pointers, a parameter named align" c
 program twins "first second" "two units each with a record of its own under one name: two records, each in its unit"
 echo "check_lattice_emit.sh: all checks passed"

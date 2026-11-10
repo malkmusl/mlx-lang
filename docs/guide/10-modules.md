@@ -142,8 +142,12 @@ table over what a frame takes in the aggregate arena, which is not freed:
 brixOS's console drew its font so and filled the kernel's arena in 173
 characters). A constant that holds addresses (strings, functions) or
 values not known until the program runs is still built where it is used.
-`&TABLE` is a pointer to a constant, to the table's image where it has
-one (`tests/444_constant_address_runtime.mlx`).
+No module-level `const` has storage of its own: `&LIMIT` (or
+`&module.LIMIT`) is the address of a copy of its value in the function
+that takes it, good for a `*const T` parameter and no identity of the
+constant (`tests/445_constant_address_runtime.mlx`); of a table that has
+an image it is the image's address, the same as `&TABLE[0]`
+(`tests/444_constant_address_runtime.mlx`).
 `pub var` opens a global to
 other modules, which read and write it as `module.name` and may take its
 address:

@@ -694,12 +694,12 @@ are lowered as before: their initializer, where they are used
 
 The address of a module-level constant, `&NAME` (a pointer to a
 constant), is the slot's for a table that has one, so `&TABLE` and
-`&TABLE[0]` are the same address and stay it; for another struct, union
-or array it is the value built where it is used, and for an integer, an
-enum's value, a boolean or a pointer a slot of the function that holds
-it (`lowerAddressOf`, `tests/444_constant_address_runtime.mlx`; before,
+`&TABLE[0]` are the same address and stay it (`lowerAddressOf`,
+`tests/444_constant_address_runtime.mlx`); for every other constant it
+is the address of a copy of its value in a slot of the function
+(`constantAddress`, `tests/445_constant_address_runtime.mlx`). Before,
 such an expression lowered to no address at all, and a read through it
-faulted).
+faulted.
 
 ## Atomics
 

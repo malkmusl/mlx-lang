@@ -121,15 +121,19 @@ when the bound is hit.
 
 `main.mlx` delegates everything to `driver/pipeline.mlx`'s `Pipeline.compile`,
 which runs inside one `unsafe` block and drives the whole compilation
-through an arena allocator (`arena_allocator.init(pages, 1073741824)` — a
-1&nbsp;GiB arena of address space, whose pages are touched only as it fills)
+through an arena allocator — 8&nbsp;GiB of address space asked for
+(`ARENA_REQUEST`), half as much again and again down to 1&nbsp;GiB where
+the system does not give it, whose pages are touched only as it fills —
 that is freed in one shot at the end. `projects/observatory` takes 252&nbsp;MiB
-of it, which was all but the whole of the former 256&nbsp;MiB; a request the
+of it, which was all but the whole of the first 256&nbsp;MiB; ANGLE
+translated to one Mlx program (66&nbsp;MiB of source in 341 modules,
+`projects/webkit/LATTICE.md`) filled the 1&nbsp;GiB that followed. A request the
 arena cannot hold ends the compile with "the compiler's arena is full"
 (status 9) instead of a null its caller would unwrap into a trap, or turn
 into a symbol never defined (`compilerAlloc` and `compilerRemap` wrap the
-arena's functions). The metric "compiler arena capacity" names the size,
-which `tools/ensure_compiler.sh` probes. The compile in outline:
+arena's functions). The metrics "compiler arena capacity" and "compiler
+arena request" name what the arena has and what was asked for;
+`tools/ensure_compiler.sh` probes the request. The compile in outline:
 
 ```mlx
 pub const Pipeline = struct {
