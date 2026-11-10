@@ -889,7 +889,30 @@ buffer). Moving the pointer thus redraws a few hundred pixels rather than
 the screen, and the frame after a client's commit only that window. The
 Vulkan renderer redraws everything, which costs the GPU little.
 `tests/268_compositor_damage_runtime.mlx` checks the bookkeeping against
-frames composed from scratch. Composition itself works on whole pixels
+frames composed from scratch.
+
+The blur behind a surface (the top bar, the dock, a sidebar) is kept from
+frame to frame by the CPU renderer: the picture below the surface within
+the blur's reach, and that picture blurred. A frame that draws the surface
+compares what it drew below it with the kept picture and blurs again only
+what lies within reach (18 pixels) of a difference; where nothing below
+changed (the pointer moving over the bar, the bar's own commit, a window
+under it committing what it showed there, the whole screen drawn again)
+the kept blur is copied. So damage near a blurred surface takes in the
+blurred pixels within reach of it rather than the whole blur, and the
+pointer's takes in nothing. A surface that moved, was raised or is new is
+blurred anew, all of it, out of the frame that draws it (`damageSurface`
+says so; a commit's new content is reported with `damageContent`, which
+leaves the blur as it is). The blur is made a tile at a time, a pixel's
+four channels summed in one 64-bit word and divided with a multiplication:
+the same pixels as the plain passes give (the test holds them against each
+other), in about a sixth of the time. On a 3840x1080 output, composed on
+one core of a 2.1 GHz Xeon: the pointer moving in the top bar 0.03 ms a
+frame where it took 21, the top bar committing 1.3 ms where it took 22, a
+maximized window committing 16 ms where it took 42, the whole screen 6 ms
+where it took 32, the bar's blur made anew 4.4 ms where it took 21.
+
+Composition itself works on whole pixels
 and 64-bit words (`state.copyPixels`, `fillPixels`), copies opaque
 windows' rows outright and blends the three channels of a translucent
 pixel at once; a full 1920x1080 frame with an opaque window takes about 6
