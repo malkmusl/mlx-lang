@@ -508,6 +508,21 @@ negates_floats_by_sign() {
     return $ok
 }
 
+# Whether $1 takes an optional pointer as an atomic's type
+# (tests/437_atomic_optional_pointer_runtime.mlx exits 21).
+atomics_take_optional_pointers() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/437_atomic_optional_pointer_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 21 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 reads a function type where a builtin takes a type
 # (tests/436_function_type_in_builtin_runtime.mlx exits 13): `@ptrCast(
 # fn(u8) -> u8, raw)`, `?fn(...)`, `[*]?fn(...)`.
@@ -847,6 +862,7 @@ probes=(
     "lays_out_packed_structs|packed structs laid out in bits"
     "negates_floats_by_sign|floats negated by their sign bit (-0.0)"
     "parses_function_types_in_builtins|function types as a builtin's type argument"
+    "atomics_take_optional_pointers|atomics on optional pointers"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

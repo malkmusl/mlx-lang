@@ -60,7 +60,7 @@ survey_one() {
     local lines status=ok functions=0 held=0 marks=0 externs=0 compiled=-
     lines=$(wc -l < "$source")
     # shellcheck disable=SC2086
-    if ! timeout 600 "$out/mlx-cc" $flags $standard --emit-mlx-runtime=./c.mlx --emit-mlx-std=./libcpp.mlx --emit-mlx="$file" "$source" > "$file.log" 2>&1; then
+    if ! timeout 600 "$out/mlx-cc" $flags $standard --emit-mlx-runtime=./c.mlx --emit-mlx-std=./libcpp.mlx --emit-mlx-std-file=projects/lattice/runtime/libcpp.mlx --emit-mlx="$file" "$source" > "$file.log" 2>&1; then
         status=fail
     else
         functions=$(grep -c '^\(pub \)\?fn ' "$file" || true)

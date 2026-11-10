@@ -120,4 +120,5 @@ feature() { # DIRECTORY NAME WORDS
 }
 feature virtual shapes "virtual functions: overriding, a pure virtual, deletion through the base, a second base's adjustment of this"
 feature bits bits "bit-fields in words of their own, an anonymous union, two bases with table pointers"
+feature idioms idioms "pointers stepped through members, std::array members, same-named static locals, a class beside a function of its name, references from pointers, an object in storage, an atomic pointer"
 echo "check_lattice_emit.sh: all checks passed"
