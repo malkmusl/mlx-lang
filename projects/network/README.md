@@ -170,7 +170,9 @@ shows the links with their addresses, routes and name servers and a
 switch each (`Up`, `Down`), the networks in sight (`Search again`:
 `Scan`), and for the one chosen its passphrase field (masked) and Join,
 or Disconnect and Forget once it is joined. A passphrase refused is said
-on its row and asked again.
+on its row and asked again. (On brixOS the kernel runs the network and
+there is no `nexus`: the page is `network.brixos.mlx`, which shows what
+the kernel says of each link; projects/brix/README.md, "The network".)
 
 Without an answer from `nexus` the page says why and what to run
 (`projects/desktop/settings/network_status.mlx`): `nexus` not

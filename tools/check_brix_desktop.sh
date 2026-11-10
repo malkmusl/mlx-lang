@@ -12,8 +12,11 @@
 # launcher; Alt+Enter opens vector, whose window the compositor
 # maps; what is typed goes through the compositor (wl_keyboard) to the
 # terminal and its flux on a session pair; the mouse moves the cursor.
+# The settings app (control) on its Network page shows what the kernel
+# says of the link (QEMU's user network on a virtio network device:
+# /devices/net0's record, read natively), and follows the cable.
 # The screen is dumped through QEMU's monitor, which also moves and
-# clicks the mouse.
+# clicks the mouse and pulls the cable.
 #
 #   tools/check_brix_desktop.sh [compiler]
 set -euo pipefail
@@ -57,6 +60,7 @@ mkdir -p "$work/bin" "$work/services"
 "$compiler" --quiet $brix projects/desktop/launcher/main.mlx -o "$work/launch"
 "$compiler" --quiet $brix projects/desktop/dock/main.mlx -o "$work/orbit"
 "$compiler" --quiet $brix projects/desktop/topbar/main.mlx -o "$work/horizon"
+"$compiler" --quiet $brix projects/desktop/settings/main.mlx -o "$work/control"
 keymap=()
 if [[ -f /usr/share/X11/xkb/rules/evdev ]]; then
     "$compiler" --quiet projects/brix/tools/keymap/main.mlx -o "$work/brix-keymap"
@@ -74,8 +78,8 @@ sed -e 's/^exec = kepler$/exec = kepler --verbose/' -e '/^disabled = yes$/d' -e 
 grep -q '^exec = kepler --verbose$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
 entries=()
 for service in "$work"/services/*.service; do entries+=("settings/init/services/$(basename "$service")=$service"); done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "share/apps/Vector.app/app.ini=projects/desktop/apps/Vector.app/app.ini" "share/apps/Vector.app/icon.png=projects/desktop/apps/Vector.app/icon.png" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
-echo "ok   the kernel, impulse, ignition, kepler, vector, the launcher, the dock, the top bar$([[ ${#keymap[@]} -gt 0 ]] && echo ", the us keymap") and a boot image with the desktop service build"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "control=$work/control" "share/apps/Vector.app/app.ini=projects/desktop/apps/Vector.app/app.ini" "share/apps/Vector.app/icon.png=projects/desktop/apps/Vector.app/icon.png" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "$work/bin/"
+echo "ok   the kernel, impulse, ignition, kepler, vector, the launcher, the dock, the top bar, control$([[ ${#keymap[@]} -gt 0 ]] && echo ", the us keymap") and a boot image with the desktop service build"
 
 # The QEMU monitor on a socket: screen dumps, keys, the mouse.
 monitor() {
@@ -119,12 +123,35 @@ for y in range(height):
 print(blue, white_right)
 PY
 }
+# Of a PPM dump with the settings window in front: how many pixels of its
+# title bar are blue right of column 700 (where the terminal's window
+# does not reach), and how many are light where its page's rows have
+# their values (columns 480 to 700, rows 190 to 400).
+page() {
+    python3 - "$1" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+parts = data.split(b"\n", 3)
+width, height = map(int, parts[1].split())
+pixels = parts[3]
+bar = 0
+text = 0
+for y in range(height):
+    row = y * width * 3
+    for x in range(width):
+        i = row + x * 3
+        r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
+        if x > 700 and y < 60 and abs(r - 0x5a) < 24 and abs(g - 0xa0) < 24 and b > 220: bar += 1
+        if 480 < x < 700 and 190 < y < 400 and r > 200 and g > 200 and b > 200: text += 1
+print(bar, text)
+PY
+}
 
 rm -f "$work/input"
 mkfifo "$work/input"
 : > "$work/serial.txt"
 qemu-system-x86_64 -m 256M -display none -monitor "unix:$work/monitor,server,nowait" -no-reboot -cpu max -serial stdio \
-    -kernel "$work/brix.img" < "$work/input" > "$work/serial.txt" 2>&1 &
+    -kernel "$work/brix.img" -netdev user,id=n0 -device virtio-net-pci,netdev=n0 < "$work/input" > "$work/serial.txt" 2>&1 &
 qemu_pid=$!
 exec 3> "$work/input"
 output() { sed 's/\x1b\[K//g' "$work/serial.txt" | tr '\r' '\n'; }
@@ -228,6 +255,32 @@ sleep 1
 monitor "mouse_move -120 0" "mouse_button 1" "mouse_button 0"
 wait_for '^workspace: 1$'
 echo "ok   the top bar's workspace buttons and its tiling button work on the bar's channel, both ways (workspace 2, tiling on there, back to 1)"
+# The settings app on its Network page, started from the serial shell as
+# one more client of the compositor. On brixOS the kernel runs the
+# network: the page reads each link's record from /devices/net0 (natively)
+# and says on its errors what it shows, once each time that changes.
+# (Not anchored: the serial shell's prompt stands before these lines.)
+printf 'XDG_RUNTIME_DIR=/temporary WAYLAND_DISPLAY=wayland-mlx control network &\r' >&3
+wait_for 'map: Settings$'
+wait_for 'control: network: net0 (virtio, 52:54:00:12:34:56) connected, 10.0.2.15/24 by DHCP, gateway 10.0.2.2, name server 10.0.2.3$'
+# The page on the screen: the settings window in front (its title bar)
+# with the link's rows in it.
+bar=0
+rows=0
+for (( i = 0; i < 20; i++ )); do
+    monitor "screendump $work/network.ppm"
+    sleep 0.3
+    read -r bar rows < <(page "$work/network.ppm")
+    (( bar > 1500 && rows > 200 )) && break
+    sleep 0.3
+done
+(( bar > 1500 && rows > 200 )) || fail "the Network page is not on the display ($bar title-bar pixels, $rows of its rows)"
+echo "ok   control's Network page shows what the kernel says of net0: connected, 10.0.2.15/24 by DHCP, its gateway and name server ($rows pixels of its rows on the display)"
+# The cable pulled (QEMU's set_link): the page reads the kernel again
+# within two seconds and shows it.
+monitor "set_link n0 off"
+wait_for 'control: network: net0 (virtio, 52:54:00:12:34:56) no cable, 10.0.2.15/24 by DHCP, gateway 10.0.2.2, name server 10.0.2.3$'
+echo "ok   the page follows the link on its own: the cable pulled, it says no cable"
 printf 'impulsectl poweroff\r' >&3
 wait_for '^impulse: poweroff$'
 # Told to end (the terminate event), the compositor leaves its last frame

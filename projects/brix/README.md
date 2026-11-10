@@ -458,11 +458,37 @@ The kernel's stack (kernel/net) runs on it:
 - ping (projects/ping): `ping HOST [COUNT]` on a datagram socket of
   IPPROTO_ICMP (the kernel sets the identifier; Linux's ping sockets
   work the same).
+- link.mlx: the link's state for programs. /devices/net0 is a node of a
+  kind of its own (as /devices/framebuffer is the display's): a read
+  gives the link's record as things are at that moment (spec
+  `<NetworkLink>`, 64 bytes with its length first: whether the cable is
+  in (igb's status register, virtio-net's status word), DHCP still
+  asking, where the address is from (nowhere yet, DHCP, the settings
+  file), the speed where the card says it, the hardware address, the
+  driver's name, the address, netmask, gateway and name server, the
+  frames received and sent). std.os.brix's `networkLink(index, &link)`
+  reads it into a struct. A machine without a network device has no
+  such node. Until DHCP has answered the record has no address, and the
+  boot line is "brixOS: net0 has no address yet (DHCP is asking)".
+
+The settings app's Network page (projects/desktop/settings,
+network.brixos.mlx) shows that record for every link, read again every
+two seconds: connected or no cable, the address with its prefix length
+and "by DHCP" or "from the settings", gateway, name server, hardware
+address, driver, the frames; and how to give a fixed address
+(/system/settings/network, read at boot). Nothing is changed from the
+page yet.
 
 tools/check_brix_net.sh boots with the user network: DHCP, ping to the
 gateway, wget fetching files (a small one, a 400 KiB one, a missing one)
-from an HTTP server on the host, and the native calls (a stream to
-ourselves, a datagram, an echo). Not yet: IPv6, a lease's renewal.
+from an HTTP server on the host, the native calls (a stream to
+ourselves, a datagram, an echo), and the link's record as netcalls reads
+it; then again on a wire without a DHCP server (no address yet), on
+another network (192.168.76.0/26: the record has what that DHCP server
+answered, not what the stack starts with) and with a fixed address in
+the settings file. tools/check_brix_desktop.sh opens
+the Network page and pulls the cable. Not yet: IPv6, a lease's renewal,
+a second link, the configuration changed while the system runs.
 
 ## brixfs: the disk's format
 
@@ -966,8 +992,10 @@ opens the terminal with Alt+Enter (its window on the display, the blue
 of its title bar counted), types a command through the compositor into
 its shell (a file read back from the serial shell), moves the mouse
 through QEMU's monitor (the cursor's white counted right of the window),
-clicks the dock's apps button (the launcher comes up) and powers off.
-Xwayland is not on brixOS.
+clicks the dock's apps button (the launcher comes up), starts the
+settings app on its Network page (`control network`: what the kernel
+says of net0 on QEMU's user network, then "no cable" once QEMU's monitor
+pulls it) and powers off. Xwayland is not on brixOS.
 
 The programs carry their product names (projects/desktop and the system
 programs): the compositor is `kepler`, the terminal `vector`, the shell

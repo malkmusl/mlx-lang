@@ -314,10 +314,11 @@ output is descriptor 1
 errors is descriptor 2
 session kind (session) 6
 no directory role
+no network link (not found) 6
 END
 output | sed -n '/^@@ native$/,/^@@ end 7$/p' | sed '1d;$d' | grep -v '^$' > "$work/native.brix"
 diff "$work/native.expected" "$work/native.brix" > "$work/native.diff" || fail "the native calls answer otherwise (< expected, > brixOS): $(cat "$work/native.diff")"
-echo "ok   brixOS's own calls: handles, the one wait with deadlines, positioned and streaming reads and writes, the clock, process_exit"
+echo "ok   brixOS's own calls: handles, the one wait with deadlines, positioned and streaming reads and writes, the clock, no network link without a device, process_exit"
 
 # brixOS's events: the queue, the upcall, a wait it interrupts, a default
 # action, a fault through the upcall.
