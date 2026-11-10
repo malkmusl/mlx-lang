@@ -178,6 +178,7 @@ run 432_local_module_alias_runtime "a module bound to a local constant in a body
 run 433_narrow_integers_runtime "narrow integers canonical after left shifts, complements and narrowing casts"
 run 434_packed_struct_runtime "packed structs: fields at bit offsets in one word of 1, 2, 4 or 8 bytes, read and written with shifts and masks, signed fields with their sign, literals and constants, @bitCast to and from the word's integer"
 run 435_float_negative_zero_runtime "a float's negation flips its sign bit: -(0.0) is -0.0, in f32 and f64"
+run 436_function_type_in_builtin_runtime "a function type where a builtin takes a type: fn, ?fn and [*]?fn in @ptrCast"
 run 413_git_runtime "git object names, deltas applied, commits parsed, this checkout's HEAD read and its commits counted, a directory without a repository"
 run 418_h264_stream_runtime "H.264 parameter sets into the Vulkan video structures, every access unit of WebKit's test.mp4 as a picture with its references and slices, the DPB's output order against the file's presentation times, Annex B framing, a cut SPS refused"
 run 422_h264_cpu_decode_runtime "WebKit's test.mp4 (Main profile, B frames) decoded on the CPU through std.mp4 and std.h264: every picture, in presentation order, the planes' CRC-32 the reference decoding's"

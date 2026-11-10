@@ -191,6 +191,14 @@ pub fn main() -> u8 {
 
 (`tests/130_function_pointer_runtime.mlx` → 13)
 
+A function pointer may be absent (`?fn(u8) -> u8`, compared with `null`
+and called as `callback.?(1)`), kept in arrays (`[2]?fn(*S, u64) -> u64`)
+and cast from and to a raw pointer in `unsafe`; the type is written out
+where a builtin takes one, bare or under the type prefixes:
+`@ptrCast(fn(u8) -> u8, raw)`, `@ptrCast([*]?fn(*S, u64) -> u64, slots)`.
+
+(`tests/436_function_type_in_builtin_runtime.mlx` → 13)
+
 ## `inline`/`noinline`
 
 The `inline` and `noinline` modifiers are a request/veto, not a semantic
