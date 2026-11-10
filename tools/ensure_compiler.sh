@@ -508,6 +508,22 @@ negates_floats_by_sign() {
     return $ok
 }
 
+# Whether $1 types a function named in a module-level initializer above
+# its declaration (tests/439_function_before_declaration_runtime.mlx
+# exits 13).
+types_functions_named_ahead() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/439_function_before_declaration_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 gives a module-level var its floats and addresses
 # (tests/438_global_address_initializers_runtime.mlx exits 13).
 initializes_globals_with_addresses() {
@@ -879,6 +895,7 @@ probes=(
     "parses_function_types_in_builtins|function types as a builtin's type argument"
     "atomics_take_optional_pointers|atomics on optional pointers"
     "initializes_globals_with_addresses|module-level vars initialized with floats and addresses"
+    "types_functions_named_ahead|a function named in an initializer above its declaration"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

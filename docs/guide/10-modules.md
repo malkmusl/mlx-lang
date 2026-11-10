@@ -124,8 +124,10 @@ a pointer of its own or inside an array or struct literal. The global's
 bytes are static data, at one address wherever it is named (a table of
 functions other objects point into); the addresses in them are written
 when the program starts, before `main`
-(`tests/438_global_address_initializers_runtime.mlx`). A `const`
-aggregate, by contrast, is a value built where it is used. `pub var` opens it to
+(`tests/438_global_address_initializers_runtime.mlx`). The function
+named may be declared further down the module, as any module-level
+declaration may (`tests/439_function_before_declaration_runtime.mlx`). A
+`const` aggregate, by contrast, is a value built where it is used. `pub var` opens it to
 other modules, which read and write it as `module.name` and may take its
 address:
 
