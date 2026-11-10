@@ -117,11 +117,12 @@ echo "ok   every crash is kept in \$XDG_STATE_HOME/mlx/crashes.log, the context 
 # The rule: every program build.mlx declares (its root module) installs the
 # crash report first thing in main, so a crash anywhere on the system is
 # said and kept for MLX Observatory. The Android packages are left out:
-# their entry is the activity's, and std.crash's handler is x86-64's.
+# their entry is the activity's, and std.crash's handler is x86-64's; so is
+# brixOS's kernel, which is no process (it reports its own faults).
 # The coreutils install it through projects/coreutils' shared modules
 # (digest_cli.mlx for the sums) or their own main.
 missing=$(grep -oE '(Build\.)?program\(b, ([a-z_]+, )?"[^"]+", "[^"]+"' build.mlx | sed 's/.*", "//; s/"$//' | sort -u | while read -r root; do
-    [[ "$root" == *coreutils* || "$root" == *android* ]] && continue
+    [[ "$root" == *coreutils* || "$root" == *android* || "$root" == projects/brix/kernel/* ]] && continue
     grep -qE 'crash[a-z_]*\.install\(' "$root" || echo "$root"
 done)
 [[ -z "$missing" ]] || fail "these programs do not install the crash report (std.crash install() first in main): $missing"

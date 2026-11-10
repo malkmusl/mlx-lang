@@ -26,6 +26,12 @@
 // the frame pointers for the callers. Without a name an address is shown
 // as the file and the offset in it.
 //
+// On a system without those files (brixOS: its Linux layer has
+// /proc/self/exe alone) the report is the same: the program's own file
+// says where its segments are loaded (readMappings) and what it is called
+// (programName), and is read into memory where it cannot be mapped
+// (mapFile).
+//
 // A C or C++ program mlx-cc linked has the functions' own names in its
 // symbol table, a C++ one's mangled; the report says the C++ spelling
 // after it (std.demangle), and where the function was defined from the
@@ -71,6 +77,7 @@ const leaks = @import("./leaks.mlx")
 const turns = @import("./turns.mlx")
 const demangle = @import("./demangle.mlx")
 
+const EINTR: isize = -4
 const SA_SIGINFO: usize = 4
 const SA_ONSTACK: usize = 134217728
 const SA_RESTORER: usize = 67108864
@@ -87,7 +94,8 @@ const SI_ADDR_OFFSET: usize = 16
 // siginfo_t's si_code for a signal sent with sigqueue.
 const SI_QUEUE: usize = 4294967295
 // ucontext_t: uc_flags, uc_link, uc_stack (24 bytes), then uc_mcontext,
-// whose gregs hold rbp at 10, rsp at 15 and rip at 16.
+// whose gregs hold rbp at 10, rsp at 15, rip at 16 and the number of the
+// processor's exception at 20.
 const GREGS_OFFSET: usize = 40
 // The general registers in gregs' order (r8 to r15, rdi, rsi, rbp, rbx,
 // rdx, rax, rcx, rsp; rip at 16).
@@ -98,6 +106,10 @@ const SI_KERNEL: usize = 128
 const RBP_OFFSET: usize = 40 + 10 * 8
 const RSP_OFFSET: usize = 40 + 15 * 8
 const RIP_OFFSET: usize = 40 + 16 * 8
+const TRAP_OFFSET: usize = 40 + 20 * 8
+// The exception a page raises: it has an address, whatever si_code says
+// (brixOS's Linux layer says SI_KERNEL for every fault).
+const TRAP_PAGE_FAULT: usize = 14
 
 // The memory the handler maps when a crash comes: /proc/self/maps, the
 // message, the record and a path.
@@ -108,6 +120,12 @@ const SCRATCH_SIZE: usize = 1048576
 // that the arena ran out.
 var arenaBase: usize = 0
 const ARENA_ROOM: usize = 1048576
+// Values lie below the arena's end, so memory the handler maps holds them
+// only where the kernel places it below the arena (Linux). Where new
+// mappings go above it (brixOS), install() keeps this much of the arena
+// itself for the handler, from the start: its address, 0 when none is
+// kept.
+var arenaRoom: usize = 0
 // What the program said it was doing (context): the text's address and
 // length, read when a crash comes, and the buffer contextAt() puts its
 // text together in. A context longer than this much is cut in the report.
@@ -118,6 +136,11 @@ const CONTEXT_SIZE: usize = 1024
 var contextBuffer: [1024]u8 = undefined
 const MAPS_AT: usize = 0
 const MAPS_SIZE: usize = 524288
+// Where readMappings reads the program's ELF header and program headers
+// (the first PROGRAM_HEADERS of them) when it makes the lines itself: in
+// the mappings' own buffer, past the lines (which end before TEXT_SIZE).
+const PROGRAM_FILE_AT: usize = 262144
+const PROGRAM_HEADERS: usize = 64
 const MESSAGE_AT: usize = 524288
 const RECORD_AT: usize = 655360
 const PATH_AT: usize = 786432
@@ -294,16 +317,16 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
     }
     // Before any value of the handler's own: a full arena is the crash.
     var arena_full = false
+    const room = if arenaRoom != 0 { arenaRoom } else { mapped + SCRATCH_SIZE }
     if arenaBase != 0 && turns.left(arenaBase) < ARENA_ROOM {
         arena_full = true
-        const room = mapped + SCRATCH_SIZE
         if room + ARENA_ROOM <= turns.end(arenaBase) { turns.moveFill(arenaBase, room) }
     }
-    reportRoom = mapped + SCRATCH_SIZE
+    reportRoom = room
     var scratch: [*]u8 = undefined
     unsafe { scratch = @ptrFromInt([*]u8, mapped) }
     const maps = offsetPointer(scratch, MAPS_AT)
-    const maps_length = fs.readFile("/proc/self/maps".pointer, maps, MAPS_SIZE - 1)
+    const maps_length = readMappings(maps)
     reportScratch = mapped
     reportMapsLength = maps_length
     const message = offsetPointer(scratch, MESSAGE_AT)
@@ -313,11 +336,10 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
     reportMessage = @intFromPtr(message)
     reportRecord = @intFromPtr(record)
 
-    // The program's name (the dock uses this too), from /proc/self/comm.
-    var name: [32]u8 = undefined
+    // The program's name (the dock uses this too).
+    var name: [64]u8 = undefined
     const name_into: [*]u8 = &name
-    var name_length = fs.readFile("/proc/self/comm".pointer, name_into, 31)
-    if name_length > 0 && name[name_length - 1] == 10 { name_length -= 1 }
+    const name_length = programName(name_into, 64, offsetPointer(scratch, PATH_AT))
     if name_length == 0 {
         put(message, &message_length, "mlx")
         put(record, &record_length, "mlx")
@@ -347,7 +369,7 @@ export fn mlxCompositorCrashed(signal: i32, info: usize, context: usize) -> void
         put(message, &message_length, "illegal instruction (the values' arena is full: 1 GiB of values never given back, a loop that does not release its turns with std.turns)")
     } else if signal == 4 {
         put(message, &message_length, "illegal instruction (a failed runtime check: an index out of range, an unsigned subtraction below zero, an overflow)")
-    } else if signal == 11 && info != 0 && wordsAt(info)[1] & 4294967295 == SI_KERNEL {
+    } else if signal == 11 && info != 0 && wordsAt(info)[1] & 4294967295 == SI_KERNEL && registers[TRAP_OFFSET / 8] != TRAP_PAGE_FAULT {
         // A general protection fault: an address no page can have (bits
         // above the 47th not all equal; the kernel says 0). The registers
         // show which (a pointer with mlx-cc's evaluator's tags in its top
@@ -600,7 +622,14 @@ fn appendCut(buffer: [*]u8, length: *usize, text: []const u8) -> void {
 // crash, "NAME: failed: REASON" with the functions that called this, then
 // the program ends (exit status 1). Without the handler installed it only
 // ends.
+//
+// The handler is called from here, as the kernel calls it for a signal
+// (failFrom): that asks nothing of the kernel, and brixOS's Linux layer
+// cannot queue a signal with a value. Where this copy of the module
+// installed none, the reason goes with a signal the process queues for
+// itself, to the handler another copy installed if one did.
 pub fn fail(reason: []const u8) -> void {
+    if installed { failFrom(@frameAddress(), reason) }
     var text: [2]usize = [2]usize{ 0, reason.length }
     text[0] = @intFromPtr(reason.pointer)
     // siginfo_t: signo, errno; code; pid, uid; value (the reason).
@@ -621,6 +650,141 @@ pub fn fail(reason: []const u8) -> void {
         _ = io.writeAll(io.stderr(), "\n")
     }
     linux.exitGroup(1)
+}
+
+// fail()'s report, made from where it is: the handler gets the siginfo a
+// queued signal would bring (the reason as its value, this process as its
+// sender) and a context as far as it reads one, with `frame` (fail's
+// own) as the frame and the stack pointer, so the first caller it finds
+// is fail's. It does not return.
+fn failFrom(frame: usize, reason: []const u8) -> void {
+    var text: [2]usize = [2]usize{ 0, reason.length }
+    text[0] = @intFromPtr(reason.pointer)
+    var info: [16]usize = [16]usize{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    info[0] = linux.SIGUSR2
+    info[1] = SI_QUEUE
+    info[2] = @bitCast(usize, linux.getpid()) & 4294967295
+    info[3] = @intFromPtr(&text)
+    var registers: [32]usize = undefined
+    var index: usize = 0
+    while index < 32 {
+        registers[index] = 0
+        index += 1
+    }
+    registers[RBP_OFFSET / 8] = frame
+    registers[RSP_OFFSET / 8] = frame
+    unsafe { registers[RIP_OFFSET / 8] = @intFromPtr(fail) }
+    mlxCompositorCrashed(@intCast(i32, linux.SIGUSR2), @intFromPtr(&info), @intFromPtr(&registers))
+}
+
+// The program's name into `into` (`capacity` bytes), its length: what
+// /proc/self/comm says, else the last component of the path
+// /proc/self/exe links to (brixOS has no comm), read into `path` (4096
+// bytes of the scratch memory); 0 when the kernel says neither.
+fn programName(into: [*]u8, capacity: usize, path: [*]u8) -> usize {
+    var length = fs.readFile("/proc/self/comm".pointer, into, capacity)
+    if length > 0 && into[length - 1] == 10 { length -= 1 }
+    if length > 0 { return length }
+    const linked = linux.syscall3(linux.SYS_readlink, @intFromPtr("/proc/self/exe".pointer), @intFromPtr(path), 4096)
+    if linked <= 0 { return 0 }
+    var start: usize = 0
+    var at: usize = 0
+    while at < @bitCast(usize, linked) {
+        if path[at] == 47 { start = at + 1 }
+        at += 1
+    }
+    while start + length < @bitCast(usize, linked) && length < capacity {
+        into[length] = path[start + length]
+        length += 1
+    }
+    return length
+}
+
+// The process's mappings as /proc/self/maps lists them, into `into`
+// (MAPS_SIZE bytes); the text's length. Where the kernel has no such file
+// (or an empty one) the program's own segments stand in, a line each as
+// the kernel would write it, from the program headers of its file (the one
+// /proc/self/exe links to):
+//
+//     00400000-00420000 r-xp 00000000 00:00 0 /system/programs/polaris
+//
+// which is where they are for a program linked at its addresses (ET_EXEC:
+// every program of brixOS); where a position-independent one was loaded
+// its file does not say. Nothing else is in that list (no stack, no
+// memory mapped since), which mappingsOfProgram says.
+var mappingsOfProgram: bool = false
+
+const ET_EXEC: usize = 2
+const PT_LOAD: usize = 1
+const PF_X: usize = 1
+const PF_W: usize = 2
+const PF_R: usize = 4
+
+fn readMappings(into: [*]u8) -> usize {
+    mappingsOfProgram = false
+    var length = fs.readFile("/proc/self/maps".pointer, into, MAPS_SIZE - 1)
+    if length > 0 { return length }
+    mappingsOfProgram = true
+    // (Opened by the link itself: the path it names may be another file
+    // by now.)
+    const file = linux.syscall3(linux.SYS_open, @intFromPtr("/proc/self/exe".pointer), 0, 0)
+    if file < 0 { return 0 }
+    const header = @intFromPtr(into) + PROGRAM_FILE_AT
+    const magic = bytesAt(header)
+    if readAt(file, header, 64, 0) && magic[0] == 127 && magic[1] == 69 && magic[2] == 76 && magic[3] == 70 && magic[4] == 2 && read16(header, 16) == ET_EXEC {
+        const segments = header + 64
+        var count = read16(header, 56)
+        if count > PROGRAM_HEADERS { count = PROGRAM_HEADERS }
+        if !readAt(file, segments, count * 56, read64(header, 32)) { count = 0 }
+        var index: usize = 0
+        while index < count {
+            const segment = segments + index * 56
+            index += 1
+            if read32(segment, 0) != PT_LOAD { continue }
+            const flags = read32(segment, 4)
+            const address = read64(segment, 16)
+            putMapped(into, &length, address & 18446744073709547520)
+            put(into, &length, "-")
+            putMapped(into, &length, (address + read64(segment, 40) + 4095) & 18446744073709547520)
+            put(into, &length, if flags & PF_R != 0 { " r" } else { " -" })
+            put(into, &length, if flags & PF_W != 0 { "w" } else { "-" })
+            put(into, &length, if flags & PF_X != 0 { "xp " } else { "-p " })
+            putMapped(into, &length, read64(segment, 8) & 18446744073709547520)
+            put(into, &length, " 00:00 0 ")
+            // The file's path, as the link says it (straight into the
+            // line: no memory of the handler's own for it).
+            const linked = linux.syscall3(linux.SYS_readlink, @intFromPtr("/proc/self/exe".pointer), @intFromPtr(into) + length, 4000)
+            if linked > 0 { length += @bitCast(usize, linked) }
+            put(into, &length, "\n")
+        }
+    }
+    linux.close(file)
+    return length
+}
+
+// A number as /proc/self/maps writes its addresses and offsets:
+// hexadecimal, eight digits at least.
+fn putMapped(at: [*]u8, length: *usize, value: usize) -> void {
+    var shift: usize = 60
+    while true {
+        const digit = (value >> shift) & 15
+        if shift < 32 || value >> shift != 0 { putByte(at, length, if digit < 10 { @intCast(u8, 48 + digit) } else { @intCast(u8, 87 + digit) }) }
+        if shift == 0 { break }
+        shift -= 4
+    }
+}
+
+// Reads exactly `count` bytes of `file` from `offset` to `address`; false
+// when the file ends before or cannot be read.
+fn readAt(file: isize, address: usize, count: usize, offset: usize) -> bool {
+    var done: usize = 0
+    while done < count {
+        const got = linux.syscall4(linux.SYS_pread64, @bitCast(usize, file), address + done, count - done, offset + done)
+        if got == EINTR { continue }
+        if got <= 0 { return false }
+        done += @bitCast(usize, got)
+    }
+    return true
 }
 
 // Whether `address` is in an executable mapping.
@@ -668,6 +832,19 @@ fn describeFault(maps: [*]u8, length: usize, fault: usize, rsp: usize, out: [*]u
             stack_at = at
         }
         line = at + 1
+    }
+    // (A list of the program's own segments alone, readMappings, does
+    // not say what else is mapped: only where the stack pointer is.)
+    if mappingsOfProgram {
+        put(out, out_length, " (the stack pointer ")
+        putHex(out, out_length, rsp)
+        if fault < rsp {
+            put(out, out_length, " is ")
+            putNumber(out, out_length, (rsp - fault + 1023) / 1024)
+            put(out, out_length, " KiB above it")
+        }
+        put(out, out_length, ")")
+        return
     }
     put(out, out_length, " (in no mapping")
     if above_start != 0 && above_start - fault < 1073741824 {
@@ -785,7 +962,7 @@ fn describe(address: usize, exact: bool, maps: [*]const u8, maps_length: usize, 
 // A return address named as a crash's frames are (path:line:name+0xOFFSET,
 // else the file and the offset in it), into `out`: std.leaks gives this to
 // the debug allocator for the places blocks were allocated and freed. It
-// keeps a scratch mapping for the next time and reads /proc/self/maps each
+// keeps a scratch mapping for the next time and reads the mappings each
 // time (modules come and go).
 var describeScratch: usize = 0
 
@@ -801,7 +978,7 @@ pub fn describeReturn(address: usize, out: [*]u8, out_length: *usize) -> void {
     var scratch: [*]u8 = undefined
     unsafe { scratch = @ptrFromInt([*]u8, describeScratch) }
     const maps = offsetPointer(scratch, MAPS_AT)
-    const maps_length = fs.readFile("/proc/self/maps".pointer, maps, MAPS_SIZE - 1)
+    const maps_length = readMappings(maps)
     describe(address - 1, false, maps, maps_length, scratch, out, out_length)
 }
 
@@ -870,9 +1047,10 @@ fn memfdPath(path: [*]const u8, into: [*]u8) -> bool {
     return found
 }
 
-// The file the last address was named from: mapped read-only, with its
-// functions sorted by address (pairs of words: the address, the symbol's
-// offset in the file), both kept for the next frame in the same file.
+// The file the last address was named from: mapped read-only (or read
+// into memory: mapFile), with its functions sorted by address (pairs of
+// words: the address, the symbol's offset in the file), both kept for the
+// next frame in the same file.
 var cachedPath: [4096]u8 = undefined
 var cachedPathLength: usize = 0
 var cachedImage: usize = 0
@@ -939,7 +1117,18 @@ fn mapFile(path: [*]const u8) -> bool {
     if file < 0 { return false }
     const size = linux.syscall3(linux.SYS_lseek, @bitCast(usize, file), 0, 2)
     var mapped: isize = -1
-    if size > 64 { mapped = linux.syscall6(linux.SYS_mmap, 0, @bitCast(usize, size), 1, 2, @bitCast(usize, file), 0) }
+    if size > 64 {
+        mapped = linux.syscall6(linux.SYS_mmap, 0, @bitCast(usize, size), 1, 2, @bitCast(usize, file), 0)
+        // Where a file cannot be mapped (brixOS's Linux layer maps memory
+        // alone): memory of its size with the file read into it, which
+        // forgetFile gives back the same way.
+        if mapped < 0 {
+            const memory = linux.mapAnonymous(@bitCast(usize, size))
+            if memory != 0 {
+                if readAt(file, memory, @bitCast(usize, size), 0) { mapped = @bitCast(isize, memory) } else { linux.munmap(memory, @bitCast(usize, size)) }
+            }
+        }
+    }
     linux.close(file)
     if mapped < 0 { return false }
     cachedImage = @bitCast(usize, mapped)
@@ -1208,6 +1397,9 @@ export fn mlxCompositorSignalReturn() -> void {
     _ = linux.syscall0(linux.SYS_rt_sigreturn)
 }
 
+// Whether install() put the handler in place (fail() calls it itself).
+var installed: bool = false
+
 // Installs the handler for the fatal signals, on a stack of its own, and
 // starts std.leaks' watch when MLX_LEAK_CHECK asks for it; false when the
 // kernel refused the handler (the default action then remains).
@@ -1231,7 +1423,14 @@ pub fn install() -> bool {
     for signal in signals {
         if linux.syscall4(linux.SYS_rt_sigaction, signal, @intFromPtr(&action), 0, 8) != 0 { ok = false }
     }
+    installed = ok
     arenaBase = turns.locate()
+    // The handler's room in the arena, where what it maps would lie above
+    // it (as the stack just mapped does).
+    if arenaBase != 0 && arenaRoom == 0 && stack > arenaBase && turns.left(arenaBase) > 2 * ARENA_ROOM {
+        arenaRoom = turns.fillWord(arenaBase).*
+        turns.moveFill(arenaBase, arenaRoom + ARENA_ROOM)
+    }
     // The rest of the runtime's diagnostics: with MLX_LEAK_CHECK the
     // program's memory is watched from here on (std.leaks), its reports
     // naming the frames as the crash report does.
