@@ -15,9 +15,19 @@ const Bytes = @import("./bytes.mlx").Bytes
 const keyboard = @import("./keyboard.mlx")
 const mouse = @import("./mouse.mlx")
 const console = @import("./console.mlx")
+const clock = @import("./clock.mlx")
 const Page = memory.Page
+const Deadline = clock.Deadline
 
-const PATIENCE: usize = 100000000
+// How long each wait may take, in milliseconds (deadlines on the clock: a
+// count of register reads is a blink on one machine and minutes on
+// another). A controller halts within 16 ms and resets within a few; a
+// device may take its time over a request.
+const HALT_MS: usize = 1000
+const RESET_MS: usize = 2000
+const HANDOFF_MS: usize = 1000
+const PORT_MS: usize = 500
+const EVENT_MS: usize = 3000
 // The register block (the capability, operational, runtime and doorbell
 // registers: BAR0, 64 KiB), what is mapped.
 const REGISTERS: usize = 0x10000
@@ -138,18 +148,28 @@ pub const Xhci = struct {
         self.*.maxSlots = @intCast(usize, hcs1 & 0xFF)
         self.*.maxPorts = @intCast(usize, (hcs1 >> 24) & 0xFF)
         self.*.contextSize = if self.cap32(0x10) & 0x4 != 0 { 64 } else { 32 }
+        // (A controller that is not there reads as all ones.)
+        if hcs1 == 0xFFFFFFFF || caplength < 0x20 {
+            console.out.write("usb: no controller answers at its registers\n")
+            return false
+        }
+        self.handoff()
         // Stop, then reset.
         self.op(0x00).* = self.op(0x00).* & @intCast(u32, 0xFFFFFFFF ^ 1)
-        var tries: usize = 0
+        var deadline = Deadline.after(HALT_MS)
         while self.op(0x04).* & 1 == 0 {
-            tries += 1
-            if tries > PATIENCE { return false }
+            if deadline.passed() {
+                console.out.write("usb: the controller does not halt\n")
+                return false
+            }
         }
         self.op(0x00).* = 0x2 // HCRST
-        tries = 0
+        deadline = Deadline.after(RESET_MS)
         while self.op(0x00).* & 0x2 != 0 || self.op(0x04).* & 0x800 != 0 {
-            tries += 1
-            if tries > PATIENCE { return false }
+            if deadline.passed() {
+                console.out.write("usb: the controller does not come out of its reset\n")
+                return false
+            }
         }
         const frames = memory.allFrames()
         self.*.dcbaa = frames.allocate()
@@ -192,22 +212,60 @@ pub const Xhci = struct {
         self.write64rt(0x30, self.*.erst) // ERSTBA
         // Run.
         self.op(0x00).* = 1
-        tries = 0
+        deadline = Deadline.after(HALT_MS)
         while self.op(0x04).* & 1 != 0 {
-            tries += 1
-            if tries > PATIENCE { return false }
+            if deadline.passed() {
+                console.out.write("usb: the controller does not run\n")
+                return false
+            }
         }
         return true
+    }
+
+    // The controller taken from the firmware (the USB Legacy Support
+    // capability among the extended ones: our ownership asked for, the
+    // firmware's waited to go, taken anyway after a second) and the
+    // firmware's interrupts for it (SMIs: its keyboard emulation) off.
+    // A firmware that still holds the controller answers its events
+    // beside us.
+    fn handoff(self: *const Self) -> void {
+        var offset = @intCast(usize, (self.cap32(0x10) >> 16) & 0xFFFF) << 2
+        var guard: usize = 0
+        while offset != 0 && offset + 8 <= REGISTERS && guard < 64 {
+            const capability = unsafe { @ptrFromInt(*u32, self.*.regs + offset) }
+            const value = @intCast(usize, capability.*)
+            if value & 0xFF == 1 {
+                if value & 0x10000 != 0 {
+                    capability.* = @intCast(u32, value | 0x1000000)
+                    const deadline = Deadline.after(HANDOFF_MS)
+                    while @intCast(usize, capability.*) & 0x10000 != 0 {
+                        if deadline.passed() {
+                            console.out.write("usb: the firmware keeps the controller (taken anyway)\n")
+                            capability.* = @intCast(u32, (@intCast(usize, capability.*) & ~@intCast(usize, 0x10000)) | 0x1000000)
+                            break
+                        }
+                    }
+                }
+                // USBLEGCTLSTS: every SMI enable off, the events (write 1
+                // to clear) cleared.
+                const control = unsafe { @ptrFromInt(*u32, self.*.regs + offset + 4) }
+                control.* = @intCast(u32, (@intCast(usize, control.*) & 0x000E1FEE) | 0xE0000000)
+                return
+            }
+            const next = (value >> 8) & 0xFF
+            if next == 0 { return }
+            offset += next << 2
+            guard += 1
+        }
     }
 
     // Waits for the next event with our cycle; returns whether one came and
     // leaves its four dwords in `out` (a 4-word buffer).
     fn nextEvent(self: *Self, out: *[4]usize) -> bool {
         const trb = Bytes.pointer(layout.Memory.virtual(self.*.event) + self.*.eventDequeue * 16)
-        var tries: usize = 0
+        const deadline = Deadline.after(EVENT_MS)
         while Bytes.read32(trb, 12) & 1 != self.*.eventCycle {
-            tries += 1
-            if tries > PATIENCE { return false }
+            if deadline.passed() { return false }
         }
         out.*[0] = Bytes.read32(trb, 0)
         out.*[1] = Bytes.read32(trb, 4)
@@ -324,21 +382,23 @@ fn enumerate(self: *Xhci) -> void {
         }
         console.out.write("usb: port ")
         console.out.decimal(port)
-        console.out.write(" connected (portsc 0x")
+        console.out.write(" connected (portsc ")
         console.out.hex(@intCast(usize, portsc))
         console.out.write(")\n")
         // Reset the port (keep PP, clear the write-1-to-clear change bits
         // and PED), then wait for it to enable.
         self.portReg(port).* = (portsc & @intCast(u32, 0xFFFFFFFF ^ 0x00FE0002)) | 0x10
-        var tries: usize = 0
-        while self.portReg(port).* & 0x2 == 0 {
-            tries += 1
-            if tries > PATIENCE { break }
-        }
-        var spin: usize = 0
-        while spin < 2000000 { spin += 1 }
+        const enabled = Deadline.after(PORT_MS)
+        while self.portReg(port).* & 0x2 == 0 && !enabled.passed() {}
+        // (The device's time to recover from the reset.)
+        clock.pause(20000)
         const after = self.portReg(port).*
         if after & 0x2 == 0 {
+            console.out.write("usb: port ")
+            console.out.decimal(port)
+            console.out.write(" does not enable after its reset (portsc ")
+            console.out.hex(@intCast(usize, after))
+            console.out.write(")\n")
             port += 1
             continue
         }
@@ -350,9 +410,27 @@ fn enumerate(self: *Xhci) -> void {
     }
 }
 
+// "usb: port N: TEXT" (and the controller's completion code, when one
+// says why): where a device's bring-up ended.
+fn gaveUp(port: usize, text: []const u8, code: usize) -> void {
+    console.out.write("usb: port ")
+    console.out.decimal(port)
+    console.out.write(": ")
+    console.out.write(text)
+    if code != 0 {
+        console.out.write(" (completion code ")
+        console.out.decimal(code)
+        console.out.write(")")
+    }
+    console.out.write("\n")
+}
+
 fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memory.Frames) -> void {
     const res = self.runCommand(0, TRB_ENABLE_SLOT << 10)
-    if res & 0xFF != 1 { return }
+    if res & 0xFF != 1 {
+        gaveUp(port, "no slot for it", res & 0xFF)
+        return
+    }
     const slot = (res >> 8) & 0xFF
     console.out.write("usb: port ")
     console.out.decimal(port)
@@ -380,14 +458,23 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
     Bytes.write32(contextAt(inctx, 2, cs), 4, (mp0 << 16) | (4 << 3) | (3 << 1))
     Bytes.write64(contextAt(inctx, 2, cs), 8, ep0.base | 1)
     const addressed = self.runCommand(inctx, (TRB_ADDRESS_DEVICE << 10) | (slot << 24))
-    if addressed & 0xFF != 1 { return }
+    if addressed & 0xFF != 1 {
+        gaveUp(port, "the device takes no address", addressed & 0xFF)
+        return
+    }
     const buffer = frames.allocate()
     if buffer == 0 { return }
     // The configuration descriptor (its total length, then the whole).
-    if !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0200, 0, 9, buffer, true) { return }
+    if !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0200, 0, 9, buffer, true) {
+        gaveUp(port, "the device does not describe itself", 0)
+        return
+    }
     var total = Bytes.read16(Bytes.pointer(layout.Memory.virtual(buffer)), 2)
     if total > Page.SIZE { total = Page.SIZE }
-    if !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0200, 0, total, buffer, true) { return }
+    if total < 9 || !controlTransfer(self, &ep0, slot, 0x80, 6, 0x0200, 0, total, buffer, true) {
+        gaveUp(port, "the device does not describe its configuration", 0)
+        return
+    }
     // Walk the descriptors, collecting every boot-HID interface (keyboard
     // protocol 1, mouse protocol 2) with its own interrupt-IN endpoint. A
     // device can carry more than one (a keyboard with a mouse-emulation
@@ -448,7 +535,10 @@ fn setupDevice(self: *Xhci, port: usize, speed: usize, cs: usize, frames: *memor
         console.out.write(": no boot-HID interface\n")
         return
     }
-    if !controlTransfer(self, &ep0, slot, 0x00, 9, configValue, 0, 0, 0, false) { return } // SET_CONFIGURATION
+    if !controlTransfer(self, &ep0, slot, 0x00, 9, configValue, 0, 0, 0, false) { // SET_CONFIGURATION
+        gaveUp(port, "the device does not take its configuration", 0)
+        return
+    }
     // Configure each collected interface's interrupt endpoint and register
     // a HID for it.
     var entries: usize = 1
@@ -724,12 +814,27 @@ pub fn probe() -> bool {
     controller.present = false
     controller.hidCount = 0
     const address = Pci.findClass(0x0C0330, 0xFFFFFF, 0)
-    if address == Pci.NONE { return false }
+    if address == Pci.NONE {
+        console.out.write("usb: no xHCI controller\n")
+        return false
+    }
     Pci.enableMemory(address)
     const base = Pci.memBase(address, 0)
+    console.out.write("usb: xHCI controller ")
+    console.out.hexByte((address >> 16) & 0xFF)
+    console.out.write(":")
+    console.out.hexByte((address >> 11) & 0x1F)
+    console.out.write(".")
+    console.out.decimal((address >> 8) & 0x7)
+    console.out.write(", registers at ")
+    console.out.hex(base)
+    console.out.write("\n")
     if base == 0 { return false }
     controller.regs = memory.Device.map(base, REGISTERS, memory.Device.UNCACHED)
-    if controller.regs == 0 { return false }
+    if controller.regs == 0 {
+        console.out.write("usb: no room to map its registers\n")
+        return false
+    }
     if !controller.start() { return false }
     controller.present = true
     enumerate(&controller)
