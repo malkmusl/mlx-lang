@@ -123,7 +123,9 @@ are named for what they hold:
     /system/fonts      the fonts of the boot archive (DejaVu Sans Mono)
     /users/root        the user's home (the shell starts there)
     /temporary         scratch space (init/control, the init's FIFO;
-                       logs/NAME.log, the services' output)
+                       logs/NAME.log, the services' output;
+                       screen-picture, the last frame of the program
+                       that left the screen, for the one that takes it)
     /volumes           each disk's volume (diskN: brixfs, or ext2
                        read-only) and the brixfs volumes' snapshots
 
@@ -706,7 +708,11 @@ view of these (linux/signals.mlx): a signal number is an event with the
 number as its detail, so it comes back as sent; handlers, masks and
 rt_sigframes are the Linux layer's, and wait4's status words its
 encoding. A process that has claimed nothing and set no upcall sees its
-events that way. projects/brix/tools/events shows the native side.
+events that way; and a fault a process has not claimed still goes to a
+handler it has there for the fault's signal, so a program that takes
+some kinds itself (the compositor its terminate event) keeps the crash
+report std.crash installed (tools/check_brix_crash.sh).
+projects/brix/tools/events shows the native side.
 
 std on brixOS: a program built with --target=x86_64-brixos reads and
 writes its files by brixOS's own calls (std/bootstrap/fs.mlx and

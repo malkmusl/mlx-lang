@@ -608,8 +608,24 @@ brix-keymap into the boot image). Programs and the helpers start with
 process_spawn ([`children.brixos.mlx`](children.brixos.mlx), the
 helper's channel end as its own role; [`children.mlx`](children.mlx) is
 the Linux side of the same interface, fork, execve and socket pairs).
-No logind, VT, D-Bus, Vulkan or Xwayland there, and no greeter yet.
-tools/check_brix_desktop.sh runs it in QEMU.
+Its first frames fade in from the picture the program before left on the
+screen (the splash, the greeter's compositor, a session's). That picture
+is never read back from the framebuffer (video memory, mapped
+write-combining: fast to write, seconds to read): the program that
+leaves the screen hands its last frame on in a file,
+/temporary/screen-picture ([`../splash/picture.mlx`](../splash/picture.mlx):
+the width, the height and the pixels' order, then the pixels; in memory
+when the system runs from its boot archive, on the disk's /temporary when
+it runs from a disk), which the next one reads and removes; without one, or with one of another size,
+the first frame is simply drawn. The compositor leaves its own when it
+ends, also when it is told to (the terminate event, which sentinel sends
+the greeter's before the session starts and the init a service it
+stops); one that is killed or crashes leaves none, and the next starts
+without a fade.
+No logind, VT, D-Bus, Vulkan or Xwayland there; the login is sentinel's,
+with aurora as the greeter on a compositor of its own
+(tools/check_brix_login.sh). tools/check_brix_desktop.sh runs the desktop
+in QEMU.
 
 ## Desktop session (GDM, SDDM)
 
