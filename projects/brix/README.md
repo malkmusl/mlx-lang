@@ -1086,6 +1086,24 @@ projects/desktop/apps). The image ships Vector.app (the terminal), its
 icon a dark window with a green prompt. (The boot archive's names were
 widened to 72 bytes to hold the bundle paths.)
 
+An app is one thing to the launcher, the dock and the top bar: all three
+ask apps.mlx's `find` which entry a name stands for. An entry is found by
+its **id**, the app id its program gives its windows (`Id=org.mlx.files`
+in Polaris.app's app.ini; a desktop entry's file name), by its own file
+name (`Polaris`) and by its StartupWMClass (`polaris`, the program). So
+the top bar names a window by its entry's Name, the dock shows it with
+the bundle's icon.png (the terminal too: Vector's icon as in the
+launcher, no sign of the dock's own), and "Pin to Dock" (the dock's menu,
+the launcher's, or the app dragged from the launcher onto the dock) writes
+the id into the user's settings, /users/NAME/.config/mlx/dock, where the
+next dock finds it. tools/check_brix_apps.sh starts Polaris, Control and
+Vector from the launcher and looks at the bar's names, the dock's icons
+and the pins (pinned by the dock's menu, there again after the desktop is
+started again, unpinned; pinned and unpinned by the launcher's menu, the
+latter from a pins file of before that names the app twice; pinned by
+dragging); tests/run_desktop_apps.sh asks the same of apps.mlx on the
+host.
+
 ## The login
 
 Instead of the desktop as root, the boot image can start a login, all on

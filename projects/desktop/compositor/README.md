@@ -208,6 +208,12 @@ that stays shows at once (a second click closes it). Both look every few
 seconds (the launcher also whenever it is shown) whether apps were
 installed or removed (the application directories' modification times)
 and the dock whether `~/.config/mlx/dock` changed, and take the changes in.
+Which app a window's app id or a pin stands for, the launcher, the dock
+and the top bar ask in one place (projects/desktop/shared/apps.mlx,
+`find`: an entry's `Id=` or file name, its StartupWMClass), so its name
+and its icon are the same in all three; with `--verbose` the helpers say
+in the log what they show for each app (the compositor hands that on as
+`MLX_DESKTOP_VERBOSE=1`).
 It shows an apps button, the pinned apps,
 and after a separator the apps that have windows but are not pinned; a dot
 marks an app that runs. Icons grow under the pointer, which shows the
