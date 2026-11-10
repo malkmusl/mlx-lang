@@ -554,6 +554,21 @@ ends_functions_with_endless_loops() {
     return $ok
 }
 
+# Whether functions $1 builds begin at multiples of 16
+# (tests/442_function_alignment_runtime.mlx exits 13).
+aligns_functions() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/442_function_alignment_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 resolves the records of modules that import one another and
 # name one another (tests/441_types_across_import_ring_runtime.mlx exits
 # 13).
@@ -963,6 +978,7 @@ probes=(
     "resolves_types_across_import_rings|records of modules that import one another naming one another"
     "leaves_brixos_by_process_exit|a linked brixOS program leaving by process_exit"
     "reads_constant_tables_from_static_data|module-level const tables read from static data"
+    "aligns_functions|functions at multiples of 16"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

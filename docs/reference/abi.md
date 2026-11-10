@@ -43,6 +43,15 @@ caller/callee-saved sets are fixed by `spec/01-abi/mlxcc-x86_64.xml`:
 <CalleeSaved>rbx rbp r12 r13 r14 r15 rsp</CalleeSaved>
 ```
 
+A function begins at a multiple of 16 bytes (the bytes before it, after
+the function above, are never run), so a function's address is even and
+its low bits are free: a word that is a function's address or an odd
+number tells the two apart
+(`tests/442_function_alignment_runtime.mlx`). A function's address as an
+integer is `@intFromPtr(name)`, and `@ptrFromInt(fn(...) -> T, word)`
+makes the function of it again; `&name` is the address of a copy of the
+function value, not the function's.
+
 That is the same register order and stack-growth direction as the x86_64
 System V ABI, with no red zone. `136_six_register_parameters_runtime.mlx`
 exercises all six integer argument registers directly:

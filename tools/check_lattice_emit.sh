@@ -127,6 +127,7 @@ feature variadic variadic "functions with variable arguments: va_start, va_arg, 
 feature system system "the system by number as foreign code calls it: a futex wait and wake, fcntl, and sscanf"
 feature jumps jumps "goto: labels at a function's top (a parser's loop) and in a loop's body (a scanner's), a goto out of two loops; a switch whose cases run on and one with a break inside an if; continue and break across them"
 feature hides hides "a member with the name of a base class's member, twice over: both fields of the record, each reached by its class"
+feature members members "pointers to member functions in a table, called through this and through a reference, a virtual one, a pointer to a data member; a derived object where its base is taken"
 feature cnames cnames "C's struct stat beside stat(), sigaction, std::copysign beside C's copysign: the names kept apart"
 feature casts casts "a cast that keeps the element under an address taken again, an array's storage as bytes"
 
@@ -163,4 +164,7 @@ program() { # DIRECTORY "UNITS" WORDS
 program library "library" "the library's classes as records: map and set, shared_ptr, mutex, optional, a vector from a braced list, sort, lambdas, function"
 program program "main shapes" "two units as one program: a header's record, template instances and inline function in one home, a class made in one unit and deleted in the other"
 program incomplete "user maker" "records only declared in one unit and defined in the other: references to them kept, returned and handed on"
+program lists "lists" "an initializer_list of records, an array of records as a pointer, a vector of pairs and a map from braced lists, a table's rows, references to arrays of char"
+program statics "statics" "objects made before main: constant ones as data (bit-fields in their words, a pointer into an array, a table of pointers to them, an empty record), one with a constructor through the unit's start, static locals behind their guards"
+program twins "first second" "two units each with a record of its own under one name: two records, each in its unit"
 echo "check_lattice_emit.sh: all checks passed"
