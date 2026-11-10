@@ -89,7 +89,8 @@ echo "ok   with 6 GiB the kernel counts ${seen} MiB: the RAM above the memory ho
 # was left in: it sets the monitor's own (its EDID's) when the firmware
 # has it, or the one the image names in settings/display. OVMF starts in
 # 1280x800; an image built for 1920x1080 comes up in that, one that names
-# a mode the firmware does not have stays in the firmware's.
+# a mode the firmware does not have comes up in the nearest below it, or
+# stays in the firmware's when that is no larger picture.
 default=$(output | grep -a '^brixOS: display [0-9]*x[0-9]* ' | head -1 | grep -ao '[0-9][0-9]*x[0-9][0-9]*' | head -1)
 # The image built for the display mode $1, started; `got`: the mode the
 # kernel says it has.
@@ -106,8 +107,15 @@ mode_with() {
 mode_with 1920x1080
 [[ $got == 1920x1080 ]] || fail "an image built for 1920x1080 came up in $got (the firmware's own was $default)"
 output | grep -aq "^brixOS: the loader set this mode, the one the image names (settings/display); the firmware's was $default\$" || fail "the kernel does not say that the loader set the image's mode and what the firmware's was"
+output | grep -aq "^brixOS: the firmware's modes: .* 1920x1080 " || fail "the kernel does not say the firmware's modes"
+# A mode the firmware lacks: the nearest below it when that is a larger
+# picture than the firmware's (3840x1080, a wide monitor's: 1920x1080), and
+# the firmware's own when it is not (1234x567: nothing larger fits).
+mode_with 3840x1080
+[[ $got == 1920x1080 ]] || fail "an image built for 3840x1080, which the firmware lacks, came up in $got, not in the nearest below it (1920x1080)"
+output | grep -aq "^brixOS: the loader set this mode, the nearest the firmware has to the one the image names; the firmware's was $default\$" || fail "the kernel does not say that the loader set the nearest mode"
 mode_with 1234x567
 [[ $got == "$default" ]] || fail "an image built for a mode the firmware lacks came up in $got, not the firmware's $default"
 output | grep -aq '^brixOS: the loader set this mode' && fail "the kernel says the loader set a mode where the firmware's stayed"
-echo "ok   the loader sets the display mode the image names when the firmware has it (1920x1080 instead of $default) and the kernel says so, and leaves the firmware's otherwise"
+echo "ok   the loader sets the display mode the image names when the firmware has it (1920x1080 instead of $default), the nearest below one it lacks, and leaves the firmware's otherwise; the kernel says which and lists the firmware's modes"
 echo PASS
