@@ -8,7 +8,9 @@ address, a router that says a host cannot be reached, and a name server
 with names of its own.
 
 The network is 10.10.36.0/24; the guest has an address of it from its
-settings file.
+settings file. Nobody here gives addresses (DHCP's questions get no
+answer): a guest without a settings file stays without an address, which
+the check uses for what such a machine puts on the wire.
 
   10.10.36.1    the gateway: answers echo; routes to 192.0.2.0/24:
                   192.0.2.10 answers echo
@@ -17,7 +19,8 @@ settings file.
                   (the rest of it: silence)
   10.10.36.2    the name server (answers echo too): gateway.lan,
                 slow.lan, far.lan (192.0.2.10) have addresses; quiet.lan
-                gets no answer at all; any other name does not exist
+                gets no answer at all; any other name does not exist;
+                it calls everyone twice a second (UDP port 4715)
   10.10.36.20   answers echo 1.5 s late
   10.10.36.21   answers every echo twice
   10.10.36.22   says its hardware address only 0.3 s after it is asked
@@ -90,11 +93,20 @@ def main():
         via = speaker if speaker in HOSTS else GATEWAY
         send(guest_mac + mac_of(via) + b"\x08\x00" + packet, delay)
 
+    # The name server calls everyone twice a second (a datagram to UDP
+    # port 4715): a guest with an address hears it at a socket on that
+    # port (netcalls hears), one without an address must not.
+    call = b"\xff" * 6 + mac_of(NAMESERVER) + b"\x08\x00" + ip_packet(NAMESERVER, bytes([255] * 4), 17, struct.pack(">HHHH", 4715, 4715, 8 + 7, 0) + b"anyone?")
+    next_call = time.monotonic()
+
     while True:
         now = time.monotonic()
+        if now >= next_call:
+            wire.sendto(call, ("127.0.0.1", qemu_port))
+            next_call = now + 0.5
         while later and later[0][0] <= now:
             wire.sendto(heapq.heappop(later)[2], ("127.0.0.1", qemu_port))
-        wait = max(0.0, later[0][0] - now) if later else 1.0
+        wait = min(max(0.0, later[0][0] - now) if later else 1.0, max(0.0, next_call - now))
         if not select.select([wire], [], [], wait)[0]:
             continue
         frame = wire.recv(4096)

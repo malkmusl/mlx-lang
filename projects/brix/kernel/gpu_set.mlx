@@ -1,0 +1,334 @@
+// A plan for the monitor's own mode (gpu_mode.mlx) carried out on a
+// Polaris card's display controller: the only place where a register of
+// the display is written, and only when the image asks for it (`asked`:
+// settings/gpu says "native"; gpu.mlx hands the card's write over).
+// Without that, with a plan that is not complete, nothing is written and
+// the firmware's picture stays as it is.
+//
+// Carried out the careful way:
+// - first every register the plan writes is read (the firmware's values,
+//   for the way back), and the new picture's memory is cleared;
+// - each write is read back, and each wait has its time: a word that does
+//   not hold what was written, or a state that does not come, ends it;
+// - afterwards the controller's frame counter must run at the rate the
+//   plan gives, and the memory interface must not say that it ran dry
+//   (DMIF_STATUS's DMIF_UNDERFLOW) where it did not say so before. (The
+//   headers name the bit; Linux does not use it, so whether it stays set
+//   or clears when read is not known. It is read once right after the
+//   last step and judged by a second read after the frames were counted:
+//   if reading clears it, what happened while the controller was being
+//   changed does not count, only what goes on with the new picture.)
+// - when any of that fails the firmware's state is put back: the plan's
+//   steps gone through again, those that make the output quiet (the
+//   stream stopped, the controller blanked) and those that are only on
+//   the way (a lock, a mark set chosen) done as planned, every other
+//   write with the firmware's value of its register (for the urgency
+//   marks, which are four sets behind one word, what each set held when
+//   it was written), the waits and pauses as planned. Then the registers
+//   are read against the firmware's values once more and the frames
+//   counted, and the log says what came back.
+//
+// Built for the host too, against a card that is a table
+// (tests/460_gpu_mode_set_runtime.mlx).
+const scanout = @import("./gpu_display.mlx")
+const mode = @import("./gpu_mode.mlx")
+
+// What the kernel lends for a change: a display register written (its
+// number as the headers count, as for a read), and `bytes` of the
+// aperture from `offset` cleared (the new picture's memory).
+pub const Hands = struct {
+    write: fn(usize, u32) -> void
+    clear: fn(usize, usize) -> void
+}
+
+pub const Outcome = enum(u8) {
+    // Nothing was written: not asked for, or the plan is not complete.
+    untouched,
+    // The plan is carried out and the controller runs with it.
+    done,
+    // It failed and the firmware's state is back.
+    back,
+    // It failed and not every register took the firmware's value again.
+    astray
+}
+
+// Why it failed.
+pub const Reason = enum(u8) { none, read_back, wait, frames, underflow }
+
+pub const Result = struct {
+    outcome: Outcome
+    reason: Reason
+    // The step it failed at (for read_back and wait), and what was read
+    // there.
+    step: usize
+    read: usize
+    // Writes made on the way there, and on the way back.
+    writes: usize
+    writesBack: usize
+    // Registers that do not hold the firmware's value after the way back.
+    astray: usize
+    // The frames counted after the change (or after the way back).
+    rate: scanout.Rate
+}
+
+// The firmware's value of each step's register (a write step's: read
+// before the first write of all), and for a banked write what the word
+// held just before it was written.
+const Kept = struct {
+    first: [mode.STEPS]usize
+    banked: [mode.STEPS]usize
+    bankedRead: [mode.STEPS]bool
+}
+
+var kept: Kept = undefined // (per run)
+
+fn less(a: usize, b: usize) -> usize { return if a > b { a - b } else { 0 } }
+
+// One register written and read back: whether the bits `mask` hold what
+// was written (`read`: what the word says).
+fn writeChecked(card: *const scanout.Card, hands: *const Hands, register: usize, value: usize, mask: usize, read: *usize) -> bool {
+    const write = hands.*.write
+    write(register, @intCast(u32, value & 0xFFFFFFFF))
+    read.* = card.reg(register)
+    return read.* & mask == value & mask
+}
+
+// Until the bits `mask` of a register are `value`, `time` nanoseconds at
+// most (and a count of looks at most, should the clock stand).
+fn waitFor(card: *const scanout.Card, register: usize, mask: usize, value: usize, time: usize, read: *usize) -> bool {
+    const began = card.time()
+    var looks: usize = 0
+    while looks < 100000000 {
+        looks += 1
+        read.* = card.reg(register)
+        if read.* & mask == value & mask { return true }
+        if less(card.time(), began) > time { return false }
+    }
+    return false
+}
+
+fn pause(card: *const scanout.Card, time: usize) -> void {
+    const began = card.time()
+    var looks: usize = 0
+    while looks < 100000000 && less(card.time(), began) <= time { looks += 1 }
+}
+
+// The frames a controller counts against the plan's rate: within a
+// fiftieth of it.
+fn framesRun(card: *const scanout.Card, plan: *const mode.Plan, rate: *scanout.Rate) -> bool {
+    rate.* = scanout.rateOf(card, plan.*.controller, plan.*.hTotal, plan.*.vTotal)
+    if rate.*.frames == 0 { return false }
+    return less(rate.*.millihertz, plan.*.millihertz) + less(plan.*.millihertz, rate.*.millihertz) <= plan.*.millihertz / 50
+}
+
+fn sayRate(card: *const scanout.Card, rate: *const scanout.Rate) -> void {
+    const part = rate.*.millihertz % 1000
+    card.field("", rate.*.millihertz / 1000)
+    card.say(if part < 10 { ".00" } else if part < 100 { ".0" } else { "." })
+    card.decimal(part)
+}
+
+// The firmware's state put back after the steps up to `reached` were gone
+// into (`quiet`: whether a step that makes the output quiet was among
+// them: then the steps that wake it are gone through too, to the plan's
+// end). How many registers do not hold the firmware's value afterwards.
+fn putBack(card: *const scanout.Card, hands: *const Hands, plan: *const mode.Plan, reached: usize, quiet: bool, result: *Result) -> void {
+    const end = if quiet { plan.*.count } else { reached + 1 }
+    var read: usize = 0
+    var k: usize = 0
+    while k < end && k < plan.*.count {
+        const step = &plan.*.steps[k]
+        if step.*.kind == mode.Kind.pause {
+            pause(card, step.*.time)
+        } else if step.*.kind == mode.Kind.wait {
+            _ = waitFor(card, step.*.register, step.*.mask, step.*.value, step.*.time, &read)
+        } else {
+            var value = kept.first[k]
+            var skip = false
+            if step.*.phase == mode.Phase.quiet || step.*.transient {
+                value = step.*.value
+            } else if step.*.banked {
+                value = kept.banked[k]
+                skip = !kept.bankedRead[k]
+            }
+            if !skip {
+                _ = writeChecked(card, hands, step.*.register, value, step.*.mask, &read)
+                result.*.writesBack += 1
+            }
+        }
+        k += 1
+    }
+    // What is there now against what the firmware had, a register at a
+    // time under all the bits the plan's writes to it are read back by (a
+    // banked word says only the set that is chosen: left out). One that
+    // differs is written once more (a word that was only on the way when
+    // the plan ended early, a mark set left chosen; or a write that did
+    // not hold); one that differs still is said.
+    result.*.astray = 0
+    k = 0
+    while k < plan.*.count {
+        const step = &plan.*.steps[k]
+        if step.*.kind == mode.Kind.write && !step.*.banked {
+            var mask: usize = 0
+            var first = true
+            var j: usize = 0
+            while j < plan.*.count {
+                if plan.*.steps[j].kind == mode.Kind.write && plan.*.steps[j].register == step.*.register {
+                    if j < k { first = false }
+                    mask = mask | plan.*.steps[j].mask
+                }
+                j += 1
+            }
+            if first && card.reg(step.*.register) & mask != kept.first[k] & mask {
+                result.*.writesBack += 1
+                if !writeChecked(card, hands, step.*.register, kept.first[k], mask, &read) {
+                    result.*.astray += 1
+                    card.say("gpu: ")
+                    card.hexDigits(step.*.register, 4)
+                    card.say(" holds ")
+                    card.hexDigits(read, 8)
+                    card.say(", the firmware had ")
+                    card.hexDigits(kept.first[k], 8)
+                    card.say("\n")
+                }
+            }
+        }
+        k += 1
+    }
+}
+
+// The plan carried out, or nothing done: see the head. `asked`: whether
+// the image asks for the monitor's own mode. What happened is said in the
+// log and left in `result`; true when the controller runs the plan's
+// picture.
+pub fn attempt(card: *const scanout.Card, hands: *const Hands, plan: *const mode.Plan, asked: bool, result: *Result) -> bool {
+    result.*.outcome = Outcome.untouched
+    result.*.reason = Reason.none
+    result.*.step = 0
+    result.*.read = 0
+    result.*.writes = 0
+    result.*.writesBack = 0
+    result.*.astray = 0
+    result.*.rate = scanout.Rate.{ .frames = 0, .nanoseconds = 0, .millihertz = 0, .kilohertz = 0 }
+    if !asked {
+        card.say("gpu: nothing is written to the card (the image does not ask for the monitor's own mode: settings/gpu)\n")
+        return false
+    }
+    if !plan.*.complete || plan.*.count > mode.STEPS {
+        card.say("gpu: the image asks for the monitor's own mode (settings/gpu), but the plan is not complete: nothing is written to the card\n")
+        return false
+    }
+    card.field("gpu: the image asks for the monitor's own mode (settings/gpu): carrying out the plan's ", plan.*.writes)
+    card.say(" writes\n")
+
+    // The firmware's values, and whether the memory interface says it ran
+    // dry before anything is changed.
+    var k: usize = 0
+    while k < plan.*.count {
+        kept.first[k] = 0
+        kept.banked[k] = 0
+        kept.bankedRead[k] = false
+        if plan.*.steps[k].kind == mode.Kind.write {
+            // (A register written more than once: its first step's
+            // value, read before any write.)
+            var j: usize = 0
+            var found = false
+            while j < k && !found {
+                if plan.*.steps[j].kind == mode.Kind.write && plan.*.steps[j].register == plan.*.steps[k].register {
+                    kept.first[k] = kept.first[j]
+                    found = true
+                }
+                j += 1
+            }
+            if !found { kept.first[k] = card.reg(plan.*.steps[k].register) }
+        }
+        k += 1
+    }
+    const dryBefore = card.reg(mode.DMIF_STATUS) & mode.DMIF_STATUS__DMIF_UNDERFLOW != 0
+    const clear = hands.*.clear
+    clear(plan.*.offset, plan.*.bytes)
+
+    var quiet = false
+    var failed = false
+    k = 0
+    while k < plan.*.count && !failed {
+        const step = &plan.*.steps[k]
+        if step.*.phase == mode.Phase.quiet { quiet = true }
+        if step.*.kind == mode.Kind.pause {
+            pause(card, step.*.time)
+        } else if step.*.kind == mode.Kind.wait {
+            if !waitFor(card, step.*.register, step.*.mask, step.*.value, step.*.time, &result.*.read) {
+                result.*.reason = Reason.wait
+                failed = true
+            }
+        } else {
+            if step.*.banked {
+                kept.banked[k] = card.reg(step.*.register)
+                kept.bankedRead[k] = true
+            }
+            result.*.writes += 1
+            if !writeChecked(card, hands, step.*.register, step.*.value, step.*.mask, &result.*.read) {
+                result.*.reason = Reason.read_back
+                failed = true
+            }
+        }
+        if failed { result.*.step = k } else { k += 1 }
+    }
+    if !failed { _ = card.reg(mode.DMIF_STATUS) }
+    if failed {
+        card.field("gpu: step ", result.*.step + 1)
+        card.field(" of ", plan.*.count)
+        card.say(if result.*.reason == Reason.wait { " did not come: " } else { " did not hold: " })
+        mode.sayStep(card, &plan.*.steps[result.*.step], "")
+        card.say(", read ")
+        card.hexDigits(result.*.read, 8)
+        card.say("\n")
+    } else if !framesRun(card, plan, &result.*.rate) {
+        result.*.reason = Reason.frames
+        result.*.step = plan.*.count - 1
+        failed = true
+        card.controller(plan.*.controller)
+        if result.*.rate.frames == 0 {
+            card.say(" counts no frames after the change")
+        } else {
+            card.say(" counts ")
+            sayRate(card, &result.*.rate)
+            card.field(" frames a second after the change, not the ", plan.*.millihertz / 1000)
+            card.say(" planned")
+        }
+        card.say("\n")
+    } else if !dryBefore && card.reg(mode.DMIF_STATUS) & mode.DMIF_STATUS__DMIF_UNDERFLOW != 0 {
+        result.*.reason = Reason.underflow
+        result.*.step = plan.*.count - 1
+        failed = true
+        card.say("gpu: the memory interface ran dry after the change (DMIF_STATUS says an underflow)\n")
+    }
+    if !failed {
+        result.*.outcome = Outcome.done
+        card.controller(plan.*.controller)
+        card.size(" shows a picture of ", plan.*.width, plan.*.height)
+        card.say(" as it is, ")
+        sayRate(card, &result.*.rate)
+        card.field(" frames a second: the monitor's own mode is set (", result.*.writes)
+        card.say(" writes, each read back)\n")
+        return true
+    }
+
+    card.say("gpu: putting the firmware's state back\n")
+    putBack(card, hands, plan, result.*.step, quiet, result)
+    // (The rate the firmware's timing ran at is not the plan's when the
+    // plan changed the timing: the frames are counted and said, not
+    // judged.)
+    result.*.rate = scanout.rateOf(card, plan.*.controller, plan.*.hTotal, plan.*.vTotal)
+    if result.*.astray == 0 {
+        result.*.outcome = Outcome.back
+        card.field("gpu: the firmware's state is back (", result.*.writesBack)
+        card.say(" writes)")
+    } else {
+        result.*.outcome = Outcome.astray
+        card.field("gpu: the firmware's state is NOT all back: ", result.*.astray)
+        card.say(if result.*.astray == 1 { " register differs" } else { " registers differ" })
+    }
+    card.say(if result.*.rate.frames != 0 { "; the controller counts frames\n" } else { "; the controller counts no frames\n" })
+    return false
+}

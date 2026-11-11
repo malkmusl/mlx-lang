@@ -32,8 +32,8 @@ ping_cases() {
     local went
     # The name server first: a neighbour whose hardware address the
     # kernel has not asked for. The first request is answered all the
-    # same (ping sends it again while the kernel asks, or the kernel
-    # holds it), and the summary has the loss and the times.
+    # same (the kernel keeps it while it asks, and sends it when the
+    # answer comes), and the summary has the loss and the times.
     type_line 'ping 10.0.2.3 2; echo neighbour $?'
     wait_for '^PING 10.0.2.3: 56 bytes of data$'
     wait_for '^64 bytes from 10.0.2.3: seq=1 time=[0-9.]* ms$'
@@ -54,13 +54,19 @@ ping_cases() {
     [[ $went == "10.0.2.2 10.0.2.3" ]] || fail "the echo requests to 10.0.2.2 and 10.0.2.3 went to: $went"
     echo "ok   ping: straight after the boot a neighbour not spoken to yet answers from the first request on; the gateway answers; the requests go to the host pinged; the summary has the loss and the least, mean and greatest time"
     # An address of the subnet nobody has: no answer, said for each
-    # request (whose hardware address nobody answered for, where the
-    # kernel does not send before it knows it), all lost, status 1.
+    # request within its second, with the reason (the kernel kept the
+    # request while it asked for the hardware address, and says itself
+    # that nobody answered: ICMP's "host unreachable" from the machine's
+    # own address, which ping reads so), all lost, status 1. No request
+    # for it went onto the wire.
     type_line 'ping -c 2 10.0.2.9; echo nobody $?'
-    wait_for '^no answer \(from 10.0.2.9 (its hardware address is not known: nobody answered for it)\|for seq=[12]\)$' 2
+    wait_for '^no answer from 10.0.2.9 (its hardware address is not known: nobody answered for it)$' 2
     wait_for '^--- 2 sent, 0 received, 100% lost$'
     wait_for '^nobody 1$'
-    echo "ok   ping to an address nobody has: no answer for each request, all lost"
+    if output | grep -q '^no answer for seq='; then fail "a request whose neighbour nobody answered for got a bare \"no answer\""; fi
+    went=$(echo_destinations)
+    [[ $went == "10.0.2.2 10.0.2.3" ]] || fail "after a ping to an address nobody has the echo requests on the wire went to: $went"
+    echo "ok   ping to an address nobody has: for each request, that nobody answered for its hardware address; all lost"
     # The count before the host, after it, joined to its option; none at
     # all (the usage), none that is one, a host that is no address.
     type_line 'ping -c 1 10.0.2.2; echo count-before $?'
@@ -83,9 +89,11 @@ ping_cases() {
     wait_for '^no-address 1$'
     echo "ok   ping takes -c COUNT before and after the host and as -cCOUNT; the usage without a host; a count of 0 and a host that is no address are said"
     # The machine itself, by its address and as 127.0.0.1 and localhost:
-    # answered (each reply once), and nothing of it on the wire.
+    # answered from the address that was asked (each reply once), and
+    # nothing of it on the wire.
     type_line 'ping -c 1 10.0.2.15; ping -c 1 127.0.0.1; ping -c 1 localhost; echo itself $?'
-    wait_for '^64 bytes from 10.0.2.15: seq=1 time=[0-9.]* ms$' 3
+    wait_for '^64 bytes from 10.0.2.15: seq=1 time=[0-9.]* ms$'
+    wait_for '^64 bytes from 127.0.0.1: seq=1 time=[0-9.]* ms$' 2
     wait_for '^PING localhost (127.0.0.1): 56 bytes of data$'
     wait_for '^--- 1 sent, 1 received, 0% lost$' 6
     wait_for '^itself 0$'

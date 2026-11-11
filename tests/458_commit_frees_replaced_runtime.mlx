@@ -1,0 +1,304 @@
+// How brixfs's store finds its free blocks (projects/brix/kernel/volume.mlx,
+// "free blocks"), on a model with the store's own map (blockmap.mlx): a
+// volume of files whose records sit in table blocks under a root, and
+// snapshots that keep old roots. A commit rewrites files at chance (some
+// blocks kept, some new, files grown, cut, removed, made), notes every
+// block of each rewritten file's old record, the table blocks and the root
+// it replaces, lets them go but for what a snapshot keeps, and marks the
+// new records again. After every commit the map must be exactly what a
+// walk over every root marks: no block a root reaches free (it could be
+// written over), none held that no root reaches. Snapshots are made and
+// taken out between the commits (each followed by a walk, as in the
+// store), the disk runs full and empties again.
+// Exits 13.
+const std = @import("std")
+const blockmap = @import("../projects/brix/blockmap.mlx")
+const BlockMap = blockmap.BlockMap
+const Runs = blockmap.Runs
+
+const BLOCKS: usize = 4000
+const WORDS: usize = (BLOCKS + 63) / 64
+const FILES: usize = 96
+const PER_TABLE: usize = 16
+const TABLES: usize = FILES / PER_TABLE
+// A file's blocks at the most.
+const LONGEST: usize = 40
+const ROOTS: usize = 4
+const RUN_PAGES: usize = 8
+
+// A root: its block, its table blocks, each file's blocks (0: none).
+const Root = struct {
+    used: bool
+    block: usize
+    tables: [TABLES]usize
+    lengths: [FILES]usize
+    blocks: [FILES][LONGEST]usize
+}
+
+// Root 0 is the current one, the others snapshots.
+var roots: [ROOTS]Root = undefined // (per run)
+var mapWords: [WORDS]usize = undefined // (per run)
+var keptWords: [WORDS]usize = undefined // (per run)
+var walkWords: [WORDS]usize = undefined // (per run)
+var map: BlockMap = undefined // (per run)
+var kept: BlockMap = undefined // (per run)
+var walked: BlockMap = undefined // (per run)
+var cursor: usize = 2 // (per run)
+var runPages: [RUN_PAGES][512]usize = undefined // (per run)
+var runPage: usize = 0 // (per run)
+var rewritten: [FILES]bool = undefined // (per run)
+var seed: usize = 0x2545F4914F6CDD1D // (per run)
+
+fn chance(below: usize) -> usize {
+    seed ^= seed << 13
+    seed ^= seed >> 7
+    seed ^= seed << 17
+    return (seed >> 11) % below
+}
+
+// A free block, marked (the first there is: none below the cursor is
+// free); 0 when the disk is full.
+fn allocate() -> usize {
+    const found = map.firstFree(cursor)
+    if found >= BLOCKS { return 0 }
+    _ = map.markRun(found, 1)
+    cursor = found + 1
+    return found
+}
+
+// A block the commit replaces.
+fn replace(block: usize) -> bool {
+    if block == 0 { return true }
+    if Runs.add(&runPages[runPage], block, 1) { return true }
+    if runPage + 1 == RUN_PAGES { return false }
+    runPage += 1
+    Runs.clear(&runPages[runPage])
+    return Runs.add(&runPages[runPage], block, 1)
+}
+
+// Every block a root reaches, marked in `into` (and in `also`).
+fn walk(root: *const Root, into: *BlockMap, also: ?*BlockMap) -> void {
+    _ = into.markRun(root.*.block, 1)
+    if also != null { _ = also.?.markRun(root.*.block, 1) }
+    var t: usize = 0
+    while t < TABLES {
+        if root.*.tables[t] != 0 {
+            _ = into.markRun(root.*.tables[t], 1)
+            if also != null { _ = also.?.markRun(root.*.tables[t], 1) }
+        }
+        t += 1
+    }
+    var f: usize = 0
+    while f < FILES {
+        var i: usize = 0
+        while i < root.*.lengths[f] {
+            const block = root.*.blocks[f][i]
+            if block != 0 {
+                _ = into.markRun(block, 1)
+                if also != null { _ = also.?.markRun(block, 1) }
+            }
+            i += 1
+        }
+        f += 1
+    }
+}
+
+// The sweep: the map from a walk over every root, `kept` from the
+// snapshots'.
+fn sweep(into: *BlockMap, keeping: ?*BlockMap) -> void {
+    into.clear()
+    if keeping != null { keeping.?.clear() }
+    _ = into.markRun(0, 2)
+    walk(&roots[0], into, null)
+    var r: usize = 1
+    while r < ROOTS {
+        if roots[r].used { walk(&roots[r], into, keeping) }
+        r += 1
+    }
+}
+
+// Whether the map is exactly what a walk finds.
+fn exact() -> bool {
+    sweep(&walked, null)
+    return walked.notIn(&map) == 0 && map.notIn(&walked) == 0 && map.used == walked.used
+}
+
+// One commit: files rewritten at chance. False when the disk ran full
+// (then nothing changed but the map, which a sweep puts right, as in the
+// store).
+fn commit(removing: bool) -> bool {
+    var next: Root = roots[0]
+    runPage = 0
+    Runs.clear(&runPages[0])
+    var noted = true
+    var full = false
+    var touched: [TABLES]bool = undefined
+    var t: usize = 0
+    while t < TABLES {
+        touched[t] = false
+        t += 1
+    }
+    var f: usize = 0
+    while f < FILES {
+        rewritten[f] = false
+        f += 1
+    }
+    var changes = 1 + chance(12)
+    while changes > 0 && !full {
+        f = chance(FILES)
+        if !rewritten[f] {
+            rewritten[f] = true
+            touched[f / PER_TABLE] = true
+            // Its blocks until now are replaced, all of them.
+            var i: usize = 0
+            while i < next.lengths[f] {
+                noted = replace(next.blocks[f][i]) && noted
+                i += 1
+            }
+            // The new record: removed, or cut or grown, some blocks kept
+            // where they are, the rest new.
+            const length = if removing || chance(6) == 0 { 0 } else { chance(LONGEST + 1) }
+            i = 0
+            while i < length && !full {
+                const keeps = i < next.lengths[f] && next.blocks[f][i] != 0 && chance(3) != 0
+                if !keeps {
+                    // (A hole now and then.)
+                    next.blocks[f][i] = if chance(9) == 0 { 0 } else { allocate() }
+                    if next.blocks[f][i] == 0 && map.free() == 0 { full = true }
+                }
+                i += 1
+            }
+            next.lengths[f] = length
+        }
+        changes -= 1
+    }
+    // The table blocks of what changed, the root.
+    t = 0
+    while t < TABLES && !full {
+        if touched[t] {
+            noted = replace(next.tables[t]) && noted
+            next.tables[t] = allocate()
+            if next.tables[t] == 0 { full = true }
+        }
+        t += 1
+    }
+    if !full {
+        noted = replace(next.block) && noted
+        next.block = allocate()
+        if next.block == 0 { full = true }
+    }
+    if full {
+        // The commit failed: the disk has the last one; what it took is
+        // found free again by a walk.
+        sweep(&map, &kept)
+        cursor = 2
+        return false
+    }
+    // On the disk. What it replaced is free but for what a snapshot
+    // keeps, and the rewritten files' blocks are marked again.
+    roots[0] = next
+    if !noted {
+        sweep(&map, &kept)
+        cursor = 2
+        return true
+    }
+    var p: usize = 0
+    while p <= runPage {
+        var k: usize = 0
+        while k < Runs.count(&runPages[p]) {
+            const start = Runs.start(&runPages[p], k)
+            if map.releaseRun(start, Runs.length(&runPages[p], k), &kept) > 0 && start < cursor { cursor = start }
+            k += 1
+        }
+        p += 1
+    }
+    f = 0
+    while f < FILES {
+        if rewritten[f] {
+            var i: usize = 0
+            while i < roots[0].lengths[f] {
+                if roots[0].blocks[f][i] != 0 { _ = map.markRun(roots[0].blocks[f][i], 1) }
+                i += 1
+            }
+        }
+        f += 1
+    }
+    return true
+}
+
+pub fn main() -> u8 {
+    map.init(&mapWords, BLOCKS)
+    kept.init(&keptWords, BLOCKS)
+    walked.init(&walkWords, BLOCKS)
+    kept.clear()
+    var r: usize = 0
+    while r < ROOTS {
+        roots[r].used = false
+        r += 1
+    }
+    // A fresh volume: the root, no files.
+    roots[0].used = true
+    roots[0].block = 2
+    var t: usize = 0
+    while t < TABLES {
+        roots[0].tables[t] = 0
+        t += 1
+    }
+    var f: usize = 0
+    while f < FILES {
+        roots[0].lengths[f] = 0
+        f += 1
+    }
+    sweep(&map, &kept)
+    cursor = 2
+    if !exact() || map.used != 3 { return 1 }
+
+    var commits: usize = 0
+    var failed: usize = 0
+    var snapshots: usize = 0
+    var fullest: usize = 0
+    var step: usize = 0
+    while step < 3000 {
+        // Files go when the disk is nearly full, so that it fills and
+        // empties a few times.
+        const removing = map.free() < 25 || (step % 700 > 600)
+        const what = chance(40)
+        if what == 0 {
+            // A snapshot of the current root (a walk follows, as in the
+            // store), where there is a place for one.
+            r = 1
+            while r < ROOTS && roots[r].used { r += 1 }
+            if r < ROOTS {
+                roots[r] = roots[0]
+                sweep(&map, &kept)
+                cursor = 2
+                snapshots += 1
+            }
+        } else if what == 1 {
+            // A snapshot taken out.
+            r = 1 + chance(ROOTS - 1)
+            if roots[r].used {
+                roots[r].used = false
+                sweep(&map, &kept)
+                cursor = 2
+            }
+        } else if commit(removing) {
+            commits += 1
+        } else {
+            failed += 1
+        }
+        // No block below the cursor is free.
+        if map.firstFree(2) < cursor { return 2 }
+        // The map is what a walk finds: nothing a root reaches is free.
+        sweep(&walked, null)
+        if walked.notIn(&map) != 0 { return 3 }
+        if map.notIn(&walked) != 0 || map.used != walked.used { return 4 }
+        if map.used > fullest { fullest = map.used }
+        step += 1
+    }
+    // (The run did what it is for: many commits, some on a full disk,
+    // snapshots made, the disk nearly full once.)
+    if commits < 2000 || snapshots < 20 || fullest < BLOCKS - 400 { return 5 }
+    if failed == 0 { return 6 }
+    return 13
+}

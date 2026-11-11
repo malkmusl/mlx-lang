@@ -3,11 +3,19 @@
 // IPv4 (one address, netmask and gateway: a packet goes to a neighbour
 // of the subnet or to the gateway; no fragments), ICMP (echo answered;
 // echo requests sent, the replies counted) and the dispatch to UDP and
-// TCP (udp.mlx, tcp.mlx). The configuration is QEMU's user network's by
-// default (10.0.2.15/24, gateway 10.0.2.2, name server 10.0.2.3) or
-// /system/settings/network's (address, netmask, gateway, nameserver),
-// else DHCP's (dhcp.mlx); `source` says which it is, for the link's
-// record (link.mlx).
+// TCP (udp.mlx, tcp.mlx). The configuration is /system/settings/network's
+// (address, netmask, gateway, nameserver), else DHCP's (dhcp.mlx);
+// `source` says which it is, for the link's record (link.mlx). Until one
+// of them gives an address there is none: nothing is sent but DHCP's own
+// messages (from 0.0.0.0, to everyone), nothing is taken but DHCP's
+// answers, and no ARP request is answered. What the file or DHCP's answer
+// leaves out is none as well (0.0.0.0): without a gateway only the own
+// subnet is reached, without a name server no names are looked up.
+// A packet for a neighbour whose hardware address is not known yet waits
+// for it (`held`), four packets at a time; when nobody says the address,
+// the ping socket whose echo request it was is told. 127.0.0.0/8 is this
+// machine itself: what is sent there comes straight back in, with or
+// without an address, and never goes onto the wire.
 const console = @import("../console.mlx")
 const clock = @import("../clock.mlx")
 const netdev = @import("../netdev.mlx")
@@ -16,6 +24,7 @@ const udp = @import("./udp.mlx")
 const tcp = @import("./tcp.mlx")
 const sockets = @import("./sockets.mlx")
 const dhcp = @import("./dhcp.mlx")
+const lease = @import("./lease.mlx")
 
 pub const Ip = [4]u8
 pub const Mac = [6]u8
@@ -30,9 +39,9 @@ pub const PROTOCOL_UDP: u8 = 17
 // The most an IP payload may be (the frame's 1514 less the headers).
 pub const MAX_PAYLOAD: usize = 1514 - ETHERNET_HEADER - IP_HEADER
 
-// Where the configuration's address came from: nowhere yet (the
-// addresses are the defaults while DHCP asks), DHCP, or the settings
-// file. The link's record gives these numbers to programs.
+// Where the configuration's address came from: nowhere yet (there is no
+// address: the four are 0.0.0.0), DHCP, or the settings file. The link's
+// record gives these numbers to programs.
 pub const Source = struct {
     pub const NONE: usize = 0
     pub const DHCP: usize = 1
@@ -71,6 +80,8 @@ var echoReplies: usize = 0 // (per run)
 var lastEchoFrom: Ip = undefined // (per run)
 
 pub fn configuration() -> *Config { return &config }
+// Whether there is an address (the file's or DHCP's).
+pub fn configured() -> bool { return config.source != Source.NONE }
 pub fn echoRepliesSeen() -> usize { return echoReplies }
 pub fn lastEchoSource() -> Ip { return lastEchoFrom }
 
@@ -78,31 +89,102 @@ pub fn same(a: Ip, b: Ip) -> bool { return a[0] == b[0] && a[1] == b[1] && a[2] 
 
 pub fn ipOf(a: u8, b: u8, c: u8, d: u8) -> Ip { return [4]u8{ a, b, c, d } }
 
-// The network up with QEMU's user network's addresses (the settings
-// file may change them: settings).
+// Whether `ip` is this machine by the name every machine has for itself
+// (127.0.0.0/8).
+pub fn itself(ip: Ip) -> bool { return ip[0] == 127 }
+
+// The address a packet to `destination` is sent from: the stack's own;
+// to 127.0.0.0/8 that address itself (who speaks to 127.0.0.1 is
+// answered from 127.0.0.1, and a connection's two ends know each other
+// by the one name). TCP and UDP make their checksums with it.
+pub fn sourceFor(destination: Ip) -> Ip { return if itself(destination) { destination } else { config.address } }
+
+// The network up, without an address: the settings file gives one
+// (settings), or DHCP (dhcp.mlx, through configure).
 pub fn init() -> void {
     config.up = netdev.present()
-    config.source = Source.NONE
-    config.address = ipOf(10, 0, 2, 15)
-    config.mask = ipOf(255, 255, 255, 0)
-    config.gateway = ipOf(10, 0, 2, 2)
-    config.nameServer = ipOf(10, 0, 2, 3)
-    var k: usize = 0
-    while k < MAX_NEIGHBOURS {
-        neighbours[k].valid = false
-        k += 1
-    }
+    unconfigure()
     echoReplies = 0
     sockets.sockets().init()
     udp.init()
     tcp.init()
-    if config.up { arpRequest(config.gateway) }
 }
 
+// The configuration taken over from `source` (four bytes each; 0.0.0.0
+// for a gateway or a name server: none). What was known of the
+// neighbours belonged to the configuration before.
+pub fn configure(source: usize, address: [*]const u8, mask: [*]const u8, gateway: [*]const u8, nameServer: [*]const u8) -> void {
+    forgetNeighbours()
+    readIp(address, 0, &config.address)
+    readIp(mask, 0, &config.mask)
+    readIp(gateway, 0, &config.gateway)
+    readIp(nameServer, 0, &config.nameServer)
+    config.source = source
+}
+
+// No address any more (DHCP's lease ended), or none yet.
+pub fn unconfigure() -> void {
+    forgetNeighbours()
+    config.source = Source.NONE
+    clearIp(&config.address)
+    clearIp(&config.mask)
+    clearIp(&config.gateway)
+    clearIp(&config.nameServer)
+}
+
+fn forgetNeighbours() -> void {
+    var k: usize = 0
+    while k < MAX_NEIGHBOURS {
+        neighbours[k].valid = false
+        neighbours[k].when = 0
+        k += 1
+    }
+    k = 0
+    while k < HELD {
+        held[k].used = false
+        held[k].since = 0
+        k += 1
+    }
+    heldCount = 0
+}
+
+// The configuration said in the kernel's log, as the boot says it:
+// "brixOS: net0 is 10.10.36.20, gateway 10.10.36.1, name server
+// 10.10.36.1 (DHCP)"; "none" for a gateway or a name server there is
+// not.
+pub fn say() -> void {
+    const out = console.out
+    out.write("brixOS: net0 is ")
+    writeIp(config.address, out)
+    out.write(", gateway ")
+    writeIpOrNone(&config.gateway, out)
+    out.write(", name server ")
+    writeIpOrNone(&config.nameServer, out)
+    out.write(if config.source == Source.DHCP { " (DHCP)\n" } else { "\n" })
+}
+
+fn writeIpOrNone(ip: *const Ip, out: console.Console) -> void {
+    if lease.none4(ip) { out.write("none") } else { writeIp(ip.*, out) }
+}
+
+// What the settings' lines gave (static: as locals they came from the
+// aggregate arena).
+var fileAddress: Ip = undefined // (per run)
+var fileMask: Ip = undefined // (per run)
+var fileGateway: Ip = undefined // (per run)
+var fileNameServer: Ip = undefined // (per run)
+
 // The settings' text (address, netmask, gateway, nameserver lines) taken
-// over: whether it gave an address.
+// over: whether it gave an address. With an address line the file is the
+// configuration: a gateway or a name server it has no line for is none,
+// a netmask it has no line for is the one of the address's class.
+// Without an address line (or with 0.0.0.0 on it) nothing of it is used
+// (DHCP asks, and its answer is the configuration).
 pub fn settings(text: []const u8) -> bool {
     var given = false
+    var masked = false
+    clearIp(&fileGateway)
+    clearIp(&fileNameServer)
     var at: usize = 0
     while at < text.length {
         var end = at
@@ -114,19 +196,27 @@ pub fn settings(text: []const u8) -> bool {
             const key = line[0..space]
             var value: Ip = undefined
             if parseIp(line[space + 1..line.length], &value) {
-                if sameText(key, "address") {
-                    config.address = value
-                    config.source = Source.SETTINGS
+                // (0.0.0.0 is no address, here as in the record: taken
+                // as one, the stack was configured without an address,
+                // sent from 0.0.0.0, and DHCP never asked.)
+                if sameText(key, "address") && !lease.none4(&value) {
+                    readIp(&value, 0, &fileAddress)
                     given = true
                 }
-                if sameText(key, "netmask") { config.mask = value }
-                if sameText(key, "gateway") { config.gateway = value }
-                if sameText(key, "nameserver") { config.nameServer = value }
+                if sameText(key, "netmask") {
+                    readIp(&value, 0, &fileMask)
+                    masked = true
+                }
+                if sameText(key, "gateway") { readIp(&value, 0, &fileGateway) }
+                if sameText(key, "nameserver") { readIp(&value, 0, &fileNameServer) }
             }
         }
         at = end + 1
     }
-    return given
+    if !given { return false }
+    if !masked { lease.classMask(&fileAddress, &fileMask) }
+    configure(Source.SETTINGS, &fileAddress, &fileMask, &fileGateway, &fileNameServer)
+    return true
 }
 
 fn sameText(a: []const u8, b: []const u8) -> bool {
@@ -265,7 +355,7 @@ pub fn receive(bytes: [*]const u8, length: usize) -> void {
     const kind = be16(bytes, 12)
     const payload = Bytes.pointer(@intFromPtr(bytes) + ETHERNET_HEADER)
     if kind == TYPE_ARP { arpReceive(payload, length - ETHERNET_HEADER) }
-    if kind == TYPE_IPV4 { ipReceive(payload, length - ETHERNET_HEADER) }
+    if kind == TYPE_IPV4 { ipReceive(payload, length - ETHERNET_HEADER, false) }
 }
 
 // ---- ARP ----
@@ -323,8 +413,14 @@ fn learn(ip: Ip, mac: Mac) -> void {
     neighbours[slot].when = clock.system().monotonic()
 }
 
-// The neighbour's address: (whether it is known, its slot). Unknown:
-// asked for (the packet is dropped; the sender tries again).
+// A neighbour learnt, and what waited for it sent.
+fn learnt(ip: Ip, mac: Mac) -> void {
+    learn(ip, mac)
+    if heldCount > 0 { release(ip, mac) }
+}
+
+// The neighbour's address: (whether it is known, its slot). One known
+// for long is asked for again, and used meanwhile.
 fn neighbour(ip: Ip) -> (bool, usize) {
     var k: usize = 0
     while k < MAX_NEIGHBOURS {
@@ -334,15 +430,148 @@ fn neighbour(ip: Ip) -> (bool, usize) {
         }
         k += 1
     }
-    arpRequest(ip)
     return -> (false, 0)
 }
 
 fn arpRequest(ip: Ip) -> void { arpSend(1, &broadcastMac, &noMac, ip) }
 
-// A neighbour's hardware address asked for ahead of the first packet to
-// it (DHCP: the gateway it gave).
-pub fn askFor(ip: Ip) -> void { arpRequest(ip) }
+// ---- packets that wait for a neighbour's hardware address ----
+
+// A packet for a neighbour that is not known yet is not dropped: it is
+// kept here while the neighbour is asked for, and goes out when the
+// answer comes (the first packet to a host, or through the gateway:
+// a ping's first echo, a connection's SYN, the first name looked up).
+// HELD packets wait at a time, for one neighbour or several (two
+// programs' first packets through the gateway both go); with all in
+// use a newer packet takes the place of one for the same neighbour (the
+// newest is kept: RFC 1122, 2.3.2.2), else of the one waiting longest.
+// A neighbour is asked for three times, ASK_EVERY apart, and HOLD_FOR
+// after the first time what waits for it is dropped, as it would be on
+// the wire: an echo request's ping socket is told then (undelivered).
+// The wait is under a second, so that a program that sends a request a
+// second (ping) hears of each before it sends the next; an answer that
+// comes later still is kept all the same (arpReceive), and what is sent
+// after it goes.
+const HELD: usize = 4
+const HOLD_FOR: usize = 750 * 1000000
+const ASK_EVERY: usize = 250 * 1000000
+
+const Held = struct {
+    used: bool
+    hop: Ip
+    // Since when its neighbour is asked for, and when it is asked for
+    // next (the same for every packet that waits for that neighbour).
+    since: usize
+    askAt: usize
+    // The frame: the Ethernet header's room, then the IP packet of
+    // `length` bytes.
+    length: usize
+    bytes: [1514]u8
+}
+
+var held: [HELD]Held = undefined // (per run)
+var heldCount: usize = 0 // (per run)
+
+// The packet made in `frame` (`length` bytes after the Ethernet header)
+// kept for `hop`, and `hop` asked for unless it is being asked for
+// already (then the packet waits with the others, no longer than they).
+fn hold(hop: Ip, length: usize) -> bool {
+    const now = clock.system().monotonic()
+    var mate: usize = HELD
+    var free: usize = HELD
+    var oldest: usize = 0
+    var k: usize = 0
+    while k < HELD {
+        if held[k].used && same(held[k].hop, hop) { mate = k }
+        if !held[k].used && free == HELD { free = k }
+        if held[k].since < held[oldest].since { oldest = k }
+        k += 1
+    }
+    const slot = if free != HELD { free } else if mate != HELD { mate } else { oldest }
+    if !held[slot].used { heldCount += 1 }
+    held[slot].used = true
+    held[slot].hop = hop
+    held[slot].since = if mate != HELD { held[mate].since } else { now }
+    held[slot].askAt = if mate != HELD { held[mate].askAt } else { now + ASK_EVERY }
+    held[slot].length = length
+    Bytes.copy(Bytes.pointer(@intFromPtr(&held[slot].bytes) + ETHERNET_HEADER), Bytes.pointer(@intFromPtr(&frame) + ETHERNET_HEADER), length)
+    if mate == HELD { arpRequest(hop) }
+    return true
+}
+
+// Neighbour `ip` is at `mac`: what waited for it goes out.
+fn release(ip: Ip, mac: Mac) -> void {
+    var k: usize = 0
+    while k < HELD {
+        if held[k].used && same(held[k].hop, ip) {
+            held[k].used = false
+            heldCount -= 1
+            const f: [*]u8 = &held[k].bytes
+            var j: usize = 0
+            while j < 6 {
+                f[j] = mac[j]
+                f[6 + j] = netdev.macByte(j)
+                j += 1
+            }
+            putBe16(f, 12, TYPE_IPV4)
+            var total = ETHERNET_HEADER + held[k].length
+            if total < 60 {
+                Bytes.fill(Bytes.pointer(@intFromPtr(f) + total), 60 - total, 0)
+                total = 60
+            }
+            _ = netdev.transmit(f, total)
+        }
+        k += 1
+    }
+}
+
+// The waiting packets' timers: the neighbour asked for again, a packet
+// that waited too long dropped.
+fn heldTick() -> void {
+    const now = clock.system().monotonic()
+    var k: usize = 0
+    while k < HELD {
+        if held[k].used {
+            if now - held[k].since >= HOLD_FOR {
+                held[k].used = false
+                heldCount -= 1
+                undelivered(k)
+            } else if now >= held[k].askAt {
+                // (Once for the neighbour, whatever waits for it.)
+                arpRequest(held[k].hop)
+                var j: usize = 0
+                while j < HELD {
+                    if held[j].used && same(held[j].hop, held[k].hop) { held[j].askAt = now + ASK_EVERY }
+                    j += 1
+                }
+            }
+        }
+        k += 1
+    }
+}
+
+// ICMP's word about a packet that was not delivered, as this machine
+// says it to itself (static: a local came from the aggregate arena).
+var word: [8 + IP_HEADER + 8]u8 = undefined // (per run)
+
+// The packet in `held[slot]` waited in vain: nobody said its neighbour's
+// hardware address. An echo request of a ping socket: the socket is told
+// in ICMP's own words, as a router on the way would say it (destination
+// unreachable, host unreachable; the packet's IP header and its first 8
+// bytes after it), from this machine's own address: the program that
+// pings can say why there is no answer. Other packets go as they would
+// on the wire: TCP sends again, and who sent a datagram asks again.
+fn undelivered(slot: usize) -> void {
+    const packet = Bytes.pointer(@intFromPtr(&held[slot].bytes) + ETHERNET_HEADER)
+    if held[slot].length < IP_HEADER + 8 || packet[9] != PROTOCOL_ICMP || packet[IP_HEADER] != 8 { return }
+    const w: [*]u8 = &word
+    Bytes.fill(w, 8, 0)
+    w[0] = 3
+    w[1] = 1
+    Bytes.copy(Bytes.pointer(@intFromPtr(w) + 8), packet, IP_HEADER + 8)
+    putBe16(w, 2, checksum(w, 8 + IP_HEADER + 8, 0))
+    sockets.Sockets.deliverDatagram(sockets.Kind.icmp, be16(packet, IP_HEADER + 4), config.address, 0, w, 8 + IP_HEADER + 8)
+}
 
 fn known(ip: Ip) -> bool {
     var k: usize = 0
@@ -355,6 +584,9 @@ fn known(ip: Ip) -> bool {
 
 fn arpReceive(bytes: [*]const u8, length: usize) -> void {
     if length < 28 || be16(bytes, 2) != TYPE_IPV4 || bytes[4] != 6 || bytes[5] != 4 { return }
+    // Without an address nothing is ours to answer for, and nobody was
+    // asked.
+    if !configured() { return }
     const operation = be16(bytes, 6)
     var senderMac: Mac = undefined
     var k: usize = 0
@@ -367,7 +599,7 @@ fn arpReceive(bytes: [*]const u8, length: usize) -> void {
     // Only what is said to us, or about a neighbour we already have, is
     // kept: with every broadcast request of a busy network learnt, the
     // gateway is pushed out of the table's 16 places again and again.
-    if same(targetIp, config.address) || known(senderIp) { learn(senderIp, senderMac) }
+    if same(targetIp, config.address) || known(senderIp) { learnt(senderIp, senderMac) }
     if operation == 1 && same(targetIp, config.address) {
         // A request for our address: the reply.
         arpSend(2, &senderMac, &senderMac, senderIp)
@@ -393,19 +625,33 @@ fn local(ip: Ip) -> bool {
 pub fn payloadArea() -> [*]u8 { return Bytes.pointer(@intFromPtr(&frame) + ETHERNET_HEADER + IP_HEADER) }
 
 // The payload (`length` bytes at payloadArea) sent to `destination` as
-// `protocol`; false when it is too long, the neighbour is unknown yet,
-// or the device is busy.
-pub fn send(protocol: u8, destination: Ip, length: usize) -> bool { return sendFrom(config.address, protocol, destination, length) }
+// `protocol`, from sourceFor(destination); false when it is too long,
+// there is no address to send from, the destination cannot be reached
+// (it is not on the own subnet and there is no gateway), or the device
+// is busy. True also for a packet that waits for its neighbour's
+// hardware address (hold).
+pub fn send(protocol: u8, destination: Ip, length: usize) -> bool {
+    if !configured() && !itself(destination) { return false }
+    return sendFrom(sourceFor(destination), protocol, destination, length)
+}
 
-// The same from `source` (0.0.0.0 while DHCP runs).
+// The same from `source` (0.0.0.0: DHCP without an address, which
+// reaches everyone and nobody else). To this machine itself (its own
+// address, or 127.0.0.0/8, which needs no address) the packet comes
+// straight back in, and nothing goes onto the wire.
 pub fn sendFrom(source: Ip, protocol: u8, destination: Ip, length: usize) -> bool {
     if !config.up || length > MAX_PAYLOAD { return false }
-    const hop = if local(destination) || same(destination, ipOf(255, 255, 255, 255)) { destination } else { config.gateway }
+    const toEveryone = same(destination, BROADCAST_IP)
+    const toOurselves = itself(destination) || (configured() && same(destination, config.address))
+    if !configured() && !toEveryone && !toOurselves { return false }
+    const direct = toEveryone || toOurselves || local(destination)
+    if !direct && lease.none4(&config.gateway) { return false }
+    const hop = if direct { destination } else { config.gateway }
     var mac: *const Mac = &broadcastMac
-    if !same(hop, ipOf(255, 255, 255, 255)) && !same(destination, config.address) {
+    var waits = false
+    if !toEveryone && !toOurselves {
         const found = neighbour(hop)
-        if !found.0 { return false }
-        mac = &neighbours[found.1].mac
+        if found.0 { mac = &neighbours[found.1].mac } else { waits = true }
     }
     const h: [*]u8 = Bytes.pointer(@intFromPtr(&frame) + ETHERNET_HEADER)
     h[0] = 0x45
@@ -420,17 +666,19 @@ pub fn sendFrom(source: Ip, protocol: u8, destination: Ip, length: usize) -> boo
     putIp(h, 12, source)
     putIp(h, 16, destination)
     putBe16(h, 10, checksum(h, IP_HEADER, 0))
-    if same(destination, config.address) {
+    if toOurselves {
         // To ourselves: taken in at once (from a copy: the receiver's
         // answers use the frame).
         Bytes.copy(&loopback, h, IP_HEADER + length)
-        ipReceive(&loopback, IP_HEADER + length)
+        ipReceive(&loopback, IP_HEADER + length, true)
         return true
     }
+    if waits { return hold(hop, IP_HEADER + length) }
     return sendFrame(mac, TYPE_IPV4, IP_HEADER + length)
 }
 
-fn ipReceive(bytes: [*]const u8, length: usize) -> void {
+// A packet: off the wire, or (`inside`) one of our own to ourselves.
+fn ipReceive(bytes: [*]const u8, length: usize, inside: bool) -> void {
     if length < IP_HEADER || bytes[0] >> 4 != 4 { return }
     const headerLength = @intCast(usize, bytes[0] & 15) * 4
     const total = be16(bytes, 2)
@@ -439,13 +687,27 @@ fn ipReceive(bytes: [*]const u8, length: usize) -> void {
     // A fragment: not taken.
     if be16(bytes, 6) & 0x3FFF != 0 { return }
     const destination = getIp(bytes, 16)
-    if !same(destination, config.address) && !same(destination, ipOf(255, 255, 255, 255)) { return }
     const source = getIp(bytes, 12)
     const protocol = bytes[9]
     const payload = Bytes.pointer(@intFromPtr(bytes) + headerLength)
     const payloadLength = total - headerLength
+    // (127.0.0.0/8 is nobody's on the wire: a frame that names it, as
+    // where it is from or where it goes, is not taken.)
+    if !inside && (itself(source) || itself(destination)) { return }
+    if !inside && !configured() {
+        // Without an address nothing off the wire is ours but a DHCP
+        // server's answer, which comes to everyone or to the address it
+        // offers, at our hardware address: DHCP's port hears it, nothing
+        // else does. (A packet to everyone is no exception: taken as
+        // with an address, a datagram to everyone reached the sockets,
+        // and a connection asked of everyone took a listener's place.)
+        if protocol == PROTOCOL_UDP { udp.receive(source, destination, payload, payloadLength, true) }
+        return
+    }
+    const ours = (configured() && same(destination, config.address)) || (inside && itself(destination))
+    if !ours && !same(destination, BROADCAST_IP) { return }
     if protocol == PROTOCOL_ICMP { icmpReceive(source, payload, payloadLength) }
-    if protocol == PROTOCOL_UDP { udp.receive(source, destination, payload, payloadLength) }
+    if protocol == PROTOCOL_UDP { udp.receive(source, destination, payload, payloadLength, false) }
     if protocol == PROTOCOL_TCP { tcp.receive(source, destination, payload, payloadLength) }
 }
 
@@ -500,11 +762,6 @@ pub fn sendEcho(identifier: usize, destination: Ip, message: [*]const u8, length
     putBe16(request, 2, 0)
     putBe16(request, 4, identifier)
     putBe16(request, 2, checksum(request, length, 0))
-    // 127.0.0.0/8 is this machine and never goes onto the wire (it went
-    // to the gateway). The stack has one address and no loopback one:
-    // the request goes to that address, the stack's way to itself, and
-    // the reply comes from it.
-    if destination[0] == 127 { return send(PROTOCOL_ICMP, config.address, length) }
     return send(PROTOCOL_ICMP, destination, length)
 }
 
@@ -512,6 +769,7 @@ pub fn sendEcho(identifier: usize, destination: Ip, message: [*]const u8, length
 pub fn tick() -> void {
     tcp.tick()
     dhcp.tick()
+    if heldCount > 0 { heldTick() }
 }
 
 // An echo request (`identifier`, `sequence`, 32 bytes of data) to

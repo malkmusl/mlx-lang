@@ -9,11 +9,22 @@
 // (gpu_display.mlx: every controller's timing, surface, viewport, scaler,
 // encoder and pixel clock, decoded and raw) and says whether the card
 // scales the firmware's small picture onto the monitor's own timing or the
-// monitor is sent the small picture, and what the next stage would have to
-// set; it writes nothing there, and reads nothing of another AMD card's
-// (the same numbers are other registers there). It drives nothing yet;
-// QEMU has no such card, so on a VM it finds none. The register reads can
-// only be seen on the real hardware (the "gpu:" lines).
+// monitor is sent the small picture; it writes nothing there, and reads
+// nothing of another AMD card's (the same numbers are other registers
+// there). Stage 2c reads the monitor's own timing from its EDID (edid.mlx;
+// the EFI loader passes the EDID on) and plans the monitor's own mode for
+// either situation (gpu_mode.mlx: every word that would be written, in
+// order), still without a write. Only an image that asks for it
+// (settings/gpu: "native") has the plan carried out (gpu_set.mlx), each
+// write read back and the firmware's state put back when anything fails;
+// the kernel's display then is the new picture. QEMU has no such card, so
+// on a VM it finds none. The register reads can only be seen on the real
+// hardware (the "gpu:" lines).
+//
+// That the default boot writes no register of the display can be read
+// here: gpu_display.mlx and gpu_mode.mlx reach the card by `displayRead`
+// alone, and `displayWriteRegister` below, the one place such a register
+// is written, does nothing unless `native` (the image's settings/gpu).
 //
 // What the next stages stand on here: the VRAM aperture mapped
 // write-combining (`vramView`; the firmware's picture, which the kernel's
@@ -28,8 +39,9 @@
 // layout.Vector.GPU and smp.localApic's id (trap.mlx calls `interrupted`
 // and ends it), though polling does until the rings run.
 //
-// The firmware's picture has to stay: there is no mode setting here, and
-// the screen is the only console on the machine. From what Linux's amdgpu
+// The firmware's picture has to stay unless the image asks for the
+// monitor's own mode: the screen is the only console on the machine. From
+// what Linux's amdgpu
 // does (vi.c, gmc_v8_0.c, dce_v11_0.c; the register numbers are to be
 // checked against its headers before use), while the firmware's mode is
 // the console none of this may be done:
@@ -43,7 +55,8 @@
 //   again (it runs: the picture is there);
 // - BIF_FB_EN's read and write enables cleared (the processor's way into
 //   the aperture), anything of the display engine (CRTC, GRPH, VGA
-//   registers, ATOM's encoder, transmitter and pixel clock tables);
+//   registers, ATOM's encoder, transmitter and pixel clock tables) but
+//   what gpu_mode.mlx plans, by gpu_set.mlx;
 // - the SMU started again or DPM enabled before the rings run (a memory
 //   clock switched outside the vertical blank tears the picture).
 const layout = @import("../layout.mlx")
@@ -54,6 +67,12 @@ const console = @import("./console.mlx")
 const display = @import("./display.mlx")
 const clock = @import("./clock.mlx")
 const scanout = @import("./gpu_display.mlx")
+const mode = @import("./gpu_mode.mlx")
+const modeset = @import("./gpu_set.mlx")
+const edid = @import("./edid.mlx")
+const cpu = @import("./cpu.mlx")
+const archive = @import("./archive.mlx")
+const vfs = @import("./vfs.mlx")
 const Page = memory.Page
 
 const VENDOR_AMD: usize = 0x1002
@@ -233,13 +252,57 @@ fn displayNow() -> usize { return clock.system().monotonic() }
 
 fn displayWrite(text: []const u8) -> void { console.out.write(text) }
 
+// Whether the image asks for the monitor's own mode to be set by this
+// driver: a file settings/gpu in the boot archive whose first word is
+// "native" (the word, then the file's or a line's end or a blank: a file
+// that says anything else, "native-off" too, does not ask). The
+// archive's, whatever / is mounted from: the image that was started says
+// it, so that a trial image tries and the usual one beside it does not.
+var native = false // (per run)
+
+fn nativeAsked() -> bool {
+    const file = archive.Archive.boot().find("settings/gpu")
+    const word = "native"
+    if file.size < word.length { return false }
+    var k: usize = 0
+    while k < word.length {
+        if file.data[k] != word[k] { return false }
+        k += 1
+    }
+    if file.size == word.length { return true }
+    const after = file.data[word.length]
+    return after == 10 || after == 13 || after == 32 || after == 9
+}
+
+// A register of the display written: the one place, and only when the
+// image asks for the monitor's own mode. gpu_set.mlx is lent this and
+// `displayClear`, nothing else of the card.
+fn displayWriteRegister(number: usize, value: u32) -> void {
+    if !native || (number << 2) + 4 > gpu.registersSize { return }
+    gpu.at(number << 2).* = value
+}
+
+// A part of the aperture set to black (a new picture's memory, before the
+// controller shows it); never the part the console draws on.
+fn displayClear(offset: usize, bytes: usize) -> void {
+    if !native || gpu.vramView == 0 || offset + bytes > gpu.vramViewSize { return }
+    if offset < gpu.consoleOffset + gpu.consoleBytes && offset + bytes > gpu.consoleOffset { return }
+    Bytes.fill(Bytes.pointer(gpu.vramView + offset), bytes, 0)
+}
+
+// What the read-out was told of the aperture and the firmware's picture,
+// the plan for the monitor's own mode, and what became of it.
+var known: scanout.Memory = undefined // (per run)
+var planned: mode.Plan = undefined // (per run)
+var outcome: modeset.Result = undefined // (per run)
+
 // The display controller read out and said: decoded, with what it shows
 // and what the next stage would set, on the screen too; the registers
 // themselves in the log alone (/devices/klog), where a wrong number can be
 // looked for.
 fn readDisplay() -> void {
     const card = scanout.Card.{ .read = displayRead, .now = displayNow, .write = displayWrite }
-    var known = scanout.Memory.{
+    known = scanout.Memory.{
         .aperture = if gpu.vramViewSize != 0 { gpu.vramViewSize } else { gpu.vramSize },
         .pictureOffset = 0,
         .pictureBytes = 0,
@@ -259,6 +322,123 @@ fn readDisplay() -> void {
     const was = console.screen(false)
     scanout.dump(&card, &shown)
     _ = console.screen(was)
+}
+
+// The plan for the monitor's own mode, made from the read-out and the
+// monitor's timing and said: what it comes to on the screen too, its
+// steps in the log alone. Nothing is written for it.
+fn planDisplay() -> void {
+    const card = scanout.Card.{ .read = displayRead, .now = displayNow, .write = displayWrite }
+    if monitor.state == edid.State.none { console.out.write("gpu: the monitor's own timing is not known (no EDID from the firmware)\n") }
+    mode.make(&card, &shown, &known, &monitor, &planned)
+    mode.say(&card, &planned)
+    const was = console.screen(false)
+    mode.list(&card, &planned)
+    _ = console.screen(was)
+}
+
+// A picture in the card's aperture (`offset` bytes into it, `width` by
+// `height`, `pitch` pixels from row to row) taken as the kernel's display,
+// when the controller shows it: the display's record is the new picture's
+// (display.mlx `retake`; what /devices/framebuffer tells and maps from
+// here on, and the node's size), the console's part of the aperture is
+// the new one, and the console is made anew on it (cleared, and what the
+// screen showed drawn again). What the kernel says in between goes to the
+// log and is drawn with the rest.
+fn takePicture(offset: usize, width: usize, height: usize, pitch: usize) -> void {
+    const screen = display.screen()
+    screen.retake(gpu.vram + offset, width, height, pitch * 4)
+    gpu.consoleOffset = offset
+    gpu.consoleBytes = screen.size()
+    // (The node's size was the firmware's picture's when the file system
+    // was made.)
+    const tree = vfs.fileSystem()
+    const devices = tree.lookup(vfs.Vfs.ROOT, "devices".pointer, 7)
+    if devices != vfs.Vfs.NONE {
+        const node = tree.lookup(devices, "framebuffer".pointer, 11)
+        if node != vfs.Vfs.NONE { tree.node(node).*.size = screen.size() }
+    }
+    console.out.write("brixOS: display ")
+    console.out.decimal(screen.*.width)
+    console.out.write("x")
+    console.out.decimal(screen.*.height)
+    console.out.write(" pitch ")
+    console.out.decimal(screen.*.pitch)
+    console.out.write(" format ")
+    console.out.decimal(screen.*.format)
+    console.out.write(" at ")
+    console.out.hex(screen.*.address)
+    console.out.write(" (the monitor's own mode, set by the GPU's driver)\n")
+    _ = console.reshapeFramebuffer()
+}
+
+// The plan carried out when the image asks for it (gpu_set.mlx says what
+// happens, and puts the firmware's state back when it fails). When the
+// controller runs the new picture, it is the kernel's display from here
+// on (`takePicture`), and the programs that map /devices/framebuffer
+// later get the new picture and its size. No program runs yet, and the
+// other processors are not started: nothing else draws while it changes.
+fn setDisplay() -> void {
+    const card = scanout.Card.{ .read = displayRead, .now = displayNow, .write = displayWrite }
+    const hands = modeset.Hands.{ .write = displayWriteRegister, .clear = displayClear }
+    native = nativeAsked()
+    // The new picture is cleared before the controller shows it: its
+    // memory has to be in the kernel's view (`displayClear` leaves alone
+    // what is not).
+    if native && planned.complete && (gpu.vramView == 0 || planned.offset + planned.bytes > gpu.vramViewSize) {
+        native = false
+        console.out.write("gpu: the image asks for the monitor's own mode (settings/gpu), but the new picture's memory is not in the kernel's view: nothing is written to the card\n")
+        return
+    }
+    if !modeset.attempt(&card, &hands, &planned, native, &outcome) { return }
+    takePicture(planned.offset, planned.width, planned.height, planned.pitch)
+}
+
+// What the monitor of the firmware's display says of itself: its EDID as
+// the EFI loader passed it on (layout.Blob.EDID, Info.EDID_BYTES bytes of
+// it; none under a Multiboot loader), read for the monitor's own timing
+// and said in the log. Whatever card there is, or none: the timing is the
+// monitor's.
+var monitor: edid.Monitor = undefined // (per run)
+
+fn readMonitor() -> void {
+    var count = cpu.BootInfo.get(layout.Info.EDID_BYTES)
+    if count > layout.Blob.EDID_ROOM { count = layout.Blob.EDID_ROOM }
+    var bytes = unsafe { @ptrFromInt([*]const u8, layout.Blob.virtual(layout.Blob.EDID)) }
+    if count == 0 {
+        // A virtual machine's Bochs adapter (QEMU's VGA and bochs-display)
+        // keeps its monitor's EDID at the start of its register area, and
+        // its firmware passes none on: taken from there when it begins as
+        // an EDID does.
+        const adapter = bochsEdid()
+        if adapter != 0 {
+            bytes = unsafe { @ptrFromInt([*]const u8, adapter) }
+            count = layout.Blob.EDID_ROOM
+        }
+    }
+    monitor = edid.read(bytes[0..count])
+    edid.say(displayWrite, &monitor)
+}
+
+// The Bochs display adapter's EDID (PCI 1234:1111; the first bytes of
+// the memory its BAR2 names: "edid data blob", QEMU's
+// docs/specs/standard-vga), in the kernel's view; 0 when there is no such
+// adapter or the bytes do not begin as an EDID.
+fn bochsEdid() -> usize {
+    const adapter = Pci.find(0x1234, 0x1111)
+    if adapter == Pci.NONE { return 0 }
+    const physical = Pci.memBase(adapter, 2)
+    if physical == 0 { return 0 }
+    const view = memory.Device.map(physical, 4096, memory.Device.UNCACHED)
+    if view == 0 { return 0 }
+    const bytes = unsafe { @ptrFromInt([*]const u8, view) }
+    var k: usize = 0
+    while k < 8 {
+        const wanted: u8 = if k == 0 || k == 7 { 0 } else { 0xFF }
+        if bytes[k] != wanted { return 0 }
+        k += 1
+    }
+    return view
 }
 
 // The AMD display device number `n` of class `code` (VGA, or another
@@ -329,6 +509,8 @@ fn take(address: usize) -> bool {
     gpu.report()
     if gpu.polaris() {
         readDisplay()
+        planDisplay()
+        setDisplay()
     } else {
         console.out.write("gpu: the display controller is not read (its registers are known for Polaris cards only)\n")
     }
@@ -340,6 +522,7 @@ fn take(address: usize) -> bool {
 // is AMD, else one of another display class.)
 pub fn probe() -> bool {
     gpu.present = false
+    readMonitor()
     var pass: usize = 0
     while pass < 2 {
         var n: usize = 0

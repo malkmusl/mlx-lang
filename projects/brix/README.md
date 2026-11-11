@@ -281,6 +281,29 @@ asked still waits inside the kernel meanwhile: no other one runs until
 the request is done.
 While a volume is mounted from it, a /devices/diskN is not writable.
 
+A large disk costs what is done on it, not what it is. The store keeps a
+map of the blocks in use (projects/brix/blockmap.mlx: a bit a block, 15
+MiB for 500 GB) with the count of them, so the free room is a
+subtraction; a free block is found by stepping over full words; a commit
+frees just the blocks it replaced, where it walked every root of the
+volume before (volume.mlx, "free blocks", says why that is safe, and
+when a walk is still made). The kernel says at each mount how long it
+took ("brixOS: disk0: a brixfs volume of 131072000 blocks, 131071996
+free, read in 46 ms (its roots walked in 3 ms, 6 blocks read)"), and
+`volume PATH` what the store did since (projects/brix/tools/volume, on
+volume_info, call 56: commits and their times, walks, blocks read and
+written; `volume --check PATH` has the map compared with a walk over
+every root; the check below builds it, the boot image does not hold it
+yet).
+tools/check_brix_bigdisk.sh does it on a sparse 500 GB image: the mount
+and a thousand status questions within bounds, the free count against the
+host's `brixfs check` (which holds a volume of any size and counts the
+blocks in use), a small disk filled and emptied, six thousand files made
+in one go with a snapshot of them and a file of 600 MiB read after a
+restart (the store's loops let go, each round, what they made in the
+kernel's arena: kept, it ran out and the kernel stopped), the machine
+cut off.
+
 ## On a real machine
 
 Beside virtio, the kernel drives what a board has (a Supermicro H11 with
@@ -342,7 +365,10 @@ often has no 3840x1080 for a wide monitor), the loader takes, of the
 modes no wider and no higher, the one that shows most of a picture of
 that shape (1280x960 before 1280x1024 on such a monitor), if that is
 more than the firmware's own mode shows: still stretched, but less; the
-monitor's own mode then takes the card's driver. An image may name a mode
+monitor's own mode then takes the card's driver, for which the loader
+passes the EDID itself on to the kernel (its base block and first
+extension block, 256 bytes at layout.Blob.EDID; Info.EDID_BYTES says how
+many there are). An image may name a mode
 itself: a file settings/display in the archive, "3840x2160" (that mode,
 or the nearest below it) or "firmware" (the firmware's, come what may);
 brix-image builds the loader for it. The kernel's log says what
@@ -374,7 +400,9 @@ firmware's framebuffer (fbcon.mlx: an 8x16 font, a grid of characters so
 that a scroll never reads the adapter's memory back, the framebuffer
 mapped write-combining) until a graphical program maps it, and kept in a
 log (/devices/klog; klogsave writes it to boot.log on the brixfs
-volumes). `console.screen(false)` keeps a long dump off the screen (in
+volumes and keeps the boot before's beside it as boot.previous.log: what
+the kernel said in a boot that ended with a dark screen is read after
+the next one). `console.screen(false)` keeps a long dump off the screen (in
 the log and on the serial line only). A fault of the kernel's own stops
 it with a report on the screen (trap.mlx `stop`: what, where, the
 registers, the callers), drawn over whatever is there.
@@ -441,6 +469,8 @@ writes two images for such a machine beside the build's: BOOTX64-diag.EFI
 photographed) and BOOTX64-console.EFI (mlx-console on the screen: a
 shell with the USB keyboard; `cat /devices/klog` shows the log). Both
 run on one processor and carry the GPU's firmware.
+(tools/brix-native-efi.sh makes the images that ask the GPU's driver for
+the monitor's own mode: below.)
 
 The GPU (gpu.mlx: an AMD Radeon, Polaris) is found and its register path
 tried; its driver is built in stages, and what the next ones stand on is
@@ -449,11 +479,14 @@ the card reads and writes (`gpu.dma`), its firmware from the boot
 archive by name (`Archive.find`), a vector for its interrupt
 (layout.Vector.GPU, `Pci.enableMsi`, `smp.localApic`). The firmware's
 picture is the console and the desktop's screen: the file's head says
-what must not be done to the card while it is.
+what must not be done to the card while it is, and where to read that
+the usual boot writes no register of the display.
 
-Its display controller (DCE 11.2) is read, not yet set
-(gpu_display.mlx; the register numbers are those of Linux's
-dce_11_2_d.h, vid.h and gmc_8_1_d.h, looked up there; only a Polaris
+Its display controller (DCE 11.2) is read at every boot, and set only
+when the image asks for it (gpu_display.mlx reads, gpu_mode.mlx plans,
+gpu_set.mlx writes; the register numbers and fields are those of Linux's
+dce_11_2_d.h, dce_11_2_sh_mask.h, vid.h and gmc_8_1_d.h, looked up there
+and held against them by tools/check_gpu_registers.py; only a Polaris
 card's is read, on another AMD card the same numbers are other
 registers and the log says that it is not read). For every
 controller that is on the log says the timing (the size shown, the
@@ -468,26 +501,104 @@ one line says what it shows:
     gpu: controller 0 shows 3840x1080 from a picture of 1280x960: the card scales
     gpu: controller 0 shows a picture of 1280x960 as it is: the monitor is sent 1280x960
 
-In the first case a picture of the size shown needs only a surface of
-that size, the viewport, the scaler and the line buffer set on the
-running controller, and "gpu: would set" lines say with what (the
-surface in the aperture after the firmware's picture and surface); that
-is the monitor's own size only if the firmware runs the monitor's own
-timing, which the kernel cannot tell (it does not read the EDID). In the
-second the pixel clock, the timing and the link have to be set, which
-is not there yet. Numbers that do not fit together (a total smaller
-than what is shown, a viewport that is not the firmware's picture, an
-address outside the aperture) are not concluded from: "gpu: the
-read-out is not plausible (...): the register map needs correcting".
-The registers themselves
-("gpu: raw 1b80: 00000f9f ...": a register's number, then its value and
-those of the registers after it) are in the log only
-(/devices/klog); a shell shows them by themselves with
+Numbers that do not fit together (a total smaller than what is shown, a
+viewport that is not the firmware's picture, an address outside the
+aperture) are not concluded from: "gpu: the read-out is not plausible
+(...): the register map needs correcting".
 
-    while read l; do case "$l" in "gpu: raw"*) echo "$l";; esac; done < /devices/klog
+The monitor's own timing is its EDID's (edid.mlx: the detailed timings
+of the base block, of a CTA-861 and of a DisplayID extension block; the
+monitor's own size is its preferred timing's, and of the timings of that
+size the one with the lowest rate of 50 Hz or more is taken, which asks
+least of the link; an interlaced one and one for stereo glasses are
+passed over):
+
+    gpu: the monitor's own timing is 3840x1080 at 60.00 Hz: pixel clock 266640 kHz, h 3840 4000 (front 48 sync 32 +), v 1080 1111 (front 3 sync 10 -)
+
+(OVMF has no EDID for QEMU's display. tools/check_brix_efi.sh tries the
+loader's way all the same: a test image's loader gives the firmware an
+EDID first, `brix-image --test-edid=FILE`. Where the loader passes none
+on, the kernel takes the Bochs adapter's own, QEMU's `-device
+VGA,edid=on,xres=3840,yres=1080`.)
+
+From the read-out and that timing the kernel makes a plan and says it
+(for the card that shows the picture the kernel draws on: where the
+firmware's console is another adapter's, the EDID is that one's
+monitor's and nothing is planned).
+There are two situations. (a) The controller runs the monitor's own
+timing and the card scales the firmware's small picture: a picture of
+the timing's size needs a surface of that size, the viewport, the scaler
+off, and for the long rows the line buffer's whole memory, more buffers
+and safe urgency marks, on the running controller. (b) The controller
+runs the small picture's timing: the pixel clock, the timing and the
+stream have to be set too. That is planned for DisplayPort, where this
+controller makes the pixel clock by a DTO (a phase over a modulo: two
+registers), and only when the link the firmware trained has room for the
+new clock (lanes times rate times 8/10 over the bits a pixel; the rate
+is not in a register of its own and is worked out from the stream's M
+and N and the pixel clock). A link
+that is too slow would have to be trained again, and an HDMI or DVI
+output's clock is a PLL's; Linux sets both by the card's firmware
+tables, which are not run here: not there yet.
+
+    gpu: plan (a): the controller runs this timing already; a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 38 writes would do it
+    gpu: plan (b, DisplayPort): the link has 4 lanes at 2.70 Gbit/s (by M 0x3333 over N 0x8000), room for 360000 kHz at 24 bits: 266640 kHz fits
+    gpu: plan (b, DisplayPort): the pixel clock from 108000 to 266640 kHz (the DTO's phase from 108000000 to 266640000), the timing, the stream stopped and started, a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 63 writes would do it
+    gpu: plan (b): nothing would be set: HDMI: the TMDS clock's PLL must be set, not there yet
+
+The plan's steps, a line each ("gpu: would write 1b9d = 00000100 (the
+controller's picture blanked)"), and the registers themselves ("gpu: raw
+1b80: 00000f9f ...": a register's number, then its value and those of
+the registers after it) are in the log only (/devices/klog, boot.log); a
+shell shows them by themselves with
+
+    while read l; do case "$l" in "gpu: raw"*|"gpu: would w"*) echo "$l";; esac; done < /devices/klog
+
+The steps' order and locks are those of Linux's display core
+(gpu_mode.mlx names the function each one follows, and says where Linux
+hands a step to the firmware's tables and the registers are written
+directly instead). (The read-out's own "next stage" and "would set"
+lines are the stage's before; the plan says more.)
+
+None of this writes to the card. A plan is carried out only by an image
+whose archive has a file settings/gpu with the word `native`:
+
+    tools/brix-native-efi.sh
+
+makes it from the build's image: mlx-out/bin/brix/esp/EFI/BOOT/
+BOOTX64-native.EFI is BOOTX64.EFI with that one file more (`brix-image
+--add`), and BOOTX64-diag-native.EFI the diagnostic image likewise when
+tools/brix-diag-efi.sh has made one. With the file, and a plan that is
+complete, the kernel carries the plan out before any program runs
+(gpu_set.mlx): the new picture's memory is cleared, each write is read
+back, each state waited for has its time, and afterwards the
+controller's frame counter must run at the planned rate and the memory
+interface must not say that it ran dry. When anything of that fails the
+firmware's state is put back, every register from the value read before,
+and the log says what failed and what came back. When it holds, the
+kernel's display is the new picture from there on: the console is drawn
+again on it, and /devices/framebuffer gives the programs the monitor's
+own size.
+
+On the machine: start the build's image (or the diagnostic one, where
+the log stays on the screen) and photograph the "gpu:" lines: the
+monitor's timing, the controller's lines and the plan say which
+situation it is and whether the plan is complete. If it is ("... writes
+would do it"), copy BOOTX64-native.EFI to the ESP beside BOOTX64.EFI and
+start it from the firmware's boot menu. The desktop at the monitor's own
+size is the success; the log says "gpu: controller 0 shows a picture of
+3840x1080 as it is, ... the monitor's own mode is set". If the screen
+stays dark, or is as before, start the normal image again and read what
+the driver did: klogsave kept that boot's log as boot.previous.log on
+the brixfs volumes (`cat /volumes/NAME/boot.previous.log`; the boot
+after that one overwrites it, klogsave run again by hand does not).
 
 tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
-numbers on the host.
+numbers on the host, tests/459_edid_timing_runtime.mlx reads EDIDs
+written from the standard's layout, and
+tests/460_gpu_mode_set_runtime.mlx holds both plans' writes against the
+sequences worked out from Linux's code, on a card that is a table and
+can fail at every step.
 
 What is not there yet: disks served by their interrupts (AHCI, NVMe: a
 command is waited for), USB devices other than boot keyboards, mice and
@@ -509,15 +620,29 @@ ahead and a transmit queue, on a virtqueue of their own, virtqueue.mlx);
 The kernel's stack (kernel/net) runs on it:
 
 - stack.mlx: Ethernet, ARP (a table of the neighbours, a request when
-  one is missing: the packet is dropped and the sender tries again),
-  IPv4 (one address, netmask and gateway; no fragments) and ICMP (echo
-  answered). The addresses are QEMU's user network's (10.0.2.15/24,
-  the gateway 10.0.2.2, the name server 10.0.2.3) unless
-  /system/settings/network says otherwise (`address`, `netmask`,
-  `gateway`, `nameserver` lines); the kernel writes
-  /system/settings/resolv.conf for programs that look names up
-  ("brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server
-  10.0.2.3").
+  one is missing: the packet waits for the answer, four packets at a
+  time, the neighbour asked three times a quarter of a second apart;
+  when nobody answers what waited is dropped, and an echo request's
+  ping socket is told in ICMP's words, "host unreachable" from the
+  machine's own address), IPv4 (one address, netmask and gateway; no
+  fragments; 127.0.0.0/8 is the machine itself: what is sent there
+  comes straight back in, from the address it was sent to, with or
+  without an address of the network's, and never goes onto the wire)
+  and ICMP (echo answered). The
+  addresses are /system/settings/network's (`address`, `netmask`,
+  `gateway`, `nameserver` lines) or DHCP's. Until one of them gives an
+  address the stack has none: it sends nothing but DHCP's messages
+  (from 0.0.0.0), takes nothing but DHCP's answers and answers no ARP
+  request. What the file or DHCP's answer leaves out is none: without
+  a gateway only the own subnet is reached (a send to anywhere else
+  fails as one that could not go: would_block for a datagram, a
+  connection that times out), without a name server resolv.conf has no
+  line and no name is looked up; a netmask left out is the one of the
+  address's class. The kernel writes /system/settings/resolv.conf for
+  programs that look names up, and says at boot "brixOS: net0 is
+  10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)" (without
+  "(DHCP)" for the file's; "none" for a gateway or a name server there
+  is not).
 - udp.mlx, tcp.mlx: datagrams; connections (active and passive open,
   segments of MSS bytes within the peer's window from a send ring,
   sent again after a timeout that doubles, data received in order into
@@ -534,10 +659,30 @@ The kernel's stack (kernel/net) runs on it:
   std.platform's paths) and std.http.client run unchanged, so does
   wget (projects/wget: `wget URL [-O FILE]`, http and https).
 
-- dhcp.mlx: at boot, unless the settings give an address, DHCP asks
-  QEMU's user network (DISCOVER, REQUEST; the ACK's address, netmask,
-  router and name server; "(DHCP)" on the boot line; the lease is not
-  renewed). settings.mlx reads the network file and writes resolv.conf.
+- lease.mlx, dhcp.mlx: unless the settings give an address, DHCP asks
+  for one (RFC 2131). lease.mlx is the client and knows no kernel (its
+  clock and its wire are two functions, so tests/455_dhcp_lease_runtime
+  drives it on the host); dhcp.mlx puts it on the kernel's clock and
+  UDP and does to the stack what it says. DISCOVER goes at boot (the
+  boot waits half a second for the answer) and again after 1, 2, 4, 8
+  and then every 16 seconds for as long as nobody answers, and at once
+  when the cable comes in (the link is looked at once a second). The
+  ACK's address, netmask, router and name server are the configuration.
+  The lease's time and its T1 and T2 are the answer's (options 51, 58,
+  59; half and seven eighths of the lease without them, or where they
+  do not lie in order inside the lease, or T1 is no seconds): at T1 a
+  REQUEST goes to the server from the own address, at T2 to everyone,
+  each again after half of what is left (a minute at least); when the
+  lease ends or a server answers NAK the address is given up (the
+  stack has none again) and discovery starts from the beginning. A
+  lease for ever is not renewed. When the answer comes after the boot
+  has said "net0 has no address yet (DHCP is asking)", the kernel says
+  "brixOS: net0 is ..., gateway ..., name server ... (DHCP)" then, on
+  a line of its own, and again only when a renewal changes the
+  configuration; an address given up is "brixOS: net0 gave up
+  10.0.2.15: its lease ran out (DHCP is asking)" (or ": the DHCP
+  server took it back"). settings.mlx reads the network file and
+  writes resolv.conf.
 - native/sockets.mlx: brixOS's own socket calls (spec calls 39 to 46:
   socket_open of a stream, datagram or ping socket, bind, connect,
   listen, accept, send, receive, info; std.os.brix's socketOpen and
@@ -552,27 +697,36 @@ The kernel's stack (kernel/net) runs on it:
   (host.brixos.mlx: socket_open's kind 3, the one wait, the interrupt
   event; host.mlx is Linux's datagram socket of IPPROTO_ICMP). The
   kernel sets the identifier and gives the socket its replies, and
-  ICMP's word that a request was not delivered. The destination is the
-  address given with the send (its port means nothing); would_block
-  says the neighbour's hardware address is being asked for, and ping
-  sends again. 127.0.0.0/8 is answered by the machine's own address.
+  ICMP's word that a request was not delivered: a router's, or the
+  kernel's own when nobody said the hardware address the request was
+  to go to (ping then says "no answer from 10.10.36.9 (its hardware
+  address is not known: nobody answered for it)", or names the
+  gateway). The destination is the address given with the send (its
+  port means nothing); would_block says the request cannot go now
+  (there is no address yet, no gateway leads there, the device is
+  busy): ping tries again for the request's second and then says which
+  it was. 127.0.0.1 is answered from 127.0.0.1.
 - link.mlx: the link's state for programs. /devices/net0 is a node of a
   kind of its own (as /devices/framebuffer is the display's): a read
   gives the link's record as things are at that moment (spec
-  `<NetworkLink>`, 64 bytes with its length first: whether the cable is
+  `<NetworkLink>`, 72 bytes with its length first: whether the cable is
   in (igb's status register, virtio-net's status word), DHCP still
   asking, where the address is from (nowhere yet, DHCP, the settings
   file), the speed where the card says it, the hardware address, the
-  driver's name, the address, netmask, gateway and name server, the
-  frames received and sent). std.os.brix's `networkLink(index, &link)`
-  reads it into a struct. A machine without a network device has no
-  such node. Until DHCP has answered the record has no address, and the
-  boot line is "brixOS: net0 has no address yet (DHCP is asking)".
+  driver's name, the address, netmask, gateway and name server
+  (0.0.0.0: none), the frames received and sent, and the seconds
+  DHCP's lease still runs and was given for). The record was 64 bytes
+  before the lease's two words: a program that asks for 64 gets those
+  as they were. std.os.brix's `networkLink(index, &link)` reads it
+  into a struct. A machine without a network device has no such node.
+  Until DHCP has answered the record has no address, and the boot line
+  is "brixOS: net0 has no address yet (DHCP is asking)".
 
 The settings app's Network page (projects/desktop/settings,
 network.brixos.mlx) shows that record for every link, read again every
 two seconds: connected or no cable, the address with its prefix length
-and "by DHCP" or "from the settings", gateway, name server, hardware
+and "by DHCP" or "from the settings", gateway and name server ("None"
+where there is none), how long DHCP's lease still runs, hardware
 address, driver, the frames; and how to give a fixed address
 (/system/settings/network, read at boot). Nothing is changed from the
 page yet.
@@ -591,22 +745,36 @@ pulls the cable, and boots without a card and without a DHCP server).
 
 tools/check_brix_net.sh boots with the user network: DHCP, ping as a
 person types it (tools/brix_ping_cases.sh, which the igb check goes
-through too: a neighbour not spoken to yet, the gateway, an address
-nobody has, the machine itself, a name, the count's forms, two at once,
-forty in a row, Ctrl+C; QEMU's capture of the frames says where the
-echo requests went), wget fetching files (a small one, a 400 KiB one, a
-missing one) from an HTTP server on the host, the native calls (a
-stream to ourselves, a datagram, an echo), and the link's record as
-netcalls reads it; then again on a wire without a DHCP server (no
-address yet), on another network (192.168.76.0/26: the record has what
-that DHCP server answered, not what the stack starts with), with a
-fixed address in the settings file, and on a network of the check's own
-(tools/brix_lan.py at the other end of QEMU's socket network: a name
-server, replies later than a second, a reply twice, a neighbour slow to
-say its hardware address, a router that says a host cannot be
-reached). tools/check_brix_desktop.sh opens
-the Network page and pulls the cable. Not yet: IPv6, a lease's renewal,
-a second link, the configuration changed while the system runs.
+through too: a neighbour not spoken to yet, whose first request the
+kernel keeps until its hardware address is known, the gateway, an
+address nobody has, the machine itself, a name, the count's forms, two
+at once, forty in a row, Ctrl+C; QEMU's capture of the frames says
+where the echo requests went), wget fetching files (a small one, a 400
+KiB one, a missing one) from an HTTP server on the host, the native
+calls (a stream to ourselves, a datagram, an echo; a stream and a
+datagram to 127.0.0.1), and the link's record as netcalls reads it,
+with the lease; then again on a wire without a DHCP server (no address:
+nothing but DHCP's questions is on the wire, a datagram sent to
+everyone is not heard, resolv.conf is empty, 127.0.0.1 is reached all
+the same), with the cable out until after the boot (the address said
+when it comes), on another network (192.168.76.0/26: the record has
+what that DHCP server answered), with a fixed address in the settings
+file (the first packet through its gateway answered), with an address
+line alone (no gateway, no name server: the own subnet and nothing
+else), with an address line of 0.0.0.0 (that is no address: DHCP
+asks), and on a network of the
+check's own (tools/brix_lan.py at the other end of QEMU's socket
+network: a name server, replies later than a second, a reply twice, a
+neighbour slow to say its hardware address, a router that says a host
+cannot be reached, a host and a gateway nobody answers for).
+tools/check_brix_net_igb.sh does the cable pulled and put back and the
+late answer on the igb card. tests/455_dhcp_lease_runtime.mlx runs the
+lease's renewal and end on a clock of its own (QEMU's user network
+gives a lease of a day, and its length cannot be set).
+tools/check_brix_desktop.sh opens the Network page and pulls the cable.
+Not yet: IPv6, a second link, the configuration changed while the
+system runs, a lease checked again when the cable comes back (it is
+kept until it ends).
 
 ## brixfs: the disk's format
 
