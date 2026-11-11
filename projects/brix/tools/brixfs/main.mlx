@@ -13,7 +13,10 @@
 //                                 and no block in two files of one root,
 //                                 entries naming inodes that are there,
 //                                 link counts; the snapshots' roots too.
-//                                 Exits 1 when something is wrong.
+//                                 It says how many blocks are in use (the
+//                                 superblocks, the snapshot table, what a
+//                                 root reaches). Exits 1 when something
+//                                 is wrong.
 //   brixfs repair DEVICE          checked, and what can be mended is:
 //                                 link counts set to the entries' count,
 //                                 entries naming no inode cleared, in a
@@ -24,6 +27,7 @@
 const std = @import("std")
 const crash = @import("std.crash")
 const format = @import("../../brixfs.mlx")
+const BlockMap = @import("../../blockmap.mlx").BlockMap
 const random = @import("std.random")
 const flate = @import("std.flate")
 const Brixfs = format.Brixfs
@@ -532,14 +536,20 @@ fn createImage(path: [*]const u8, megabytes: []const u8) -> u8 {
 // ---- check and repair ----
 
 // What a root holds: a bit a block in use, a link count an inode (from
-// the entries), what was found wrong.
+// the entries), what was found wrong. The maps are as large as the
+// volume needs (a bit a block: 15 MiB for 500 GB; a fixed one ended the
+// check at 16 GiB), and an extent is marked as a run, not a block at a
+// time.
 const Check = struct {
-    const MAX_BLOCKS_CHECKED: usize = 1 << 22
     const LINKS: usize = Brixfs.MAX_INODES
 
     device: Device
     blocks: usize
-    used: [MAX_BLOCKS_CHECKED / 8]u8
+    // The blocks the root being checked reaches; those any root reaches,
+    // with the superblocks and the snapshot table: the volume's blocks
+    // in use.
+    used: BlockMap
+    all: BlockMap
     links: [LINKS]u32
     problems: usize
     // Repair: the table blocks changed (a page each by index; 0 none).
@@ -554,23 +564,15 @@ const Check = struct {
         self.*.problems += 1
     }
 
-    fn isUsed(self: *const Self, block: usize) -> bool { return self.*.used[block / 8] & (@intCast(u8, 1) << @intCast(u3, block % 8)) != 0 }
-
     // The block marked; false when it was marked already (two files of
     // the root name it) or is out of range.
-    fn use(self: *Self, block: usize) -> bool {
-        if block < Brixfs.SUPERBLOCKS || block >= self.*.blocks { return false }
-        if self.isUsed(block) { return false }
-        self.*.used[block / 8] |= @intCast(u8, 1) << @intCast(u3, block % 8)
-        return true
-    }
+    fn use(self: *Self, block: usize) -> bool { return self.useRun(block, 1) }
 
-    fn clearUsed(self: *Self) -> void {
-        var k: usize = 0
-        while k < (self.*.blocks + 7) / 8 {
-            self.*.used[k] = 0
-            k += 1
-        }
+    // A run of blocks marked; false when one of them was marked already
+    // or is out of range.
+    fn useRun(self: *Self, start: usize, length: usize) -> bool {
+        if start < Brixfs.SUPERBLOCKS || start >= self.*.blocks || length > self.*.blocks - start { return false }
+        return self.*.used.markRun(start, length) == length
     }
 
     // An inode's extents: in range, its blocks used once, covering no
@@ -598,14 +600,7 @@ const Check = struct {
                 return
             }
             if e.start + e.length > need { self.say("inode with an extent past its size:", number) }
-            var j: usize = 0
-            while j < e.length {
-                if !self.use(e.block + j) {
-                    self.say("inode naming a block out of range or in use twice:", number)
-                    break
-                }
-                j += 1
-            }
+            if !self.useRun(e.block, e.length) { self.say("inode naming a block out of range or in use twice:", number) }
             k += 1
         }
     }
@@ -640,7 +635,7 @@ const Check = struct {
 
     // One root (the current one or a snapshot's): everything it holds.
     fn checkRoot(self: *Self, root: usize, nextInode: usize) -> void {
-        self.clearUsed()
+        self.*.used.clear()
         var k: usize = 0
         while k < Brixfs.MAX_INODES {
             self.*.links[k] = 0
@@ -691,7 +686,16 @@ const Check = struct {
             }
             number += 1
         }
+        self.*.all.join(&self.*.used)
     }
+}
+
+// Memory for a map of `blocks` blocks (the caller clears it); null when
+// there is none.
+fn mapMemory(blocks: usize) -> ?[*]usize {
+    const memory = std.heap.allocator().alloc(BlockMap.bytesFor(blocks) + 8, 4096)
+    if memory == null { return null }
+    return unsafe { @ptrFromInt([*]usize, @intFromPtr(memory.?)) }
 }
 
 var checker: Check = undefined // (per run)
@@ -706,10 +710,51 @@ fn check(path: [*]const u8, repairing: bool) -> u8 {
     c.*.device = device
     c.*.blocks = superblock.blocks
     c.*.problems = 0
-    if superblock.blocks > Check.MAX_BLOCKS_CHECKED { return fail("the volume is larger than check can hold (16 GiB)") }
+    if superblock.blocks < Brixfs.SUPERBLOCKS || superblock.blocks > deviceBytes(path) / BLOCK { return fail("the superblock names more blocks than the device has") }
+    const usedMemory = mapMemory(superblock.blocks)
+    const allMemory = mapMemory(superblock.blocks)
+    if usedMemory == null || allMemory == null { return fail("no memory for the map of the volume's blocks") }
+    c.*.used.init(usedMemory.?, superblock.blocks)
+    c.*.all.init(allMemory.?, superblock.blocks)
+    // (The heap's memory is not zeros when it was used before: a small
+    // volume's map comes from a block given back.)
+    c.*.used.clear()
+    c.*.all.clear()
+    _ = c.*.all.markRun(0, Brixfs.SUPERBLOCKS)
     if superblock.root == 0 || superblock.root >= superblock.blocks { c.say("superblock naming a table root out of range:", superblock.root) }
     if superblock.nextInode > Brixfs.MAX_INODES { c.say("superblock with a next inode past the table:", superblock.nextInode) }
+    // The snapshots' roots first (each a volume of its own: what it
+    // holds must be whole too), then the current one, whose link counts
+    // the repair below reads.
+    if superblock.snapshots != 0 {
+        var table: [BLOCK]u8 = undefined
+        if superblock.snapshots < Brixfs.SUPERBLOCKS || superblock.snapshots >= superblock.blocks || !device.readBlock(superblock.snapshots, &table) {
+            c.say("superblock naming a snapshot table that cannot be read:", superblock.snapshots)
+        } else {
+            _ = c.*.all.markRun(superblock.snapshots, 1)
+            var slot: usize = 0
+            while slot < Brixfs.MAX_SNAPSHOTS {
+                const root = SnapshotEntry.root(&table, slot)
+                if root != 0 {
+                    const before = c.*.problems
+                    c.checkRoot(root, superblock.nextInode)
+                    if c.*.problems != before {
+                        print("brixfs: (in snapshot ")
+                        print(table[SnapshotEntry.nameAt(slot)..SnapshotEntry.nameAt(slot) + SnapshotEntry.nameLength(&table, slot)])
+                        print(")\n")
+                    }
+                }
+                slot += 1
+            }
+        }
+    }
     c.checkRoot(superblock.root, superblock.nextInode)
+    // (What the kernel's count of blocks in use is compared with.)
+    print("brixfs: ")
+    printNumber(c.*.all.used)
+    print(" of ")
+    printNumber(superblock.blocks)
+    print(" blocks in use\n")
     // Repair: link counts, in a new commit.
     if repairing && c.*.problems > 0 {
         var mended: usize = 0
@@ -736,18 +781,19 @@ fn check(path: [*]const u8, repairing: bool) -> u8 {
                     i += 1
                 }
                 if changed {
-                    // A free block for the new table block.
-                    while cursor < superblock.blocks && c.isUsed(cursor) { cursor += 1 }
+                    // A free block for the new table block: one no
+                    // root reaches (a snapshot's blocks are in use too).
+                    cursor = c.*.all.firstFree(cursor)
                     if cursor >= superblock.blocks { return fail("no free block for the repair") }
                     if !device.writeBlock(cursor, &tableBlock) { return fail("cannot write") }
-                    _ = c.use(cursor)
+                    _ = c.*.all.markRun(cursor, 1)
                     Brixfs.put(&rootBlock, t * 8, 8, cursor)
                 }
             }
             t += 1
         }
         if mended > 0 {
-            while cursor < superblock.blocks && c.isUsed(cursor) { cursor += 1 }
+            cursor = c.*.all.firstFree(cursor)
             if cursor >= superblock.blocks { return fail("no free block for the repair") }
             if !device.writeBlock(cursor, &rootBlock) { return fail("cannot write") }
             var next = superblock

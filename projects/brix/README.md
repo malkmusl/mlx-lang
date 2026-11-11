@@ -281,6 +281,29 @@ asked still waits inside the kernel meanwhile: no other one runs until
 the request is done.
 While a volume is mounted from it, a /devices/diskN is not writable.
 
+A large disk costs what is done on it, not what it is. The store keeps a
+map of the blocks in use (projects/brix/blockmap.mlx: a bit a block, 15
+MiB for 500 GB) with the count of them, so the free room is a
+subtraction; a free block is found by stepping over full words; a commit
+frees just the blocks it replaced, where it walked every root of the
+volume before (volume.mlx, "free blocks", says why that is safe, and
+when a walk is still made). The kernel says at each mount how long it
+took ("brixOS: disk0: a brixfs volume of 131072000 blocks, 131071996
+free, read in 46 ms (its roots walked in 3 ms, 6 blocks read)"), and
+`volume PATH` what the store did since (projects/brix/tools/volume, on
+volume_info, call 56: commits and their times, walks, blocks read and
+written; `volume --check PATH` has the map compared with a walk over
+every root; the check below builds it, the boot image does not hold it
+yet).
+tools/check_brix_bigdisk.sh does it on a sparse 500 GB image: the mount
+and a thousand status questions within bounds, the free count against the
+host's `brixfs check` (which holds a volume of any size and counts the
+blocks in use), a small disk filled and emptied, six thousand files made
+in one go with a snapshot of them and a file of 600 MiB read after a
+restart (the store's loops let go, each round, what they made in the
+kernel's arena: kept, it ran out and the kernel stopped), the machine
+cut off.
+
 ## On a real machine
 
 Beside virtio, the kernel drives what a board has (a Supermicro H11 with
