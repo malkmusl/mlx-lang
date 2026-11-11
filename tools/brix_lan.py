@@ -3,9 +3,11 @@
 QEMU's `-netdev socket,udp=`: every Ethernet frame the guest sends comes
 here as a datagram, and what is sent back is what the guest's card
 receives. It plays what QEMU's user network cannot: a host whose replies
-come late, one that answers twice, a neighbour slow to say its hardware
-address, a router that says a host cannot be reached, and a name server
-with names of its own.
+come late, one that answers twice, one whose replies come from another
+address, a neighbour slow to say its hardware address, a router that
+says a host cannot be reached (also of one that answers all the same),
+and a name server with names of its own, which is deaf once and for
+some names says that it cannot look names up.
 
 The network is 10.10.36.0/24; the guest has an address of it from its
 settings file. Nobody here gives addresses (DHCP's questions get no
@@ -16,14 +18,21 @@ the check uses for what such a machine puts on the wire.
                   192.0.2.10 answers echo
                   192.0.2.9  the gateway says: host unreachable
                   192.0.2.11 the gateway says: time exceeded
+                  192.0.2.12 the gateway says: host unreachable, and
+                             0.2 s later the host's reply comes
                   (the rest of it: silence)
   10.10.36.2    the name server (answers echo too): gateway.lan,
                 slow.lan, far.lan (192.0.2.10) have addresses; quiet.lan
-                gets no answer at all; any other name does not exist;
-                it calls everyone twice a second (UDP port 4715)
+                gets no answer at all; second.lan (the gateway) gets
+                none the first time its address is asked for, and one
+                from then on; of broken.lan the server says that it
+                cannot look it up (a server failure); any other name
+                does not exist; it calls everyone twice a second (UDP
+                port 4715)
   10.10.36.20   answers echo 1.5 s late
   10.10.36.21   answers every echo twice
   10.10.36.22   says its hardware address only 0.3 s after it is asked
+  10.10.36.23   its echo replies come from 10.10.36.24
   anything else: nobody (no hardware address, no answer)
 
     tools/brix_lan.py LISTEN_PORT QEMU_PORT [--silent-gateway]
@@ -43,12 +52,17 @@ NAMESERVER = bytes([10, 10, 36, 2])
 SLOW = bytes([10, 10, 36, 20])
 TWICE = bytes([10, 10, 36, 21])
 SLOW_NEIGHBOUR = bytes([10, 10, 36, 22])
-HOSTS = (GATEWAY, NAMESERVER, SLOW, TWICE, SLOW_NEIGHBOUR)
+TWO_ADDRESSES = bytes([10, 10, 36, 23])
+ITS_OTHER = bytes([10, 10, 36, 24])
+HOSTS = (GATEWAY, NAMESERVER, SLOW, TWICE, SLOW_NEIGHBOUR, TWO_ADDRESSES)
 FAR = bytes([192, 0, 2, 10])
 UNREACHABLE = bytes([192, 0, 2, 9])
 TOO_FAR = bytes([192, 0, 2, 11])
-NAMES = {b"gateway.lan": GATEWAY, b"slow.lan": SLOW, b"far.lan": FAR}
+REFUSED_YET_THERE = bytes([192, 0, 2, 12])
+NAMES = {b"gateway.lan": GATEWAY, b"slow.lan": SLOW, b"far.lan": FAR, b"second.lan": GATEWAY}
 QUIET_NAME = b"quiet.lan"
+DEAF_ONCE_NAME = b"second.lan"
+BROKEN_NAME = b"broken.lan"
 
 
 def mac_of(ip):
@@ -82,6 +96,7 @@ def main():
     wire.bind(("127.0.0.1", listen_port))
     later = []
     order = 0
+    heard_once = False
 
     def send(frame, delay=0.0):
         nonlocal order
@@ -138,11 +153,17 @@ def main():
             elif destination == TWICE:
                 to_guest(guest_mac, destination, echo)
                 to_guest(guest_mac, destination, echo, 0.05)
-            elif destination in (UNREACHABLE, TOO_FAR):
+            elif destination == TWO_ADDRESSES:
+                # The reply from the host's other address (through the
+                # card that was asked).
+                to_guest(guest_mac, destination, ip_packet(ITS_OTHER, source, 1, icmp(0, 0, payload[4:8], payload[8:])))
+            elif destination in (UNREACHABLE, TOO_FAR, REFUSED_YET_THERE):
                 # The router's word, with the IP header and the first 8
                 # bytes of what it could not deliver.
-                said = icmp(3, 1, bytes(4), packet[:header + 8]) if destination == UNREACHABLE else icmp(11, 0, bytes(4), packet[:header + 8])
+                said = icmp(11, 0, bytes(4), packet[:header + 8]) if destination == TOO_FAR else icmp(3, 1, bytes(4), packet[:header + 8])
                 to_guest(guest_mac, GATEWAY, ip_packet(GATEWAY, source, 1, said))
+                if destination == REFUSED_YET_THERE:
+                    to_guest(guest_mac, destination, echo, 0.2)
         elif protocol == 17 and destination == NAMESERVER and len(payload) >= 8 + 12 and struct.unpack(">H", payload[2:4])[0] == 53:
             source_port = struct.unpack(">H", payload[0:2])[0]
             query = payload[8:]
@@ -155,8 +176,17 @@ def main():
             asked_for = struct.unpack(">H", query[at + 1:at + 3])[0] if at + 5 <= len(query) else 0
             if name == QUIET_NAME:
                 continue
+            if name == DEAF_ONCE_NAME and asked_for == 1 and not heard_once:
+                # (The first question for its address is lost; who asks
+                # again is answered.)
+                heard_once = True
+                continue
             address = NAMES.get(name)
-            if address is None:
+            if name == BROKEN_NAME:
+                # A server failure (code 2): the server cannot look the
+                # name up, which says nothing about the name.
+                answer = query[:2] + struct.pack(">HHHHH", 0x8182, 1, 0, 0, 0) + question
+            elif address is None:
                 answer = query[:2] + struct.pack(">HHHHH", 0x8183, 1, 0, 0, 0) + question
             elif asked_for == 1:
                 answer = query[:2] + struct.pack(">HHHHH", 0x8180, 1, 1, 0, 0) + question + struct.pack(">HHHIH", 0xC00C, 1, 1, 60, 4) + address

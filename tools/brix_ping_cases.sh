@@ -28,12 +28,30 @@ print(" ".join(sorted(seen)))
 PY
 }
 
+# Whether the first summary on the serial line has the times of the two
+# replies from $1 above it: the least and the greatest are the replies'
+# own, as they were printed, and the mean is theirs (to the figures
+# shown).
+summary_times_hold() {
+    output | python3 -c '
+import re, sys
+text = sys.stdin.read()
+times = [float(t) for t in re.findall(r"^64 bytes from %s: seq=\d+ time=([0-9.]+) ms$" % re.escape(sys.argv[1]), text, re.M)][:2]
+said = re.search(r"^round trip: least ([0-9.]+) ms, mean ([0-9.]+) ms, greatest ([0-9.]+) ms$", text, re.M)
+if len(times) != 2 or not said:
+    sys.exit(1)
+least, mean, greatest = (float(figure) for figure in said.groups())
+sys.exit(0 if least == min(times) and greatest == max(times) and abs(mean - sum(times) / 2) <= 0.01 * greatest + 0.002 else 1)
+' "$1"
+}
+
 ping_cases() {
     local went
     # The name server first: a neighbour whose hardware address the
     # kernel has not asked for. The first request is answered all the
     # same (the kernel keeps it while it asks, and sends it when the
-    # answer comes), and the summary has the loss and the times.
+    # answer comes), and the summary has the loss and the times: the
+    # least and the greatest of the two replies', and their mean.
     type_line 'ping 10.0.2.3 2; echo neighbour $?'
     wait_for '^PING 10.0.2.3: 56 bytes of data$'
     wait_for '^64 bytes from 10.0.2.3: seq=1 time=[0-9.]* ms$'
@@ -41,6 +59,7 @@ ping_cases() {
     wait_for '^--- 2 sent, 2 received, 0% lost$'
     wait_for '^round trip: least [0-9.]* ms, mean [0-9.]* ms, greatest [0-9.]* ms$'
     wait_for '^neighbour 0$'
+    summary_times_hold 10.0.2.3 || fail "the summary's least, mean and greatest time are not those of the two replies above it: $(output | grep -e '^64 bytes from 10.0.2.3' -e '^round trip' | head -n 3 | tr '\n' ';')"
     type_line 'ping 10.0.2.2 2; echo ping $?'
     wait_for '^64 bytes from 10.0.2.2: seq=1 time=[0-9.]* ms$'
     wait_for '^64 bytes from 10.0.2.2: seq=2 time=[0-9.]* ms$'
@@ -87,7 +106,18 @@ ping_cases() {
     type_line 'ping 10.0.2.300; echo no-address $?'
     wait_for '^ping: 10.0.2.300 is no address (four numbers up to 255 with dots between)$'
     wait_for '^no-address 1$'
-    echo "ok   ping takes -c COUNT before and after the host and as -cCOUNT; the usage without a host; a count of 0 and a host that is no address are said"
+    # What is no name is said to be none, and no name server is asked
+    # for it (it was "the name server did not answer", as if one had
+    # been). Of what is longer than a name can be, the beginning is
+    # shown, and what is said about it and the line's end are kept (in
+    # a line of 256 bytes such a name took the place of both).
+    type_line 'ping a..b; echo no-name $?'
+    wait_for '^ping: a\.\.b is no name (parts of 1 to 63 characters with dots between, 253 in all)$'
+    wait_for '^no-name 1$'
+    type_line "ping $(printf 'x%.0s' $(seq 1 300)); echo long-name \$?"
+    wait_for '^ping: x\{60\}\.\.\. is no name (parts of 1 to 63 characters with dots between, 253 in all)$'
+    wait_for '^long-name 1$'
+    echo "ok   ping takes -c COUNT before and after the host and as -cCOUNT; the usage without a host; a count of 0, a host that is no address and one that is no name are said, whole also of a name of 300 characters"
     # The machine itself, by its address and as 127.0.0.1 and localhost:
     # answered from the address that was asked (each reply once), and
     # nothing of it on the wire.

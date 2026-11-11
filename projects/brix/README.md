@@ -705,7 +705,20 @@ The kernel's stack (kernel/net) runs on it:
   port means nothing); would_block says the request cannot go now
   (there is no address yet, no gateway leads there, the device is
   busy): ping tries again for the request's second and then says which
-  it was. 127.0.0.1 is answered from 127.0.0.1.
+  it was; the summary counts such requests apart ("0 sent, 0 received,
+  1 could not be sent"). 127.0.0.1 is answered from 127.0.0.1. A
+  request that stays without an answer while the link is down says so
+  ("no answer for seq=7 (the network link is down)": the link as it is
+  then, so a cable that comes out during a run shows request by
+  request); a reply from another address than the one asked is marked
+  "(not the host asked)". A reply's time is from before the request
+  was handed to the kernel. A name that cannot be looked up is said
+  with the reason (no name server set, none answered, the server
+  answered that it cannot look names up, no such name, no name at
+  all), and, where no server is set or none answered, with what
+  stands in the way on this machine's side (the link down, no address
+  yet). Each request's second gives back what it took of the value
+  arena (std.turns): ping left running does not grow.
 - link.mlx: the link's state for programs. /devices/net0 is a node of a
   kind of its own (as /devices/framebuffer is the display's): a read
   gives the link's record as things are at that moment (spec
@@ -764,11 +777,16 @@ line alone (no gateway, no name server: the own subnet and nothing
 else), with an address line of 0.0.0.0 (that is no address: DHCP
 asks), and on a network of the
 check's own (tools/brix_lan.py at the other end of QEMU's socket
-network: a name server, replies later than a second, a reply twice, a
-neighbour slow to say its hardware address, a router that says a host
-cannot be reached, a host and a gateway nobody answers for).
-tools/check_brix_net_igb.sh does the cable pulled and put back and the
-late answer on the igb card. tests/455_dhcp_lease_runtime.mlx runs the
+network: a name server, also deaf to a first question and unable to
+look a name up, replies later than a second, a reply twice, one from
+another address, a neighbour slow to say its hardware address, a
+router that says a host cannot be reached, also of one that answers, a
+host and a gateway nobody answers for).
+tools/check_brix_net_igb.sh does the cable pulled and put back (also
+while a ping runs) and the late answer on the igb card.
+tools/check_ping_linux.sh runs ping's Linux build on the loopback of a
+network namespace of its own, and watches that it does not grow while
+it runs. tests/455_dhcp_lease_runtime.mlx runs the
 lease's renewal and end on a clock of its own (QEMU's user network
 gives a lease of a day, and its length cannot be set).
 tools/check_brix_desktop.sh opens the Network page and pulls the cable.
