@@ -28,7 +28,10 @@
 #   Dock" takes it out again; the launcher's menu (a right click on an
 #   app there) pins too, and unpins an app that a pins file of before
 #   names twice; and Control dragged from the launcher onto the dock is
-#   pinned (the drop's data through a native stream).
+#   pinned (the drop's data through a native stream);
+# - an app installed while the desktop runs (the user's own bundle for
+#   Polaris's id, with another name) is taken in by all three: the top
+#   bar, the dock and the launcher call the window by the new name.
 # The helpers say what they show because the compositor runs --verbose
 # (MLX_DESKTOP_VERBOSE in their environment). Every check that fails is
 # listed; the first does not end the run.
@@ -86,7 +89,7 @@ if [[ -f /usr/share/X11/xkb/rules/evdev ]]; then
     "$work/brix-keymap" us "$work/us.xkb"
     keymap=("settings/keyboard/us.xkb=$work/us.xkb")
 fi
-for program in cat echo; do
+for program in cat echo mkdir mv; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
 cp projects/brix/settings/init/services/serial-shell.service "$work/services/"
@@ -447,6 +450,40 @@ else
     problem "Control dragged from the launcher onto the dock is not pinned (the pins file:$pins)"
 fi
 monitor "sendkey esc"
+sleep 1
+
+# An app installed while the desktop runs is the same app for all three
+# at once. Polaris runs and has the bar; then the user's own bundle for
+# its id comes (/users/root/.local/share/apps/Polaris.app, read before
+# the system's: Name=Sirius, no icon), made aside and moved there whole.
+# The top bar, the dock and the launcher read the apps again and call the
+# window Sirius: none of them keeps the name it had.
+said=$(count_of 'horizon: shows Polaris for org.mlx.files$')
+windows=$(count_of '^window: ')
+show_launcher
+monitor "sendkey p" "sendkey o" "sendkey l" "sendkey ret"
+wait_for '^window: ' $((windows + 1))
+if comes 'horizon: shows Polaris for org.mlx.files$' $((said + 1)); then
+    printf 'mkdir -p /users/root/.local/share /users/root/new/Polaris.app; echo "[Desktop Entry]" > /users/root/new/Polaris.app/app.ini; echo Type=Application >> /users/root/new/Polaris.app/app.ini; echo made-aside\r' >&3
+    wait_for '^made-aside$'
+    printf 'echo Name=Sirius >> /users/root/new/Polaris.app/app.ini; echo Exec=polaris >> /users/root/new/Polaris.app/app.ini; echo Id=org.mlx.files >> /users/root/new/Polaris.app/app.ini; mv /users/root/new /users/root/.local/share/apps; echo moved-in\r' >&3
+    wait_for '^moved-in$'
+    bar_said=no
+    dock_said=no
+    launcher_said=no
+    comes 'horizon: shows Sirius for org.mlx.files$' && bar_said=yes
+    comes 'orbit: shows Sirius (org.mlx.files) with a letter, 1 window, \(not \)\?pinned$' && dock_said=yes
+    show_launcher
+    comes 'launch: shows Sirius (org.mlx.files) with a letter$' && launcher_said=yes
+    monitor "sendkey esc"
+    if [[ $bar_said == yes && $dock_said == yes && $launcher_said == yes ]]; then
+        echo "ok   an app installed while the desktop runs (the user's own bundle for org.mlx.files, named Sirius) is taken in by the top bar, the dock and the launcher: each calls Polaris's window Sirius"
+    else
+        problem "an app installed while the desktop runs is not taken in by all three (the user's own bundle names org.mlx.files Sirius; the top bar says so: $bar_said, the dock: $dock_said, the launcher: $launcher_said)"
+    fi
+else
+    problem "Polaris started again does not get the top bar's name (an app installed while the desktop runs was not tried)"
+fi
 
 printf 'impulsectl poweroff\r' >&3
 wait_for '^impulse: poweroff$'

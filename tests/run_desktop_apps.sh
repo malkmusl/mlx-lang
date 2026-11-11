@@ -24,12 +24,12 @@ printf '[Desktop Entry]\nType=Application\nName=Files\nExec=nautilus --new-windo
 printf '[Desktop Entry]\nType=Application\nName=Firefox\nExec=firefox %%u\nIcon=firefox\nStartupWMClass=Navigator\n' > "$work/share/applications/firefox.desktop"
 printf '[Desktop Entry]\nType=Application\nName=Polaris again\nExec=/usr/bin/polaris\n' > "$work/share/applications/polaris.desktop"
 # Two apps of one program (both count), and a bundle (its app.ini with
-# carriage returns) beside a desktop entry of another program that goes by
-# the bundle's name.
+# carriage returns, and blanks around its id) beside a desktop entry of
+# another program that goes by the bundle's name.
 printf '[Desktop Entry]\nType=Application\nName=Office Writer\nExec=office --writer %%U\n' > "$work/share/applications/office-writer.desktop"
 printf '[Desktop Entry]\nType=Application\nName=Office Calc\nExec=office --calc %%U\n' > "$work/share/applications/office-calc.desktop"
 mkdir -p "$work/share/apps/Marker.app"
-printf '[Desktop Entry]\r\nType=Application\r\nName=Marker\r\nExec=marker\r\nId=org.example.marker\r\n' > "$work/share/apps/Marker.app/app.ini"
+printf '[Desktop Entry]\r\nType=Application\r\nName=Marker\r\nExec=marker\r\nId= org.example.marker \r\n' > "$work/share/apps/Marker.app/app.ini"
 printf '[Desktop Entry]\nType=Application\nName=Marker Pen\nExec=marker-pen\n' > "$work/share/applications/marker.desktop"
 cp projects/desktop/apps/Voyager.app/icon.png "$work/share/icons/hicolor/64x64/apps/firefox.png"
 

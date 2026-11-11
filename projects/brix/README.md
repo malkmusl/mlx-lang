@@ -751,7 +751,9 @@ DSDT's `\_S5` names, written with the sleep enable bit to the PM1 control
 register the FADT names, ACPI mode turned on first where the firmware
 left it off. There is no AML interpreter: `\_S5` is a name with a
 package of small constants in every table seen, and that one form is
-read, inside the table's own length. A restart is the FADT's reset
+read, inside the table's own length; a package that is not two sleep
+types, or two definitions that differ, is not taken (what went to the
+register would be a guess). A restart is the FADT's reset
 register where there is one, then port 0xCF9, then the keyboard
 controller's reset line where there is a controller, last a fault the
 processor cannot take. The kernel says at boot what it found:
@@ -761,7 +763,8 @@ processor cannot take. The kernel says at boot what it found:
 and at the end each step it takes. A machine whose tables give no S5 (the
 line says why) gets the ports of QEMU's chipsets tried, which are also
 the last attempt everywhere; one that is still on afterwards says so on
-the screen and stays halted.
+the screen, with the line above and the steps it took (they were said
+while a program had the display), and stays halted.
 
 Not there yet: orphaned process groups (a stopped one whose parent
 ended stays stopped), TOSTOP's SIGTTOU, other processes running while
@@ -1101,8 +1104,10 @@ Vector from the launcher and looks at the bar's names, the dock's icons
 and the pins (pinned by the dock's menu, there again after the desktop is
 started again, unpinned; pinned and unpinned by the launcher's menu, the
 latter from a pins file of before that names the app twice; pinned by
-dragging); tests/run_desktop_apps.sh asks the same of apps.mlx on the
-host.
+dragging), and at an app installed while the desktop runs (all three read
+the apps again when an application directory changes, the user's own
+/users/NAME/.local/share/apps before the system's);
+tests/run_desktop_apps.sh asks the same of apps.mlx on the host.
 
 ## The login
 

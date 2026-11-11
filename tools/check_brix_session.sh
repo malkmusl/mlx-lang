@@ -258,8 +258,11 @@ row_restart=(88 214)
 row_shut_down=(88 250)
 words_restart=(56 201 180 30)
 words_shut_down=(56 237 180 30)
+menu_cancel=(80 206)
 menu_confirm=(200 206)
 menu_confirm_button=(147 190 115 32)
+# (The Restart row where the question's button comes to stand.)
+row_restart_right=(200 214)
 
 # The greeter is up $1 times now (since this QEMU started), and has the
 # keyboard.
@@ -340,6 +343,33 @@ restart_row=$(pixels light "${words_restart[@]}")
 shut_down_row=$(pixels light "${words_shut_down[@]}")
 (( restart_row > 40 && shut_down_row > 40 )) || fail "the session menu has no Restart and Shut Down rows ($restart_row and $shut_down_row light pixels where they stand)"
 echo "ok   the session menu has Restart and Shut Down below Log Out ($restart_row and $shut_down_row light pixels in their rows)"
+
+# A double click on "Restart ..." only asks. The question's button comes
+# to stand where the row was, and the second click (the pointer a pixel
+# on, as a hand moves it) falls on it before anyone has read the
+# question: it must not count. (The monitor's commands in one write, so
+# that the two clicks are milliseconds apart.)
+pointer "${row_restart_right[@]}"
+python3 - "$work/monitor" <<'PY'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendall(b"mouse_button 1\nmouse_button 0\nmouse_move 1 0\nmouse_button 1\nmouse_button 0\n")
+time.sleep(0.5)
+PY
+wait_pixels "the question of Restart after a double click on its row" blue "${menu_confirm_button[@]}" 1500
+sleep 2
+output | grep -a -q '^impulse: reboot$' && fail "a double click on Restart restarted the machine: its second click answered the question"
+(( $(pixels blue "${menu_confirm_button[@]}") > 1500 )) || fail "the question of Restart is gone after a double click on its row"
+echo "ok   a double click on Restart only asks: the question stays, nothing restarts"
+
+# Cancel: the list is back, and nothing has happened.
+click "${menu_cancel[@]}"
+wait_pixels "the session menu's list after Cancel" light "${row_settings[@]}" 40
+(( $(pixels blue "${menu_confirm_button[@]}") < 200 )) || fail "the question is still there after Cancel"
+output | grep -a -q '^impulse: \(reboot\|poweroff\)$' && fail "Cancel did not cancel: the init was asked to end the system"
+output | grep -a -q 'login: session ended' && fail "Cancel did not cancel: the session ended"
+echo "ok   Cancel takes the question away: the list is back, the session goes on"
 
 # Log Out: asked first, then the session ends and the greeter is back.
 ask "Log Out" "${row_log_out[@]}"
