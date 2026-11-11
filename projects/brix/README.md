@@ -330,7 +330,8 @@ The picture's mode is the monitor's own where the firmware can set it:
 the loader (image/efi.mlx) reads what the monitor says of itself (its
 EDID: the firmware's EDID Active protocol on a handle whose Graphics
 Output Protocol is the one in use or shows the same picture's memory;
-the first timing is the mode it prefers), finds that size among the
+the first timing is the mode it prefers; an interlaced one's lines are
+doubled, its count being one field's), finds that size among the
 firmware's modes and sets it, instead of taking the mode the firmware
 was left in (often a smaller one, or one of another shape that the
 monitor stretches). Only the EDID of the display in use counts (a server
@@ -359,7 +360,13 @@ says so ("brixOS: the picture is shown on a screen of the shape
 shape and is round on a monitor that stretches the mode
 (projects/desktop/splash, tools/check_brix_shape.sh); the desktop does
 not yet (text brought together would not be readable: it waits for the
-monitor's own mode).
+monitor's own mode). That the monitor stretches is taken, not known: the
+kernel cannot see what the monitor does with a mode. One that shows it in
+the mode's own shape, with borders, gets a boot screen too narrow by as
+much, and so does a monitor behind a switch that answers with an EDID of
+its own. Nothing in the image says the screen's shape by hand yet:
+settings/display names a mode, and the monitor's word goes before it;
+ignition takes --screen WIDTH:HEIGHT, which the init does not pass.
 
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the
