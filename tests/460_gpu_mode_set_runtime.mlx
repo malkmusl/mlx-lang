@@ -1,0 +1,1195 @@
+// The kernel's plan for a monitor's own mode on a Radeon's display
+// controller and its carrying out (projects/brix/kernel/gpu_mode.mlx and
+// gpu_set.mlx, built for the host) against a card that is a table of
+// registers and writes down every write in order.
+//
+// (a) The firmware's 1280x960 picture scaled by the card onto the
+// monitor's own 3840x1080 timing: the plan's writes are, word for word
+// and in order, the sequence worked out here by hand from Linux 6.6's
+// code (each group names the function it follows), and afterwards the
+// controller shows a 3840x1080 picture.
+// (b) A 1280x960 timing on a DisplayPort link of four lanes at 2.7
+// Gbit/s, the monitor's own timing 3840x1080 at 266.64 MHz: the link has
+// room, and the writes are the sequence for the clock, the timing, the
+// stream and the picture.
+// Then what must not write: the setting off, a link without room, a
+// TMDS output, a link that is not trained, several controllers, a
+// read-out that does not fit, a picture of the kernel's that is another
+// adapter's, a timing the controller's words or the DTO cannot hold, an
+// aperture without room. And what must put the firmware's state
+// back: a read-back that fails, at every write of both plans in turn; a
+// state waited for that does not come, at every wait in turn; a frame
+// counter that does not run again, or runs at another rate; the memory
+// interface running dry. On the way back the encoder's start bit is
+// written set again, whatever the firmware's word read. After each of them every register (the four
+// sets of urgency marks too) holds what it held before.
+// With an argument, the log of every case is printed.
+// Exits 13.
+const std = @import("std")
+const scanout = @import("../projects/brix/kernel/gpu_display.mlx")
+const edid = @import("../projects/brix/kernel/edid.mlx")
+const mode = @import("../projects/brix/kernel/gpu_mode.mlx")
+const set = @import("../projects/brix/kernel/gpu_set.mlx")
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+
+// The card: registers by number (all 0 at first), the four sets of
+// urgency marks behind their one word, a clock that goes on by STEP at
+// every look, and a frame counter that runs as the timing and the pixel
+// clock in the registers say.
+const ROOM: usize = 0x6000
+const STEP: usize = 500
+var registers: [ROOM]usize = undefined
+var marks: [4]usize = undefined
+var clock: usize = 0
+
+// Every write, in order.
+const WRITES: usize = 1024
+var writtenTo: [WRITES]usize = undefined
+var writtenWith: [WRITES]usize = undefined
+var written: usize = 0
+// The picture memory cleared (offset, bytes; how often).
+var clearedAt: usize = 0
+var clearedBytes: usize = 0
+var cleared: usize = 0
+// Whether a write came before the picture's memory was cleared.
+var writtenBeforeClear = false
+
+// What the card can be made to do wrong.
+const NEVER: usize = 0xFFFFFFFF
+// The write (counted from 0) that does not hold: this bit of it comes out
+// the other way.
+var spoilAt: usize = NEVER
+var spoilBit: usize = 0
+// A state that never comes: from the `stuckFrom`th write to this register
+// on, these bits of it read as this value whatever is asked for.
+var stuckRegister: usize = NEVER
+var stuckMask: usize = 0
+var stuckValue: usize = 0
+var stuckFrom: usize = 0
+var stuckSeen: usize = 0
+// A register that takes no more writes after its first `deafAfter`.
+var deafRegister: usize = NEVER
+var deafAfter: usize = 0
+var deafSeen: usize = 0
+// The frame counter stands while this register holds this value.
+var freezeRegister: usize = NEVER
+var freezeValue: usize = 0
+// The pixel clock stays what it was, whatever the DTO's phase says.
+var clockDeaf = false
+var clockAtFirst: usize = 0
+// The memory interface says it ran dry once this register is written;
+// `dryClears`: the word says so once, to the first read after.
+var dryAfter: usize = NEVER
+var dry = false
+var dryClears = false
+// The encoder's start bit (DIG_FE_CNTL's DIG_START, front end 1) does its
+// work when it is written and reads as 0 afterwards.
+var startClears = false
+// What the kernel knows of its picture, for the next plan: nothing of it
+// in this card's memory; an aperture of this many bytes (0: 256 MiB).
+var pictureElsewhere = false
+var apertureOf: usize = 0
+
+// The log.
+const LOG: usize = 65536
+var log: [LOG]u8 = undefined
+var logged: usize = 0
+var show = false
+
+const URGENCY: usize = 0x1B33
+const MARK_SET: usize = 0x1B32
+const FRAME_COUNT: usize = 0x1BA6
+
+fn raw(number: usize) -> usize { return if number < ROOM { registers[number] } else { 0 } }
+
+fn store(number: usize, value: usize) -> void {
+    if number < ROOM { registers[number] = value }
+}
+
+// The pixel clock in Hz: the DTO's phase over its modulo of a reference
+// of 600 MHz.
+fn pixelClock() -> usize {
+    const modulo = raw(0x142)
+    if modulo == 0 { return 0 }
+    return 600000000 * raw(0x141) / modulo
+}
+
+fn read(number: usize) -> u32 {
+    var value = raw(number)
+    if number == URGENCY { value = marks[(raw(MARK_SET) >> 8) & 3] }
+    if number == FRAME_COUNT {
+        const hertz = if clockDeaf { clockAtFirst } else { pixelClock() }
+        if hertz == 0 || (freezeRegister != NEVER && raw(freezeRegister) == freezeValue) { return 7 }
+        const period = (raw(0x1B80) + 1) * (raw(0x1B87) + 1) * 1000000000 / hertz
+        return @intCast(u32, (clock / period) & 0xFFFFFF)
+    }
+    // The states that follow what was asked for: the blanking, the
+    // buffers given, the stream running.
+    if number == 0x1B9D { value = (value & ~@intCast(usize, 1)) | ((value >> 8) & 1) }
+    if number == 0x321 { value = value | 0x10 }
+    if number == 0x4BA4 { value = (value & ~@intCast(usize, 0x10000)) | ((value & 1) << 16) }
+    if number == 0x2F7 && dry {
+        value = value | 0x10000000
+        if dryClears { dry = false }
+    }
+    if number == stuckRegister && stuckSeen >= stuckFrom { value = (value & ~stuckMask) | stuckValue }
+    return @intCast(u32, value)
+}
+
+fn write(number: usize, value: u32) -> void {
+    var word = @intCast(usize, value)
+    if cleared == 0 { writtenBeforeClear = true }
+    if number == stuckRegister { stuckSeen += 1 }
+    if written < WRITES {
+        writtenTo[written] = number
+        writtenWith[written] = word
+    }
+    if written == spoilAt { word = word ^ spoilBit }
+    written += 1
+    if number == dryAfter { dry = true }
+    if number == deafRegister {
+        deafSeen += 1
+        if deafSeen > deafAfter { return }
+    }
+    if number == URGENCY {
+        marks[(raw(MARK_SET) >> 8) & 3] = word
+        return
+    }
+    if number == 0x4B00 && startClears { word = word & ~@intCast(usize, 0x400) }
+    store(number, word)
+}
+
+fn clear(offset: usize, bytes: usize) -> void {
+    clearedAt = offset
+    clearedBytes = bytes
+    cleared += 1
+}
+
+fn now() -> usize {
+    clock += STEP
+    return clock
+}
+
+fn logWrite(text: []const u8) -> void {
+    var k: usize = 0
+    while k < text.length && logged < LOG {
+        log[logged] = text[k]
+        logged += 1
+        k += 1
+    }
+    if show { say(text) }
+}
+
+fn has(text: []const u8) -> bool {
+    if text.length > logged { return false }
+    var at: usize = 0
+    while at + text.length <= logged {
+        var k: usize = 0
+        while k < text.length && log[at + k] == text[k] { k += 1 }
+        if k == text.length { return true }
+        at += 1
+    }
+    return false
+}
+
+var failed: u8 = 0
+
+fn expect(holds: bool, what: []const u8) -> void {
+    if holds { return }
+    say("not as expected: ")
+    say(what)
+    say("\n")
+    if failed == 0 { failed = 1 }
+}
+
+fn line(text: []const u8) -> void { expect(has(text), text) }
+
+fn noLine(text: []const u8) -> void {
+    if !has(text) { return }
+    say("said, but should not be: ")
+    say(text)
+    say("\n")
+    if failed == 0 { failed = 2 }
+}
+
+// A state begun: no registers but the card's memory (8 GiB at
+// 0xf400000000), nothing wrong with the card.
+fn begin(name: []const u8) -> void {
+    var k: usize = 0
+    while k < ROOM {
+        registers[k] = 0
+        k += 1
+    }
+    logged = 0
+    clock = 0
+    written = 0
+    cleared = 0
+    writtenBeforeClear = false
+    spoilAt = NEVER
+    stuckRegister = NEVER
+    stuckSeen = 0
+    deafRegister = NEVER
+    deafSeen = 0
+    freezeRegister = NEVER
+    clockDeaf = false
+    dryAfter = NEVER
+    dry = false
+    dryClears = false
+    startClears = false
+    pictureElsewhere = false
+    apertureOf = 0
+    marks[0] = 0x00FA0030
+    marks[1] = 0x00FA0040
+    marks[2] = 0
+    marks[3] = 0
+    store(0x809, 0xF5FFF400)
+    if show {
+        say("-- ")
+        say(name)
+        say("\n")
+    }
+}
+
+// Controller 0 on with a timing: the size shown, the totals, the sync
+// pulse and what follows it to the picture (the counters begin with the
+// sync), and whether the frame's pulse is the low one.
+fn timing(width: usize, height: usize, hTotal: usize, vTotal: usize, hSync: usize, hBack: usize, vSync: usize, vBack: usize, vLow: usize) -> void {
+    store(0x1B9C, 0x00010001)
+    store(0x1B80, hTotal - 1)
+    store(0x1B87, vTotal - 1)
+    store(0x1B81, ((hSync + hBack) << 16) | (hSync + hBack + width))
+    store(0x1B8D, ((vSync + vBack) << 16) | (vSync + vBack + height))
+    store(0x1B82, hSync << 16)
+    store(0x1B8E, vSync << 16)
+    store(0x1B8F, vLow)
+}
+
+// What both states share: the firmware's 1280x960 picture as controller
+// 0's surface at the start of the card's memory, the words beside it as a
+// firmware may leave them, and a DisplayPort link of four lanes on DIG 1
+// (its front end 1 takes controller 0), trained, its stream on.
+fn firmware() -> void {
+    store(0x1A00, 1)
+    store(0x1A01, 2)
+    store(0x1A04, 0)
+    store(0x1A07, 0xF4)
+    store(0x1A06, 1280)
+    store(0x1A0D, 1280)
+    store(0x1A0E, 960)
+    store(0x1A12, 1)
+    store(0x1AC3, 960)
+    store(0x1B5C, 0)
+    store(0x1B5D, (1280 << 16) | 960)
+    store(0x1AC1, 0x1006B0)
+    store(0x1B53, 0x11)
+    store(0x321, 0x12)
+    store(MARK_SET, 0x00010100)
+    store(0x1BB6, 0x100)
+    store(0x4B48, 0x101)
+    store(0x4B47, 0x10000200)
+    store(0x4B00, 0x400)
+    store(0x4BA3, 3)
+    store(0x4BA0, 0x10)
+    store(0x4BA4, 0x10001)
+    store(0x4BA1, 0x01000000)
+    store(0x4BA8, 0x100)
+    store(0x140, 0x10)
+    store(0x142, 600000000)
+}
+
+// (a): the monitor's 3840x1080 timing (4000 by 1111, 266.64 MHz: 60
+// frames a second), the picture made large by the scaler; M and N say the
+// link's 2.7 Gbit/s.
+fn scaled() -> void {
+    firmware()
+    timing(3840, 1080, 4000, 1111, 32, 80, 10, 18, 1)
+    store(0x1B42, 0x11)
+    store(0x1B43, 0x303)
+    store(0x1B49, 0x555555)
+    store(0x1B4C, 0xE38E38)
+    store(0x141, 266640000)
+    store(0x4BA9, 0x8000)
+    store(0x4BAA, 0x7E68)
+    clockAtFirst = 266640000
+}
+
+// (b): the picture's own 1280x960 timing (1800 by 1000, 108 MHz: 60
+// frames a second), nothing scaled; M over N is 108 over 270 MHz.
+fn asItIs() -> void {
+    firmware()
+    timing(1280, 960, 1800, 1000, 112, 312, 3, 36, 0)
+    store(0x141, 108000000)
+    store(0x4BA9, 0x8000)
+    store(0x4BAA, 0x3333)
+    store(0x1B30, 0x0001242B)
+    store(0x1BB3, 0x00003101)
+    clockAtFirst = 108000000
+}
+
+// What the kernel knows of the firmware's picture: 1280x960 at the start
+// of an aperture of 256 MiB.
+fn known() -> scanout.Memory {
+    return scanout.Memory.{ .aperture = 256 * 1024 * 1024, .pictureOffset = 0, .pictureBytes = 1280 * 960 * 4, .pictureWidth = 1280, .pictureHeight = 960, .picturePitch = 1280 }
+}
+
+// The monitor: its own timing 3840x1080 at 60 Hz (266.64 MHz, 4000 by
+// 1111, porches 48 and 3, pulses 32 high and 10 low), or one that said
+// nothing.
+fn wide() -> edid.Monitor {
+    return edid.Monitor.{ .state = edid.State.found, .width = 3840, .height = 1080, .timing = edid.Timing.{ .clock = 266640, .width = 3840, .hTotal = 4000, .hFront = 48, .hSync = 32, .hPositive = true, .height = 1080, .vTotal = 1111, .vFront = 3, .vSync = 10, .vPositive = false, .interlaced = false, .stereo = false }, .timings = 1, .ofOwnSize = 1, .extension = edid.Extension.none }
+}
+
+fn silent() -> edid.Monitor {
+    var m = wide()
+    m.state = edid.State.none
+    m.width = 0
+    m.height = 0
+    return m
+}
+
+var readout: scanout.Readout = undefined
+var plan: mode.Plan = undefined
+var result: set.Result = undefined
+var memory: scanout.Memory = undefined
+
+// The registers as they were before a change.
+var before: [ROOM]usize = undefined
+var beforeMarks: [4]usize = undefined
+
+fn remember() -> void {
+    var k: usize = 0
+    while k < ROOM {
+        before[k] = registers[k]
+        k += 1
+    }
+    k = 0
+    while k < 4 {
+        beforeMarks[k] = marks[k]
+        k += 1
+    }
+}
+
+// Whether every register holds what it held (one written for the first
+// time holds 0 again).
+fn asBefore() -> bool {
+    var k: usize = 0
+    while k < ROOM {
+        if registers[k] != before[k] {
+            if show {
+                say("differs: ")
+                const card = scanout.Card.{ .read = read, .now = now, .write = say }
+                card.hexDigits(k, 4)
+                say(" ")
+                card.hexDigits(registers[k], 8)
+                say(" was ")
+                card.hexDigits(before[k], 8)
+                say("\n")
+            }
+            return false
+        }
+        k += 1
+    }
+    k = 0
+    while k < 4 {
+        if marks[k] != beforeMarks[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// The card read out, the plan made and said.
+fn make(monitor: *const edid.Monitor) -> void {
+    const card = scanout.Card.{ .read = read, .now = now, .write = logWrite }
+    memory = known()
+    if apertureOf != 0 { memory.aperture = apertureOf }
+    if pictureElsewhere {
+        memory.pictureOffset = 0
+        memory.pictureBytes = 0
+        memory.pictureWidth = 0
+        memory.pictureHeight = 0
+        memory.picturePitch = 0
+    }
+    scanout.report(&card, &memory, &readout)
+    mode.make(&card, &readout, &memory, monitor, &plan)
+    mode.say(&card, &plan)
+    mode.list(&card, &plan)
+    remember()
+    written = 0
+}
+
+// The plan carried out (or not): what `attempt` says.
+fn carry(asked: bool) -> bool {
+    const card = scanout.Card.{ .read = read, .now = now, .write = logWrite }
+    const hands = set.Hands.{ .write = write, .clear = clear }
+    return set.attempt(&card, &hands, &plan, asked, &result)
+}
+
+// The plan's steps by their kind, in order ("w" a write, "?" a state
+// waited for, "p" a pause), against the order worked out by hand: the
+// waits and pauses stand between the writes where Linux has them (the
+// blanking waited for before anything of the controller is set; the
+// stream's stop polled before the encoder is taken off the controller's
+// timing, "must be done after the polling"; the 60 ms after it; the 100
+// us before the stream is enabled).
+fn sameShape(name: []const u8, wanted: []const u8) -> void {
+    var same = plan.count == wanted.length
+    var k: usize = 0
+    while same && k < plan.count {
+        const kind = plan.steps[k].kind
+        const letter: u8 = if kind == mode.Kind.write { 119 } else if kind == mode.Kind.wait { 63 } else { 112 }
+        if wanted[k] != letter { same = false }
+        k += 1
+    }
+    expect(same, name)
+}
+
+// (a): the marks (8 writes); blanked, and waited for; the buffers, and
+// waited for; the scaler (8); the surface under its lock (16), and
+// waited for; shown, and waited for; the mark set.
+const SCALED_SHAPE = "wwwwwwwwww?w?wwwwwwwwwwwwwwwwwwwwwwww?ww?w"
+// (b): the marks (8); the stream to stop, stopped, waited for, the
+// encoder off the timing, the pause; blanked, and waited for; the clock,
+// the timing (12) and the early blanking; M and N, the start bit and the
+// encoder on the timing (6), the pause, the stream on, waited for; the
+// pixel's duration; then as (a) from the buffers on.
+const DISPLAYPORT_SHAPE = "wwwwwwwwww?wpww?wwwwwwwwwwwwwwwwwwwwpw?ww?wwwwwwwwwwwwwwwwwwwwwwww?ww?w"
+
+// The writes against a sequence worked out by hand: pairs of a register
+// and the word written.
+fn sameWrites(name: []const u8, pairs: []const usize) -> void {
+    var k: usize = 0
+    while k * 2 + 1 < pairs.length && k < written {
+        if writtenTo[k] != pairs[k * 2] || writtenWith[k] != pairs[k * 2 + 1] {
+            const card = scanout.Card.{ .read = read, .now = now, .write = say }
+            say("not as expected: ")
+            say(name)
+            card.field(": write ", k + 1)
+            say(" is ")
+            card.hexDigits(writtenTo[k], 4)
+            say(" = ")
+            card.hexDigits(writtenWith[k], 8)
+            say(", worked out ")
+            card.hexDigits(pairs[k * 2], 4)
+            say(" = ")
+            card.hexDigits(pairs[k * 2 + 1], 8)
+            say("\n")
+            if failed == 0 { failed = 3 }
+            return
+        }
+        k += 1
+    }
+    expect(written == pairs.length / 2, name)
+}
+
+// The sequence for (a), from Linux 6.6 (drivers/gpu/drm/amd/display/dc
+// unless amdgpu/ is named), for controller 0 with the words `scaled`
+// gives it. A picture of 3840x1080 goes after the firmware's 4800 KiB:
+// at 0x500000 of the aperture, the card's 0xf400500000.
+const SCALED_WRITES = [_]usize{
+    // dce110_prepare_bandwidth -> dce110_set_safe_displaymarks ->
+    // dce112_mi_program_display_marks -> program_urgency_watermark, sets
+    // 0 to 3: REG_UPDATE(DPG_WATERMARK_MASK_CONTROL, URGENCY_WATERMARK_
+    // MASK, set) on 0x00010100, then REG_SET_2(DPG_PIPE_URGENCY_CONTROL,
+    // 0, low and high MAX_WATERMARK 0xFFFF).
+    0x1B32, 0x00010000, 0x1B33, 0xFFFFFFFF,
+    0x1B32, 0x00010100, 0x1B33, 0xFFFFFFFF,
+    0x1B32, 0x00010200, 0x1B33, 0xFFFFFFFF,
+    0x1B32, 0x00010300, 0x1B33, 0xFFFFFFFF,
+    // dce110_tg_set_blank(true): CRTC_DOUBLE_BUFFER_CONTROL written as
+    // CRTC_BLANK_DATA_DOUBLE_BUFFER_EN alone, CRTC_BLANK_CONTROL as
+    // CRTC_BLANK_DATA_EN alone (then hwss_wait_for_blank_complete).
+    0x1BB6, 0x00010000, 0x1B9D, 0x00000100,
+    // amdgpu/dce_v11_0.c dce_v11_0_line_buffer_adjust: 3840 is 2560 or
+    // more: DMIF_BUFFERS_ALLOCATED 4 into the word read (0x12), then the
+    // wait for DMIF_BUFFERS_ALLOCATION_COMPLETED.
+    0x0321, 0x00000014,
+    // dce_transform_set_scaler: LB_MEMORY_CONFIG 0 (the word read is
+    // 0x1006b0), SCL_F_SHARP_CONTROL 0, program_overscan (no borders:
+    // both words 0), setup_scaling_configuration (SCL_BYPASS_CONTROL 0;
+    // SCL_MODE and SCL_PSCL_EN 0 of 0x11), program_viewport (start 0,0;
+    // size 3840 above 1080).
+    0x1AC1, 0x000006B0, 0x1B53, 0x00000000, 0x1B5E, 0x00000000, 0x1B5F, 0x00000000,
+    0x1B45, 0x00000000, 0x1B42, 0x00000000, 0x1B5C, 0x00000000, 0x1B5D, 0x0F000438,
+    // dce_mi_program_surface_flip_and_addr: REG_UPDATE(GRPH_UPDATE,
+    // GRPH_UPDATE_LOCK, 1), here before the extent too.
+    0x1A11, 0x00010000,
+    // dce_mi_program_surface_config: GRPH_ENABLE 1; amdgpu's
+    // dce_v11_0_crtc_do_set_base: GRPH_SURFACE_OFFSET_X and _Y 0;
+    // program_size_and_rotation: GRPH_X_START, GRPH_Y_START 0, GRPH_X_END
+    // 3840, GRPH_Y_END 1080, GRPH_PITCH 3840; do_set_base:
+    // LB_DESKTOP_HEIGHT 1080.
+    0x1A00, 0x00000001, 0x1A09, 0x00000000, 0x1A0A, 0x00000000, 0x1A0B, 0x00000000, 0x1A0C, 0x00000000,
+    0x1A0D, 0x00000F00, 0x1A0E, 0x00000438, 0x1A06, 0x00000F00, 0x1AC3, 0x00000438,
+    // dce_mi_program_surface_flip_and_addr: GRPH_SURFACE_UPDATE_H_
+    // RETRACE_EN 0 (of 1); program_pri_addr, the high word first, with
+    // do_set_base's secondary words beside them (its order: primary
+    // high, secondary high, primary, secondary); the lock let go.
+    0x1A12, 0x00000000, 0x1A07, 0x000000F4, 0x1A08, 0x000000F4, 0x1A04, 0x00500000, 0x1A05, 0x00500000,
+    0x1A11, 0x00000000,
+    // program_surface_visibility -> dce110_tg_set_blank(false).
+    0x1BB6, 0x00010000, 0x1B9D, 0x00000000,
+    // amdgpu's dce_v11_0_program_watermarks: "restore original
+    // selection".
+    0x1B32, 0x00010100
+}
+
+// The sequence for (b) on DisplayPort, for controller 0 with the words
+// `asItIs` gives it and the monitor's 3840x1080 timing (266640 kHz, 4000
+// by 1111, front porches 48 and 3, pulses 32 high and 10 low), on DIG 1's
+// front end (0x4b00).
+const DISPLAYPORT_WRITES = [_]usize{
+    // The safe urgency marks, as in (a).
+    0x1B32, 0x00010000, 0x1B33, 0xFFFFFFFF,
+    0x1B32, 0x00010100, 0x1B33, 0xFFFFFFFF,
+    0x1B32, 0x00010200, 0x1B33, 0xFFFFFFFF,
+    0x1B32, 0x00010300, 0x1B33, 0xFFFFFFFF,
+    // dce110_reset_hw_ctx_wrap -> set_dpms_off -> dce110_blank_stream ->
+    // dce110_stream_encoder_dp_blank: DP_VID_STREAM_DIS_DEFER 2 into
+    // 0x10001, DP_VID_STREAM_ENABLE 0, the wait for DP_VID_STREAM_STATUS,
+    // then DP_STEER_FIFO_RESET 1 (and blank_stream's 60 ms).
+    0x4BA4, 0x00010201, 0x4BA4, 0x00010200, 0x4BA5, 0x00000001,
+    // dce110_reset_hw_ctx_wrap: tg->set_blank(true), then
+    // hwss_wait_for_blank_complete.
+    0x1BB6, 0x00010000, 0x1B9D, 0x00000100,
+    // dce110_enable_stream_timing: program_pix_clk. On this controller
+    // dce112_program_pix_clk hands it to the firmware's SetPixelClock;
+    // written here as dcn31_program_pix_clk writes it ("phase = target
+    // clock"): DP_DTO0_PHASE 266640000, the modulo as it is.
+    0x0141, 0x0FE49A80,
+    // dce110_timing_generator_program_blanking: CRTC_H_TOTAL 3999,
+    // CRTC_V_TOTAL 1110, CRTC_V_TOTAL_MAX and _MIN the same;
+    // CRTC_H_BLANK_START_END: the end 4000 - (3840 + 48) = 112, the start
+    // 112 + 3840 = 3952; CRTC_V_BLANK_START_END: the end 1111 - (1080 +
+    // 3) = 28, the start 28 + 1080 = 1108.
+    0x1B80, 0x00000F9F, 0x1B87, 0x00000456, 0x1B89, 0x00000456, 0x1B88, 0x00000456,
+    0x1B81, 0x00700F70, 0x1B8D, 0x001C0454,
+    // What program_timing_generator leaves to the firmware's table: the
+    // sync pulses from 0 to 32 and to 10, the line's high (0), the
+    // frame's low (1).
+    0x1B82, 0x00200000, 0x1B83, 0x00000000, 0x1B8E, 0x000A0000, 0x1B8F, 0x00000001,
+    // program_horz_count_by_2: CRTC_HORZ_COUNT_BY2_EN 0;
+    // enable_advanced_request: pulse and front porch are 13 lines, more
+    // than 3: CRTC_ADVANCED_START_LINE_POSITION 4, CRTC_PREFETCH_EN 1,
+    // CRTC_LEGACY_REQUESTOR_EN 0, both early bits 1, into 0x3101.
+    0x1BA9, 0x00000000, 0x1BB3, 0x00004007,
+    // dce110_enable_stream -> set_early_control: 3840 over 4 lanes
+    // leaves 0, so the lanes' count: CRTC_HBLANK_EARLY_CONTROL 4 into
+    // 0x10001.
+    0x1B9C, 0x00410001,
+    // dce110_unblank_stream -> dce110_stream_encoder_dp_unblank:
+    // DP_VID_M_N_GEN_EN 0 (of 0x100), DP_VID_N 0x8000, DP_VID_M 0x8000 *
+    // 266640 / 270000 = 32360, DP_VID_M_N_GEN_EN 1, DIG_START 1 (0x400
+    // is there), DP_STEER_FIFO_RESET 0, 100 us, DP_VID_STREAM_ENABLE 1.
+    0x4BA8, 0x00000000, 0x4BA9, 0x00008000, 0x4BAA, 0x00007E68, 0x4BA8, 0x00000100,
+    0x4B00, 0x00000400, 0x4BA5, 0x00000000, 0x4BA4, 0x00010201,
+    // dce110_apply_ctx_for_surface -> dce_mi_allocate_dmif: PIXEL_DURATION
+    // 10^9 / 266640 = 3750 into 0x1242b; the buffers by amdgpu's
+    // dce_v11_0_line_buffer_adjust.
+    0x1B30, 0x00010EA6, 0x0321, 0x00000014,
+    // dce_transform_set_scaler, as in (a) (the scaler is off already:
+    // SCL_MODE 0 of 0).
+    0x1AC1, 0x000006B0, 0x1B53, 0x00000000, 0x1B5E, 0x00000000, 0x1B5F, 0x00000000,
+    0x1B45, 0x00000000, 0x1B42, 0x00000000, 0x1B5C, 0x00000000, 0x1B5D, 0x0F000438,
+    // The surface under GRPH_UPDATE's lock, as in (a).
+    0x1A11, 0x00010000,
+    0x1A00, 0x00000001, 0x1A09, 0x00000000, 0x1A0A, 0x00000000, 0x1A0B, 0x00000000, 0x1A0C, 0x00000000,
+    0x1A0D, 0x00000F00, 0x1A0E, 0x00000438, 0x1A06, 0x00000F00, 0x1AC3, 0x00000438,
+    0x1A12, 0x00000000, 0x1A07, 0x000000F4, 0x1A08, 0x000000F4, 0x1A04, 0x00500000, 0x1A05, 0x00500000,
+    0x1A11, 0x00000000,
+    // program_surface_visibility -> dce110_tg_set_blank(false); the mark
+    // set chosen as it was.
+    0x1BB6, 0x00010000, 0x1B9D, 0x00000000,
+    0x1B32, 0x00010100
+}
+
+// The card read again after a change: what was read fits together, the
+// new picture is shown as it is (at its place, which the kernel now knows
+// as the picture), and there is nothing more to plan.
+fn readAgain(name: []const u8) -> void {
+    const card = scanout.Card.{ .read = read, .now = now, .write = logWrite }
+    const after = scanout.Memory.{ .aperture = 256 * 1024 * 1024, .pictureOffset = 0x500000, .pictureBytes = 16588800, .pictureWidth = 3840, .pictureHeight = 1080, .picturePitch = 3840 }
+    const monitor = wide()
+    scanout.report(&card, &after, &readout)
+    expect(readout.plausible && readout.shows[0] == scanout.Shows.as_it_is, name)
+    line("gpu: controller 0 shows a picture of 3840x1080 as it is: the monitor is sent 3840x1080\n")
+    mode.make(&card, &readout, &after, &monitor, &plan)
+    mode.say(&card, &plan)
+    expect(!plan.complete && plan.missing == mode.Missing.already, name)
+    line("gpu: plan: nothing to set (the controller shows the monitor's own mode as it is)\n")
+}
+
+// The way back for (b), worked out by hand from the plan's steps and the
+// rule of gpu_set.mlx: a step that makes the output quiet (the stream
+// stopped, the controller blanked) and one that is only on the way (a
+// mark set chosen, the M and N generator held, the encoder's start bit,
+// the surface's lock) is written as planned, each set of urgency marks
+// gets what it held, and every other register the firmware's word
+// (`asItIs`).
+const DISPLAYPORT_BACK = [_]usize{
+    // The mark sets chosen in turn, each given its marks again.
+    0x1B32, 0x00010000, 0x1B33, 0x00FA0030,
+    0x1B32, 0x00010100, 0x1B33, 0x00FA0040,
+    0x1B32, 0x00010200, 0x1B33, 0x00000000,
+    0x1B32, 0x00010300, 0x1B33, 0x00000000,
+    // The stream stopped and the controller blanked, as planned.
+    0x4BA4, 0x00010201, 0x4BA4, 0x00010200, 0x4BA5, 0x00000001,
+    0x1BB6, 0x00010000, 0x1B9D, 0x00000100,
+    // The firmware's clock (108 MHz) and timing (1800 by 1000, the
+    // blankings 1704..424 and 999..39, pulses of 112 and 3, both high),
+    // its start line word and its control word.
+    0x0141, 0x066FF300,
+    0x1B80, 0x00000707, 0x1B87, 0x000003E7, 0x1B89, 0x00000000, 0x1B88, 0x00000000,
+    0x1B81, 0x01A806A8, 0x1B8D, 0x002703E7,
+    0x1B82, 0x00700000, 0x1B83, 0x00000000, 0x1B8E, 0x00030000, 0x1B8F, 0x00000000,
+    0x1BA9, 0x00000000, 0x1BB3, 0x00003101,
+    0x1B9C, 0x00010001,
+    // The stream started with the firmware's M and N: the generator held
+    // as planned, then its words as they were.
+    0x4BA8, 0x00000000, 0x4BA9, 0x00008000, 0x4BAA, 0x00003333, 0x4BA8, 0x00000100,
+    0x4B00, 0x00000400, 0x4BA5, 0x00000000, 0x4BA4, 0x00010001,
+    // The firmware's pixel duration, buffers, line buffer, sharpening,
+    // borders, scaler and viewport (1280 above 960).
+    0x1B30, 0x0001242B, 0x0321, 0x00000012,
+    0x1AC1, 0x001006B0, 0x1B53, 0x00000011, 0x1B5E, 0x00000000, 0x1B5F, 0x00000000,
+    0x1B45, 0x00000000, 0x1B42, 0x00000000, 0x1B5C, 0x00000000, 0x1B5D, 0x050003C0,
+    // The firmware's surface under the lock (taken and let go as
+    // planned): 1280 by 960 at the start of the card's memory, the high
+    // words first.
+    0x1A11, 0x00010000,
+    0x1A00, 0x00000001, 0x1A09, 0x00000000, 0x1A0A, 0x00000000, 0x1A0B, 0x00000000, 0x1A0C, 0x00000000,
+    0x1A0D, 0x00000500, 0x1A0E, 0x000003C0, 0x1A06, 0x00000500, 0x1AC3, 0x000003C0,
+    0x1A12, 0x00000001, 0x1A07, 0x000000F4, 0x1A08, 0x00000000, 0x1A04, 0x00000000, 0x1A05, 0x00000000,
+    0x1A11, 0x00000000,
+    // The picture shown as the firmware had it, its mark set chosen.
+    0x1BB6, 0x00000100, 0x1B9D, 0x00000000,
+    0x1B32, 0x00010100
+}
+
+// The way back for (a), by the same rule: the firmware's words of
+// `scaled` (the scaler on with its prescaler, a viewport of 1280 above
+// 960, two buffers, the line buffer's second setting).
+const SCALED_BACK = [_]usize{
+    0x1B32, 0x00010000, 0x1B33, 0x00FA0030,
+    0x1B32, 0x00010100, 0x1B33, 0x00FA0040,
+    0x1B32, 0x00010200, 0x1B33, 0x00000000,
+    0x1B32, 0x00010300, 0x1B33, 0x00000000,
+    // Blanked as planned while the rest is put back.
+    0x1BB6, 0x00010000, 0x1B9D, 0x00000100,
+    0x0321, 0x00000012,
+    0x1AC1, 0x001006B0, 0x1B53, 0x00000011, 0x1B5E, 0x00000000, 0x1B5F, 0x00000000,
+    0x1B45, 0x00000000, 0x1B42, 0x00000011, 0x1B5C, 0x00000000, 0x1B5D, 0x050003C0,
+    0x1A11, 0x00010000,
+    0x1A00, 0x00000001, 0x1A09, 0x00000000, 0x1A0A, 0x00000000, 0x1A0B, 0x00000000, 0x1A0C, 0x00000000,
+    0x1A0D, 0x00000500, 0x1A0E, 0x000003C0, 0x1A06, 0x00000500, 0x1AC3, 0x000003C0,
+    0x1A12, 0x00000001, 0x1A07, 0x000000F4, 0x1A08, 0x00000000, 0x1A04, 0x00000000, 0x1A05, 0x00000000,
+    0x1A11, 0x00000000,
+    0x1BB6, 0x00000100, 0x1B9D, 0x00000000,
+    0x1B32, 0x00010100
+}
+
+// The writes from number `from` on against a sequence worked out by hand.
+fn sameWritesFrom(name: []const u8, from: usize, pairs: []const usize) -> void {
+    var k: usize = 0
+    while k * 2 + 1 < pairs.length && from + k < written {
+        if writtenTo[from + k] != pairs[k * 2] || writtenWith[from + k] != pairs[k * 2 + 1] {
+            const card = scanout.Card.{ .read = read, .now = now, .write = say }
+            say("not as expected: ")
+            say(name)
+            card.field(": write ", k + 1)
+            say(" of the way back is ")
+            card.hexDigits(writtenTo[from + k], 4)
+            say(" = ")
+            card.hexDigits(writtenWith[from + k], 8)
+            say(", worked out ")
+            card.hexDigits(pairs[k * 2], 4)
+            say(" = ")
+            card.hexDigits(pairs[k * 2 + 1], 8)
+            say("\n")
+            if failed == 0 { failed = 4 }
+            return
+        }
+        k += 1
+    }
+    expect(written == from + pairs.length / 2, name)
+}
+
+// One of the two states made again, with the plan for the wide monitor.
+fn again(displayport: bool, name: []const u8) -> void {
+    begin(name)
+    if displayport { asItIs() } else { scaled() }
+    const monitor = wide()
+    make(&monitor)
+}
+
+// A change that must fail and leave every register as it was.
+fn mustComeBack(name: []const u8, reason: set.Reason) -> void {
+    const done = carry(true)
+    expect(!done && result.outcome == set.Outcome.back, name)
+    expect(result.reason == reason, name)
+    expect(result.astray == 0 && asBefore(), name)
+    line("gpu: putting the firmware's state back\n")
+    line("gpu: the firmware's state is back (")
+    noLine("the monitor's own mode is set")
+    noLine("NOT all back")
+}
+
+// The lowest bit of a word that is set.
+fn lowest(word: usize) -> usize { return word & (~word + 1) }
+
+// Both plans with every write in turn not holding, and every wait in turn
+// not coming.
+fn everyStep(displayport: bool) -> void {
+    again(displayport, "the steps counted")
+    const count = plan.count
+    var k: usize = 0
+    var writes: usize = 0
+    while k < count {
+        again(displayport, if displayport { "(b): a step that fails" } else { "(a): a step that fails" })
+        const step = &plan.steps[k]
+        if step.*.kind == mode.Kind.write && step.*.mask == 0 {
+            // A bit that may clear itself (the encoder's DIG_START): what
+            // is read back is not held against it, and the plan goes on.
+            spoilAt = writes
+            spoilBit = step.*.value
+            writes += 1
+            expect(carry(true) && result.outcome == set.Outcome.done, "a bit that clears itself does not stop the plan")
+        } else if step.*.kind == mode.Kind.write {
+            spoilAt = writes
+            spoilBit = lowest(step.*.mask)
+            writes += 1
+            mustComeBack("a write that does not hold", set.Reason.read_back)
+            expect(result.step == k, "the step that did not hold")
+        } else if step.*.kind == mode.Kind.wait {
+            // The state waited for is the other one from the write that
+            // asks for it on (the last write to the register before the
+            // wait; the bits that write sets itself hold).
+            var asking: usize = NEVER
+            var nth: usize = 0
+            var j: usize = 0
+            while j < k {
+                if plan.steps[j].kind == mode.Kind.write && plan.steps[j].register == step.*.register {
+                    asking = j
+                    nth += 1
+                }
+                j += 1
+            }
+            expect(asking != NEVER, "a wait follows a write to its register")
+            if asking != NEVER {
+                stuckRegister = step.*.register
+                stuckMask = step.*.mask & ~plan.steps[asking].mask
+                stuckValue = (step.*.value ^ step.*.mask) & stuckMask
+                stuckFrom = nth
+                stuckSeen = 0
+                mustComeBack("a state that does not come", set.Reason.wait)
+                expect(result.step == k, "the wait that did not come")
+            }
+        }
+        k += 1
+    }
+    expect(writes == plan.writes, "every write was tried")
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    show = std.process.count(arguments) > 1
+    var monitor = wide()
+
+    // (a) The card scales onto the monitor's own timing.
+    begin("(a): the monitor's own timing, the picture scaled")
+    scaled()
+    make(&monitor)
+    line("gpu: controller 0 shows 3840x1080 from a picture of 1280x960: the card scales\n")
+    line("gpu: plan (a): the controller runs this timing already; a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 38 writes would do it\n")
+    line("gpu: would write 1b32 = 00010000 (an urgency mark set chosen)\n")
+    line("gpu: would write 1b33 = ffffffff (its urgency marks at their highest)\n")
+    line("gpu: would write 1b9d = 00000100 (the controller's picture blanked)\n")
+    line("gpu: would wait for 1b9d & 00000101 = 00000101 (until it is blank)\n")
+    line("gpu: would write 0321 = 00000014 (the buffers the rows are read through)\n")
+    line("gpu: would wait for 0321 & 00000010 = 00000010 (until they are given)\n")
+    line("gpu: would write 1ac1 = 000006b0 (all of the line buffer's memory)\n")
+    line("gpu: would write 1b42 = 00000000 (the scaler off, its prescaler too)\n")
+    line("gpu: would write 1b5d = 0f000438 (the viewport's size)\n")
+    line("gpu: would write 1a11 = 00010000 (the surface's words held)\n")
+    line("gpu: would write 1a07 = 000000f4 (the surface's address, upper part)\n")
+    line("gpu: would write 1a04 = 00500000 (the surface's address)\n")
+    line("gpu: would write 1a05 = 00500000 (the second address)\n")
+    line("gpu: would write 1ac3 = 00000438 (the line buffer's count of rows)\n")
+    line("gpu: would wait for 1a11 & 00000004 = 00000000 (until the controller has taken them)\n")
+    line("gpu: would wait for 1b9d & 00000001 = 00000000 (until it is shown)\n")
+    expect(plan.situation == mode.Situation.scaled && plan.complete && plan.missing == mode.Missing.nothing, "(a) is complete")
+    expect(plan.writes == 38 && plan.count == 42, "(a): 38 writes and 4 waits")
+    sameShape("(a): where the waits stand among the writes", SCALED_SHAPE)
+    expect(plan.width == 3840 && plan.height == 1080 && plan.pitch == 3840 && plan.offset == 0x500000 && plan.bytes == 16588800 && plan.address == 0xF400500000, "(a): the picture's place")
+    expect(plan.millihertz == 60000 && plan.hTotal == 4000 && plan.vTotal == 1111, "(a): the rate to hold against")
+    expect(written == 0, "the plan is made without a write")
+
+    // The setting off: nothing at all is written.
+    expect(!carry(false), "the setting off: not done")
+    expect(written == 0 && cleared == 0 && result.outcome == set.Outcome.untouched, "the setting off: no write, nothing cleared")
+    expect(asBefore(), "the setting off: every register as it was")
+    line("gpu: nothing is written to the card (the image does not ask for the monitor's own mode: settings/gpu)\n")
+
+    // The setting on: the sequence worked out from Linux, and the picture.
+    expect(carry(true), "(a) carried out")
+    sameWrites("(a): the writes in order", SCALED_WRITES[0..])
+    expect(result.outcome == set.Outcome.done && result.writes == 38 && result.writesBack == 0, "(a): done in 38 writes")
+    expect(cleared == 1 && clearedAt == 0x500000 && clearedBytes == 16588800 && !writtenBeforeClear, "(a): the new picture cleared first")
+    expect(marks[0] == 0xFFFFFFFF && marks[1] == 0xFFFFFFFF && marks[2] == 0xFFFFFFFF && marks[3] == 0xFFFFFFFF && raw(MARK_SET) == 0x00010100, "(a): all four mark sets, the choice as it was")
+    expect(result.rate.frames != 0 && result.rate.millihertz == 60000, "(a): the frames counted afterwards")
+    line("gpu: the image asks for the monitor's own mode (settings/gpu): carrying out the plan's 38 writes\n")
+    line("gpu: controller 0 shows a picture of 3840x1080 as it is, 60.000 frames a second: the monitor's own mode is set (38 writes, each read back)\n")
+    noLine("putting the firmware's state back")
+    // The card read again says so: the picture as it is, at its place.
+    readAgain("(a): read again")
+
+    // (a) without a monitor that says its timing: the timing's own size.
+    begin("(a): no EDID")
+    scaled()
+    monitor = silent()
+    make(&monitor)
+    expect(plan.situation == mode.Situation.scaled && plan.complete && plan.width == 3840 && plan.height == 1080, "(a) without an EDID: the timing's size")
+    monitor = wide()
+
+    // (b) The picture's own timing on DisplayPort, room on the link.
+    begin("(b): a 1280x960 timing on DisplayPort")
+    asItIs()
+    make(&monitor)
+    line("gpu: controller 0 shows a picture of 1280x960 as it is: the monitor is sent 1280x960\n")
+    line("gpu: plan (b, DisplayPort): the link has 4 lanes at 2.70 Gbit/s (by M 0x3333 over N 0x8000), room for 360000 kHz at 24 bits: 266640 kHz fits\n")
+    line("gpu: plan (b, DisplayPort): the pixel clock from 108000 to 266640 kHz (the DTO's phase from 108000000 to 266640000), the timing, the stream stopped and started, a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 63 writes would do it\n")
+    line("gpu: would write 4ba4 = 00010201 (the stream to stop at a frame's end)\n")
+    line("gpu: would write 4ba4 = 00010200 (the stream stopped)\n")
+    line("gpu: would wait for 4ba4 & 00010000 = 00000000 (until it has stopped)\n")
+    line("gpu: would write 4ba5 = 00000001 (the encoder off the controller's timing)\n")
+    line("gpu: would wait 60000 us (the monitor sees the stream gone)\n")
+    line("gpu: would write 0141 = 0fe49a80 (the pixel clock: the DTO's phase)\n")
+    line("gpu: would write 1b80 = 00000f9f (the timing: pixels in a line, less one)\n")
+    line("gpu: would write 1b81 = 00700f70 (where a line's blanking starts and ends)\n")
+    line("gpu: would write 1b8d = 001c0454 (where a frame's blanking starts and ends)\n")
+    line("gpu: would write 1b82 = 00200000 (a line's sync pulse)\n")
+    line("gpu: would write 1b8f = 00000001 (whether it is the low one)\n")
+    line("gpu: would write 1bb3 = 00004007 (when the rows are asked for)\n")
+    line("gpu: would write 1b9c = 00410001 (DisplayPort's early blanking)\n")
+    line("gpu: would write 4baa = 00007e68 (M for the new pixel clock)\n")
+    line("gpu: would wait 100 us (the encoder takes a few lines)\n")
+    line("gpu: would wait for 4ba4 & 00010000 = 00010000 (until it runs)\n")
+    line("gpu: would write 1b30 = 00010ea6 (a pixel's duration)\n")
+    expect(plan.situation == mode.Situation.displayport && plan.complete, "(b) is complete")
+    expect(plan.writes == 63 && plan.count == 71, "(b): 63 writes, 6 waits, 2 pauses")
+    sameShape("(b): where the waits and pauses stand among the writes", DISPLAYPORT_SHAPE)
+    expect(plan.link.lanes == 4 && plan.link.clock == 270000 && plan.link.bits == 24 && plan.link.room == 360000, "(b): the link")
+    expect(plan.clockNow == 108000 && !plan.clockMeasured && plan.phase == 266640000 && plan.millihertz == 60000, "(b): the clock")
+    expect(!carry(false) && written == 0 && asBefore(), "(b), the setting off: no write")
+    expect(carry(true), "(b) carried out")
+    sameWrites("(b): the writes in order", DISPLAYPORT_WRITES[0..])
+    expect(result.outcome == set.Outcome.done && result.writes == 63, "(b): done in 63 writes")
+    expect(result.rate.frames != 0 && result.rate.millihertz == 60000 && result.rate.kilohertz == 266640, "(b): 60 frames a second of 4000 by 1111")
+    line("gpu: controller 0 shows a picture of 3840x1080 as it is, 60.000 frames a second: the monitor's own mode is set (63 writes, each read back)\n")
+    readAgain("(b): read again")
+    line("gpu: controller 0 is on (control 0x410001): 3840x1080 of 4000x1111, h blank 3952..112 sync 0..32 +, v blank 1108..28 sync 0..10 -\n")
+    line("gpu: controller 0 goes out by DIG 1 (front end 1): DisplayPort, 4 lanes, trained, stream on\n")
+
+    // A link without room (two lanes at 1.62 Gbit/s: 108000 kHz at 24
+    // bits): nothing is written, asked or not.
+    begin("(b): a link of two lanes at 1.62 Gbit/s")
+    asItIs()
+    store(0x4BA3, 1)
+    store(0x4BAA, 0x5555)
+    make(&monitor)
+    line("gpu: plan (b, DisplayPort): the link has 2 lanes at 1.62 Gbit/s (by M 0x5555 over N 0x8000), room for 108000 kHz at 24 bits: 266640 kHz does not fit\n")
+    line("gpu: plan (b, DisplayPort): nothing would be set: the link is too slow: it must be trained again, not there yet\n")
+    noLine("would write")
+    expect(!plan.complete && plan.missing == mode.Missing.link_too_slow && plan.count == 0, "a link without room: no plan")
+    expect(!carry(true) && written == 0 && cleared == 0 && asBefore(), "a link without room: no write")
+    line("gpu: the image asks for the monitor's own mode (settings/gpu), but the plan is not complete: nothing is written to the card\n")
+
+    // Thirty bits a pixel on the same four lanes: 288000 kHz of room.
+    begin("(b): ten bits a colour")
+    asItIs()
+    store(0x4BA1, 0x02000000)
+    make(&monitor)
+    line("gpu: plan (b, DisplayPort): the link has 4 lanes at 2.70 Gbit/s (by M 0x3333 over N 0x8000), room for 288000 kHz at 30 bits: 266640 kHz fits\n")
+    expect(plan.complete, "ten bits a colour: fits")
+
+    // HDMI: the clock is a PLL's.
+    begin("(b): the same timing by HDMI")
+    asItIs()
+    store(0x4B47, 0x10030200)
+    make(&monitor)
+    line("gpu: controller 0 goes out by DIG 1 (front end 1): TMDS (HDMI)\n")
+    line("gpu: plan (b): nothing would be set: HDMI: the TMDS clock's PLL must be set, not there yet\n")
+    noLine("would write")
+    expect(plan.situation == mode.Situation.tmds && !plan.complete && plan.missing == mode.Missing.tmds, "HDMI: no plan")
+    expect(!carry(true) && written == 0 && cleared == 0 && asBefore(), "HDMI: no write")
+
+    // A link that is not trained, one of several streams, a clock that is
+    // no DTO's, M and N that give no rate, sync pulses elsewhere.
+    begin("(b): a link that is not trained")
+    asItIs()
+    store(0x4BA0, 0)
+    make(&monitor)
+    expect(!plan.complete && plan.missing == mode.Missing.not_trained, "not trained")
+    line("gpu: plan (b, DisplayPort): nothing would be set: the link is not trained or its stream is off: it must be trained, not there yet\n")
+    expect(!carry(true) && written == 0, "not trained: no write")
+    begin("(b): several streams")
+    asItIs()
+    store(0x4B47, 0x10050200)
+    make(&monitor)
+    expect(!plan.complete && plan.missing == mode.Missing.several_streams, "several streams")
+    begin("(b): the clock is no DTO's")
+    asItIs()
+    store(0x140, 0)
+    make(&monitor)
+    expect(!plan.complete && plan.missing == mode.Missing.no_dto, "no DTO")
+    begin("(b): M and N of no rate")
+    asItIs()
+    store(0x4BAA, 0x2000)
+    make(&monitor)
+    expect(!plan.complete && plan.missing == mode.Missing.no_link_rate, "no link rate")
+    line("gpu: plan (b, DisplayPort): M 0x2000 and N 0x8000 with a pixel clock of 108000 kHz give no rate a link has\n")
+    line("gpu: plan (b, DisplayPort): nothing would be set: the link's rate is not known from M and N\n")
+    begin("(b): sync pulses that do not begin the counters")
+    asItIs()
+    store(0x1B82, (160 << 16) | 48)
+    make(&monitor)
+    expect(!plan.complete && plan.missing == mode.Missing.sync_elsewhere, "sync elsewhere")
+    expect(!carry(true) && written == 0, "sync elsewhere: no write")
+
+    // A DTO whose phase is not the clock in Hz (a modulo of 1200 for a
+    // phase of 216, against the same reference): the new phase is the old
+    // one brought to the new clock by the measured clock.
+    begin("(b): a DTO in other units")
+    asItIs()
+    store(0x141, 216000)
+    store(0x142, 1200000)
+    make(&monitor)
+    expect(plan.complete && plan.clockMeasured && plan.clockNow == 108000 && plan.phase == 533280, "the phase by the measured clock")
+    line("gpu: plan (b, DisplayPort): the pixel clock from 108000 to 266640 kHz (the DTO's phase from 216000 to 533280, by the measured clock), the timing,")
+    expect(carry(true) && result.rate.millihertz == 60000, "a DTO in other units: carried out, 60 frames a second")
+
+    // A frame's pulse and front porch of three lines or fewer: the rows
+    // are asked for three lines early, without the prefetch
+    // (enable_advanced_request).
+    begin("(b): a short frame pulse")
+    asItIs()
+    var brief = wide()
+    brief.timing.vFront = 1
+    brief.timing.vSync = 2
+    make(&brief)
+    expect(plan.complete, "a short frame pulse: planned")
+    line("gpu: would write 1bb3 = 00003003 (when the rows are asked for)\n")
+    line("gpu: would write 1b8e = 00020000 (a frame's sync pulse)\n")
+
+    // What the controller's words cannot hold, or the DTO cannot make, or
+    // the aperture has no room for: no plan and no write.
+    begin("(b): a pixel clock above the DTO's reference")
+    asItIs()
+    var fast = wide()
+    fast.timing.clock = 620000
+    make(&fast)
+    expect(!plan.complete && plan.missing == mode.Missing.no_clock && plan.count == 0, "a phase that is no part of the modulo: no plan")
+    expect(!carry(true) && written == 0, "a phase that is no part of the modulo: no write")
+    begin("(b): a line longer than the controller counts")
+    asItIs()
+    var long = wide()
+    long.timing.hTotal = 0x4001
+    make(&long)
+    expect(!plan.complete && plan.missing == mode.Missing.too_large && plan.count == 0, "a line of 16385 pixels: no plan")
+    line("gpu: plan (b, DisplayPort): nothing would be set: the size is more than the controller's words hold\n")
+    expect(!carry(true) && written == 0, "a line of 16385 pixels: no write")
+    begin("(a): an aperture of 16 MiB")
+    scaled()
+    apertureOf = 16 * 1024 * 1024
+    make(&monitor)
+    expect(!plan.complete && plan.missing == mode.Missing.no_room && plan.count == 0, "no room in the aperture: no plan")
+    line("gpu: plan (a): the controller runs this timing already; nothing would be set: the picture does not fit the aperture\n")
+    expect(!carry(true) && written == 0 && cleared == 0, "no room in the aperture: no write, nothing cleared")
+
+    // The picture the kernel draws on is another adapter's (the firmware's
+    // console is not this card's): the monitor whose timing is known is
+    // that picture's, and there is none here to replace. No plan in either
+    // state, and no write.
+    begin("(a): the kernel's picture is another adapter's")
+    scaled()
+    pictureElsewhere = true
+    make(&monitor)
+    line("gpu: plan: nothing to set (the picture the kernel draws on is not this card's)\n")
+    noLine("would write")
+    expect(plan.situation == mode.Situation.none && !plan.complete && plan.missing == mode.Missing.elsewhere && plan.count == 0, "another adapter's picture, (a): no plan")
+    expect(!carry(true) && written == 0 && cleared == 0 && asBefore(), "another adapter's picture, (a): no write")
+    begin("(b): the kernel's picture is another adapter's")
+    asItIs()
+    pictureElsewhere = true
+    make(&monitor)
+    expect(!plan.complete && plan.missing == mode.Missing.elsewhere && !carry(true) && written == 0, "another adapter's picture, (b): no plan, no write")
+
+    // Nothing to go to, and states nothing is planned for.
+    begin("as it is, no EDID")
+    asItIs()
+    monitor = silent()
+    make(&monitor)
+    line("gpu: plan: nothing to set (the card sends the picture as it is and the monitor's own timing is not known)\n")
+    expect(plan.situation == mode.Situation.none && !plan.complete && !carry(true) && written == 0, "no monitor: nothing")
+    monitor = wide()
+    begin("a read-out that does not fit")
+    scaled()
+    store(0x1A06, 0)
+    make(&monitor)
+    line("gpu: plan: nothing to set (the read-out is not plausible)\n")
+    expect(!plan.complete && !carry(true) && written == 0, "not plausible: nothing")
+    begin("two controllers on")
+    scaled()
+    store(0x1D9C, 0x00010001)
+    store(0x1D80, 1799)
+    store(0x1D87, 999)
+    store(0x1D81, (424 << 16) | 1704)
+    store(0x1D8D, (39 << 16) | 999)
+    store(0x1C00, 1)
+    store(0x1C01, 2)
+    store(0x1C07, 0xF4)
+    store(0x1C06, 1280)
+    store(0x1C0D, 1280)
+    store(0x1C0E, 960)
+    store(0x1D5D, (1280 << 16) | 960)
+    make(&monitor)
+    line("gpu: plan: nothing to set (more than one controller is on: one monitor only for now)\n")
+    expect(!plan.complete && !carry(true) && written == 0, "two controllers: nothing")
+    begin("no frames counted")
+    scaled()
+    store(0x142, 0)
+    make(&monitor)
+    expect(!plan.complete && plan.missing == mode.Missing.no_frames, "(a) without frames: nothing to hold against")
+    line("gpu: plan (a): the controller runs this timing already; nothing would be set: no frames were counted: there is nothing to hold a change against\n")
+
+    // The card scales onto a timing that is not the monitor's (1280x1024):
+    // (b), with the scaler turned off on the way.
+    begin("(b): scaled onto a timing that is not the monitor's")
+    firmware()
+    timing(1280, 1024, 1688, 1066, 112, 248, 3, 38, 0)
+    store(0x1B42, 1)
+    store(0x1B43, 0x303)
+    store(0x141, 107964480)
+    store(0x4BA9, 0x8000)
+    store(0x4BAA, 0x332F)
+    make(&monitor)
+    line("gpu: controller 0 shows 1280x1024 from a picture of 1280x960: the card scales\n")
+    expect(plan.situation == mode.Situation.displayport && plan.complete && plan.width == 3840, "scaled onto another timing: (b)")
+    expect(carry(true) && raw(0x1B42) == 0 && raw(0x1B5D) == 0x0F000438, "the scaler off on the way")
+
+    // A read-back that fails, at every write; a state that does not come,
+    // at every wait.
+    everyStep(false)
+    everyStep(true)
+
+    // The frame counter does not run again with the new picture, in (a)
+    // and in (b); and it runs at another rate (the pixel clock did not
+    // follow the DTO).
+    again(false, "(a): the frames stand with the new viewport")
+    freezeRegister = 0x1B5D
+    freezeValue = 0x0F000438
+    mustComeBack("frames that stand", set.Reason.frames)
+    line("gpu: controller 0 counts no frames after the change\n")
+    line("gpu: the firmware's state is back (")
+    line("; the controller counts frames\n")
+    sameWritesFrom("(a): the way back after the last step", 38, SCALED_BACK[0..])
+    again(true, "(b): the frames stand with the new timing")
+    freezeRegister = 0x1B80
+    freezeValue = 3999
+    mustComeBack("frames that stand", set.Reason.frames)
+    line("gpu: controller 0 counts no frames after the change\n")
+    again(true, "(b): the pixel clock does not follow")
+    clockDeaf = true
+    mustComeBack("frames at another rate", set.Reason.frames)
+    line("gpu: controller 0 counts 24.302 frames a second after the change, not the 60 planned\n")
+    // The way back itself, write for write: after all 63 writes were
+    // made, and after a failure at the clock's write (the fourteenth),
+    // where the steps not yet come to are gone through as well, so that
+    // the stream and the picture are woken as planned.
+    sameWritesFrom("(b): the way back after the last step", 63, DISPLAYPORT_BACK[0..])
+    again(true, "(b): the clock's write does not hold")
+    spoilAt = 13
+    spoilBit = 1
+    mustComeBack("the clock's write", set.Reason.read_back)
+    sameWritesFrom("(b): the way back from the clock's write", 14, DISPLAYPORT_BACK[0..])
+    // An encoder whose start bit clears itself (the firmware's word reads
+    // without it): the plan is carried out all the same, and on the way
+    // back the bit is written set again, once, so that the encoder comes
+    // in step with the timing put back, not with what the word read.
+    begin("(b): a start bit that clears itself")
+    asItIs()
+    store(0x4B00, 0)
+    startClears = true
+    make(&monitor)
+    expect(carry(true) && result.outcome == set.Outcome.done && raw(0x4B00) == 0, "a start bit that clears itself: done")
+    begin("(b): a start bit that clears itself, and the frames stand")
+    asItIs()
+    store(0x4B00, 0)
+    startClears = true
+    make(&monitor)
+    freezeRegister = 0x1B80
+    freezeValue = 3999
+    mustComeBack("frames that stand, the start bit clearing itself", set.Reason.frames)
+    var starts: usize = 0
+    var others: usize = 0
+    var back: usize = 63
+    while back < written {
+        if writtenTo[back] == 0x4B00 {
+            if writtenWith[back] == 0x400 { starts += 1 } else { others += 1 }
+        }
+        back += 1
+    }
+    expect(starts == 1 && others == 0, "the way back writes the start bit set, once")
+
+    // Before anything was made quiet (the marks): only what was gone into
+    // is gone through again, and the mark set is chosen as it was.
+    again(true, "(b): the first write does not hold")
+    spoilAt = 0
+    spoilBit = 0x100
+    mustComeBack("the first write", set.Reason.read_back)
+    expect(written == 3 && writtenTo[1] == 0x1B32 && writtenWith[1] == 0x00010000 && writtenTo[2] == 0x1B32 && writtenWith[2] == 0x00010100, "the way back from the first write: the mark set chosen as it was")
+    again(true, "(b): the third write does not hold")
+    spoilAt = 2
+    spoilBit = 0x100
+    mustComeBack("the third write", set.Reason.read_back)
+    expect(written == 6 && writtenTo[3] == 0x1B32 && writtenWith[3] == 0x00010000 && writtenTo[4] == 0x1B33 && writtenWith[4] == 0x00FA0030 && writtenTo[5] == 0x1B32 && writtenWith[5] == 0x00010100, "the way back from the third write: the first set's marks and the choice")
+
+    // The memory interface runs dry with the new rows; and one that said
+    // so before is not held against the change.
+    again(false, "(a): the memory interface runs dry")
+    dryAfter = 0x1B5D
+    mustComeBack("an underflow", set.Reason.underflow)
+    line("gpu: the memory interface ran dry after the change (DMIF_STATUS says an underflow)\n")
+    again(false, "(a): the memory interface said so before")
+    dry = true
+    expect(carry(true) && result.outcome == set.Outcome.done, "an underflow from before: not held against the change")
+    // A word that clears when read, and ran dry only while the controller
+    // was being changed: not held against the new picture.
+    again(false, "(a): the memory interface ran dry during the change only")
+    dryAfter = 0x1B5D
+    dryClears = true
+    expect(carry(true) && result.outcome == set.Outcome.done, "an underflow during the change, cleared by its reading: done")
+
+    // A register that does not take the firmware's value again on the way
+    // back (the frames stand with the new viewport, and the viewport's
+    // size takes one write and no more): said, with the register. And a
+    // write on the way back that does not hold at first is made again.
+    again(false, "(a): a register astray on the way back")
+    freezeRegister = 0x1B5D
+    freezeValue = 0x0F000438
+    deafRegister = 0x1B5D
+    deafAfter = 1
+    expect(!carry(true) && result.reason == set.Reason.frames, "astray: fails at the frames")
+    expect(result.outcome == set.Outcome.astray && result.astray == 1 && !asBefore(), "astray: one register differs")
+    line("gpu: 1b5d holds 0f000438, the firmware had 050003c0\n")
+    line("gpu: the firmware's state is NOT all back: 1 register differs; the controller counts no frames\n")
+    again(false, "(a): a write on the way back that holds at the second try")
+    freezeRegister = 0x1B5D
+    freezeValue = 0x0F000438
+    spoilAt = 38 + 18
+    spoilBit = 1
+    mustComeBack("a second try on the way back", set.Reason.frames)
+    expect(result.writesBack == 39, "one write more on the way back")
+
+    if failed != 0 { return failed }
+    return 13
+}

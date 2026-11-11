@@ -365,7 +365,10 @@ often has no 3840x1080 for a wide monitor), the loader takes, of the
 modes no wider and no higher, the one that shows most of a picture of
 that shape (1280x960 before 1280x1024 on such a monitor), if that is
 more than the firmware's own mode shows: still stretched, but less; the
-monitor's own mode then takes the card's driver. An image may name a mode
+monitor's own mode then takes the card's driver, for which the loader
+passes the EDID itself on to the kernel (its base block and first
+extension block, 256 bytes at layout.Blob.EDID; Info.EDID_BYTES says how
+many there are). An image may name a mode
 itself: a file settings/display in the archive, "3840x2160" (that mode,
 or the nearest below it) or "firmware" (the firmware's, come what may);
 brix-image builds the loader for it. The kernel's log says what
@@ -397,7 +400,9 @@ firmware's framebuffer (fbcon.mlx: an 8x16 font, a grid of characters so
 that a scroll never reads the adapter's memory back, the framebuffer
 mapped write-combining) until a graphical program maps it, and kept in a
 log (/devices/klog; klogsave writes it to boot.log on the brixfs
-volumes). `console.screen(false)` keeps a long dump off the screen (in
+volumes and keeps the boot before's beside it as boot.previous.log: what
+the kernel said in a boot that ended with a dark screen is read after
+the next one). `console.screen(false)` keeps a long dump off the screen (in
 the log and on the serial line only). A fault of the kernel's own stops
 it with a report on the screen (trap.mlx `stop`: what, where, the
 registers, the callers), drawn over whatever is there.
@@ -464,6 +469,8 @@ writes two images for such a machine beside the build's: BOOTX64-diag.EFI
 photographed) and BOOTX64-console.EFI (mlx-console on the screen: a
 shell with the USB keyboard; `cat /devices/klog` shows the log). Both
 run on one processor and carry the GPU's firmware.
+(tools/brix-native-efi.sh makes the images that ask the GPU's driver for
+the monitor's own mode: below.)
 
 The GPU (gpu.mlx: an AMD Radeon, Polaris) is found and its register path
 tried; its driver is built in stages, and what the next ones stand on is
@@ -472,11 +479,14 @@ the card reads and writes (`gpu.dma`), its firmware from the boot
 archive by name (`Archive.find`), a vector for its interrupt
 (layout.Vector.GPU, `Pci.enableMsi`, `smp.localApic`). The firmware's
 picture is the console and the desktop's screen: the file's head says
-what must not be done to the card while it is.
+what must not be done to the card while it is, and where to read that
+the usual boot writes no register of the display.
 
-Its display controller (DCE 11.2) is read, not yet set
-(gpu_display.mlx; the register numbers are those of Linux's
-dce_11_2_d.h, vid.h and gmc_8_1_d.h, looked up there; only a Polaris
+Its display controller (DCE 11.2) is read at every boot, and set only
+when the image asks for it (gpu_display.mlx reads, gpu_mode.mlx plans,
+gpu_set.mlx writes; the register numbers and fields are those of Linux's
+dce_11_2_d.h, dce_11_2_sh_mask.h, vid.h and gmc_8_1_d.h, looked up there
+and held against them by tools/check_gpu_registers.py; only a Polaris
 card's is read, on another AMD card the same numbers are other
 registers and the log says that it is not read). For every
 controller that is on the log says the timing (the size shown, the
@@ -491,26 +501,104 @@ one line says what it shows:
     gpu: controller 0 shows 3840x1080 from a picture of 1280x960: the card scales
     gpu: controller 0 shows a picture of 1280x960 as it is: the monitor is sent 1280x960
 
-In the first case a picture of the size shown needs only a surface of
-that size, the viewport, the scaler and the line buffer set on the
-running controller, and "gpu: would set" lines say with what (the
-surface in the aperture after the firmware's picture and surface); that
-is the monitor's own size only if the firmware runs the monitor's own
-timing, which the kernel cannot tell (it does not read the EDID). In the
-second the pixel clock, the timing and the link have to be set, which
-is not there yet. Numbers that do not fit together (a total smaller
-than what is shown, a viewport that is not the firmware's picture, an
-address outside the aperture) are not concluded from: "gpu: the
-read-out is not plausible (...): the register map needs correcting".
-The registers themselves
-("gpu: raw 1b80: 00000f9f ...": a register's number, then its value and
-those of the registers after it) are in the log only
-(/devices/klog); a shell shows them by themselves with
+Numbers that do not fit together (a total smaller than what is shown, a
+viewport that is not the firmware's picture, an address outside the
+aperture) are not concluded from: "gpu: the read-out is not plausible
+(...): the register map needs correcting".
 
-    while read l; do case "$l" in "gpu: raw"*) echo "$l";; esac; done < /devices/klog
+The monitor's own timing is its EDID's (edid.mlx: the detailed timings
+of the base block, of a CTA-861 and of a DisplayID extension block; the
+monitor's own size is its preferred timing's, and of the timings of that
+size the one with the lowest rate of 50 Hz or more is taken, which asks
+least of the link; an interlaced one and one for stereo glasses are
+passed over):
+
+    gpu: the monitor's own timing is 3840x1080 at 60.00 Hz: pixel clock 266640 kHz, h 3840 4000 (front 48 sync 32 +), v 1080 1111 (front 3 sync 10 -)
+
+(OVMF has no EDID for QEMU's display. tools/check_brix_efi.sh tries the
+loader's way all the same: a test image's loader gives the firmware an
+EDID first, `brix-image --test-edid=FILE`. Where the loader passes none
+on, the kernel takes the Bochs adapter's own, QEMU's `-device
+VGA,edid=on,xres=3840,yres=1080`.)
+
+From the read-out and that timing the kernel makes a plan and says it
+(for the card that shows the picture the kernel draws on: where the
+firmware's console is another adapter's, the EDID is that one's
+monitor's and nothing is planned).
+There are two situations. (a) The controller runs the monitor's own
+timing and the card scales the firmware's small picture: a picture of
+the timing's size needs a surface of that size, the viewport, the scaler
+off, and for the long rows the line buffer's whole memory, more buffers
+and safe urgency marks, on the running controller. (b) The controller
+runs the small picture's timing: the pixel clock, the timing and the
+stream have to be set too. That is planned for DisplayPort, where this
+controller makes the pixel clock by a DTO (a phase over a modulo: two
+registers), and only when the link the firmware trained has room for the
+new clock (lanes times rate times 8/10 over the bits a pixel; the rate
+is not in a register of its own and is worked out from the stream's M
+and N and the pixel clock). A link
+that is too slow would have to be trained again, and an HDMI or DVI
+output's clock is a PLL's; Linux sets both by the card's firmware
+tables, which are not run here: not there yet.
+
+    gpu: plan (a): the controller runs this timing already; a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 38 writes would do it
+    gpu: plan (b, DisplayPort): the link has 4 lanes at 2.70 Gbit/s (by M 0x3333 over N 0x8000), room for 360000 kHz at 24 bits: 266640 kHz fits
+    gpu: plan (b, DisplayPort): the pixel clock from 108000 to 266640 kHz (the DTO's phase from 108000000 to 266640000), the timing, the stream stopped and started, a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 63 writes would do it
+    gpu: plan (b): nothing would be set: HDMI: the TMDS clock's PLL must be set, not there yet
+
+The plan's steps, a line each ("gpu: would write 1b9d = 00000100 (the
+controller's picture blanked)"), and the registers themselves ("gpu: raw
+1b80: 00000f9f ...": a register's number, then its value and those of
+the registers after it) are in the log only (/devices/klog, boot.log); a
+shell shows them by themselves with
+
+    while read l; do case "$l" in "gpu: raw"*|"gpu: would w"*) echo "$l";; esac; done < /devices/klog
+
+The steps' order and locks are those of Linux's display core
+(gpu_mode.mlx names the function each one follows, and says where Linux
+hands a step to the firmware's tables and the registers are written
+directly instead). (The read-out's own "next stage" and "would set"
+lines are the stage's before; the plan says more.)
+
+None of this writes to the card. A plan is carried out only by an image
+whose archive has a file settings/gpu with the word `native`:
+
+    tools/brix-native-efi.sh
+
+makes it from the build's image: mlx-out/bin/brix/esp/EFI/BOOT/
+BOOTX64-native.EFI is BOOTX64.EFI with that one file more (`brix-image
+--add`), and BOOTX64-diag-native.EFI the diagnostic image likewise when
+tools/brix-diag-efi.sh has made one. With the file, and a plan that is
+complete, the kernel carries the plan out before any program runs
+(gpu_set.mlx): the new picture's memory is cleared, each write is read
+back, each state waited for has its time, and afterwards the
+controller's frame counter must run at the planned rate and the memory
+interface must not say that it ran dry. When anything of that fails the
+firmware's state is put back, every register from the value read before,
+and the log says what failed and what came back. When it holds, the
+kernel's display is the new picture from there on: the console is drawn
+again on it, and /devices/framebuffer gives the programs the monitor's
+own size.
+
+On the machine: start the build's image (or the diagnostic one, where
+the log stays on the screen) and photograph the "gpu:" lines: the
+monitor's timing, the controller's lines and the plan say which
+situation it is and whether the plan is complete. If it is ("... writes
+would do it"), copy BOOTX64-native.EFI to the ESP beside BOOTX64.EFI and
+start it from the firmware's boot menu. The desktop at the monitor's own
+size is the success; the log says "gpu: controller 0 shows a picture of
+3840x1080 as it is, ... the monitor's own mode is set". If the screen
+stays dark, or is as before, start the normal image again and read what
+the driver did: klogsave kept that boot's log as boot.previous.log on
+the brixfs volumes (`cat /volumes/NAME/boot.previous.log`; the boot
+after that one overwrites it, klogsave run again by hand does not).
 
 tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
-numbers on the host.
+numbers on the host, tests/459_edid_timing_runtime.mlx reads EDIDs
+written from the standard's layout, and
+tests/460_gpu_mode_set_runtime.mlx holds both plans' writes against the
+sequences worked out from Linux's code, on a card that is a table and
+can fail at every step.
 
 What is not there yet: disks served by their interrupts (AHCI, NVMe: a
 command is waited for), USB devices other than boot keyboards, mice and

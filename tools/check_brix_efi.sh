@@ -118,4 +118,59 @@ mode_with 1234x567
 [[ $got == "$default" ]] || fail "an image built for a mode the firmware lacks came up in $got, not the firmware's $default"
 output | grep -aq '^brixOS: the loader set this mode' && fail "the kernel says the loader set a mode where the firmware's stayed"
 echo "ok   the loader sets the display mode the image names when the firmware has it (1920x1080 instead of $default), the nearest below one it lacks, and leaves the firmware's otherwise; the kernel says which and lists the firmware's modes"
+
+# The monitor's EDID. A card's firmware has its monitor's EDID (the EDID
+# Active protocol on the display's handle); the loader reads the
+# monitor's own mode from it and passes the EDID itself on to the kernel,
+# whose GPU driver takes the monitor's own timing from it. OVMF has no
+# EDID for QEMU's display, so a test image's loader gives the firmware one
+# first (brix-image --test-edid): two blocks written here from the
+# standard's layout, 3840x1080 at 120 Hz preferred in the base block and
+# the same size at 60 Hz in a CTA-861 extension. The kernel must say the
+# monitor's own mode (the loader's reading of the first timing) and the
+# timing of 60 Hz (its own reading of both blocks: the extension came
+# too).
+# The bytes $2... (two hex digits each) as a block of 128 bytes, zeros
+# after them and the checksum last, appended to the file $1.
+edid_block() {
+    local file=$1 sum=0 count=0 byte
+    shift
+    for byte in "$@"; do
+        printf "\\x$byte" >> "$file"
+        sum=$(( (sum + 0x$byte) & 255 ))
+        count=$(( count + 1 ))
+    done
+    while (( count < 127 )); do
+        printf '\0' >> "$file"
+        count=$(( count + 1 ))
+    done
+    printf "\\x$(printf '%02x' $(( (256 - sum) & 255 )))" >> "$file"
+}
+: > "$work/edid.bin"
+# The header, a maker and a product, EDID 1.4, a digital input of 120 by
+# 34 cm; no established or standard timings; the preferred timing (549.12
+# MHz, 3840 of 4000, 1080 of 1144, porches 48 and 3, pulses 32 high and 10
+# low), the name, two empty descriptors; one extension block.
+edid_block "$work/edid.bin" 00 ff ff ff ff ff ff 00 4c 2d 12 34 00 00 00 00 01 21 01 04 a5 78 22 78 3a \
+    00 00 00 00 00 00 00 00 00 00 00 00 00 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 \
+    80 d6 00 a0 f0 38 40 40 30 20 3a 00 b0 50 41 00 00 1a \
+    00 00 00 fc 00 57 49 44 45 20 54 45 53 54 0a 20 20 20 \
+    00 00 00 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 \
+    00 00 00 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 \
+    01
+# A CTA-861 extension (revision 3, its timings from byte 4): the same
+# size at 60 Hz (266.64 MHz, 3840 of 4000, 1080 of 1111).
+edid_block "$work/edid.bin" 02 03 04 01 28 68 00 a0 f0 38 1f 40 30 20 3a 00 b0 50 41 00 00 1a
+[[ $(wc -c < "$work/edid.bin") -eq 256 ]] || fail "the test EDID is not two blocks"
+"$work/brix-image" "--test-edid=$work/edid.bin" "$work/kernel" "$work/esp/EFI/BOOT/BOOTX64.EFI" "flux=$work/flux" "$work/bin/"
+start 1G
+wait_for '^brixOS: display [0-9]*x[0-9]* '
+wait_for '^brixOS: [0-9]* MiB'
+stop
+got=$(output | grep -a '^brixOS: display [0-9]*x[0-9]* ' | head -1 | grep -ao '[0-9][0-9]*x[0-9][0-9]*' | head -1)
+[[ $got == 1920x1080 ]] || fail "with a monitor of 3840x1080, which the firmware lacks, the image came up in $got, not in the nearest below it (1920x1080)"
+output | grep -aq "^brixOS: the loader set this mode, the nearest the firmware has to the monitor's own; the firmware's was $default\$" || fail "the kernel does not say that the loader set the nearest mode to the monitor's own"
+output | grep -aq "^brixOS: the monitor's own mode is 3840x1080, which was not set" || fail "the kernel does not say the monitor's own mode (the loader's reading of the EDID)"
+output | grep -aq "^gpu: the monitor's own timing is 3840x1080 at 60.00 Hz: pixel clock 266640 kHz, h 3840 4000 (front 48 sync 32 +), v 1080 1111 (front 3 sync 10 -) (the least demanding of 2 of that size)\$" || fail "the kernel does not say the monitor's own timing from the EDID the loader passed on (both blocks of it)"
+echo "ok   with an EDID from the firmware the loader takes the monitor's own mode from it and passes the EDID on: the kernel says the monitor's own timing, the least demanding of the two the base block and the extension hold"
 echo PASS
