@@ -1352,6 +1352,17 @@ settings app on its Network page (`control network`: what the kernel
 says of net0 on QEMU's user network, then "no cable" once QEMU's monitor
 pulls it) and powers off. Xwayland is not on brixOS.
 
+The whole picture is the processor's work here, so a frame costs what it
+changes: the terminal draws the cells that changed, the top bar's and
+the dock's frames are compared with the ones before, and kepler composes
+the rectangle a client names (`MLX_FRAMES_SAY=1` in the desktop's
+environment says every frame and what was composed for it).
+tools/check_brix_draw.sh sees a character typed be two cells drawn and
+composed, a minute's turn the clock's digits, the pointer on the dock
+less than the dock, and the screen that frames of parts left be, pixel
+for pixel, the screen drawn whole after the window was made large and
+small again.
+
 The programs carry their product names (projects/desktop and the system
 programs): the compositor is `kepler`, the terminal `vector`, the shell
 `flux`, the dock `orbit`, the launcher `launch`, the top bar `horizon`,

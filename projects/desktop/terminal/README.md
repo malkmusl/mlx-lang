@@ -25,6 +25,12 @@ tools/check_terminal.sh              # the emulation, the drawing, the pty
   line-drawing set.
 - 5000 lines of history: the wheel and Shift+Page Up/Down scroll through
   it, any key comes back to the live screen.
+- A character stands in its cell, whatever the font's own advance is,
+  and a frame draws the cells that changed: a character typed is two
+  cells (its own and the cursor's), text that scrolls is moved a row of
+  pixels at a time and the new lines drawn. The compositor is told that
+  rectangle and composes it, not the window (`MLX_FRAMES_SAY=1` says each
+  frame on the errors).
 - The window follows the size its compositor configures, in whole cells,
   and the shell learns each new size (`TIOCSWINSZ`, so `stty size` and
   `$COLUMNS` follow). It starts at 80x24.
