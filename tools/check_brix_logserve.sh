@@ -11,16 +11,29 @@
 # never ends and a connection that says nothing keep nobody waiting and
 # are closed after the time limit; three clients at once; each request
 # is a line on the terminal (a path's control characters not passed on);
-# Ctrl+C ends it with 0 and the port is closed. With two brixfs volumes:
+# Ctrl+C ends it with 0 and the port is closed. Started again at once on
+# the same port it listens (a client of the run before still keeps its
+# connection); clients that got their answer and never close their side
+# take the kernel's sockets only for a while (as many as it has: then no
+# request is answered, and twenty seconds later the next one is). A
+# request's head of 2048 bytes is read, one of 2049 refused; a head that
+# comes a byte at a time; a query, a fragment or a NUL in the path lead
+# to no file. With two brixfs volumes:
 # /boot.log (a link of that name is not followed), /boot.previous.log
 # from both (a megabyte of each at most; also for a client that closes
 # its side after asking, and many times over without the machine's
 # memory going), /all with them, and a client that stops reading a long
 # answer (one in brixOS: tools/logserve-test/reader.mlx) is given up
 # after ten seconds while the others are answered. `logserve send`
-# writes the /all text to a listener on the host. Then on an igb card
+# writes the /all text to a listener on the host (one that closed its own
+# side at once, as a listener without input does). Then as many requests
+# one after the other as the machine's free memory has rings for the
+# kernel's sockets (32 a MiB: each one is answered, and the machine has
+# the memory it had). Then on an igb card
 # whose cable is out at boot (no address: said; the cable and the
-# address said when they have come; the pages over igb), and on a
+# address said when they have come; the pages over igb), on a machine
+# with little memory (eight clients at once ask for more megabytes than
+# it has: each gets the text or a 503, and logserve goes on), and on a
 # machine without a network device (said, 1).
 #
 #   tools/check_brix_logserve.sh [compiler]
@@ -38,10 +51,12 @@ fi
 work=$(mktemp -d)
 qemu_pid=
 listener_pid=
+holder_pid=
 cleanup() {
     exec 3>&- 2> /dev/null || true
     [[ -n "$qemu_pid" ]] && kill "$qemu_pid" 2> /dev/null || true
     [[ -n "$listener_pid" ]] && kill "$listener_pid" 2> /dev/null || true
+    [[ -n "$holder_pid" ]] && kill "$holder_pid" 2> /dev/null || true
     rm -rf -- "$work"
 }
 trap cleanup EXIT
@@ -191,12 +206,46 @@ def pages(port, out):
     if status != "HTTP/1.1 200 OK" or body != b"" or int(headers.get("content-length", "0")) < len(klog):
         fail("HEAD /klog: %r %r %d bytes" % (status, headers, len(body)))
 
+# A request for /gpu whose head is `total` bytes.
+def head_of(total, end=b"\r\n\r\n"):
+    start = b"GET /gpu HTTP/1.1\r\nHost: brix\r\nX-Fill: "
+    return start + b"a" * (total - len(start) - len(end)) + end
+
 def refusals(port):
     for path in ("/nothing", "/klog/", "/KLOG", "/devices/klog", "/../devices/klog", "/system/settings/shadow",
-                 "//", "/all/../klog", "/%6blog", "/favicon.ico", "/\x1b[2Jx"):
+                 "//", "/all/../klog", "/%6blog", "/favicon.ico", "/\x1b[2Jx", "/\x1b]0;x\x07", "/klog%00", "/klog\x00",
+                 "/klog\x00/../devices/klog", "//klog", "/./klog", "/klog/.", "/%2e%2e/devices/klog", "/..%2fdevices%2fklog", "/klog;x"):
         status, headers, body = get(port, path)
         if status != "HTTP/1.1 404 Not Found" or body != NO_PAGE:
             fail("%r: %r %r" % (path, status, body[:100]))
+    # What follows a ? or a # is no part of the path, whatever it names;
+    # nor does a header say where to look.
+    gpu = page(port, "/gpu")
+    for path in ("/gpu?/devices/klog", "/gpu#/devices/klog", "/gpu?../../devices/klog#/system/settings/shadow"):
+        if page(port, path) != gpu:
+            fail("%r is not the /gpu page" % path)
+    status, headers, body = split(exchange(port, b"GET /gpu HTTP/1.1\r\nHost: ../../devices/klog\r\nX-Forwarded-Host: /devices/klog\x00\r\n\r\n"))
+    if status != "HTTP/1.1 200 OK" or body != gpu:
+        fail("with a Host of chance: %r" % status)
+    # The limit at its edge: a head of 2047 and of 2048 bytes is read (a
+    # body after it too), one of 2049 is not.
+    for total, more in ((2047, b""), (2048, b""), (2048, b"x=1&y=2")):
+        status, headers, body = split(exchange(port, head_of(total) + more))
+        if status != "HTTP/1.1 200 OK" or body != gpu:
+            fail("a head of %d bytes (and %d after it): %r" % (total, len(more), status))
+    for total, end in ((2049, b"\r\n\r\n"), (2049, b"\n\n"), (2048, b"")):
+        status, headers, body = split(exchange(port, head_of(total, end), True))
+        if status != "HTTP/1.1 431 Request Header Fields Too Large":
+            fail("a head of %d bytes ending %r: %r" % (total, end, status))
+    # A head that comes a byte at a time.
+    s = socket.create_connection((HOST, port), timeout=60)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    for byte in b"GET /gpu HTTP/1.1\r\nHost: brix\r\n\r\n":
+        s.sendall(bytes([byte]))
+        time.sleep(0.01)
+    status, headers, body = split(rest(s))
+    if status != "HTTP/1.1 200 OK" or body != gpu:
+        fail("a head sent a byte at a time: %r" % status)
     for method in ("POST", "PUT", "DELETE", "PATCH"):
         status, headers, body = split(exchange(port, ("%s /klog HTTP/1.1\r\nHost: brix\r\nContent-Length: 7\r\n\r\nx=1&y=2" % method).encode(), True))
         if status != "HTTP/1.1 405 Method Not Allowed" or headers.get("allow") != "GET, HEAD" or not body.startswith(b"logserve answers GET and HEAD only"):
@@ -256,6 +305,88 @@ def closed(port):
     if data:
         fail("the port still answers: %r" % data[:60])
 
+# A request's answer within `timeout` seconds, or b"" (the kernel had no
+# socket for the connection: nothing comes).
+def answer(port, raw, timeout):
+    s = socket.create_connection((HOST, port), timeout=timeout)
+    data = b""
+    try:
+        s.sendall(raw)
+        while True:
+            got = s.recv(65536)
+            if not got:
+                break
+            data += got
+    except (socket.timeout, ConnectionResetError):
+        data = b""
+    return s, data
+
+# Clients that get their answer and keep their connection open, one after
+# the other: `count` of them, or (0) as many as are answered, which is as
+# many as the kernel has sockets for. How many there are is written to
+# `out`; then they are kept until this is ended.
+def hold(port, count, out):
+    kept = []
+    refused = 0
+    while len(kept) < (count or 64) and refused < 2:
+        s, data = answer(port, b"GET /gpu HTTP/1.1\r\nHost: brix\r\n\r\n", 2)
+        if data.startswith(b"HTTP/1.1 200 OK\r\n"):
+            kept.append(s)
+            refused = 0
+            continue
+        # (Not kept: nothing of it is to come later.)
+        s.close()
+        if count:
+            fail("a client that keeps its connection got no answer")
+        # (A connection that ended a moment ago keeps its socket for two
+        # seconds more: once that is over, one more try says whether the
+        # kept ones have them all.)
+        refused += 1
+        if refused < 2:
+            time.sleep(2.5)
+    open(out + ".part", "w").write("%d\n" % len(kept))
+    os.rename(out + ".part", out)
+    time.sleep(300)
+
+# A request is answered within `seconds`, tried again every second.
+def later(port, seconds):
+    started = time.time()
+    while True:
+        s, data = answer(port, b"GET /system HTTP/1.1\r\nHost: brix\r\n\r\n", 3)
+        s.close()
+        if data.startswith(b"HTTP/1.1 200 OK\r\n"):
+            break
+        if time.time() - started > seconds:
+            fail("no request was answered for %d s" % seconds)
+        time.sleep(1)
+    print("%d" % (time.time() - started))
+
+def free_memory(port):
+    return int(re.search(r"^memory: \d+ MiB, (\d+) free$", page(port, "/system").decode(), re.M).group(1))
+
+# As many requests one after the other as the machine's free memory has
+# rings for the kernel's sockets (a connection's two rings are 32 KiB: 32
+# connections a MiB), and some more: each is answered, and the machine has
+# the memory it had (within 3 MiB). Each client closes its side once it
+# has asked, as nc does: the kernel's socket is free again at once.
+def many(port):
+    free = free_memory(port)
+    count = 32 * free + 64
+    for k in range(count):
+        s = socket.create_connection((HOST, port), timeout=30)
+        s.sendall(b"GET /system HTTP/1.0\r\n\r\n")
+        s.shutdown(socket.SHUT_WR)
+        try:
+            data = rest(s)
+        except socket.timeout:
+            data = b""
+        if not data.startswith(b"HTTP/1.1 200 OK\r\n") or b"\r\n\r\nmemory: " not in data:
+            fail("the %d. request of %d one after the other: %r" % (k + 1, count, data[:60]))
+    after = free_memory(port)
+    if free - after > 3:
+        fail("%d requests took %d MiB of the machine's memory for good (%d MiB free before, %d after)" % (count, free - after, free, after))
+    print(count)
+
 # The two volumes' logs as the check wrote them (seq 200000, seq 300000
 # 500000), a megabyte of each.
 def previous(volume):
@@ -309,9 +440,12 @@ def volumes(port, out, device="virtio"):
         fail("/all with volumes: the end, or the kernel log twice")
 
 def beside(port):
+    started = time.time()
     status, headers, body = get(port, "/system")
-    if status != "HTTP/1.1 200 OK":
-        fail("beside a client that does not read, the next got %r" % status)
+    # (While that client is still silent, 14 s: not once it reads again,
+    # nor once it was given up.)
+    if status != "HTTP/1.1 200 OK" or time.time() - started > 9:
+        fail("beside a client that does not read, the next got %r after %.1f s" % (status, time.time() - started))
 
 def listen(port, out):
     listener = socket.socket()
@@ -322,6 +456,10 @@ def listen(port, out):
     listener.settimeout(120)
     s, _ = listener.accept()
     s.settimeout(120)
+    # (It has nothing to say and closes its own side at once, as a
+    # listener without input does, nc -l PORT < /dev/null: the text
+    # comes all the same.)
+    s.shutdown(socket.SHUT_WR)
     data = rest(s)
     open(out + ".part", "wb").write(data)
     os.rename(out + ".part", out)
@@ -336,6 +474,38 @@ def sent(out, device="virtio"):
         if previous(v) not in data:
             fail("what was sent lacks the volume disk%d's boot.previous.log" % v)
     print(len(data))
+
+# Eight clients at once ask three times for everything, on a machine that
+# has no memory for that many megabytes: each gets the whole text or the
+# word that there is no memory for it, and logserve goes on.
+def crowd(port):
+    results = []
+    def one():
+        for turn in range(3):
+            try:
+                results.append(get(port, "/all"))
+            except OSError as error:
+                results.append((repr(error), {}, b""))
+    threads = [threading.Thread(target=one) for k in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    whole = refused = 0
+    for status, headers, body in results:
+        if status == "HTTP/1.1 200 OK" and headers.get("content-length") == str(len(body)) and body.endswith(b"\n==== end ====\n"):
+            whole += 1
+        elif status == "HTTP/1.1 503 Service Unavailable" and body == b"no memory for this answer at the moment\n":
+            refused += 1
+        else:
+            fail("one of eight at once on a machine with little memory: %r, %d bytes" % (status, len(body)))
+    try:
+        status, headers, body = get(port, "/system")
+    except OSError as error:
+        status = repr(error)
+    if status != "HTTP/1.1 200 OK":
+        fail("after eight clients at once on a machine with little memory logserve is gone: %r" % status)
+    print("%d %d" % (whole, refused))
 
 def igb(port, out):
     system = page(port, "/system").decode()
@@ -354,6 +524,11 @@ elif command == "refusals": refusals(int(sys.argv[2]))
 elif command == "patience": patience(int(sys.argv[2]))
 elif command == "together": together(int(sys.argv[2]), sys.argv[3])
 elif command == "closed": closed(int(sys.argv[2]))
+elif command == "hold": hold(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+elif command == "later": later(int(sys.argv[2]), int(sys.argv[3]))
+elif command == "many": many(int(sys.argv[2]))
+elif command == "free": print(free_memory(int(sys.argv[2])))
+elif command == "crowd": crowd(int(sys.argv[2]))
 elif command == "volumes": volumes(int(sys.argv[2]), sys.argv[3])
 elif command == "beside": beside(int(sys.argv[2]))
 elif command == "listen": listen(int(sys.argv[2]), sys.argv[3])
@@ -362,6 +537,24 @@ elif command == "igb": igb(int(sys.argv[2]), sys.argv[3])
 else: fail("no command " + command)
 PY
 host() { python3 "$work/client.py" "$@" || fail "the host's side: $*"; }
+# Clients on the host that got their answer and keep their connections
+# open ($1 of them; 0: as many as are answered), until release.
+hold() {
+    rm -f "$work/held"
+    python3 "$work/client.py" hold "$port" "$1" "$work/held" &
+    holder_pid=$!
+    for i in $(seq 1 600); do
+        [[ -e "$work/held" ]] && break
+        kill -0 "$holder_pid" 2> /dev/null || fail "the host's clients that keep their connections"
+        sleep 0.1
+    done
+    [[ -e "$work/held" ]] || fail "the host's clients that keep their connections did not get their answers"
+}
+release() {
+    kill "$holder_pid" 2> /dev/null || true
+    wait "$holder_pid" 2> /dev/null || true
+    holder_pid=
+}
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 port=$(free_port)
 second=$(free_port)
@@ -378,7 +571,7 @@ boot() {
     rm -f "$work/input"
     mkfifo "$work/input"
     : > "$work/serial.txt"
-    qemu-system-x86_64 -m 256M -display none -no-reboot -cpu max -serial stdio -kernel "$work/brix.img" \
+    qemu-system-x86_64 -m "$memory" -display none -no-reboot -cpu max -serial stdio -kernel "$work/brix.img" \
         -drive "file=$work/disk0.img,format=raw,if=virtio" -drive "file=$work/disk1.img,format=raw,if=virtio" \
         "$@" < "$work/input" > "$work/serial.txt" 2>&1 &
     qemu_pid=$!
@@ -401,6 +594,8 @@ wait_for() {
     done
 }
 prompts=0
+# The machine's memory (one of the last boots has little).
+memory=256M
 type_line() {
     prompts=$((prompts + 1))
     wait_for '^root@brix:[^#]*# $' "$prompts"
@@ -423,6 +618,9 @@ wait_for '^  while this runs, everyone on the network can read the log$'
 wait_for '^  Ctrl+C ends it$'
 echo "ok   started at the terminal, logserve says the address to open, that the network can read the log while it runs, and how it ends"
 host pages "$port" "$work"
+# (What the machine has free of its 256 MiB: the machine with little
+# memory further down is made from it.)
+free=$(host free "$port")
 wait_for '^10\.0\.2\.2 GET /: 200, [0-9]* bytes$'
 wait_for '^10\.0\.2\.2 GET /klog: 200, [0-9]* bytes$' 2
 wait_for '^10\.0\.2\.2 GET /gpu: 200, [0-9]* bytes$'
@@ -434,21 +632,57 @@ echo "ok   from the host: / lists the pages, /klog is the kernel log with the bo
 host refusals "$port"
 wait_for '^10\.0\.2\.2 GET /system/settings/shadow: 404, no such page$'
 wait_for '^10\.0\.2\.2 GET /?\[2Jx: 404, no such page$'
+wait_for '^10\.0\.2\.2 GET /?]0;x?: 404, no such page$'
+wait_for '^10\.0\.2\.2 GET /klog?/\.\./devices/klog: 404, no such page$'
 wait_for '^10\.0\.2\.2 POST /klog: 405, only GET and HEAD are answered$'
-wait_for '^10\.0\.2\.2: 431, a request.s head longer than 2048 bytes$' 2
+wait_for '^10\.0\.2\.2: 431, a request.s head longer than 2048 bytes$' 5
 wait_for '^10\.0\.2\.2: 400, not an HTTP/1 request$' 4
-echo "ok   only the fixed pages: every other path is 404 (a file's path too), POST, PUT, DELETE, PATCH and OPTIONS are refused (405), a head over 2048 bytes (431), what is no HTTP/1 request (400); a path's control characters do not reach the terminal"
+# (Nothing a client sent is on the terminal as it came: no escape that
+# clears the screen or names the window, no bell, no NUL.)
+python3 - "$work/serial.txt" <<'PY' || fail "a request's control characters reached the terminal"
+import sys
+data = open(sys.argv[1], "rb").read()
+sys.exit(1 if b"\x1b[2J" in data or b"\x1b]" in data or b"\x07" in data or b"\x00" in data else 0)
+PY
+echo "ok   only the fixed pages: every other path is 404 (a file's path, .., %2e, a NUL, // too; a query or a fragment is no part of the path), POST, PUT, DELETE, PATCH and OPTIONS are refused (405), a head of 2049 bytes (431; one of 2048 is read, and one that comes a byte at a time), what is no HTTP/1 request (400); a path's control characters do not reach the terminal"
 host patience "$port"
 wait_for '^10\.0\.2\.2: 408, the request did not end within 5 s$'
 host together "$port" "$work"
 wait_for '^10\.0\.2\.2 GET /klog: 200, [0-9]* bytes$' 5
 echo "ok   behind a request that never ends and a connection that says nothing the next client is answered at once; both are closed after the time limit (408); three clients at once get the whole log each"
+# (A client that got its answer and keeps its connection open, as a
+# browser may: it is still there when logserve is started again.)
+hold 1
 interrupt_after '^10\.0\.2\.2 GET /klog: 200, [0-9]* bytes$' 5
 wait_for '^logserve: ended ([0-9]* requests answered)$'
 type_line 'echo status $?'
 wait_for '^status 0$'
 host closed "$port"
 echo "ok   Ctrl+C ends logserve with 0, and the port is closed"
+
+# Started again at once: the port is its own again, though the kernel
+# still has the connection of the client that keeps its side open (and
+# those of the last answers, which take their leave for two seconds).
+type_line 'logserve'
+wait_for '^  open http://10\.0\.2\.15:8080/all on another computer of this network (a browser, or curl)$' 2
+wait_for '^  Ctrl+C ends it$' 2
+[[ "$(host later "$port" 10)" =~ ^[0-9]+$ ]] || fail "started again, logserve does not answer"
+release
+echo "ok   started again at once on the same port, logserve listens and answers (a client of the run before still keeps its connection)"
+# Clients that keep their connection after the answer take a socket of
+# the kernel each, as long as it lets them: as many as it has sockets for
+# are answered, then none is; twenty seconds after logserve closed them
+# the kernel gives them up, and the next request is answered while they
+# still hold on.
+hold 0
+kept=$(cat "$work/held")
+(( kept >= 1 )) || fail "no client that keeps its connection was answered"
+waited=$(host later "$port" 45)
+[[ "$waited" =~ ^[0-9]+$ ]] || fail "with $kept connections kept open by their clients, no request is answered any more"
+release
+echo "ok   $kept clients that keep their connection open after the answer are answered, then the kernel has no socket left (it has 32); it gives the kept ones up, and a request is answered again after $waited s while they hold on"
+interrupt_after '^10\.0\.2\.2 GET /system: 200, [0-9]* bytes$' 5
+wait_for '^logserve: ended ([0-9]* requests answered)$' 2
 
 # Two volumes with saved logs: disk0's boot.log is the kernel log as it
 # is now, both have a boot.previous.log of more than a megabyte; disk1's
@@ -463,7 +697,7 @@ type_line 'logserve 8081'
 wait_for '^  open http://10\.0\.2\.15:8081/all on another computer of this network (a browser, or curl)$'
 wait_for '^reader: asked for /boot.previous.log, reading nothing for 14 s$'
 host beside "$second"
-(( $(output | grep -c 'cut off after' || true) == 0 )) || fail "the client beside the one that does not read was answered only when that one had been given up"
+(( $(output | grep -c 'cut off after [0-9]* of [0-9]* bytes (the client took nothing' || true) == 0 )) || fail "the client beside the one that does not read was answered only when that one had been given up"
 host volumes "$second" "$work"
 wait_for '^10\.0\.2\.2 GET /boot\.previous\.log: 200, [0-9]* bytes$' 14
 echo "ok   on the port given, with two volumes: /boot.log is the saved log (a link of that name on the other volume is not followed), /boot.previous.log both volumes' under their names (a megabyte of each, whole; also to a client that closed its side after asking, and twelve times over without the memory going), /all has them and names the boot.log that is the kernel log's beginning without repeating it"
@@ -471,7 +705,7 @@ wait_for '^10\.0\.2\.15 GET /boot\.previous\.log: 200, cut off after [0-9]* of [
 wait_for '^reader: [0-9]\{4,6\} bytes came, then the connection.s end$'
 echo "ok   a client that stops reading a long answer is given up after 10 s (it finds the answer cut short); the others are answered meanwhile"
 interrupt_after '^reader: [0-9]* bytes came'
-wait_for '^logserve: ended ([0-9]* requests answered)$' 2
+wait_for '^logserve: ended ([0-9]* requests answered)$' 3
 
 # The other way: logserve connects out and writes the /all text.
 python3 "$work/client.py" listen "$listening" "$work/sent.txt" &
@@ -497,7 +731,19 @@ wait_for '^refused 1$'
 type_line 'logserve send nowhere; echo usage $?'
 wait_for '^usage: logserve \[PORT\] '
 wait_for '^usage 1$'
-echo "ok   logserve send HOST PORT writes the /all text ($size bytes) to a listener on the host and ends with 0; where nobody listens it says so (1); wrong arguments: the usage (1)"
+echo "ok   logserve send HOST PORT writes the /all text ($size bytes) to a listener on the host (one that closed its own side at once) and ends with 0; where nobody listens it says so (1); wrong arguments: the usage (1)"
+
+# Many requests one after the other: more connections than the machine's
+# free memory has room for their rings (the kernel must use a socket's
+# memory again), every one answered, and logserve no bigger for them (a
+# request's records go when its turn of the loop is over).
+type_line 'logserve'
+wait_for '^  Ctrl+C ends it$' 4
+count=$(host many "$port")
+[[ "$count" =~ ^[0-9]+$ ]] || fail "many requests one after the other"
+printf '\003' >&3
+wait_for '^logserve: ended ([0-9]* requests answered)$' 4
+echo "ok   $count requests one after the other (more connections than the free memory has rings for) are answered every one, and the machine has the memory it had"
 stop
 
 # An igb card (the machine's kind) whose cable is out when brixOS boots:
@@ -545,7 +791,29 @@ host igb "$port" "$work"
 interrupt_after '^10\.0\.2\.2 GET /all: 200, [0-9]* bytes$'
 wait_for '^logserve: ended ([0-9]* requests answered)$'
 echo "ok   the cable in: logserve says so, and the address when DHCP has given one; over igb the pages, the megabyte logs of both volumes and /all come whole (the boot.log of the boot before in it, as another text than this boot's log); Ctrl+C ends it"
+
+# A machine with little memory (10 MiB free of it when it has booted) and
+# four megabyte logs on its volumes (the boot.log of each made one now):
+# everything is more megabytes than the machine has, and eight clients at
+# once ask for it. Each gets the word that there is no memory for the
+# answer at the moment (503), or the text whole; logserve is not ended
+# at a page the kernel has no memory behind, and answers on.
+type_line 'rm /volumes/disk1/boot.log; seq 1 200000 > /volumes/disk0/boot.log && seq 1 200000 > /volumes/disk1/boot.log && sync; echo more $?'
+wait_for '^more 0$'
 stop
+memory=$((256 - free + 10))M
+boot -monitor none -netdev "user,id=n0,$forwards" -device virtio-net-pci,netdev=n0
+wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)$'
+type_line 'logserve'
+wait_for '^  Ctrl+C ends it$'
+crowd=$(host crowd "$port")
+[[ "$crowd" =~ ^[0-9]+\ [0-9]+$ ]] || fail "eight clients at once on a machine with little memory"
+(( $(output | grep -c 'ended by signal' || true) == 0 )) || fail "logserve was ended on a machine with little memory"
+printf '\003' >&3
+wait_for '^logserve: ended ([0-9]* requests answered)$'
+echo "ok   on a machine with little memory ($memory, 10 MiB of it free) eight clients at once ask for /all with four megabyte logs: ${crowd#* } are told that there is no memory for the answer (503), ${crowd% *} get it whole, and logserve goes on"
+stop
+memory=256M
 
 # A machine without a network device: said, and 1.
 boot -monitor none -nic none

@@ -4,8 +4,10 @@
 // /system/settings's on brixOS) asked over UDP (RFC 1035: a query for A and
 // one for AAAA records, the answers' names read with their compression
 // pointers, CNAMEs followed within the answer). Each server is tried in
-// turn, each query waiting at most the timeout; the addresses found go
-// IPv4 first.
+// turn, each query waiting at most the timeout and sent a second time
+// within it (a datagram may be lost); a server that answers that it
+// cannot look names up is passed over for the next. The addresses found
+// go IPv4 first.
 //
 //     var found: [8]dns.Address = undefined
 //     const count = dns.resolve("example.com", 443, &found, 8, 5000)
@@ -376,11 +378,35 @@ fn ask(server: *const Address, name: []const u8, kind: u16, port: u16, found: [*
     if sent == @intCast(isize, length) {
         var answer: [ANSWER_ROOM]u8 = undefined
         const answerBytes: [*]u8 = &answer
+        // A datagram may be lost on the way (and brixOS's kernel drops
+        // one whose neighbour did not say its hardware address in time:
+        // who sent it is to ask again): when two fifths of the time
+        // have passed without an answer, the query is sent once more,
+        // and the answer to either is taken. (A timeout without a limit
+        // waits for the one query.)
+        const started = std.time.monotonicNanoseconds()
+        const whole: usize = if timeoutMs < 0 { 0 } else { @bitCast(usize, timeoutMs) }
+        var askAgainAt: usize = whole * 2 / 5
         // Answers to other queries (another id) are passed over until the
         // time runs out.
         var tries: usize = 0
         while tries < 4 {
-            if event.waitReady(fd, false, timeoutMs) <= 0 { break }
+            var left = timeoutMs
+            if timeoutMs >= 0 {
+                const passed = (std.time.monotonicNanoseconds() - started) / 1000000
+                const until = if askAgainAt != 0 { askAgainAt } else { whole }
+                if passed >= until {
+                    if askAgainAt == 0 { break }
+                    _ = socket.sendTo(fd, queryBytes, length, 0, @intFromPtr(rawBytes), rawLength)
+                    askAgainAt = 0
+                    continue
+                }
+                left = @intCast(isize, until - passed)
+            }
+            const ready = event.waitReady(fd, false, left)
+            if ready < 0 { break }
+            // (Time up: the query once more, or the end, above.)
+            if ready == 0 { continue }
             const got = socket.receiveFrom(fd, answerBytes, ANSWER_ROOM, 0, 0, 0)
             if got < 12 { break }
             if answer[0] == idBytes[0] && answer[1] == idBytes[1] && (answer[2] & 0x80) != 0 {
@@ -402,17 +428,23 @@ pub fn resolve(name: []const u8, port: u16, found: [*]Address, max: usize, timeo
 }
 
 // std.net.lookup: resolve, and into `why` what became of it (when
-// nothing was found: whether no name server is set, none answered, or
-// the one that answered has no address for the name).
-pub fn lookup(name: []const u8, port: u16, found: [*]Address, max: usize, timeoutMs: isize, why: *net.Lookup) -> usize {
+// nothing was found: whether the text is no name at all, no name server
+// is set, none answered, the ones that answered said they cannot look
+// names up, or the one that answered has no address for the name).
+pub fn lookup(typed: []const u8, port: u16, found: [*]Address, max: usize, timeoutMs: isize, why: *net.Lookup) -> usize {
     var count: usize = 0
     why.* = net.Lookup.found
     if max == 0 { return 0 }
     var literal: Address = undefined
-    if net.parseAddress(name, port, &literal) {
+    if net.parseAddress(typed, port, &literal) {
         found[0] = literal
         return 1
     }
+    // A name written with the dot of the root at its end ("example.com.")
+    // is the name without it: so the hosts file has it, and so the
+    // answer's records are named. (Compared with the dot, no record of
+    // an answer was the name's, and it had no address.)
+    const name = if typed.length > 1 && typed[typed.length - 1] == 46 { typed[0..typed.length - 1] } else { typed }
     if equalsIgnoringCase(name, "localhost") {
         var loop = net.ipv4(127, 0, 0, 1, port)
         add(found, &count, max, &loop)
@@ -433,14 +465,31 @@ pub fn lookup(name: []const u8, port: u16, found: [*]Address, max: usize, timeou
         ipv4First(found, count)
         return count
     }
+    // What no query can be written for is no name (an empty part, one
+    // longer than 63 bytes, more than 253 in all): no server is asked.
+    var probe: [QUERY_ROOM]u8 = undefined
+    if writeQuery(name, TYPE_A, 0, &probe) == 0 {
+        why.* = net.Lookup.bad_name
+        return 0
+    }
     var servers: [MAX_SERVERS]Address = undefined
     const serverPointer: [*]Address = &servers
     const serverCount = nameServers(serverPointer, MAX_SERVERS)
     var answered = false
+    var unable = false
     var s: usize = 0
     while s < serverCount {
         var rcode: u32 = 0
         const gotA = ask(&servers[s], name, TYPE_A, port, found, &count, max, timeoutMs, &rcode)
+        // A server that says it cannot look the name up (its code is
+        // neither "no error" nor "no such name": a server failure, the
+        // query refused) has said nothing about the name: the next
+        // server is asked.
+        if gotA && rcode != 0 && rcode != 3 {
+            unable = true
+            s += 1
+            continue
+        }
         var gotAAAA = false
         if gotA && rcode != 3 { gotAAAA = ask(&servers[s], name, TYPE_AAAA, port, found, &count, max, timeoutMs, &rcode) }
         if gotA || gotAAAA {
@@ -449,7 +498,7 @@ pub fn lookup(name: []const u8, port: u16, found: [*]Address, max: usize, timeou
         }
         s += 1
     }
-    if count == 0 { why.* = if serverCount == 0 { net.Lookup.no_server } else if !answered { net.Lookup.no_answer } else { net.Lookup.no_name } }
+    if count == 0 { why.* = if serverCount == 0 { net.Lookup.no_server } else if answered { net.Lookup.no_name } else if unable { net.Lookup.unable } else { net.Lookup.no_answer } }
     ipv4First(found, count)
     return count
 }

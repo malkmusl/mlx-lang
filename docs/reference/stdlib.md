@@ -2153,8 +2153,16 @@ timeoutMs)` is `std/src/net/dns.mlx`'s: an address literal and
 "localhost" answered at once, then `/etc/hosts`, then the name servers
 of `/etc/resolv.conf` asked over UDP for A and AAAA records (RFC 1035
 messages written and read, compression pointers and CNAMEs followed),
-IPv4 addresses first. `tests/381_net_runtime.mlx` checks the addresses,
-a connection on the loopback and the DNS messages.
+IPv4 addresses first. A name written with the root's dot at its end is
+the name without it; a query is sent a second time within its timeout
+(a datagram may be lost); a server that answers that it cannot look
+names up (a server failure, the query refused) is passed over for the
+next. `lookup(name, port, found, max, timeoutMs, &why)` is `resolve`
+that also says what became of it (`Lookup`: `found`, `no_server`,
+`no_answer`, `no_name`, `unable`: the servers that answered cannot look
+names up, `bad_name`: the text is no name, and no server was asked).
+`tests/381_net_runtime.mlx` checks the addresses, a connection on the
+loopback, the DNS messages and the lookups that need no server.
 
 `spec/04-stdlib/posix.xml` requires the raw syscalls a network stack would
 sit on (`socket bind listen accept connect send recv sendmsg recvmsg poll`),

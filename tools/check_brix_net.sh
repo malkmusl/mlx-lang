@@ -25,12 +25,16 @@
 # gateway arrives), with a file that has an address line alone (no
 # gateway, no name server: the own subnet is reached, nothing beyond
 # it), with a file whose address line says 0.0.0.0 (no address: DHCP
-# asks); and ping on a network of this check's own (tools/brix_lan.py on
+# asks), without a network card (ping says there is none); and ping on
+# a network of this check's own (tools/brix_lan.py on
 # QEMU's socket network, for what the user network cannot play): the
 # first packets to a name server and through a gateway never spoken to,
-# a name looked up, replies later than a second, a reply that comes
-# twice, a neighbour slow to say its hardware address, a router's word
-# that a host cannot be reached, a host and a gateway nobody answers for.
+# a name looked up (also written with the root's dot, and when the first
+# question is lost; a name server that cannot look a name up), replies
+# later than a second, a reply that comes twice, one from another
+# address, a neighbour slow to say its hardware address, a router's word
+# that a host cannot be reached (also of one that answers all the same),
+# a host and a gateway nobody answers for.
 #
 #   tools/check_brix_net.sh [compiler]
 set -euo pipefail
@@ -262,13 +266,24 @@ done
 type_line 'ping -c 1 10.0.2.2; echo nowhere $?'
 wait_for '^ping: this machine has no address yet (DHCP is asking)$'
 wait_for '^seq=1 could not be sent: this machine has no address$'
-wait_for '^--- 1 sent, 0 received, 100% lost$'
+# (A request that never went is not one that was sent and lost: the
+# summary once said "1 sent, 0 received, 100% lost" under that line.)
+wait_for '^--- 0 sent, 0 received, 1 could not be sent$'
 wait_for '^nowhere 1$'
+# A name there: no name server is set, and why not (this machine has no
+# address) is said with it, as it is before a request to an address.
+type_line 'ping -c 1 gateway.lan; echo nameless $?'
+wait_for '^ping: gateway.lan: no name server is set to look the name up$'
+wait_for '^ping: this machine has no address yet (DHCP is asking)$' 2
+wait_for '^nameless 1$'
 type_line 'wc -c /system/settings/resolv.conf'
 wait_for '^ *0 /system/settings/resolv.conf$'
 type_line 'ping -c 1 127.0.0.1; echo home $?; netcalls itself'
 wait_for '^64 bytes from 127.0.0.1: seq=1 time=[0-9.]* ms$'
 wait_for '^home 0$'
+# (Nothing stands in the way to the machine itself: the missing address
+# was said twice above, and is not said of this request.)
+(( $(output | grep -c '^ping: this machine has no address yet (DHCP is asking)$') == 2 )) || fail "ping says of a request to 127.0.0.1 that the machine has no address"
 for expected in '^itself: the peer is 127.0.0.1, the client speaks from 127.0.0.1$' '^itself: read 5$' '^itself: datagram received 5 from 127.0.0.1$'; do
     wait_for "$expected"
 done
@@ -360,6 +375,7 @@ wait_for '^64 bytes from 10.0.2.2: seq=1 time=[0-9.]* ms$'
 wait_for '^subnet 0$'
 type_line 'ping -c 1 192.168.76.2; echo beyond $?'
 wait_for "^seq=1 could not be sent: 192.168.76.2 is not on this machine's network, and there is no gateway\$"
+wait_for '^--- 0 sent, 0 received, 1 could not be sent$'
 wait_for '^beyond 1$'
 type_line 'wc -c /system/settings/resolv.conf'
 wait_for '^ *0 /system/settings/resolv.conf$'
@@ -373,6 +389,18 @@ for expected in '^configured by DHCP$' '^address 10.0.2.15 mask 255.255.255.0$' 
     wait_for "$expected"
 done
 echo "ok   an address line of 0.0.0.0 is no address: DHCP asks, and nothing of the file is the configuration"
+# No network card at all: ping says so, of an address and with a name
+# that cannot be looked up (no name server is set: there is no device
+# one could be set for, which was not said).
+again "$work/brix.img" -nic none
+type_line 'ping -c 1 10.0.2.2; echo cardless $?'
+wait_for '^ping: this machine has no network device$'
+wait_for '^cardless 1$'
+type_line 'ping -c 1 gateway.lan; echo cardless-name $?'
+wait_for '^ping: gateway.lan: no name server is set to look the name up$'
+wait_for '^ping: this machine has no network device$' 2
+wait_for '^cardless-name 1$'
+echo "ok   without a network card ping says that there is none, also with a name it cannot look up"
 # The network of our own again (tools/brix_lan.py: 10.10.36.0/24 with a
 # gateway, a name server, and hosts that answer late, twice, or only
 # after a while say their hardware address). The guest's address is its
@@ -389,40 +417,72 @@ wait_for '^far 0$'
 type_line 'ping -c 1 nothere.lan; echo unknown $?'
 wait_for '^ping: nothere.lan: the name server knows no such name$'
 wait_for '^unknown 1$'
+# A name written with the root's dot at its end is the name (it was "no
+# such name": no record of the answer was named with the dot). A name
+# server that says it cannot look a name up has not said there is no
+# such name. One that does not hear the first question is asked again
+# within the time (it was "did not answer" after the one question).
+type_line 'ping -c 1 gateway.lan.; echo dotted $?'
+wait_for '^PING gateway.lan. (10.10.36.1): 56 bytes of data$'
+wait_for '^dotted 0$'
+type_line 'ping -c 1 broken.lan; echo broken $?'
+wait_for '^ping: broken.lan: the name server answered that it cannot look the name up$'
+wait_for '^broken 1$'
+type_line 'ping -c 1 second.lan; echo second $?'
+wait_for '^PING second.lan (10.10.36.1): 56 bytes of data$'
+wait_for '^second 0$'
 # (With an address, what the name server calls to everyone reaches a
 # socket: the same call the machine without an address did not hear.)
 type_line 'netcalls hears'
 wait_for '^hears: a datagram of 7 bytes from 10.10.36.2$'
-echo "ok   on a network of our own: a name is looked up and pinged with the first packets to the name server and through the gateway; a name there is none of is said; a datagram to everyone is heard"
+echo "ok   on a network of our own: a name is looked up and pinged with the first packets to the name server and through the gateway, also written with the root's dot and when the first question is lost; a name there is none of is said, and a name server that cannot look names up; a datagram to everyone is heard"
 # Replies that come a second and a half after their requests: each is
 # said late with its own request's number and time, none is lost and
-# none is taken for the next request's.
-type_line 'ping -c 2 10.10.36.20; echo late $?'
+# none is taken for the next request's. (Three requests, and a time of
+# one to three seconds: on a loaded host without KVM a reply may be half
+# a second later still. With two requests the first reply had to come
+# within the half second before the count's end for the others to be
+# waited for, which is where this step failed under load.)
+type_line 'ping -c 3 10.10.36.20; echo late $?'
 wait_for '^no answer for seq=1$'
-wait_for '^64 bytes from 10.10.36.20: seq=1 time=1[0-9]* ms (late)$'
+wait_for '^64 bytes from 10.10.36.20: seq=1 time=[12][0-9]* ms (late)$'
 wait_for '^no answer for seq=2$'
-wait_for '^64 bytes from 10.10.36.20: seq=2 time=1[0-9]* ms (late)$'
-wait_for '^--- 2 sent, 2 received, 0% lost$'
+wait_for '^64 bytes from 10.10.36.20: seq=2 time=[12][0-9]* ms (late)$'
+wait_for '^no answer for seq=3$'
+wait_for '^64 bytes from 10.10.36.20: seq=3 time=[12][0-9]* ms (late)$'
+wait_for '^--- 3 sent, 3 received, 0% lost$'
 wait_for '^late 0$'
 # A reply that comes twice is shown, and counted once.
 type_line 'ping -c 2 10.10.36.21; echo twice $?'
 wait_for '^64 bytes from 10.10.36.21: seq=1 time=[0-9.]* ms$'
 wait_for '^64 bytes from 10.10.36.21: seq=1 time=[0-9.]* ms (again)$'
-wait_for '^--- 2 sent, 2 received, 0% lost$' 2
+wait_for '^--- 2 sent, 2 received, 0% lost$'
 wait_for '^twice 0$'
+# A reply from another address than the one asked is shown as that.
+type_line 'ping -c 1 10.10.36.23; echo other $?'
+wait_for '^64 bytes from 10.10.36.24: seq=1 time=[0-9.]* ms (not the host asked)$'
+wait_for '^other 0$'
 # A neighbour that takes 0.3 s to say its hardware address, pinged by
 # two programs at once: the first request of each reaches it all the
 # same (both wait in the kernel for the one answer).
 type_line 'ping -c 1 10.10.36.22 > /temporary/other & ping -c 1 10.10.36.22; slow=$?; wait; cat /temporary/other; echo slow-neighbour $slow'
 wait_for '^64 bytes from 10.10.36.22: seq=1 time=[0-9.]* ms$' 2
 wait_for '^slow-neighbour 0$'
-echo "ok   replies later than a second are told by their own request, a reply that comes twice counts once, a neighbour slow to say its hardware address gets the first request of two programs that ping it at once"
+echo "ok   replies later than a second are told by their own request, a reply that comes twice counts once, one from another address is said to be, a neighbour slow to say its hardware address gets the first request of two programs that ping it at once"
 # The gateway's word that a host cannot be reached, in place of "no
 # answer"; and a host nobody answers for.
 type_line 'ping -c 1 192.0.2.9; echo unreachable $?'
 wait_for '^from 10.10.36.1: seq=1 was not delivered: the host cannot be reached$'
 wait_for '^--- 1 sent, 0 received, 100% lost$'
 wait_for '^unreachable 1$'
+# The same word of a host whose reply comes all the same, a fifth of a
+# second later: the reply counts, and is not called late (which is said
+# of a reply that comes after "no answer").
+type_line 'ping -c 2 192.0.2.12; echo yet-there $?'
+wait_for '^from 10.10.36.1: seq=2 was not delivered: the host cannot be reached$'
+wait_for '^64 bytes from 192.0.2.12: seq=1 time=[0-9.]* ms$'
+wait_for '^--- 2 sent, 1 received, 50% lost$'
+wait_for '^yet-there 1$'
 # (The kernel kept the request while it asked for the hardware address,
 # and said itself that nobody answered: ping says whose it was, for each
 # request within its second.)
@@ -430,8 +490,8 @@ type_line 'ping -c 2 10.10.36.9; echo absent $?'
 wait_for '^no answer from 10.10.36.9 (its hardware address is not known: nobody answered for it)$' 2
 wait_for '^--- 2 sent, 0 received, 100% lost$'
 wait_for '^absent 1$'
-# (The two bare ones on this serial line are the late host's, above.)
-(( $(output | grep -c '^no answer for seq=') == 2 )) || fail "a request nobody's hardware address was said for got a bare \"no answer\""
+# (The three bare ones on this serial line are the late host's, above.)
+(( $(output | grep -c '^no answer for seq=') == 3 )) || fail "a request nobody's hardware address was said for got a bare \"no answer\""
 echo "ok   a router's word that a host cannot be reached is said; for an address nobody has ping says, request by request, that nobody answered for its hardware address"
 # The same network with a gateway that does not say its hardware address:
 # what lies beyond it is not reached, and ping says whose address is

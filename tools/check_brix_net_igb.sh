@@ -160,9 +160,16 @@ echo "ok   with the cable pulled the igb link's record says no cable"
 # ping says so ahead of its requests, which nobody answers.
 type_line 'ping -c 1 10.0.2.2; echo unplugged $?'
 wait_for '^ping: the network link is down (no cable, or it is still coming up)$'
+wait_for '^no answer for seq=1 (the network link is down)$'
 wait_for '^--- 1 sent, 0 received, 100% lost$'
 wait_for '^unplugged 1$'
-echo "ok   with the cable pulled ping says the link is down, and has no answer"
+# (And of a neighbour not spoken to yet, whose request the kernel kept
+# and gave up: that the link is down, not that nobody answered for the
+# hardware address, which nobody could.)
+type_line 'ping -c 1 10.0.2.9; echo unplugged-stranger $?'
+wait_for '^no answer from 10.0.2.9 (the network link is down)$'
+wait_for '^unplugged-stranger 1$'
+echo "ok   with the cable pulled ping says the link is down, ahead and with the request that has no answer"
 # The cable back in: the link is up again, and the address, whose lease
 # runs on, is still the link's (nothing is said: nothing changed).
 monitor "set_link n0 on"
@@ -179,6 +186,22 @@ type_line 'ping -c 1 10.0.2.2; echo back $?'
 wait_for '^back 0$'
 (( $(output | grep -c '^brixOS: net0 is ') == 1 )) || fail "the kernel says the address again though nothing changed"
 echo "ok   with the cable back the link is up, the address is kept and the gateway answers"
+# The cable pulled while a ping runs: each request from then on says
+# that the link is down (the link as it is when the request stays without
+# an answer, not as it was at the start: these lines were bare "no
+# answer", as from a host that is silent); back in, the replies come
+# again, and Ctrl+C ends the run with what was lost.
+type_line 'ping 10.0.2.2; echo during $?'
+replies=$(output | grep -c '^64 bytes from 10.0.2.2: seq=[0-9]* time=[0-9.]* ms$' || true)
+wait_for '^64 bytes from 10.0.2.2: seq=[0-9]* time=[0-9.]* ms$' $((replies + 2))
+monitor "set_link n0 off"
+wait_for '^no answer for seq=[0-9]* (the network link is down)$' 3
+monitor "set_link n0 on"
+replies=$(output | grep -c '^64 bytes from 10.0.2.2: seq=[0-9]* time=[0-9.]* ms$' || true)
+wait_for '^64 bytes from 10.0.2.2: seq=[0-9]* time=[0-9.]* ms$' $((replies + 2))
+printf '\003' >&3
+wait_for '^during 1$'
+echo "ok   the cable pulled while a ping runs: the requests without an answer say that the link is down, and the replies come again when it is back"
 # The DHCP server's answer comes late: QEMU starts with the cable out
 # (set_link off before the machine runs: no frame gets through), the
 # boot says there is no address yet, and when the cable is in (the
