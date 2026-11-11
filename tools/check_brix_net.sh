@@ -12,20 +12,27 @@
 # frames saying where the echo requests went; brixOS's own socket calls
 # (netcalls: a stream connection to ourselves through the stack, a
 # datagram, an echo; a stream and a datagram to 127.0.0.1, none of it on
-# the wire); the link's state
+# the wire); a ping to the subnet's address for everyone (to everyone's
+# hardware address, nobody asked for one); the link's state
 # as a program reads it from the kernel (/devices/net0's record): by
 # DHCP, with the lease's time; then booted again without a DHCP server
 # (no address: nothing is sent from one, nothing but DHCP's answers is
 # taken, not what is sent to everyone either, no name server is written,
-# DHCP goes on asking, and the machine still reaches itself as 127.0.0.1),
+# DHCP goes on asking, and the machine still reaches itself as 127.0.0.1;
+# a connection, a datagram and an echo to another machine are refused at
+# once as unreachable, and wget says why),
 # with a DHCP answer that comes late (the cable in after the boot: the
 # kernel says the address then), on another network (what its DHCP
 # server answers), with a fixed address in /system/settings/network on a
 # card with a hardware address of its own (the first packet through its
 # gateway arrives), with a file that has an address line alone (no
 # gateway, no name server: the own subnet is reached, nothing beyond
-# it), with a file whose address line says 0.0.0.0 (no address: DHCP
-# asks), without a network card (ping says there is none); and ping on
+# it, said at once by wget too), with a file whose address line says
+# 0.0.0.0 (no address: DHCP asks), with a file whose netmask is none (a
+# hole in its bits, or 0.0.0.0: the file is not used, said in the log),
+# without a network card (ping says there is none, and the machine
+# reaches itself all the same: ping, the socket calls, logserve asked by
+# wget); and ping on
 # a network of this check's own (tools/brix_lan.py on
 # QEMU's socket network, for what the user network cannot play): the
 # first packets to a name server and through a gateway never spoken to,
@@ -34,7 +41,14 @@
 # later than a second, a reply that comes twice, one from another
 # address, a neighbour slow to say its hardware address, a router's word
 # that a host cannot be reached (also of one that answers all the same),
-# a host and a gateway nobody answers for.
+# a host and a gateway nobody answers for; there too what is sent to the
+# subnet's address for everyone and what comes from it (a datagram or an
+# echo: a stream's connect to such an address is refused), a name whose
+# IPv6 question the name server drops (not asked), and a listener
+# (logserve) that a connection asked of everyone does not reach (and
+# nothing is answered that names everyone as where it comes from), while a
+# real request is answered within two seconds behind 4 and behind 100
+# connections that were begun and never finished.
 #
 #   tools/check_brix_net.sh [compiler]
 set -euo pipefail
@@ -70,27 +84,33 @@ mkdir -p "$work/bin" "$work/www"
 "$compiler" --quiet $brix projects/wget/main.mlx -o "$work/wget"
 "$compiler" --quiet $brix projects/ping/main.mlx -o "$work/ping"
 "$compiler" --quiet $brix projects/brix/tools/netcalls/main.mlx -o "$work/netcalls"
-for program in cat wc echo sha256sum; do
+"$compiler" --quiet $brix projects/brix/tools/logserve/main.mlx -o "$work/logserve"
+for program in cat wc echo sha256sum sleep; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
 # (A name of the hosts file for ping: QEMU's name server asks the host's
 # resolver, which the machine this runs on may not have.)
 printf '10.0.2.2 gateway.test\n' > "$work/hosts"
-"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "settings/hosts=$work/hosts" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "logserve=$work/logserve" "settings/hosts=$work/hosts" "$work/bin/"
 # The same with a fixed address in the kernel's settings file (the name
 # server beyond the subnet, behind the gateway), and with a file that has
 # an address and nothing else.
 printf 'address 10.0.2.77\nnetmask 255.255.254.0\ngateway 10.0.3.1\nnameserver 10.0.9.53\n' > "$work/network"
 "$work/brix-image" "$work/kernel" "$work/static.img" "flux=$work/flux" "ping=$work/ping" "netcalls=$work/netcalls" "settings/network=$work/network" "$work/bin/"
 printf 'address 10.0.2.77\n' > "$work/network-alone"
-"$work/brix-image" "$work/kernel" "$work/alone.img" "flux=$work/flux" "ping=$work/ping" "netcalls=$work/netcalls" "settings/network=$work/network-alone" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/alone.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "settings/network=$work/network-alone" "$work/bin/"
 # And one whose address line says none (0.0.0.0), with a gateway line.
 printf 'address 0.0.0.0\nnetmask 255.255.0.0\ngateway 10.0.2.9\n' > "$work/network-none"
 "$work/brix-image" "$work/kernel" "$work/none.img" "flux=$work/flux" "netcalls=$work/netcalls" "settings/network=$work/network-none" "$work/bin/"
+# And two whose netmask line is no netmask: a hole in its bits; 0.0.0.0.
+printf 'address 10.0.2.77\nnetmask 255.0.255.0\ngateway 10.0.2.9\n' > "$work/network-holes"
+"$work/brix-image" "$work/kernel" "$work/holes.img" "flux=$work/flux" "netcalls=$work/netcalls" "settings/network=$work/network-holes" "$work/bin/"
+printf 'address 10.0.2.77\nnetmask 0.0.0.0\ngateway 10.0.2.9\n' > "$work/network-zero"
+"$work/brix-image" "$work/kernel" "$work/zero.img" "flux=$work/flux" "netcalls=$work/netcalls" "settings/network=$work/network-zero" "$work/bin/"
 # And with an address of tools/brix_lan.py's network.
 printf 'address 10.10.36.50\nnetmask 255.255.255.0\ngateway 10.10.36.1\nnameserver 10.10.36.2\n' > "$work/lan-network"
-"$work/brix-image" "$work/kernel" "$work/lan.img" "flux=$work/flux" "ping=$work/ping" "netcalls=$work/netcalls" "settings/network=$work/lan-network" "$work/bin/"
-echo "ok   the kernel, wget, ping, netcalls and a boot image build"
+"$work/brix-image" "$work/kernel" "$work/lan.img" "flux=$work/flux" "ping=$work/ping" "netcalls=$work/netcalls" "logserve=$work/logserve" "settings/network=$work/lan-network" "$work/bin/"
+echo "ok   the kernel, wget, ping, netcalls, logserve and a boot image build"
 
 # The host's HTTP server on a port of its own.
 echo "hello from the host" > "$work/www/hello.txt"
@@ -127,6 +147,17 @@ type_line() {
     prompts=$((prompts + 1))
     wait_for '^root@brix:[^#]*# $' "$prompts"
     printf '%s\r' "$1" >&3
+}
+# What tools/brix_lan.py is told to do, and the line $1 of its output
+# waited for ($2 seconds, 60 unless given): the last such line.
+tell_lan() { python3 tools/brix_lan.py --tell "$lan_port" "$@"; }
+lan_said() {
+    local tries=0
+    until grep -q -- "$1" "$work/lan.txt"; do
+        (( tries++ < ${2:-60} * 10 )) || fail "the network of this check did not say \"$1\": $(tail -n 5 "$work/lan.txt" | tr '\n' ';')"
+        sleep 0.1
+    done
+    grep -- "$1" "$work/lan.txt" | tail -n 1
 }
 # brixOS once more: this QEMU ended, another started on the image $1 with
 # the network the further arguments give (and its monitor on a socket);
@@ -169,29 +200,8 @@ for command in sys.argv[2:]:
     drain()
 PY
 }
-# The frames QEMU captured on a network (the file $1), a line each: an
-# ARP message as "arp SENDER>TARGET", an IPv4 packet as "ip
-# SOURCE>DESTINATION", UDP's with its ports after it.
-frames_of() {
-    python3 - "$1" <<'PY'
-import struct, sys
-data = open(sys.argv[1], "rb").read()
-at = 24
-dotted = lambda raw: ".".join(str(part) for part in raw)
-while at + 16 <= len(data):
-    size = struct.unpack("<I", data[at + 8:at + 12])[0]
-    frame = data[at + 16:at + 16 + size]
-    at += 16 + size
-    if len(frame) >= 42 and frame[12:14] == b"\x08\x06":
-        print("arp %s>%s" % (dotted(frame[28:32]), dotted(frame[38:42])))
-    elif len(frame) >= 34 and frame[12:14] == b"\x08\x00":
-        header = (frame[14] & 15) * 4
-        ports = ""
-        if frame[23] == 17 and len(frame) >= 14 + header + 4:
-            ports = " udp %d>%d" % struct.unpack(">HH", frame[14 + header:14 + header + 4])
-        print("ip %s>%s%s" % (dotted(frame[26:30]), dotted(frame[30:34]), ports))
-PY
-}
+# (frames_of, the frames QEMU captured on a network a line each, is
+# tools/brix_ping_cases.sh's.)
 # Those of them that name 127.0.0.0/8 (none may: it is the machine itself).
 frames_naming_itself() { frames_of "$1" | grep '[ >]127\.' | sort -u | tr '\n' ' ' || true; }
 wait_for '^brixOS: /devices/net0, [0-9a-f:]* (virtio, IRQ [0-9]*)$'
@@ -237,6 +247,20 @@ wait_for '^wget: http://10.0.2.2:[0-9]*/missing.txt: the server answered 404$'
 wait_for '^status 1$'
 grep -q 'GET /hello.txt HTTP/1.1" 200' "$work/server.txt" || fail "the host's server did not see the request"
 echo "ok   wget fetches a small and a large file over TCP from the host, and reports a 404"
+# The subnet's address for everyone, 10.0.2.255: the echo requests go to
+# everyone's hardware address and nobody is asked for one. (The kernel
+# asked for the hardware address of 10.0.2.255 as of a host's, nobody
+# answered, and ping said so; no request went.) Nobody answers on this
+# network: ping says that alone.
+type_line 'ping -c 2 10.0.2.255; echo to-everyone $?'
+wait_for '^PING 10.0.2.255: 56 bytes of data$'
+wait_for '^to-everyone 1$'
+if output | grep -q '^no answer from 10.0.2.255 '; then fail "ping to the subnet's address for everyone: $(output | grep '^no answer from 10.0.2.255 ' | head -n 1)"; fi
+asked=$(frames_of "$work/frames.pcap" | grep -c '^arp 10\.0\.2\.15>10\.0\.2\.255$' || true)
+(( asked == 0 )) || fail "the kernel asked $asked times for the hardware address of 10.0.2.255, the subnet's address for everyone"
+went=$(frames_of "$work/frames.pcap" everyone | grep -c '^ip 10\.0\.2\.15>10\.0\.2\.255$' || true)
+(( went == 2 )) || fail "of two echo requests to 10.0.2.255, $went went to everyone's hardware address"
+echo "ok   a ping to the subnet's address for everyone goes to everyone's hardware address: nobody is asked for one"
 # No DHCP server on the wire: a network of our own (tools/brix_lan.py at
 # the other end of QEMU's socket network: every frame of the guest's is
 # a datagram to it), which has hosts that would answer and nobody who
@@ -292,19 +316,34 @@ wait_for '^done$' 2
 # server of this network calls everyone twice a second (a datagram to
 # UDP port 4715, which a machine with an address hears: below), and a
 # socket on that port hears nothing.
-type_line 'netcalls hears'
-wait_for '^hears: '
-output | grep -q '^hears: nothing$' || fail "without an address a socket hears what is sent to everyone: $(output | grep '^hears: ')"
+type_line 'netcalls hears; netcalls hears 4716'
+wait_for '^hears: ' 2
+(( $(output | grep -c '^hears: nothing$') == 2 )) || fail "without an address a socket hears what is sent to everyone: $(output | grep '^hears: ' | tr '\n' ';')"
 calls=$(frames_of "$work/alone.pcap" | grep -c '^ip 10\.10\.36\.2>255\.255\.255\.255 udp 4715>4715$' || true)
 (( calls >= 2 )) || fail "the network's calls to everyone did not reach the machine's card ($calls)"
+# What is to go to another machine is refused at once, with the status
+# that says it cannot leave this one (27, unreachable): a stream's
+# connect (it was taken, and its SYN tried for over a minute), a
+# datagram and an echo (they were told to try later). wget says so with
+# the reason, and at once (it said "cannot connect" after thirty
+# seconds).
+type_line 'netcalls nowhere 10.10.36.1'
+# (std's own write of such a datagram says it as Linux's layer does,
+# error number 101, ENETUNREACH: it said 22, EINVAL.)
+for expected in '^nowhere: connect 27$' '^nowhere: datagram 27$' "^nowhere: std's write 101\$" '^nowhere: echo 27$'; do
+    wait_for "$expected"
+done
+type_line 'wget http://10.10.36.1/x; echo unreachable $?'
+wait_within '^wget: cannot fetch http://10.10.36.1/x: cannot connect: this machine has no address$' 10 "wget to a host that cannot be reached, on a machine without an address"
+wait_for '^unreachable 1$'
 output | grep -q '^brixOS: net0 is ' && fail "the kernel says an address without a DHCP server"
 asked=$(frames_of "$work/alone.pcap" | grep -c '^ip 0\.0\.0\.0>255\.255\.255\.255 udp 68>67$' || true)
 (( asked >= 2 )) || fail "DHCP does not go on asking on a wire without a DHCP server ($asked questions)"
 # (The capture has both ways: the network's calls aside, the machine's
 # own frames are DHCP's questions alone.)
-others=$(frames_of "$work/alone.pcap" | grep -v -e '^ip 0\.0\.0\.0>255\.255\.255\.255 udp 68>67$' -e '^ip 10\.10\.36\.2>255\.255\.255\.255 udp 4715>4715$' | sort -u | tr '\n' ' ' || true)
+others=$(frames_of "$work/alone.pcap" | grep -v -e '^ip 0\.0\.0\.0>255\.255\.255\.255 udp 68>67$' -e '^ip 10\.10\.36\.2>255\.255\.255\.255 udp 4715>4715$' -e '^ip 10\.10\.36\.2>10\.10\.36\.255 udp 4716>4716$' | sort -u | tr '\n' ' ' || true)
 [[ -z $others ]] || fail "without an address something else than DHCP's questions went onto the wire: $others"
-echo "ok   without a DHCP server there is no address: the record says none and that DHCP is asking, ping says it cannot send, resolv.conf names no server, the wire has DHCP's questions alone ($asked), and what is sent to everyone is not heard; 127.0.0.1 is reached all the same"
+echo "ok   without a DHCP server there is no address: the record says none and that DHCP is asking, ping says it cannot send, resolv.conf names no server, the wire has DHCP's questions alone ($asked), and what is sent to everyone is not heard; 127.0.0.1 is reached all the same; a connection, a datagram and an echo to another machine are unreachable at once, and wget says that this machine has no address"
 # The DHCP server's answer comes late: QEMU starts with the cable out
 # (set_link off before the machine runs), the boot says there is no
 # address yet, and when the cable is in the kernel asks at once and says
@@ -379,7 +418,14 @@ wait_for '^--- 0 sent, 0 received, 1 could not be sent$'
 wait_for '^beyond 1$'
 type_line 'wc -c /system/settings/resolv.conf'
 wait_for '^ *0 /system/settings/resolv.conf$'
-echo "ok   with an address line alone there is no gateway and no name server: the record and the boot say none, the own subnet is reached, nothing beyond it"
+# (And a connection beyond the subnet is refused at once, with the
+# reason: it was tried for thirty seconds.)
+type_line 'netcalls nowhere 192.168.76.2'
+wait_for '^nowhere: connect 27$'
+type_line 'wget http://192.168.76.2/x; echo beyond-wget $?'
+wait_within "^wget: cannot fetch http://192.168.76.2/x: cannot connect: the host is not on this machine's network, and there is no gateway\$" 10 "wget to a host beyond the subnet, without a gateway"
+wait_for '^beyond-wget 1$'
+echo "ok   with an address line alone there is no gateway and no name server: the record and the boot say none, the own subnet is reached, nothing beyond it (ping and wget say why, at once)"
 # A settings file whose address line says 0.0.0.0: that is no address,
 # so nothing of the file is used (not its gateway either) and DHCP asks.
 again "$work/none.img" -netdev user,id=n0 -device virtio-net-pci,netdev=n0
@@ -389,6 +435,21 @@ for expected in '^configured by DHCP$' '^address 10.0.2.15 mask 255.255.255.0$' 
     wait_for "$expected"
 done
 echo "ok   an address line of 0.0.0.0 is no address: DHCP asks, and nothing of the file is the configuration"
+# A settings file whose netmask is no netmask: a hole in its bits, or
+# 0.0.0.0. The kernel says so, uses nothing of the file, and DHCP asks.
+# (Taken as typed, 255.0.255.0 made neighbours of hosts that are none,
+# and 0.0.0.0 of every host there is.)
+again "$work/holes.img" -netdev user,id=n0 -device virtio-net-pci,netdev=n0
+wait_for '^brixOS: /system/settings/network is not used: 255\.0\.255\.0 is no netmask$'
+wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)$'
+type_line 'netcalls links'
+for expected in '^configured by DHCP$' '^address 10.0.2.15 mask 255.255.255.0$' '^done$'; do
+    wait_for "$expected"
+done
+again "$work/zero.img" -netdev user,id=n0 -device virtio-net-pci,netdev=n0
+wait_for '^brixOS: /system/settings/network is not used: 0\.0\.0\.0 is no netmask$'
+wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)$'
+echo "ok   a settings file whose netmask is none (a hole in its bits; 0.0.0.0) is not used: the kernel's log says so, and DHCP asks"
 # No network card at all: ping says so, of an address and with a name
 # that cannot be looked up (no name server is set: there is no device
 # one could be set for, which was not said).
@@ -401,6 +462,29 @@ wait_for '^ping: gateway.lan: no name server is set to look the name up$'
 wait_for '^ping: this machine has no network device$' 2
 wait_for '^cardless-name 1$'
 echo "ok   without a network card ping says that there is none, also with a name it cannot look up"
+# The machine reaches itself all the same: 127.0.0.0/8 needs no card.
+# (No socket could be opened there at all: ping said of 127.0.0.1 too
+# that there is no network device.) An echo, the socket calls (a stream
+# and a datagram), and a listener: logserve, asked by wget. What is to
+# go to another machine is unreachable, and wget says why.
+type_line 'ping -c 1 127.0.0.1; echo cardless-home $?'
+wait_for '^64 bytes from 127.0.0.1: seq=1 time=[0-9.]* ms$'
+wait_for '^cardless-home 0$'
+type_line 'netcalls itself; netcalls nowhere 10.0.2.2'
+for expected in '^itself: connected 2$' '^itself: the peer is 127.0.0.1, the client speaks from 127.0.0.1$' '^itself: received 5$' '^itself: read 5$' '^itself: datagram received 5 from 127.0.0.1$' '^nowhere: connect 27$' '^nowhere: datagram 27$' '^nowhere: echo 27$'; do
+    wait_for "$expected"
+done
+type_line 'wget http://10.0.2.2/x; echo cardless-away $?'
+wait_within '^wget: cannot fetch http://10.0.2.2/x: cannot connect: this machine has no network device$' 10 "wget to another machine, on a machine without a network card"
+wait_for '^cardless-away 1$'
+# (logserve goes on behind the shell: this boot's last line.)
+type_line 'logserve & sleep 1; wget http://127.0.0.1:8080/system -O /temporary/system && cat /temporary/system; echo cardless-fetched $?'
+wait_for '^  this machine has no network device: only this machine itself reaches it, at http://127.0.0.1:8080/all$'
+wait_for '^127\.0\.0\.1 GET /system: 200, [0-9]* bytes$'
+wait_for '^wget: /temporary/system: [0-9]* bytes$'
+wait_for '^no network link (/devices/net0 is not there)$'
+wait_for '^cardless-fetched 0$'
+echo "ok   without a network card the machine reaches itself: ping 127.0.0.1 is answered, a stream and a datagram to 127.0.0.1 arrive, logserve listens and wget fetches a page from it; what is to go elsewhere is unreachable at once, and wget says that there is no network device"
 # The network of our own again (tools/brix_lan.py: 10.10.36.0/24 with a
 # gateway, a name server, and hosts that answer late, twice, or only
 # after a while say their hardware address). The guest's address is its
@@ -493,6 +577,90 @@ wait_for '^absent 1$'
 # (The three bare ones on this serial line are the late host's, above.)
 (( $(output | grep -c '^no answer for seq=') == 3 )) || fail "a request nobody's hardware address was said for got a bare \"no answer\""
 echo "ok   a router's word that a host cannot be reached is said; for an address nobody has ping says, request by request, that nobody answered for its hardware address"
+# The subnet's address for everyone, 10.10.36.255. An echo request there
+# goes to everyone's hardware address, and this network's gateway
+# answers it (from its own address); a datagram there goes the same way;
+# nobody is asked for a hardware address. And what the name server calls
+# to that address (UDP port 4716) reaches a socket, as its call to
+# 255.255.255.255 does. (Such a datagram was not taken, and what was
+# sent there never went: the kernel asked who has 10.10.36.255.)
+type_line 'ping -c 1 10.10.36.255; echo subnet-everyone $?'
+wait_for '^64 bytes from 10.10.36.1: seq=1 time=[0-9.]* ms (not the host asked)$'
+wait_for '^subnet-everyone 0$'
+type_line 'netcalls everyone 10.10.36.255; netcalls hears 4716'
+wait_for '^everyone: datagram taken 5$'
+wait_for '^hears: a datagram of 7 bytes from 10.10.36.2$' 2
+# (The datagram, and one to 255.255.255.255, as the network saw them
+# come: at everyone's hardware address. "taken" says only that the
+# kernel took it.)
+type_line 'netcalls everyone 255.255.255.255'
+wait_for '^everyone: datagram taken 5$' 2
+for to in 10.10.36.255 255.255.255.255; do
+    came=$(lan_said "^a datagram for port 4717 to $to came to ")
+    [[ $came == "a datagram for port 4717 to $to came to everyone's hardware address" ]] || fail "a datagram sent to $to: $came"
+done
+if grep -q 'which is everyone.s$' "$work/lan.txt"; then fail "the kernel asked for a hardware address of everyone's: $(grep -c 'which is everyone.s$' "$work/lan.txt") times"; fi
+if grep -q "came to one host's hardware address" "$work/lan.txt"; then fail "an echo request to everyone went to one host's hardware address"; fi
+echo "ok   the subnet's address for everyone: an echo request and a datagram go to everyone's hardware address (the gateway answers the echo), nobody is asked for one, and a datagram sent to it is heard"
+# A stream is a connection to one host: a connect to an address that is
+# everyone's is refused as invalid (status 10) and nothing of it goes
+# onto the wire (RFC 1122, 4.2.3.10). (It was taken, 0, and its SYN went
+# to everyone's hardware address, again and again for over a minute.
+# The wire is looked at below, when the network has had its time.)
+type_line 'netcalls nowhere 10.10.36.255; netcalls nowhere 255.255.255.255; echo no-stream-to-everyone'
+wait_for '^no-stream-to-everyone$'
+(( $(output | grep -c '^nowhere: connect 10$') == 2 )) || fail "a stream's connect to an address that is everyone's is not refused as invalid: $(output | grep '^nowhere: connect ' | tr '\n' ';')"
+echo "ok   a stream's connect to an address that is everyone's (the subnet's, 255.255.255.255) is refused as invalid"
+# A name whose IPv6 address the name server does not answer for (it
+# drops such questions): brixOS speaks no IPv6, so that question is not
+# asked, of this name or of any name above. (It was asked after each
+# address found, and here the lookup waited five seconds for the answer
+# that does not come.)
+type_line 'ping -c 1 nosix.lan; echo nosix $?'
+wait_within '^PING nosix.lan (10.10.36.1): 56 bytes of data$' 4 "the lookup of a name whose IPv6 question the name server drops"
+wait_for '^nosix 0$'
+if grep -q 'asked for the IPv6 address' "$work/lan.txt"; then fail "the name server was asked for IPv6 addresses, which brixOS does not speak: $(grep 'asked for the IPv6 address' "$work/lan.txt" | sort | uniq -c | tr '\n' ';')"; fi
+echo "ok   a name is looked up without the question for its IPv6 address: a name server that drops such questions delays nothing"
+# A listener (logserve, behind the shell: this boot's last line) and
+# what is asked of it in raw frames. A connection asked of everyone
+# (a SYN to 255.255.255.255, one to 10.10.36.255) is not answered (RFC
+# 1122, 4.2.3.10; the listener answered the first). Then connections
+# that are begun and never finished: 4 of them, and a real request (a
+# page asked for as a browser does) is answered within two seconds; a
+# hundred more, and so is the next. (4 were all the listener held, for
+# 71 seconds: the request got no answer.)
+type_line 'logserve &'
+wait_for '^  Ctrl+C ends it$'
+tell_lan everyone 8080
+[[ "$(lan_said '^everyone 8080: ')" == "everyone 8080: no answer" ]] || fail "a connection asked of everyone was answered: $(lan_said '^everyone 8080: ')"
+# And what names everyone, or a group, as where it comes from is from
+# nobody (RFC 1122, 3.2.1.3): an echo request and a connection asked so
+# (from 10.10.36.255, 255.255.255.255, 224.0.0.1) get no answer. (Each
+# was answered, and the answers to the first two went to every host on
+# the wire, to everyone's hardware address.)
+tell_lan forged 8080
+[[ "$(lan_said '^forged 8080: ')" == "forged 8080: no answer" ]] || fail "what named everyone or a group as where it came from was answered: $(lan_said '^forged 8080: ')"
+answered_within() {
+    local said
+    said=$(lan_said "^get $1: " 45)
+    [[ $said =~ ^get\ $1:\ HTTP/1\.1\ 200\ OK,\ [0-9]+\ bytes,\ in\ ([0-9.]+)\ s$ ]] || fail "behind $2 connections begun and never finished, a request: $said"
+    python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 2.0 else 1)" "${BASH_REMATCH[1]}" || fail "behind $2 connections begun and never finished, a request took ${BASH_REMATCH[1]} s"
+    echo "${BASH_REMATCH[1]}"
+}
+tell_lan silent 8080 4
+lan_said '^silent: 4 ' > /dev/null
+sleep 1
+tell_lan get 8080 /system 30
+few=$(answered_within /system 4)
+tell_lan silent 8080 100
+lan_said '^silent: 100 ' > /dev/null
+sleep 1
+tell_lan get 8080 /klog 30
+many=$(answered_within /klog 104)
+echo "ok   a listener: a connection asked of everyone is not answered, nor what names everyone or a group as where it comes from; behind 4 connections that were begun and never finished a real request is answered in $few s, behind 100 more in $many s"
+# (And no segment of a stream came to everyone's hardware address: the
+# connects to everyone's addresses above put nothing on the wire.)
+if grep -q "^a stream's segment to " "$work/lan.txt"; then fail "a stream's segment went to everyone's hardware address: $(grep "^a stream's segment to " "$work/lan.txt" | sort | uniq -c | tr '\n' ';')"; fi
 # The same network with a gateway that does not say its hardware address:
 # what lies beyond it is not reached, and ping says whose address is
 # missing; the own subnet's name server still answers.

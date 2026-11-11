@@ -10,6 +10,14 @@
 // machine where no message comes is served by that alone, a hundredth of
 // a second late at most). Presented through netdev.mlx as the one network
 // device.
+//
+// Nothing here waits. A frame is taken when the transmit ring's next
+// place is free and refused when it is not (the stack's senders try
+// again: TCP by its timer and with the next acknowledgement, a program
+// with its next send). With the link down the device sends nothing, so
+// what was in the ring then stays there: netdev.mlx hands this driver no
+// frame while the link is down, and when it returns and frames are still
+// in the ring, the ring is taken back (linkCame).
 const layout = @import("./../layout.mlx")
 const memory = @import("./memory.mlx")
 const Pci = @import("./pci.mlx").Pci
@@ -53,7 +61,8 @@ const RAH0: usize = 0x5404
 // The register block (BAR0: 128 KiB), what is mapped.
 const REGISTERS: usize = 0x20000
 // STATUS bits: the link is up; its speed is bits 6 and 7 (10, 100, 1000
-// megabits a second, the last twice).
+// megabits a second, the last twice); bit 0 says full duplex.
+const STATUS_FULL_DUPLEX: u32 = 0x01
 const STATUS_LINK_UP: u32 = 0x02
 // CTRL bits.
 const CTRL_SLU: u32 = 0x40
@@ -67,9 +76,9 @@ const RCTL_SECRC: u32 = 0x04000000
 const TCTL_VALUE: u32 = 0x0003F0FA
 // Queue enable bit in RXDCTL/TXDCTL.
 const QUEUE_ENABLE: u32 = 0x02000000
-// Interrupt causes: the link changed, the receive ring runs low, a frame
-// was written to it.
-const CAUSE_LINK: u32 = 0x04
+// Interrupt causes: the receive ring runs low, a frame was written to
+// it. (The cause for a link change, 0x04, is not asked for: the link is
+// looked at on the timer's tick, netdev.mlx.)
 const CAUSE_RING_LOW: u32 = 0x10
 const CAUSE_RECEIVED: u32 = 0x80
 // The least time between two interrupts (EITR's interval, in its units of
@@ -84,12 +93,12 @@ pub const TX_COUNT: usize = 16
 pub const BUFFER: usize = 2048
 pub const MAX_FRAME: usize = 1514
 
-// How long a frame waits for its slot of the transmit ring, in
-// milliseconds.
-const SEND_MS: usize = 10
 // How long one call of receive may go on taking frames (it runs in the
 // timer's interrupt, a hundred times a second).
 const RECEIVE_MS: usize = 5
+// The ticks between the transmit queue's switching off and its being set
+// up anew (20 ms: Linux's driver waits 10 ms there).
+const RESTART_TICKS: usize = 2
 
 pub const Igb = struct {
     present: bool
@@ -109,6 +118,9 @@ pub const Igb = struct {
     txNext: usize
     received: usize
     sent: usize
+    // The transmit ring is being taken back (linkCame): the ticks until
+    // it is set up anew; 0: it is in use.
+    restarting: usize
 
     fn reg(self: *const Self, offset: usize) -> *u32 {
         return unsafe { @ptrFromInt(*u32, self.*.regs + offset) }
@@ -166,10 +178,26 @@ pub const Igb = struct {
         self.reg(RDT).* = @intCast(u32, RX_COUNT - 1)
         self.reg(RCTL).* = RCTL_EN | RCTL_BAM | RCTL_SECRC
         self.*.rxNext = 0
-        // Transmit descriptors start "done" so the first use of each slot
-        // sees it free.
-        k = 0
+        self.startTransmit()
+        self.*.received = 0
+        self.*.sent = 0
+        self.*.restarting = 0
+        self.*.irq = NO_IRQ
+        self.*.signalled = false
+        self.*.interrupts = 0
+        self.*.present = true
+        return true
+    }
+
+    // The transmit ring set up, empty, and transmit on (the transmitter
+    // is off when this is called: at the start, and when the ring is
+    // taken back). Its descriptors start "done", so the first use of
+    // each place sees it free.
+    fn startTransmit(self: *Self) -> void {
+        var k: usize = 0
         while k < TX_COUNT {
+            Bytes.write64(self.txDesc(k), 0, 0)
+            Bytes.write64(self.txDesc(k), 8, 0)
             self.txDesc(k)[12] = DD
             k += 1
         }
@@ -182,13 +210,43 @@ pub const Igb = struct {
         self.reg(TIPG).* = 0x00602008
         self.reg(TCTL).* = TCTL_VALUE
         self.*.txNext = 0
-        self.*.received = 0
-        self.*.sent = 0
-        self.*.irq = NO_IRQ
-        self.*.signalled = false
-        self.*.interrupts = 0
-        self.*.present = true
-        return true
+    }
+
+    // The frames given to the ring that are not sent yet.
+    fn inFlight(self: *const Self) -> usize {
+        var count: usize = 0
+        var k: usize = 0
+        while k < TX_COUNT {
+            if self.txDesc(k)[12] & DD == 0 { count += 1 }
+            k += 1
+        }
+        return count
+    }
+
+    // The link is up again (netdev.mlx's look found it so). Frames still
+    // in the ring were given to the device before the link went, and it
+    // did not send them: they are old by now, and whether the device
+    // sends them after all is its own business. The ring is taken back:
+    // the transmitter and its queue off now, and RESTART_TICKS later
+    // (tick) set up anew and empty, as at the start. Until then no frame
+    // is taken. (Where the device has sent them by the time of this
+    // look, the ring is as it should be and nothing is done.) How many
+    // frames are given up with the ring.
+    pub fn linkCame(self: *Self) -> usize {
+        if !self.*.present || self.*.restarting != 0 { return 0 }
+        const left = self.inFlight()
+        if left == 0 { return 0 }
+        self.reg(TCTL).* = 0
+        self.reg(TXDCTL).* = 0
+        self.*.restarting = RESTART_TICKS
+        return left
+    }
+
+    // Every tick of the timer: the ring's taking back, when it is due.
+    pub fn tick(self: *Self) -> void {
+        if self.*.restarting == 0 { return }
+        self.*.restarting -= 1
+        if self.*.restarting == 0 { self.startTransmit() }
     }
 
     // Whether the link is up (the cable, and a partner at its end), as
@@ -206,33 +264,39 @@ pub const Igb = struct {
         return if bits == 0 { 10 } else if bits == 1 { 100 } else { 1000 }
     }
 
+    // Whether the link sends and receives at once.
+    pub fn fullDuplex(self: *const Self) -> bool {
+        return self.*.present && self.reg(STATUS).* & STATUS_FULL_DUPLEX != 0
+    }
+
     // The device's interrupt as a message to the first processor (the
-    // PCI function at `address`): a received frame, a ring running low and
-    // a link change raise it, not more often than INTERRUPT_INTERVAL.
-    // Left polled when the device or the processor has no way for it.
+    // PCI function at `address`): a received frame and a ring running low
+    // raise it, not more often than INTERRUPT_INTERVAL. Left polled when
+    // the device or the processor has no way for it.
     fn signal(self: *Self, address: usize) -> void {
         const apic = smp.localApic()
         if !apic.0 { return }
         if !Pci.enableMsi(address, layout.Vector.NET, apic.1) { return }
         self.reg(EITR0).* = INTERRUPT_INTERVAL
         _ = self.reg(ICR).*
-        self.reg(IMS).* = CAUSE_RECEIVED | CAUSE_RING_LOW | CAUSE_LINK
+        self.reg(IMS).* = CAUSE_RECEIVED | CAUSE_RING_LOW
         self.*.signalled = true
     }
 
-    // `frame` (`length` bytes) to the wire; false when the slot is still in
-    // flight or the frame is too big.
+    // `frame` (`length` bytes) to the wire; false when the ring's next
+    // place is still in flight (the ring is full), the ring is being
+    // taken back, or the frame is too big.
     pub fn transmit(self: *Self, frame: [*]const u8, length: usize) -> bool {
-        if !self.*.present || length > MAX_FRAME { return false }
+        if !self.*.present || length > MAX_FRAME || self.*.restarting != 0 { return false }
         const slot = self.*.txNext
         const desc = self.txDesc(slot)
-        // (The slot's last frame not sent yet: waited for a moment, then
-        // this one is dropped. With no cable nothing is ever sent, and a
-        // long wait here, in the kernel, would stall everything else.)
-        const deadline = Deadline.after(SEND_MS)
-        while desc[12] & DD == 0 {
-            if deadline.passed() { return false }
-        }
+        // The place's last frame is not sent yet: this one is not taken.
+        // Nothing waits for the place here: this runs in the kernel,
+        // which every processor shares. (It waited 10 ms, which with the
+        // link down, when the device completes nothing, was 10 ms of
+        // every processor's time for each frame a program tried to send:
+        // eight a second from one ping.)
+        if desc[12] & DD == 0 { return false }
         const into = self.txBuffer(slot)
         Bytes.copy(into, frame, length)
         var total = length
@@ -269,8 +333,7 @@ pub const Igb = struct {
         // At most this many frames a call: frames that come as fast as
         // they are handled would keep the kernel in here (the timer's
         // interrupt, the kernel held) for good.
-        // And for so long: each frame may be answered, and an answer may
-        // wait SEND_MS for a transmitter that is stuck.
+        // And for so long: each frame may be answered.
         var budget: usize = 4 * RX_COUNT
         const deadline = Deadline.after(RECEIVE_MS)
         while budget > 0 && !deadline.passed() {

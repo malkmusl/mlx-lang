@@ -605,7 +605,7 @@ can fail at every step.
 
 What is not there yet: disks served by their interrupts (AHCI, NVMe: a
 command is waited for), USB devices other than boot keyboards, mice and
-hubs, a network controller's link going down and up said to the stack.
+hubs.
 
 (The font's glyphs were a `const` array, a value built where it was
 used: each row of each character drawn built all 1520 bytes of it in the
@@ -630,22 +630,41 @@ The kernel's stack (kernel/net) runs on it:
   machine's own address), IPv4 (one address, netmask and gateway; no
   fragments; 127.0.0.0/8 is the machine itself: what is sent there
   comes straight back in, from the address it was sent to, with or
-  without an address of the network's, and never goes onto the wire)
-  and ICMP (echo answered). The
+  without an address of the network's, a link, or a network device at
+  all, and never goes onto the wire; what is sent to everyone,
+  255.255.255.255 or the subnet's last address, goes to everyone's
+  hardware address without a question, and what comes so addressed is
+  for datagram sockets alone: a TCP segment or an echo request to
+  everyone is not answered, and a stream's connect to such an address
+  or to a group's is refused as invalid) and ICMP (echo answered).
+  What cannot leave the machine as it is (reach.mlx works it out from
+  the configuration: no device, the link down, no address, no gateway
+  to it) is not tried: a socket's connect or send says unreachable at
+  once. The
   addresses are /system/settings/network's (`address`, `netmask`,
   `gateway`, `nameserver` lines) or DHCP's. Until one of them gives an
   address the stack has none: it sends nothing but DHCP's messages
   (from 0.0.0.0), takes nothing but DHCP's answers and answers no ARP
   request. What the file or DHCP's answer leaves out is none: without
-  a gateway only the own subnet is reached (a send to anywhere else
-  fails as one that could not go: would_block for a datagram, a
-  connection that times out), without a name server resolv.conf has no
-  line and no name is looked up; a netmask left out is the one of the
-  address's class. The kernel writes /system/settings/resolv.conf for
+  a gateway only the own subnet is reached (a send or a connection to
+  anywhere else is unreachable), without a name server resolv.conf has
+  no line and no name is looked up; a netmask left out is the one of
+  the address's class, and a file whose netmask line is none (a hole
+  in its bits, or 0.0.0.0) is not used at all ("brixOS:
+  /system/settings/network is not used: 255.0.255.0 is no netmask";
+  DHCP asks). The kernel writes /system/settings/resolv.conf for
   programs that look names up, and says at boot "brixOS: net0 is
   10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)" (without
   "(DHCP)" for the file's; "none" for a gateway or a name server there
-  is not).
+  is not). The link is looked at on every tick of the timer
+  (netdev.mlx): when it goes or comes the log has a line ("net0: the
+  link is down", "net0: the link is up, 1000 Mbit/s full duplex", with
+  the frames that were not sent meanwhile when there were some), while
+  it is down nothing is handed to the card, and when it comes the
+  neighbours are forgotten and DHCP begins again. At boot a link that
+  is not up yet is waited for, half a second at most (QEMU's igb has
+  it a third of a second after its start), so that the first programs
+  find it up.
 - udp.mlx, tcp.mlx: datagrams; connections (active and passive open,
   segments of MSS bytes within the peer's window from a send ring,
   sent again after a timeout that doubles, data received in order into
@@ -654,9 +673,18 @@ The kernel's stack (kernel/net) runs on it:
   closed still sends what is left and waits for the peer's end; one
   that stands still for 20 s with nothing on its way is reset (a peer
   that never closes its side, or takes no more, would keep one of the
-  32 sockets for good).
+  sockets for good). What is asked of a listener and not made yet (its
+  SYN came, our SYN+ACK went) is a record in halfopen.mlx's table and
+  takes no socket: 64 of them at a time for the machine, the one that
+  waited longest giving way to a newcomer; the SYN+ACK goes again
+  after one and three seconds, and after seven the record is dropped.
+  The peer's ACK makes the connection, which waits in the listener's
+  queue (16 at most; while it is full a SYN gets no answer) until the
+  program accepts it. (The queue was 4, counted together with what was
+  only asked, and a connection asked took a socket for 71 seconds:
+  four SYNs nobody followed up kept a listener deaf for that long.)
 - sockets.mlx, api.mlx: the sockets a process's descriptors name
-  (files.Kind.socket; 32 at most, a 16 KiB ring each), and what a call
+  (files.Kind.socket; 128 at most, a 16 KiB ring each), and what a call
   does to one. A call that has to wait leaves the process waiting for
   the socket to change (WaitKind.socket), as reads of pipes do. The
   connections a listener took do not hold its port: a program that
@@ -680,7 +708,11 @@ The kernel's stack (kernel/net) runs on it:
   UDP and does to the stack what it says. DISCOVER goes at boot (the
   boot waits half a second for the answer) and again after 1, 2, 4, 8
   and then every 16 seconds for as long as nobody answers, and at once
-  when the cable comes in (the link is looked at once a second). The
+  when the link comes up. With an address held, the link coming up
+  asks for the lease anew at once, of everyone (the cable may be in
+  another network now; again after 1, 2, 4, 8 and 16 seconds while
+  nobody answers): an ACK renews it, a NAK gives the address up, and
+  without an answer it is kept until the lease ends. The
   ACK's address, netmask, router and name server are the configuration.
   The lease's time and its T1 and T2 are the answer's (options 51, 58,
   59; half and seven eighths of the lease without them, or where they
@@ -703,7 +735,14 @@ The kernel's stack (kernel/net) runs on it:
   the rest). A call never waits: it says would_block and the program
   waits on the handle (READABLE, WRITABLE, PEER_GONE, ENDED). A packet
   to our own address goes through the stack at once (a loopback), so a
-  program may talk to itself.
+  program may talk to itself; a machine without a network device has
+  sockets too, for 127.0.0.0/8. A connect or a send that cannot leave
+  the machine as it is says unreachable (status 27; ENETUNREACH on the
+  Linux layer), at once: the link's record says which of the reasons
+  it is, and wget says it ("cannot connect: this machine has no
+  address", "... the network link is down", "... this machine has no
+  network device", or that no gateway leads to the host). It was a
+  connection tried for over a minute, and would_block for a datagram.
 - ping (projects/ping): `ping [-c COUNT] HOST` (an echo request a
   second until Ctrl+C or COUNT of them; a line for each reply with its
   time, one for each request without an answer, then the loss and the
@@ -716,15 +755,18 @@ The kernel's stack (kernel/net) runs on it:
   to go to (ping then says "no answer from 10.10.36.9 (its hardware
   address is not known: nobody answered for it)", or names the
   gateway). The destination is the address given with the send (its
-  port means nothing); would_block says the request cannot go now
-  (there is no address yet, no gateway leads there, the device is
-  busy): ping tries again for the request's second and then says which
-  it was; the summary counts such requests apart ("0 sent, 0 received,
-  1 could not be sent"). 127.0.0.1 is answered from 127.0.0.1. A
-  request that stays without an answer while the link is down says so
-  ("no answer for seq=7 (the network link is down)": the link as it is
-  then, so a cable that comes out during a run shows request by
-  request); a reply from another address than the one asked is marked
+  port means nothing); unreachable says the request cannot leave the
+  machine as it is (the link is down, there is no address yet, no
+  gateway leads there), would_block that the device is busy: ping
+  tries again for the request's second and then says which it was
+  ("seq=7 could not be sent: the network link is down"; the link as it
+  is then, so a cable that comes out during a run shows request by
+  request); the summary counts such requests apart ("0 sent, 0
+  received, 1 could not be sent"). 127.0.0.1 is answered from
+  127.0.0.1, also on a machine without a network device. A request
+  that went and stays without an answer while the link is down says
+  so ("no answer for seq=7 (the network link is down)"); a reply from
+  another address than the one asked is marked
   "(not the host asked)". A reply's time is from before the request
   was handed to the kernel. A name that cannot be looked up is said
   with the reason (no name server set, none answered, the server
@@ -789,24 +831,36 @@ what that DHCP server answered), with a fixed address in the settings
 file (the first packet through its gateway answered), with an address
 line alone (no gateway, no name server: the own subnet and nothing
 else), with an address line of 0.0.0.0 (that is no address: DHCP
-asks), and on a network of the
+asks), with a netmask line that is none (the file not used), without a
+card (ping 127.0.0.1, the native calls and logserve asked by wget all
+the same; anywhere else unreachable), and on a network of the
 check's own (tools/brix_lan.py at the other end of QEMU's socket
 network: a name server, also deaf to a first question and unable to
 look a name up, replies later than a second, a reply twice, one from
 another address, a neighbour slow to say its hardware address, a
 router that says a host cannot be reached, also of one that answers, a
-host and a gateway nobody answers for).
+host and a gateway nobody answers for; the subnet's address for
+everyone; a name whose IPv6 question the name server drops, which is
+not asked: std.net.dns asks for AAAA records only on a system that has
+IPv6 sockets; and a listener, in raw frames: a connection asked of
+everyone is not answered, and behind 4 and behind 100 more connections
+begun and never finished a real request is answered within two
+seconds).
 tools/check_brix_net_igb.sh does the cable pulled and put back (also
-while a ping runs) and the late answer on the igb card.
+while a ping runs: the kernel's lines, what cannot be sent said at
+once, the lease asked for anew), the late answer on the igb card, and
+a ping at the first prompt with a fixed address.
 tools/check_ping_linux.sh runs ping's Linux build on the loopback of a
 network namespace of its own, and watches that it does not grow while
 it runs. tests/455_dhcp_lease_runtime.mlx runs the
 lease's renewal and end on a clock of its own (QEMU's user network
 gives a lease of a day, and its length cannot be set).
 tools/check_brix_desktop.sh opens the Network page and pulls the cable.
+tests/464_net_reach_runtime.mlx and tests/465_tcp_half_open_runtime.mlx
+run reach.mlx (the netmask's rule, everyone's addresses, the way a
+packet takes) and halfopen.mlx (the table's rules) on the host.
 Not yet: IPv6, a second link, the configuration changed while the
-system runs, a lease checked again when the cable comes back (it is
-kept until it ends).
+system runs.
 
 ## brixfs: the disk's format
 

@@ -11,11 +11,16 @@
 # program reads it from the kernel (/devices/net0's record: the cable
 # and the speed from the device's status register, also once QEMU's
 # monitor has pulled the cable, when ping says the link is down, and
-# put it back: the address stays, its lease runs on). The device's
-# frames come by its message-signalled interrupt (MSI); the timer tick
-# looks at its ring as well. Then a boot with the cable out: no address,
-# and when the cable comes in DHCP asks at once and the kernel says the
-# address then.
+# put it back: the address stays, and its lease is asked for anew). The
+# kernel's log has a line each time the link goes or comes; with the
+# link down what is to be sent is refused at once (ping says that its
+# requests could not be sent, a connection is unreachable and wget says
+# why). The device's frames come by its message-signalled interrupt
+# (MSI); the timer tick looks at its ring as well. Then a boot with the
+# cable out: no address, and when the cable comes in DHCP asks at once
+# and the kernel says the address then. Then a boot with a fixed address
+# and a ping typed at the first prompt: the boot has waited for the
+# link, and ping does not say that it is down.
 #
 #   tools/check_brix_net_igb.sh [compiler]
 set -euo pipefail
@@ -57,6 +62,9 @@ done
 # resolver, which the machine this runs on may not have.)
 printf '10.0.2.2 gateway.test\n' > "$work/hosts"
 "$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "sysinfo=$work/sysinfo" "settings/hosts=$work/hosts" "$work/bin/"
+# The same with a fixed address in the kernel's settings file.
+printf 'address 10.0.2.77\nnetmask 255.255.255.0\ngateway 10.0.2.2\n' > "$work/network"
+"$work/brix-image" "$work/kernel" "$work/static.img" "flux=$work/flux" "ping=$work/ping" "netcalls=$work/netcalls" "settings/network=$work/network" "$work/bin/"
 echo "ok   the kernel, wget, ping, netcalls and a boot image build"
 
 # The host's HTTP server on a port of its own.
@@ -120,10 +128,13 @@ for command in sys.argv[2:]:
 PY
 }
 wait_for '^brixOS: /devices/net0, [0-9a-f:]* (igb, message-signalled)$'
+# (The link's line: the boot waited for the link, which QEMU's card has a
+# third of a second after its start, and says it as it is.)
+wait_for '^net0: the link is up, 1000 Mbit/s full duplex$'
 wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)$'
 type_line 'cat /system/settings/resolv.conf'
 wait_for '^nameserver 10.0.2.3$'
-echo "ok   the igb network device is found, the stack configured by DHCP from QEMU's user network, resolv.conf written"
+echo "ok   the igb network device is found, its link said in the log (up, 1000 Mbit/s full duplex), the stack configured by DHCP from QEMU's user network, resolv.conf written"
 ping_cases
 type_line 'netcalls; echo netcalls $?'
 for expected in '^socket kind 9$' '^connect 0$' '^client writable (connected) 2$' '^listener readable (a connection waits) 1$' '^the peer is ourselves$' '^received 5$' '^hello$' '^read 5$' '^client sees the end (peer gone) 4$' '^receive at the end 0$' '^datagram received 5$' '^from port 4712$' '^echo answered 1$' '^an echo reply$' '^echo from 10.0.2.2$' '^netcalls 0$'; do
@@ -152,27 +163,52 @@ type_line 'sysinfo'
 wait_for '^device interrupts: [1-9][0-9]*$'
 echo "ok   the device's message-signalled interrupt brings its frames"
 # The cable pulled through QEMU's monitor (set_link): the device's status
-# register says so, and the link's record with it.
+# register says so; the kernel notices (it looks on every tick) and says
+# so in its log, and the link's record with it. (The kernel said nothing:
+# the status was only read when a program asked.)
 monitor "set_link n0 off"
+wait_for '^net0: the link is down$'
 type_line 'netcalls links'
 wait_for '^link net0: igb 52:54:00:12:34:56 no cable$'
-echo "ok   with the cable pulled the igb link's record says no cable"
-# ping says so ahead of its requests, which nobody answers.
+echo "ok   with the cable pulled the kernel's log says that the link is down, and the igb link's record says no cable"
+# ping says so ahead of its requests, and of each that it could not be
+# sent: with the link down nothing is given to the card. (A request was
+# taken and counted as sent and lost; on real hardware each one waited
+# in the kernel, with every processor, for a card that sends nothing.)
 type_line 'ping -c 1 10.0.2.2; echo unplugged $?'
 wait_for '^ping: the network link is down (no cable, or it is still coming up)$'
-wait_for '^no answer for seq=1 (the network link is down)$'
-wait_for '^--- 1 sent, 0 received, 100% lost$'
+wait_for '^seq=1 could not be sent: the network link is down$'
+wait_for '^--- 0 sent, 0 received, 1 could not be sent$'
 wait_for '^unplugged 1$'
-# (And of a neighbour not spoken to yet, whose request the kernel kept
-# and gave up: that the link is down, not that nobody answered for the
-# hardware address, which nobody could.)
+# (And of a neighbour not spoken to yet: the same, not that nobody
+# answered for its hardware address, which nobody could.)
 type_line 'ping -c 1 10.0.2.9; echo unplugged-stranger $?'
-wait_for '^no answer from 10.0.2.9 (the network link is down)$'
+wait_for '^seq=1 could not be sent: the network link is down$' 2
 wait_for '^unplugged-stranger 1$'
-echo "ok   with the cable pulled ping says the link is down, ahead and with the request that has no answer"
-# The cable back in: the link is up again, and the address, whose lease
-# runs on, is still the link's (nothing is said: nothing changed).
+if output | grep -q '^no answer '; then fail "with the cable pulled a request counted as sent: $(output | grep '^no answer ' | head -n 1)"; fi
+# A connection, a datagram and an echo are refused at once as
+# unreachable (status 27), and wget says why.
+type_line 'netcalls nowhere 10.0.2.2'
+for expected in '^nowhere: connect 27$' '^nowhere: datagram 27$' '^nowhere: echo 27$'; do
+    wait_for "$expected"
+done
+type_line "wget http://10.0.2.2:$port/hello.txt -O /temporary/unplugged; echo unplugged-wget \$?"
+wait_within '^wget: cannot fetch http://10.0.2.2:[0-9]*/hello.txt: cannot connect: the network link is down$' 10 "wget with the cable pulled"
+wait_for '^unplugged-wget 1$'
+echo "ok   with the cable pulled ping says the link is down, ahead and of each request that it could not be sent; a connection is refused at once, and wget says that the link is down"
+# The cable back in: the kernel's log says so, with the speed. The
+# address is still the link's (nothing is said of it: nothing changed),
+# and DHCP begins again: the lease is asked for anew, of everyone, from
+# the address held (the cable may be in another network now).
+lease_left() { output | sed -n 's/^lease 86400 s, \([0-9]*\) s left$/\1/p' | tail -n 1; }
+left_before=$(lease_left)
 monitor "set_link n0 on"
+wait_for '^net0: the link is up, 1000 Mbit/s full duplex' 2
+for (( i = 0; i < 100; i++ )); do
+    (( $(frames_of "$work/frames.pcap" | grep -c '^ip 10\.0\.2\.15>255\.255\.255\.255 udp 68>67$' || true) >= 1 )) && break
+    sleep 0.1
+done
+(( $(frames_of "$work/frames.pcap" | grep -c '^ip 10\.0\.2\.15>255\.255\.255\.255 udp 68>67$' || true) >= 1 )) || fail "with the cable back in DHCP did not ask for its lease anew"
 dones=$(output | grep -c '^done$' || true)
 for (( i = 0; i < 100; i++ )); do
     type_line 'netcalls links'
@@ -185,23 +221,28 @@ wait_for '^link net0: igb 52:54:00:12:34:56 up$' 2
 type_line 'ping -c 1 10.0.2.2; echo back $?'
 wait_for '^back 0$'
 (( $(output | grep -c '^brixOS: net0 is ') == 1 )) || fail "the kernel says the address again though nothing changed"
-echo "ok   with the cable back the link is up, the address is kept and the gateway answers"
+leases=$(output | grep -c '^lease 86400 s, [0-9]* s left$' || true)
+type_line 'netcalls links'
+wait_for '^lease 86400 s, [0-9]* s left$' $((leases + 1))
+left_after=$(lease_left)
+(( left_after > left_before )) || fail "the lease was not renewed when the cable came back: $left_before s were left before, $left_after s after"
+echo "ok   with the cable back the kernel's log says that the link is up, DHCP asks for the lease anew and it runs from now ($left_before s were left, $left_after s are), the address is kept and the gateway answers"
 # The cable pulled while a ping runs: each request from then on says
-# that the link is down (the link as it is when the request stays without
-# an answer, not as it was at the start: these lines were bare "no
-# answer", as from a host that is silent); back in, the replies come
+# that it could not be sent, the link being down (the link as it is at
+# that request, not as it was at the start); back in, the replies come
 # again, and Ctrl+C ends the run with what was lost.
 type_line 'ping 10.0.2.2; echo during $?'
 replies=$(output | grep -c '^64 bytes from 10.0.2.2: seq=[0-9]* time=[0-9.]* ms$' || true)
 wait_for '^64 bytes from 10.0.2.2: seq=[0-9]* time=[0-9.]* ms$' $((replies + 2))
+unsent=$(output | grep -c '^seq=[0-9]* could not be sent: the network link is down$' || true)
 monitor "set_link n0 off"
-wait_for '^no answer for seq=[0-9]* (the network link is down)$' 3
+wait_for '^seq=[0-9]* could not be sent: the network link is down$' $((unsent + 3))
 monitor "set_link n0 on"
 replies=$(output | grep -c '^64 bytes from 10.0.2.2: seq=[0-9]* time=[0-9.]* ms$' || true)
 wait_for '^64 bytes from 10.0.2.2: seq=[0-9]* time=[0-9.]* ms$' $((replies + 2))
 printf '\003' >&3
 wait_for '^during 1$'
-echo "ok   the cable pulled while a ping runs: the requests without an answer say that the link is down, and the replies come again when it is back"
+echo "ok   the cable pulled while a ping runs: the requests from then on say that they could not be sent, the link being down, and the replies come again when it is back"
 # The DHCP server's answer comes late: QEMU starts with the cable out
 # (set_link off before the machine runs: no frame gets through), the
 # boot says there is no address yet, and when the cable is in (the
@@ -238,4 +279,36 @@ done
 type_line 'ping -c 1 10.0.2.2; echo late $?'
 wait_for '^late 0$'
 echo "ok   a DHCP answer that comes after the boot, on igb (the cable in late): the kernel says the address then, and the record and a ping follow"
+# A fixed address, and a ping typed at the first prompt. QEMU's card has
+# its link a third of a second after the driver started it; the boot
+# waits for a link that is coming up (half a second at most), so the
+# first program finds it up. (The boot went on at once, and ping said
+# that the network link is down: true for the quarter second it was.)
+exec 3>&-
+kill "$qemu_pid" 2> /dev/null || true
+wait "$qemu_pid" 2> /dev/null || true
+: > "$work/serial.txt"
+rm -f "$work/monitor"
+qemu-system-x86_64 -machine q35 -m 256M -display none -monitor "unix:$work/monitor,server,nowait" -no-reboot -cpu max -serial stdio \
+    -kernel "$work/static.img" -netdev user,id=n0 -device igb,netdev=n0 < "$work/input" > "$work/serial.txt" 2>&1 &
+qemu_pid=$!
+exec 3> "$work/input"
+prompts=0
+wait_for '^net0: the link is up, 1000 Mbit/s full duplex$'
+wait_for '^brixOS: net0 is 10.0.2.77, gateway 10.0.2.2, name server none$'
+# (The boot's own line for the link says it up, and before the address:
+# a boot that does not wait says "net0: the link is down" there, and
+# the link's coming is a second line after the address. The ping below
+# cannot tell the two apart: before a line is typed here the link is
+# up either way.)
+(( $(output | grep -c '^net0: the link is down$' || true) == 0 )) || fail "the boot went on before the link was up: its log says the link down first"
+order=$(output | awk '/^net0: the link is up, 1000 Mbit\/s full duplex$/ && !link { link = NR } /^brixOS: net0 is 10\.0\.2\.77/ && !address { address = NR } END { print (link && address && link < address) ? "link first" : "address first" }')
+[[ $order == "link first" ]] || fail "the boot said its address before it said the link up"
+type_line 'ping -c 1 10.0.2.2; echo first $?'
+wait_for '^--- 1 sent, 1 received, 0% lost$'
+wait_for '^first 0$'
+if output | grep -q '^ping: the network link is down'; then fail "at the first prompt ping says that the network link is down"; fi
+type_line 'netcalls links'
+wait_for '^link net0: igb 52:54:00:12:34:56 up$'
+echo "ok   with a fixed address the boot has waited for the link (its log says the link up, before the address, and never down): a ping at the first prompt is answered, and does not say that the link is down"
 echo PASS

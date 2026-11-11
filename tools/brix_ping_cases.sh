@@ -1,12 +1,52 @@
 # ping as a person types it, on QEMU's user network (the guest is
 # 10.0.2.15, the gateway 10.0.2.2, the name server 10.0.2.3; nobody else
 # has an address): the cases tools/check_brix_net.sh and
-# tools/check_brix_net_igb.sh both go through, each on its card. Sourced
+# tools/check_brix_net_igb.sh both go through, each on its card, and what
+# both read QEMU's capture of the frames with (frames_of) and wait for a
+# line that is to come soon with (wait_within). Sourced
 # by them: it uses their type_line, wait_for, output, fail and $work.
 # QEMU captures the network's frames in $work/frames.pcap (-object
 # filter-dump), and the image's hosts file names 10.0.2.2 gateway.test.
 # The cases come straight after the boot: nothing has been sent to the
 # name server yet.
+
+# The frames QEMU captured on a network (the file $1), a line each: an
+# ARP message as "arp SENDER>TARGET", an IPv4 packet as "ip
+# SOURCE>DESTINATION", UDP's with its ports after it. With "everyone" as
+# $2: only the frames that went to everyone's hardware address.
+frames_of() {
+    python3 - "$1" "${2:-}" <<'PY'
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+at = 24
+dotted = lambda raw: ".".join(str(part) for part in raw)
+while at + 16 <= len(data):
+    size = struct.unpack("<I", data[at + 8:at + 12])[0]
+    frame = data[at + 16:at + 16 + size]
+    at += 16 + size
+    if sys.argv[2] == "everyone" and frame[0:6] != b"\xff" * 6:
+        continue
+    if len(frame) >= 42 and frame[12:14] == b"\x08\x06":
+        print("arp %s>%s" % (dotted(frame[28:32]), dotted(frame[38:42])))
+    elif len(frame) >= 34 and frame[12:14] == b"\x08\x00":
+        header = (frame[14] & 15) * 4
+        ports = ""
+        if frame[23] == 17 and len(frame) >= 14 + header + 4:
+            ports = " udp %d>%d" % struct.unpack(">HH", frame[14 + header:14 + header + 4])
+        print("ip %s>%s%s" % (dotted(frame[26:30]), dotted(frame[30:34]), ports))
+PY
+}
+
+# The line $1 is on the serial line within $2 seconds of now ($3 says
+# what it is that takes too long otherwise).
+wait_within() {
+    local tries=0
+    while (( $(output | grep -c -- "$1" || true) < 1 )); do
+        (( tries++ < $2 * 10 )) || fail "$3: no \"$1\" within $2 s"
+        kill -0 "$qemu_pid" 2> /dev/null || fail "QEMU ended"
+        sleep 0.1
+    done
+}
 
 # The addresses the guest's echo requests went to, by the frames QEMU
 # captured on its network (sorted, a blank between).
