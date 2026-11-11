@@ -493,9 +493,17 @@ The kernel's stack (kernel/net) runs on it:
   waits on the handle (READABLE, WRITABLE, PEER_GONE, ENDED). A packet
   to our own address goes through the stack at once (a loopback), so a
   program may talk to itself.
-- ping (projects/ping): `ping HOST [COUNT]` on a datagram socket of
-  IPPROTO_ICMP (the kernel sets the identifier; Linux's ping sockets
-  work the same).
+- ping (projects/ping): `ping [-c COUNT] HOST` (an echo request a
+  second until Ctrl+C or COUNT of them; a line for each reply with its
+  time, one for each request without an answer, then the loss and the
+  least, mean and greatest time), on a ping socket by brixOS's own calls
+  (host.brixos.mlx: socket_open's kind 3, the one wait, the interrupt
+  event; host.mlx is Linux's datagram socket of IPPROTO_ICMP). The
+  kernel sets the identifier and gives the socket its replies, and
+  ICMP's word that a request was not delivered. The destination is the
+  address given with the send (its port means nothing); would_block
+  says the neighbour's hardware address is being asked for, and ping
+  sends again. 127.0.0.0/8 is answered by the machine's own address.
 - link.mlx: the link's state for programs. /devices/net0 is a node of a
   kind of its own (as /devices/framebuffer is the display's): a read
   gives the link's record as things are at that moment (spec
@@ -517,14 +525,22 @@ address, driver, the frames; and how to give a fixed address
 (/system/settings/network, read at boot). Nothing is changed from the
 page yet.
 
-tools/check_brix_net.sh boots with the user network: DHCP, ping to the
-gateway, wget fetching files (a small one, a 400 KiB one, a missing one)
-from an HTTP server on the host, the native calls (a stream to
-ourselves, a datagram, an echo), and the link's record as netcalls reads
-it; then again on a wire without a DHCP server (no address yet), on
-another network (192.168.76.0/26: the record has what that DHCP server
-answered, not what the stack starts with) and with a fixed address in
-the settings file. tools/check_brix_desktop.sh opens
+tools/check_brix_net.sh boots with the user network: DHCP, ping as a
+person types it (tools/brix_ping_cases.sh, which the igb check goes
+through too: a neighbour not spoken to yet, the gateway, an address
+nobody has, the machine itself, a name, the count's forms, two at once,
+forty in a row, Ctrl+C; QEMU's capture of the frames says where the
+echo requests went), wget fetching files (a small one, a 400 KiB one, a
+missing one) from an HTTP server on the host, the native calls (a
+stream to ourselves, a datagram, an echo), and the link's record as
+netcalls reads it; then again on a wire without a DHCP server (no
+address yet), on another network (192.168.76.0/26: the record has what
+that DHCP server answered, not what the stack starts with), with a
+fixed address in the settings file, and on a network of the check's own
+(tools/brix_lan.py at the other end of QEMU's socket network: a name
+server, replies later than a second, a reply twice, a neighbour slow to
+say its hardware address, a router that says a host cannot be
+reached). tools/check_brix_desktop.sh opens
 the Network page and pulls the cable. Not yet: IPv6, a lease's renewal,
 a second link, the configuration changed while the system runs.
 

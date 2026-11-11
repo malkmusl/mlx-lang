@@ -4,12 +4,15 @@
 # opposed to the virtio-net device the other net check uses. QEMU's user
 # network (the guest is 10.0.2.15, the host 10.0.2.2, a name server at
 # 10.0.2.3); the kernel's stack, Linux's socket calls for std.net, and
-# wget fetching files from an HTTP server on the host; ping to the
-# gateway; brixOS's own socket calls; the link's state as a program reads
-# it from the kernel (/devices/net0's record: the cable and the speed
-# from the device's status register, also once QEMU's monitor has pulled
-# the cable). The device's frames come by its message-signalled interrupt
-# (MSI); the timer tick looks at its ring as well.
+# wget fetching files from an HTTP server on the host; ping as a person
+# types it (tools/brix_ping_cases.sh: the cases the virtio check goes
+# through too, with QEMU's capture of the frames saying where the echo
+# requests went); brixOS's own socket calls; the link's state as a
+# program reads it from the kernel (/devices/net0's record: the cable
+# and the speed from the device's status register, also once QEMU's
+# monitor has pulled the cable, when ping says the link is down). The
+# device's frames come by its message-signalled interrupt (MSI); the
+# timer tick looks at its ring as well.
 #
 #   tools/check_brix_net_igb.sh [compiler]
 set -euo pipefail
@@ -47,7 +50,10 @@ mkdir -p "$work/bin" "$work/www"
 for program in cat wc echo sha256sum; do
     "$compiler" --quiet $brix "projects/coreutils/$program/main.mlx" -o "$work/bin/$program"
 done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "sysinfo=$work/sysinfo" "$work/bin/"
+# (A name of the hosts file for ping: QEMU's name server asks the host's
+# resolver, which the machine this runs on may not have.)
+printf '10.0.2.2 gateway.test\n' > "$work/hosts"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "wget=$work/wget" "ping=$work/ping" "netcalls=$work/netcalls" "sysinfo=$work/sysinfo" "settings/hosts=$work/hosts" "$work/bin/"
 echo "ok   the kernel, wget, ping, netcalls and a boot image build"
 
 # The host's HTTP server on a port of its own.
@@ -66,10 +72,12 @@ rm -f "$work/input"
 mkfifo "$work/input"
 : > "$work/serial.txt"
 qemu-system-x86_64 -machine q35 -m 256M -display none -monitor "unix:$work/monitor,server,nowait" -no-reboot -cpu max -serial stdio \
-    -kernel "$work/brix.img" -netdev user,id=n0 -device igb,netdev=n0 < "$work/input" > "$work/serial.txt" 2>&1 &
+    -kernel "$work/brix.img" -netdev user,id=n0 -device igb,netdev=n0 -object "filter-dump,id=d0,netdev=n0,file=$work/frames.pcap" < "$work/input" > "$work/serial.txt" 2>&1 &
 qemu_pid=$!
 exec 3> "$work/input"
 output() { sed 's/\x1b\[K//g' "$work/serial.txt" | tr '\r' '\n'; }
+# ping's cases on this network (ping_cases).
+source tools/brix_ping_cases.sh
 wait_for() {
     local tries=0 want=${2:-1}
     while (( $(output | grep -c -- "$1" || true) < want )); do
@@ -89,15 +97,12 @@ wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DH
 type_line 'cat /system/settings/resolv.conf'
 wait_for '^nameserver 10.0.2.3$'
 echo "ok   the igb network device is found, the stack configured by DHCP from QEMU's user network, resolv.conf written"
-type_line 'ping 10.0.2.2 2; echo ping $?'
-wait_for '^[0-9]* bytes from 10.0.2.2: seq=1 time=[0-9.]* ms$'
-wait_for '^--- 2 sent, 2 received$'
-wait_for '^ping 0$'
+ping_cases
 type_line 'netcalls; echo netcalls $?'
-for expected in '^socket kind 9$' '^connect 0$' '^client writable (connected) 2$' '^listener readable (a connection waits) 1$' '^the peer is ourselves$' '^received 5$' '^hello$' '^read 5$' '^client sees the end (peer gone) 4$' '^receive at the end 0$' '^datagram received 5$' '^from port 4712$' '^echo answered 1$' '^an echo reply$' '^netcalls 0$'; do
+for expected in '^socket kind 9$' '^connect 0$' '^client writable (connected) 2$' '^listener readable (a connection waits) 1$' '^the peer is ourselves$' '^received 5$' '^hello$' '^read 5$' '^client sees the end (peer gone) 4$' '^receive at the end 0$' '^datagram received 5$' '^from port 4712$' '^echo answered 1$' '^an echo reply$' '^echo from 10.0.2.2$' '^netcalls 0$'; do
     wait_for "$expected"
 done
-echo "ok   ping gets its echoes; the native socket calls over igb: a stream to ourselves, a datagram, an echo"
+echo "ok   the native socket calls over igb: a stream to ourselves, a datagram, an echo answered by the gateway it was sent to"
 # The link's state, read natively from /devices/net0: the cable and the
 # speed are the device's status register's.
 for expected in '^link net0: igb 52:54:00:12:34:56 up$' '^speed 1000$' '^configured by DHCP$' '^address 10.0.2.15 mask 255.255.255.0$' '^gateway 10.0.2.2 name server 10.0.2.3$' '^frames received [1-9][0-9]* sent [1-9][0-9]*$' '^no link net1: 6$' '^record: 64 bytes, its length word 64, kind 5$'; do
@@ -139,4 +144,10 @@ PY
 type_line 'netcalls links'
 wait_for '^link net0: igb 52:54:00:12:34:56 no cable$'
 echo "ok   with the cable pulled the igb link's record says no cable"
+# ping says so ahead of its requests, which nobody answers.
+type_line 'ping -c 1 10.0.2.2; echo unplugged $?'
+wait_for '^ping: the network link is down (no cable, or it is still coming up)$'
+wait_for '^--- 1 sent, 0 received, 100% lost$'
+wait_for '^unplugged 1$'
+echo "ok   with the cable pulled ping says the link is down, and has no answer"
 echo PASS

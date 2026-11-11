@@ -1,136 +1,556 @@
-// ping HOST [COUNT]: ICMP echo requests to HOST (an address or a name),
-// one a second, COUNT of them (4), each reply's round trip said; the
-// summary at the end. On a datagram socket of IPPROTO_ICMP (Linux's
-// ping sockets, brixOS's too: the kernel sets the identifier); 0 when
-// every request was answered, 1 otherwise.
+// ping [-c COUNT] HOST: ICMP echo requests to HOST (an IPv4 address or a
+// name), one a second, until Ctrl+C or COUNT of them; a line for each
+// reply with its round trip, a line for each request without one, and
+// at the end the summary: how many were sent and answered, the loss in
+// percent, the least, mean and greatest round trip. The count may stand
+// before or after the host ("-c 3", "-c3", or as before "HOST 3"). 0
+// when every request was answered, 1 otherwise; what went wrong is said
+// on standard error.
+//
+// Without a count ping goes on until it is interrupted (Ctrl+C ends it
+// with the summary), as it does where people know it from: a line that
+// comes and goes shows only in a run that does not stop by itself after
+// four requests.
+//
+// A reply is told by its sequence number, whenever it comes: one that
+// comes after its second is said late, not taken for another request's
+// and not lost (at the end of a count, where replies came late, the
+// missing ones are waited for a little longer). A request the system
+// cannot send yet (brixOS's kernel asks for the neighbour's hardware
+// address first) is tried again for the rest of its second, and when it
+// never went ping says whose hardware address nobody answered for.
+//
+// The socket, the wait and the interrupt are the system's (host.mlx:
+// Linux's ping socket; host.brixos.mlx: brixOS's own calls).
 const std = @import("std")
 const crash = @import("std.crash")
 const net = @import("std.net")
-const socket = std.linux.socket
-const event = std.linux.event
+const host = @import("./host.mlx")
 
-fn say(text: []const u8) -> void { _ = std.linux.write(1, text.pointer, text.length) }
+const MILLISECOND: usize = 1000000
+const SECOND: usize = 1000000000
+// An echo request: ICMP's 8 bytes and 56 of data.
+const MESSAGE: usize = 64
+// The requests remembered for their replies: one that comes more than
+// this many seconds late is not known any more.
+const WINDOW: usize = 64
 
-fn sayNumber(value: usize) -> void {
-    var buffer: [20]u8 = undefined
-    var n = value
-    var count: usize = 0
-    while true {
-        buffer[19 - count] = @intCast(u8, 48 + n % 10)
-        count += 1
-        n /= 10
-        if n == 0 { break }
+// What became of a request: not sent yet (the system says later), sent
+// and waited for, said to have no answer (its reply may still come),
+// answered, or refused (a router said it cannot be delivered).
+const State = enum(u8) { none, unsent, waiting, given_up, answered, refused }
+
+const Request = struct {
+    number: usize
+    sentAt: usize
+    state: State
+}
+
+var requests: [WINDOW]Request = undefined // (per run)
+var sent: usize = 0 // (per run)
+var received: usize = 0 // (per run)
+// The round trips: the least, the greatest, their sum (nanoseconds).
+var least: usize = 0 // (per run)
+var greatest: usize = 0 // (per run)
+var total: usize = 0 // (per run)
+// A reply came after its request was said to have no answer.
+var lateSeen: bool = false // (per run)
+
+// A line of output, written whole (two pings at once do not mix theirs).
+const Line = struct {
+    bytes: [256]u8
+    length: usize
+
+    fn text(self: *Self, value: []const u8) -> void {
+        for byte in value {
+            if self.*.length < 256 {
+                self.*.bytes[self.*.length] = byte
+                self.*.length += 1
+            }
+        }
     }
-    say(buffer[20 - count..20])
+
+    fn number(self: *Self, value: usize) -> void {
+        var digits: [20]u8 = undefined
+        var rest = value
+        var count: usize = 0
+        while true {
+            digits[19 - count] = @intCast(u8, 48 + rest % 10)
+            count += 1
+            rest /= 10
+            if rest == 0 { break }
+        }
+        self.text(digits[20 - count..20])
+    }
+
+    fn address(self: *Self, value: [4]u8) -> void {
+        var k: usize = 0
+        while k < 4 {
+            if k > 0 { self.text(".") }
+            self.number(@intCast(usize, value[k]))
+            k += 1
+        }
+    }
+
+    // Nanoseconds as milliseconds, three figures or so of them:
+    // "0.045 ms", "1.23 ms", "12.3 ms", "123 ms".
+    fn time(self: *Self, nanoseconds: usize) -> void {
+        const microseconds = nanoseconds / 1000
+        self.number(microseconds / 1000)
+        const places: usize = if microseconds < 1000 { 3 } else if microseconds < 10000 { 2 } else if microseconds < 100000 { 1 } else { 0 }
+        if places > 0 {
+            self.text(".")
+            var divisor: usize = 100
+            var place: usize = 0
+            while place < places {
+                self.number((microseconds / divisor) % 10)
+                divisor /= 10
+                place += 1
+            }
+        }
+        self.text(" ms")
+    }
+
+    // The line written, and empty again.
+    fn end(self: *Self) -> void {
+        self.text("\n")
+        _ = std.io.print(self.*.bytes[0..self.*.length])
+        self.*.length = 0
+    }
+
+    // The same on standard error: what went wrong, what stands in the
+    // way.
+    fn complain(self: *Self) -> void {
+        self.text("\n")
+        _ = std.io.eprint(self.*.bytes[0..self.*.length])
+        self.*.length = 0
+    }
 }
 
-fn sayAddress(a: *const net.Address) -> void {
-    var text: [64]u8 = undefined
-    const length = net.writeAddress(a, text[0..64])
-    say(text[0..length])
+var line: Line = undefined // (per run)
+
+// The usage: asked for (-h) on standard output, else on standard error.
+fn usage(asked: bool) -> void {
+    line.text("usage: ping [-c COUNT] HOST\n")
+    line.text("an echo request a second to HOST (an address or a name), until Ctrl+C\n")
+    line.text("or COUNT of them; then how many were answered and how long they took")
+    if asked { line.end() } else { line.complain() }
 }
 
-fn now() -> usize { return std.time.monotonicNanoseconds() }
+// A count as text: its number, or 0 when it is none (a count is a
+// number from 1 on).
+fn countOf(text: []const u8) -> usize {
+    if text.length == 0 || text.length > 9 { return 0 }
+    var value: usize = 0
+    for digit in text {
+        if digit < 48 || digit > 57 { return 0 }
+        value = value * 10 + @intCast(usize, digit - 48)
+    }
+    return value
+}
+
+fn onlyDigits(text: []const u8) -> bool {
+    for byte in text {
+        if byte < 48 || byte > 57 { return false }
+    }
+    return text.length > 0
+}
+
+// Whether `text` can only be meant as an IPv4 address (digits and dots).
+fn looksLikeAddress(text: []const u8) -> bool {
+    for byte in text {
+        if (byte < 48 || byte > 57) && byte != 46 { return false }
+    }
+    return text.length > 0
+}
+
+// Whether `text` has a colon (an IPv6 address as it is written).
+fn hasColon(text: []const u8) -> bool {
+    for byte in text {
+        if byte == 58 { return true }
+    }
+    return false
+}
+
+// The echo request with sequence number `number` (the identifier and
+// the checksum are the system's to set).
+fn message(number: usize, into: *[MESSAGE]u8) -> void {
+    var k: usize = 0
+    while k < MESSAGE {
+        into.*[k] = @intCast(u8, 48 + k % 10)
+        k += 1
+    }
+    into.*[0] = 8
+    into.*[1] = 0
+    into.*[2] = 0
+    into.*[3] = 0
+    into.*[4] = 0
+    into.*[5] = 0
+    into.*[6] = @intCast(u8, (number >> 8) & 255)
+    into.*[7] = @intCast(u8, number & 255)
+}
+
+// The request whose sequence number on the wire is `sequence`, if it is
+// remembered.
+fn requestOf(sequence: usize) -> ?*Request {
+    var k: usize = 0
+    while k < WINDOW {
+        if requests[k].state != State.none && (requests[k].number & 0xFFFF) == sequence { return &requests[k] }
+        k += 1
+    }
+    return null
+}
+
+// An echo reply of `length` bytes from `from`, taken at `at`.
+fn echoed(from: [4]u8, length: usize, sequence: usize, at: usize) -> void {
+    const found = requestOf(sequence)
+    if found == null { return }
+    const request = found.?
+    if request.*.state == State.unsent { return }
+    const trip = if at > request.*.sentAt { at - request.*.sentAt } else { 0 }
+    line.number(length)
+    line.text(" bytes from ")
+    line.address(from)
+    line.text(": seq=")
+    line.number(request.*.number)
+    line.text(" time=")
+    line.time(trip)
+    if request.*.state == State.answered {
+        // The same reply once more (a network may give one twice):
+        // shown, not counted.
+        line.text(" (again)")
+        line.end()
+        return
+    }
+    if request.*.state != State.waiting {
+        line.text(" (late)")
+        lateSeen = true
+    }
+    line.end()
+    request.*.state = State.answered
+    if received == 0 || trip < least { least = trip }
+    if trip > greatest { greatest = trip }
+    total += trip
+    received += 1
+}
+
+// What a router says when it cannot deliver (ICMP's destination
+// unreachable, by its code).
+fn unreachableText(code: u8) -> []const u8 {
+    if code == 0 { return "the network cannot be reached" }
+    if code == 1 { return "the host cannot be reached" }
+    if code == 2 || code == 3 { return "the host does not take echo requests" }
+    if code == 4 { return "the request is too large for a link on the way" }
+    if code == 9 || code == 10 || code == 13 { return "the way there is closed (a filter)" }
+    return "it cannot be reached"
+}
+
+// An ICMP error from `from` about one of our requests (`bytes`: the
+// error's 8 bytes, then the IP header and the first bytes of what it is
+// about): said once, in place of "no answer".
+fn refused(from: [4]u8, bytes: []const u8) -> void {
+    if bytes.length < 8 + 20 + 8 { return }
+    const header = @intCast(usize, bytes[8] & 15) * 4
+    if header < 20 || bytes.length < 8 + header + 8 || bytes[8 + 9] != 1 || bytes[8 + header] != 8 { return }
+    const sequence = (@intCast(usize, bytes[8 + header + 6]) << 8) | @intCast(usize, bytes[8 + header + 7])
+    const found = requestOf(sequence)
+    if found == null { return }
+    const request = found.?
+    if request.*.state != State.waiting && request.*.state != State.given_up { return }
+    line.text("from ")
+    line.address(from)
+    line.text(": seq=")
+    line.number(request.*.number)
+    line.text(if bytes[0] == 11 { " was dropped: too many routers on the way" } else { " was not delivered: " })
+    if bytes[0] != 11 { line.text(unreachableText(bytes[1])) }
+    line.end()
+    request.*.state = State.refused
+}
+
+// Every datagram that waits at the socket.
+fn takeReplies() -> void {
+    var reply: [600]u8 = undefined
+    while true {
+        var from: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+        const got = host.receive(reply[0..600], &from)
+        if got < 0 { return }
+        const at = host.now()
+        const length = @bitCast(usize, got)
+        if length < 8 { continue }
+        if reply[0] == 0 && reply[1] == 0 {
+            echoed(from, length, (@intCast(usize, reply[6]) << 8) | @intCast(usize, reply[7]), at)
+        } else if reply[0] == 3 || reply[0] == 11 {
+            refused(from, reply[0..length])
+        }
+    }
+}
+
+// Whether `a` and `b` are on one subnet of `mask`.
+fn sameNet(a: [4]u8, b: [4]u8, mask: [4]u8) -> bool {
+    var k: usize = 0
+    while k < 4 {
+        if (a[k] & mask[k]) != (b[k] & mask[k]) { return false }
+        k += 1
+    }
+    return true
+}
+
+// The requests without an answer, in percent of those sent: rounded,
+// but never 0 when one was lost and never 100 when one was answered.
+fn lossPercent() -> usize {
+    if sent == 0 || received >= sent { return 0 }
+    const percent = ((sent - received) * 100 + sent / 2) / sent
+    if percent == 0 { return 1 }
+    if percent == 100 && received > 0 { return 99 }
+    return percent
+}
+
+// A request that never went: the system said later for its whole
+// second. On brixOS that is the kernel asking for a hardware address
+// nobody answers for: the host's own on our network, else the
+// gateway's.
+fn neverSent(target: [4]u8, number: usize, side: *const host.Side) -> void {
+    if !side.*.known {
+        line.text("seq=")
+        line.number(number)
+        line.text(" could not be sent")
+        line.end()
+        return
+    }
+    line.text("no answer from ")
+    line.address(target)
+    if sameNet(target, side.*.address, side.*.mask) {
+        line.text(" (its hardware address is not known: nobody answered for it)")
+    } else {
+        line.text(" (the hardware address of the gateway ")
+        line.address(side.*.gateway)
+        line.text(" is not known: nobody answered for it)")
+    }
+    line.end()
+}
+
+// How many requests that went have no answer so far.
+fn missing() -> usize {
+    var count: usize = 0
+    var k: usize = 0
+    while k < WINDOW {
+        if requests[k].state == State.waiting || requests[k].state == State.given_up { count += 1 }
+        k += 1
+    }
+    return count
+}
+
+// The requests, one a second, `wanted` of them (0: until interrupted).
+fn run(target: [4]u8, wanted: usize, side: *const host.Side) -> void {
+    var k: usize = 0
+    while k < WINDOW {
+        requests[k].state = State.none
+        k += 1
+    }
+    var number: usize = 1
+    while (wanted == 0 || number <= wanted) && !host.stopAsked() {
+        const request = &requests[number % WINDOW]
+        request.*.number = number
+        request.*.sentAt = 0
+        request.*.state = State.unsent
+        sent += 1
+        var bytes: [MESSAGE]u8 = undefined
+        message(number, &bytes)
+        const end = host.now() + SECOND
+        // When the send is tried next, and the pause before the try
+        // after it (longer each time: every try has the kernel ask for
+        // the address again).
+        var nextTry: usize = 0
+        var pause: usize = 10 * MILLISECOND
+        var failed = false
+        while true {
+            var current = host.now()
+            if request.*.state == State.unsent && !failed && current >= nextTry {
+                const result = host.send(bytes[0..MESSAGE], target)
+                current = host.now()
+                if result == host.LATER {
+                    nextTry = current + pause
+                    if pause < 200 * MILLISECOND { pause *= 2 }
+                } else if result < 0 {
+                    failed = true
+                } else {
+                    request.*.sentAt = current
+                    request.*.state = State.waiting
+                }
+            }
+            // The last one answered: nothing more to wait for.
+            if wanted != 0 && number == wanted && (request.*.state == State.answered || request.*.state == State.refused) { break }
+            if current >= end { break }
+            const until = if request.*.state == State.unsent && !failed && nextTry < end { nextTry } else { end }
+            const waited = host.wait(until)
+            if waited == host.Waited.interrupted { break }
+            if waited == host.Waited.readable { takeReplies() }
+        }
+        if host.stopAsked() { break }
+        if request.*.state == State.unsent {
+            if failed {
+                line.text("seq=")
+                line.number(number)
+                line.text(" could not be sent")
+                line.end()
+            } else {
+                neverSent(target, number, side)
+            }
+            request.*.state = State.none
+        } else if request.*.state == State.waiting {
+            line.text("no answer for seq=")
+            line.number(number)
+            line.end()
+            request.*.state = State.given_up
+        }
+        number += 1
+    }
+    // The end of a count on a slow way: where replies came late, those
+    // still missing are waited for a little longer (twice the greatest
+    // round trip, five seconds at most) and not counted lost with the
+    // last second.
+    if lateSeen && !host.stopAsked() {
+        const linger = if 2 * greatest < 5 * SECOND { 2 * greatest } else { 5 * SECOND }
+        const until = host.now() + linger
+        while missing() > 0 && host.now() < until {
+            const waited = host.wait(until)
+            if waited == host.Waited.interrupted { break }
+            if waited == host.Waited.readable { takeReplies() }
+        }
+    }
+}
 
 pub fn main(arguments: [][*]const u8) -> u8 {
     _ = crash.install()
+    line.length = 0
     const count = std.process.count(arguments)
-    if count < 2 {
-        say("usage: ping HOST [COUNT]\n")
-        return 1
-    }
-    const host = std.string.asSlice(std.process.argument(arguments, 1))
-    var wanted: usize = 4
-    if count > 2 {
-        wanted = 0
-        for digit in std.string.asSlice(std.process.argument(arguments, 2)) {
-            if digit < 48 || digit > 57 {
-                say("ping: COUNT is a number\n")
+    var name: []const u8 = ""
+    var wanted: usize = 0
+    var counted = false
+    var k: usize = 1
+    while k < count {
+        const argument = std.string.asSlice(std.process.argument(arguments, k))
+        k += 1
+        // "-c COUNT", "-cCOUNT".
+        if argument.length >= 2 && argument[0] == 45 && argument[1] == 99 {
+            var text = argument[2..argument.length]
+            if text.length == 0 && k < count {
+                text = std.string.asSlice(std.process.argument(arguments, k))
+                k += 1
+            }
+            wanted = countOf(text)
+            if wanted == 0 || counted {
+                line.text(if counted { "ping: one count is enough" } else { "ping: the count is a number from 1 on" })
+                line.complain()
                 return 1
             }
-            wanted = wanted * 10 + @intCast(usize, digit - 48)
-        }
-    }
-    var found: [1]net.Address = undefined
-    if net.resolve(host, 0, &found, 1, 5000) == 0 {
-        say("ping: ")
-        say(host)
-        say(": no address\n")
-        return 1
-    }
-    const address = found[0]
-    const fd = socket.open(if address.family == net.Family.ipv4 { socket.AF_INET } else { socket.AF_INET6 }, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC, 1)
-    if fd < 0 {
-        say("ping: cannot open a ping socket\n")
-        return 1
-    }
-    var raw: [28]u8 = undefined
-    const rawBytes: [*]u8 = &raw
-    const rawLength = net.sockaddr(&address, rawBytes)
-    say("PING ")
-    sayAddress(&address)
-    say(": 56 bytes of data\n")
-    var answered: usize = 0
-    var sequence: usize = 1
-    while sequence <= wanted {
-        var request: [64]u8 = undefined
-        var k: usize = 0
-        while k < 64 {
-            request[k] = @intCast(u8, 48 + k % 10)
-            k += 1
-        }
-        request[0] = 8
-        request[1] = 0
-        request[2] = 0
-        request[3] = 0
-        request[4] = 0
-        request[5] = 0
-        request[6] = @intCast(u8, (sequence >> 8) & 255)
-        request[7] = @intCast(u8, sequence & 255)
-        const sent = now()
-        if socket.sendTo(fd, &request, 64, 0, @intFromPtr(rawBytes), rawLength) != 64 {
-            say("ping: cannot send\n")
+            counted = true
+        } else if argument.length > 0 && argument[0] == 45 {
+            // -h, --help, and what ping does not have.
+            const asked = std.text.same(argument, "-h") || std.text.same(argument, "--help")
+            usage(asked)
+            return if asked { 0 } else { 1 }
+        } else if name.length == 0 {
+            name = argument
+        } else if !counted && onlyDigits(argument) {
+            // "HOST COUNT", as it was.
+            wanted = countOf(argument)
+            if wanted == 0 {
+                line.text("ping: the count is a number from 1 on")
+                line.complain()
+                return 1
+            }
+            counted = true
         } else {
-            var got = false
-            while !got && now() - sent < 1000000000 {
-                const left = (1000000000 - (now() - sent)) / 1000000
-                if event.waitReady(fd, false, @intCast(isize, if left == 0 { 1 } else { left })) <= 0 { break }
-                var reply: [128]u8 = undefined
-                const length = socket.receiveFrom(fd, &reply, 128, 0, 0, 0)
-                if length >= 8 && reply[0] == 0 && (@intCast(usize, reply[6]) << 8 | @intCast(usize, reply[7])) == sequence {
-                    const trip = now() - sent
-                    say("")
-                    sayNumber(@bitCast(usize, length))
-                    say(" bytes from ")
-                    sayAddress(&address)
-                    say(": seq=")
-                    sayNumber(sequence)
-                    say(" time=")
-                    sayNumber(trip / 1000000)
-                    say(".")
-                    sayNumber((trip / 100000) % 10)
-                    say(" ms\n")
-                    answered += 1
-                    got = true
-                }
-            }
-            if !got {
-                say("no answer for seq=")
-                sayNumber(sequence)
-                say("\n")
-            }
+            usage(false)
+            return 1
         }
-        if sequence < wanted {
-            const until = sent + 1000000000
-            while now() < until { std.time.sleepNanoseconds(until - now()) }
-        }
-        sequence += 1
     }
-    _ = socket.close(fd)
-    say("--- ")
-    sayNumber(wanted)
-    say(" sent, ")
-    sayNumber(answered)
-    say(" received\n")
-    return if answered == wanted { 0 } else { 1 }
+    if name.length == 0 {
+        usage(false)
+        return 1
+    }
+    // The address: the first IPv4 one (the echo spoken here is IPv4's).
+    var found: [8]net.Address = undefined
+    var why = net.Lookup.found
+    var addresses: usize = 0
+    if looksLikeAddress(name) {
+        if net.parseAddress(name, 0, &found[0]) { addresses = 1 }
+    } else {
+        addresses = net.lookup(name, 0, &found, 8, 5000, &why)
+    }
+    var target: [4]u8 = [4]u8{ 0, 0, 0, 0 }
+    var have = false
+    k = 0
+    while k < addresses && !have {
+        if found[k].family == net.Family.ipv4 {
+            target = [4]u8{ found[k].bytes[0], found[k].bytes[1], found[k].bytes[2], found[k].bytes[3] }
+            have = true
+        }
+        k += 1
+    }
+    if !have {
+        line.text("ping: ")
+        line.text(name)
+        if addresses > 0 {
+            line.text(if hasColon(name) { " is an IPv6 address (ping speaks IPv4)" } else { " has only an IPv6 address (ping speaks IPv4)" })
+        } else if looksLikeAddress(name) {
+            line.text(" is no address (four numbers up to 255 with dots between)")
+        } else if why == net.Lookup.no_server {
+            line.text(": no name server is set to look the name up")
+        } else if why == net.Lookup.no_answer {
+            line.text(": the name server did not answer")
+        } else {
+            line.text(": the name server knows no such name")
+        }
+        line.complain()
+        return 1
+    }
+    const opened = host.open()
+    if opened < 0 {
+        line.text(if opened == host.NO_DEVICE { "ping: this machine has no network device" } else if opened == host.NO_PERMISSION { "ping: no permission for a ping socket (net.ipv4.ping_group_range)" } else { "ping: cannot open a ping socket" })
+        line.complain()
+        return 1
+    }
+    // What stands in the way on this machine's side, said ahead.
+    const side = host.side()
+    if side.known && !side.cable {
+        line.text("ping: the network link is down (no cable, or it is still coming up)")
+        line.complain()
+    } else if side.known && !side.configured {
+        line.text("ping: this machine has no address yet (DHCP is asking)")
+        line.complain()
+    }
+    line.text("PING ")
+    if !looksLikeAddress(name) {
+        line.text(name)
+        line.text(" (")
+        line.address(target)
+        line.text(")")
+    } else {
+        line.address(target)
+    }
+    line.text(": 56 bytes of data")
+    line.end()
+    host.watchStop()
+    run(target, wanted, &side)
+    host.close()
+    line.text("--- ")
+    line.number(sent)
+    line.text(" sent, ")
+    line.number(received)
+    line.text(" received, ")
+    line.number(lossPercent())
+    line.text("% lost")
+    line.end()
+    if received > 0 {
+        line.text("round trip: least ")
+        line.time(least)
+        line.text(", mean ")
+        line.time(total / received)
+        line.text(", greatest ")
+        line.time(greatest)
+        line.end()
+    }
+    return if sent > 0 && received == sent { 0 } else { 1 }
 }
