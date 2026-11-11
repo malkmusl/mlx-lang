@@ -570,6 +570,18 @@ address, driver, the frames; and how to give a fixed address
 (/system/settings/network, read at boot). Nothing is changed from the
 page yet.
 
+The top bar reads the same records (projects/desktop/topbar,
+network.brixos.mlx, in the place of the Linux bar's nexus and
+/sys/class/net) once a second on its tick: its control centre's network
+tile shows "Ethernet" with the address, lit, for the first link that has
+a cable and an address, else "No address yet", "No cable" or "No device";
+the tile's symbol stands as a sign on the bar, left of the control
+centre's toggles; a click on the tile opens the settings on the Network
+page (there is nothing to switch). The bar is drawn again only when
+that changed, and under a compositor run with --verbose it says so
+("horizon: network: net0 connected, 10.0.2.15"; tools/check_brix_nettile.sh
+pulls the cable, and boots without a card and without a DHCP server).
+
 tools/check_brix_net.sh boots with the user network: DHCP, ping as a
 person types it (tools/brix_ping_cases.sh, which the igb check goes
 through too: a neighbour not spoken to yet, the gateway, an address
