@@ -372,6 +372,51 @@ the log and on the serial line only). A fault of the kernel's own stops
 it with a report on the screen (trap.mlx `stop`: what, where, the
 registers, the callers), drawn over whatever is there.
 
+The log is handed to another computer of the same network, without a
+reboot and without a photograph, by logserve
+(projects/brix/tools/logserve). It is no service: a person starts it at
+a terminal when there is something to hand over, and ends it with
+Ctrl+C.
+
+    logserve [PORT]
+
+answers HTTP on the port (8080) and says where: "open
+http://10.10.36.57:8080/all on another computer of this network" (the
+link's address; a link without an address yet or without a cable is
+said, and the address when it has come). A browser or curl there gets
+
+    /all                 everything below in one text, a heading line
+                         ("==== /klog: ... ====") before each part and
+                         "==== end ====" after the last: the one to copy
+                         and send
+    /gpu                 the log's lines that begin with "gpu:" (the
+                         graphics driver's read-out)
+    /klog                the kernel log, whole
+    /boot.log            the files of these names at the top of the
+    /boot.previous.log   mounted volumes, where klogsave writes (a
+                         megabyte of each at most; in /all, a boot.log
+                         that is the beginning of the log above is
+                         named and not repeated)
+    /system              what sysinfo says, and each network link's
+                         record in words
+    /                    a page that lists these
+
+and nothing else: the pages are these fixed ones, read-only (a
+request's path is never opened as a file, every other path is 404,
+methods other than GET and HEAD are refused), and nothing is written.
+While it runs, everyone on the network can read the log; it says so
+when it starts, and each request in a line. Where the other computer
+cannot reach the machine, the machine connects out and writes the /all
+text:
+
+    nc -l 9000 > brix.txt                (on the other computer)
+    logserve send 192.168.1.20 9000      (in brixOS: its address and port)
+
+It uses brixOS's own socket calls and the one wait: several clients at
+a time, each within time limits, so one that says nothing or stops
+reading keeps nobody waiting (tools/check_brix_logserve.sh, on virtio
+and igb; tests/461_logserve_runtime.mlx).
+
 The loader hands the kernel the ACPI tables' root from the firmware's
 configuration table (a UEFI firmware keeps none in the BIOS area), so the
 other processors are found and started there too (smp.mlx: the XSDT, the

@@ -1,0 +1,670 @@
+// logserve: the kernel log and the machine's state handed to another
+// computer of the same network, without a reboot and without a photograph
+// of the screen. The person starts it at the terminal when there is
+// something to hand over; it is no service and nothing starts it.
+//
+//   logserve [PORT]            answers HTTP on PORT (8080) until Ctrl+C:
+//                              on the other computer, a browser or curl
+//                              at http://THIS-MACHINE:8080/all
+//   logserve send HOST PORT    writes the /all text to a listener there
+//                              (the other computer: nc -l PORT > brix.txt)
+//                              and ends: for a network where the other
+//                              computer cannot reach this one
+//
+// What it answers (pages.mlx), each GET or HEAD its own connection:
+//   /                   a page that lists the others
+//   /all                everything below in one text, a heading line
+//                       before each part
+//   /klog               the kernel log (/devices/klog), whole
+//   /gpu                the kernel log's lines that begin with "gpu:"
+//   /boot.log           the logs klogsave wrote to the mounted volumes
+//   /boot.previous.log
+//   /system             what sysinfo says, and each network link's record
+//                       in words
+// Only these, read-only: a request's path is looked up among these names
+// and never opened as a file, anything else is 404, another method is
+// refused (405), as are a head longer than 2048 bytes (431) and what is
+// no HTTP/1 request (400), and nothing is written anywhere. While it
+// runs, everyone on the network can read the log: it says so when it
+// starts, and each request in a line.
+//
+// The network is brixOS's own socket calls and its one wait (wire.mlx;
+// built for Linux, that system's, to try the HTTP side on the host).
+// Several connections are answered at a time, each within time limits
+// (REQUEST_TIME for a request's head, STEP_TIME between two pieces a
+// client takes, ANSWER_TIME for an answer), so a client that says
+// nothing or stops reading keeps nobody waiting and its place is free
+// again soon. The terminal's interrupt (Ctrl+C) is an event the program
+// handles (std.events): the wait ends, the connections and the port are
+// closed, and it ends with 0.
+const std = @import("std")
+const brix = std.os.brix
+const crash = @import("std.crash")
+const events = @import("std.events")
+const net = @import("std.net")
+const wire = @import("./wire.mlx")
+const request = @import("./request.mlx")
+const pages = @import("./pages.mlx")
+const Text = @import("./text.mlx").Text
+
+const SECOND: usize = 1000000000
+const DEFAULT_PORT: usize = 8080
+// A request's head is whole this long after its connection came, or the
+// connection is closed.
+const REQUEST_TIME: usize = 5 * SECOND
+// A client takes some of its answer at least this often, and all of it
+// within ANSWER_TIME.
+const STEP_TIME: usize = 10 * SECOND
+const ANSWER_TIME: usize = 120 * SECOND
+// What still comes of a request that was refused before its end is taken
+// and dropped this long, so that the refusal reaches the client before
+// the connection's end does.
+const DRAIN_TIME: usize = SECOND
+// How often the links are looked at for an address that came or changed
+// (also the longest an interrupt that came just before a wait waits).
+const LOOK_TIME: usize = 2 * SECOND
+// `send`: the connection is made within this.
+const CONNECT_TIME: usize = 10 * SECOND
+// The connections answered at a time.
+const CONNECTIONS: usize = 8
+const HEAD: usize = 320
+const WHO: usize = 112
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+
+// A line for the terminal, put together and written at once.
+const Line = struct {
+    bytes: [256]u8
+    length: usize
+
+    fn init(self: *Self) -> void { self.*.length = 0 }
+    fn add(self: *Self, text: []const u8) -> void { self.*.length = std.text.append(&self.*.bytes, self.*.length, 255, text) }
+    fn number(self: *Self, value: usize) -> void { self.*.length = std.text.appendUnsigned(&self.*.bytes, self.*.length, 255, value) }
+    fn address(self: *Self, ip: [4]u8) -> void {
+        var k: usize = 0
+        while k < 4 {
+            if k > 0 { self.add(".") }
+            self.number(@intCast(usize, ip[k]))
+            k += 1
+        }
+    }
+    // The line's end, and the line to the terminal.
+    fn out(self: *Self) -> void {
+        self.*.bytes[self.*.length] = 10
+        say(self.*.bytes[0..self.*.length + 1])
+        self.*.length = 0
+    }
+}
+
+// The terminal's interrupt (or a request to end, or the terminal gone):
+// the loop ends at its next turn.
+var ending: bool = false // (per run)
+
+fn onEnd(record: events.Record) -> void {
+    _ = record
+    ending = true
+}
+
+const Stage = enum(u8) { free, reading, answering, draining }
+
+const Connection = struct {
+    stage: Stage
+    handle: usize
+    // When it is given up as it stands; `end`: when its answer is, however
+    // it goes.
+    deadline: usize
+    end: usize
+    // The request's bytes so far.
+    asked: [request.LIMIT]u8
+    askedLength: usize
+    // The peer closed its side: nothing more is read.
+    inputEnded: bool
+    // More of the request may still come (it was refused before its
+    // end).
+    unread: bool
+    // The answer: its head and its body (`total` bytes of both are sent,
+    // a HEAD's without the body), `sent` of them taken by the kernel.
+    head: [HEAD]u8
+    headLength: usize
+    body: Text
+    total: usize
+    sent: usize
+    status: usize
+    // What the terminal's line says after the status where it is not 200.
+    note: []const u8
+    // "10.0.2.2 GET /klog": who asked what, for the terminal's line.
+    who: [WHO]u8
+    whoLength: usize
+}
+
+var connections: [CONNECTIONS]Connection = undefined // (per run)
+var answered: usize = 0 // (per run)
+
+// The connection is over: its line on the terminal (`cut`: why its
+// answer did not go whole), its handle and its answer's memory let go.
+fn finish(c: *Connection, cut: []const u8) -> void {
+    if c.*.status != 0 {
+        var line: Line = undefined
+        line.init()
+        line.add(c.*.who[0..c.*.whoLength])
+        line.add(": ")
+        line.number(c.*.status)
+        if c.*.sent < c.*.total {
+            line.add(", cut off after ")
+            line.number(if c.*.sent > c.*.headLength { c.*.sent - c.*.headLength } else { 0 })
+            line.add(" of ")
+            line.number(c.*.total - c.*.headLength)
+            line.add(" bytes (")
+            line.add(cut)
+            line.add(")")
+        } else if c.*.note.length > 0 {
+            line.add(", ")
+            line.add(c.*.note)
+        } else {
+            line.add(", ")
+            line.number(c.*.total - c.*.headLength)
+            line.add(" bytes")
+        }
+        line.out()
+        answered += 1
+    }
+    wire.close(c.*.handle)
+    c.*.body.deinit()
+    c.*.stage = Stage.free
+}
+
+// As much of the answer as the kernel takes now; when it has all of it,
+// the connection is closed (what the kernel holds still goes, then the
+// connection's end).
+fn push(c: *Connection, now: usize) -> void {
+    while c.*.sent < c.*.total {
+        var taken: isize = 0
+        if c.*.sent < c.*.headLength {
+            taken = wire.send(c.*.handle, c.*.head[c.*.sent..c.*.headLength])
+        } else {
+            taken = wire.send(c.*.handle, c.*.body.bytes[c.*.sent - c.*.headLength..c.*.total - c.*.headLength])
+        }
+        if taken == wire.WOULD_BLOCK { return }
+        if taken < 0 {
+            finish(c, "the client went away")
+            return
+        }
+        c.*.sent += @bitCast(usize, taken)
+        c.*.deadline = now + STEP_TIME
+    }
+    if c.*.unread && !c.*.inputEnded {
+        c.*.stage = Stage.draining
+        c.*.deadline = now + DRAIN_TIME
+        return
+    }
+    finish(c, "")
+}
+
+// The answer's head made (its body is in `body` already), and the
+// answer begun.
+fn answer(c: *Connection, status: usize, reason: []const u8, kind: []const u8, headOnly: bool, note: []const u8, now: usize) -> void {
+    const h: [*]u8 = &c.*.head
+    var n = std.text.append(h, 0, HEAD, "HTTP/1.1 ")
+    n = std.text.appendUnsigned(h, n, HEAD, status)
+    n = std.text.append(h, n, HEAD, " ")
+    n = std.text.append(h, n, HEAD, reason)
+    n = std.text.append(h, n, HEAD, "\r\nContent-Type: ")
+    n = std.text.append(h, n, HEAD, kind)
+    n = std.text.append(h, n, HEAD, "\r\nContent-Length: ")
+    n = std.text.appendUnsigned(h, n, HEAD, c.*.body.length)
+    if status == 405 { n = std.text.append(h, n, HEAD, "\r\nAllow: GET, HEAD") }
+    // (The log as it is now, never a copy a browser kept; text is shown
+    // as text whatever it looks like; one request a connection.)
+    n = std.text.append(h, n, HEAD, "\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n")
+    c.*.headLength = n
+    c.*.total = n + (if headOnly { 0 } else { c.*.body.length })
+    c.*.sent = 0
+    c.*.status = status
+    c.*.note = note
+    c.*.stage = Stage.answering
+    c.*.deadline = now + STEP_TIME
+    c.*.end = now + ANSWER_TIME
+    push(c, now)
+}
+
+// A request that is not answered with a page: the status and a line of
+// text saying why.
+fn refuse(c: *Connection, status: usize, reason: []const u8, text: []const u8, note: []const u8, now: usize) -> void {
+    c.*.body.deinit()
+    c.*.body.add(text)
+    c.*.unread = true
+    answer(c, status, reason, "text/plain; charset=utf-8", false, note, now)
+}
+
+// The method and the path of a request after the peer's address in
+// `who`: letters and printable characters only (they go to the
+// terminal), the path cut where it is long.
+fn whoAsked(c: *Connection, asked: *const request.Request) -> void {
+    const w: [*]u8 = &c.*.who
+    var n = c.*.whoLength
+    n = std.text.appendByte(w, n, WHO, 32)
+    n = std.text.append(w, n, WHO, asked.*.method)
+    n = std.text.appendByte(w, n, WHO, 32)
+    var k: usize = 0
+    while k < asked.*.path.length && k < 64 {
+        const byte = asked.*.path[k]
+        n = std.text.appendByte(w, n, WHO, if byte > 32 && byte < 127 { byte } else { 63 })
+        k += 1
+    }
+    if k < asked.*.path.length { n = std.text.append(w, n, WHO, "...") }
+    c.*.whoLength = n
+}
+
+// What came of the request is read, and the request answered once its
+// head is whole.
+fn take(c: *Connection, now: usize) -> void {
+    while c.*.askedLength < request.LIMIT {
+        const got = wire.receive(c.*.handle, c.*.asked[c.*.askedLength..request.LIMIT])
+        if got == wire.WOULD_BLOCK { break }
+        if got <= 0 {
+            c.*.inputEnded = true
+            break
+        }
+        c.*.askedLength += @bitCast(usize, got)
+    }
+    const asked = request.read(c.*.asked[0..c.*.askedLength])
+    if asked.verdict == request.Verdict.more {
+        if !c.*.inputEnded { return }
+        // (A connection that came and went without a word: no line.)
+        if c.*.askedLength == 0 {
+            finish(c, "")
+        } else {
+            refuse(c, 400, "Bad Request", "the request ended before its head did\n", "the request ended before its head did", now)
+        }
+        return
+    }
+    if asked.verdict == request.Verdict.tooLong {
+        refuse(c, 431, "Request Header Fields Too Large", "logserve reads a request's head of at most 2048 bytes\n", "a request's head longer than 2048 bytes", now)
+        return
+    }
+    if asked.verdict == request.Verdict.malformed {
+        refuse(c, 400, "Bad Request", "not an HTTP/1 request\n", "not an HTTP/1 request", now)
+        return
+    }
+    whoAsked(c, &asked)
+    if asked.verdict == request.Verdict.otherMethod {
+        refuse(c, 405, "Method Not Allowed", "logserve answers GET and HEAD only: it gives the machine's logs and takes nothing\n", "only GET and HEAD are answered", now)
+        return
+    }
+    const page = pages.find(asked.path)
+    const found = pages.build(page, &c.*.body)
+    if c.*.body.short {
+        refuse(c, 503, "Service Unavailable", "no memory for this answer at the moment\n", "no memory for the answer", now)
+        // (The request was read whole.)
+        c.*.unread = false
+        return
+    }
+    if found {
+        answer(c, 200, "OK", pages.kind(page), asked.headOnly, if asked.headOnly { "the head alone" } else { "" }, now)
+    } else {
+        answer(c, 404, "Not Found", "text/plain; charset=utf-8", asked.headOnly, if page == pages.Page.none { "no such page" } else { "nothing of it on this machine" }, now)
+    }
+}
+
+// What still comes of a refused request, taken and dropped.
+fn drain(c: *Connection) -> void {
+    var dropped: [1024]u8 = undefined
+    while true {
+        const got = wire.receive(c.*.handle, dropped[0..1024])
+        if got == wire.WOULD_BLOCK { return }
+        if got <= 0 {
+            finish(c, "")
+            return
+        }
+    }
+}
+
+// The connections that wait at the listener, each into a free place.
+fn acceptWaiting(listener: usize, now: usize) -> void {
+    var k: usize = 0
+    while k < CONNECTIONS {
+        const c = &connections[k]
+        k += 1
+        if c.*.stage != Stage.free { continue }
+        var peer: [4]u8 = undefined
+        const accepted = wire.accept(listener, &peer)
+        if accepted < 0 { return }
+        c.*.stage = Stage.reading
+        c.*.handle = @bitCast(usize, accepted)
+        c.*.deadline = now + REQUEST_TIME
+        c.*.end = 0
+        c.*.askedLength = 0
+        c.*.inputEnded = false
+        c.*.unread = false
+        c.*.headLength = 0
+        c.*.body.init()
+        c.*.total = 0
+        c.*.sent = 0
+        c.*.status = 0
+        c.*.note = ""
+        var who: Line = undefined
+        who.init()
+        who.address(peer)
+        c.*.whoLength = std.text.append(&c.*.who, 0, WHO, who.bytes[0..who.length])
+    }
+}
+
+// A connection whose time is over.
+fn expire(c: *Connection, now: usize) -> void {
+    if c.*.stage == Stage.reading {
+        if c.*.askedLength == 0 {
+            finish(c, "")
+        } else {
+            refuse(c, 408, "Request Timeout", "the request's head did not end within 5 seconds\n", "the request did not end within 5 s", now)
+        }
+        return
+    }
+    if c.*.stage == Stage.answering {
+        finish(c, if now >= c.*.end { "it took longer than 120 s" } else { "the client took nothing for 10 s" })
+        return
+    }
+    finish(c, "")
+}
+
+// What was said of each link last: of its address (0: nothing yet; it
+// has one, `ip`; DHCP is asking for one; it has none) and of its cable
+// (in, out).
+const LinkSaid = struct {
+    address: u8
+    cable: u8
+    ip: [4]u8
+}
+const HAS: u8 = 1
+const ASKING: u8 = 2
+const NONE: u8 = 3
+const IN: u8 = 1
+const OUT: u8 = 2
+
+var linksSaid: [brix.NETWORK_LINKS]LinkSaid = undefined // (per run)
+
+// The links' records looked at, and what is new since the last look
+// said: where the other computer finds this one (a link's address, when
+// it has one or another one), that a link has no address yet, that its
+// cable is out or in again. `first`: the program's start, where a
+// machine without a link's record is said too.
+fn sayLinks(port: usize, first: bool) -> void {
+    var line: Line = undefined
+    line.init()
+    var index: usize = 0
+    while index < brix.NETWORK_LINKS {
+        var link: brix.NetworkLink = undefined
+        if brix.networkLink(index, &link) < 0 { break }
+        const has = link.configured != brix.NetworkLink.NONE && (link.address[0] != 0 || link.address[1] != 0 || link.address[2] != 0 || link.address[3] != 0)
+        const address: u8 = if has { HAS } else if link.asking { ASKING } else { NONE }
+        const cable: u8 = if link.up { IN } else { OUT }
+        const said = &linksSaid[index]
+        if address != said.*.address || (has && (link.address[0] != said.*.ip[0] || link.address[1] != said.*.ip[1] || link.address[2] != said.*.ip[2] || link.address[3] != said.*.ip[3])) {
+            line.add(if first { "  " } else { "logserve: " })
+            if has {
+                line.add("open http://")
+                line.address(link.address)
+                line.add(":")
+                line.number(port)
+                line.add("/all on another computer of this network (a browser, or curl)")
+            } else {
+                line.add("net")
+                line.number(index)
+                line.add(if link.asking { " has no address yet (DHCP is asking): it is said here when it has one" } else { " has no address: nothing reaches this machine over it" })
+            }
+            line.out()
+            said.*.address = address
+            said.*.ip = link.address
+        }
+        // (A cable that is in is not worth a line until it was out.)
+        if cable != said.*.cable && (cable == OUT || said.*.cable == OUT) {
+            line.add(if first { "  net" } else { "logserve: net" })
+            line.number(index)
+            line.add(if cable == OUT { " has no cable: nothing reaches this machine over it until it has" } else { " has its cable again" })
+            line.out()
+        }
+        said.*.cable = cable
+        index += 1
+    }
+    if first && index == 0 {
+        line.add("  no network link's record here to say this machine's address: it answers on port ")
+        line.number(port)
+        line.add(" of the addresses it has")
+        line.out()
+    }
+}
+
+// A port's number from an argument; 0 when it is none.
+fn portOf(text: []const u8) -> usize {
+    var value: usize = 0
+    if text.length == 0 || text.length > 5 { return 0 }
+    for digit in text {
+        if digit < 48 || digit > 57 { return 0 }
+        value = value * 10 + @intCast(usize, digit - 48)
+    }
+    return if value > 65535 { 0 } else { value }
+}
+
+fn serve(port: usize) -> u8 {
+    const listening = wire.listen(port)
+    if listening < 0 {
+        var line: Line = undefined
+        line.init()
+        if listening == wire.NO_NETWORK {
+            line.add("logserve: this machine has no network (no network device was found at boot): there is nothing to answer on")
+        } else if listening == wire.PORT_TAKEN {
+            line.add("logserve: port ")
+            line.number(port)
+            line.add(" is taken (another logserve?); another one: logserve PORT")
+        } else {
+            line.add("logserve: cannot listen on port ")
+            line.number(port)
+        }
+        line.out()
+        return 1
+    }
+    const listener = @bitCast(usize, listening)
+    _ = events.handle(events.Event.INTERRUPT, onEnd)
+    _ = events.handle(events.Event.TERMINATE, onEnd)
+    _ = events.handle(events.Event.HANGUP, onEnd)
+    var k: usize = 0
+    while k < CONNECTIONS {
+        connections[k].stage = Stage.free
+        k += 1
+    }
+    k = 0
+    while k < brix.NETWORK_LINKS {
+        linksSaid[k].address = 0
+        linksSaid[k].cable = 0
+        k += 1
+    }
+    say("logserve: the kernel log and this machine's state, for another computer of this network\n")
+    sayLinks(port, true)
+    say("  while this runs, everyone on the network can read the log\n  Ctrl+C ends it\n")
+    var nextLook = wire.now() + LOOK_TIME
+    while !ending {
+        // The one wait: the listener while a place is free, every
+        // connection for what it is at; until the first of them is over.
+        var watched: [CONNECTIONS + 1]wire.Watch = undefined
+        var slots: [CONNECTIONS + 1]usize = undefined
+        var count: usize = 0
+        var deadline = nextLook
+        var free = false
+        k = 0
+        while k < CONNECTIONS {
+            const c = &connections[k]
+            if c.*.stage == Stage.free {
+                free = true
+            } else {
+                watched[count] = wire.Watch.{ .handle = c.*.handle, .wantRead = c.*.stage != Stage.answering, .wantWrite = c.*.stage == Stage.answering, .readable = false, .writable = false, .gone = false }
+                slots[count] = k
+                count += 1
+                if c.*.deadline < deadline { deadline = c.*.deadline }
+                if c.*.stage == Stage.answering && c.*.end < deadline { deadline = c.*.end }
+            }
+            k += 1
+        }
+        if free {
+            watched[count] = wire.Watch.{ .handle = listener, .wantRead = true, .wantWrite = false, .readable = false, .writable = false, .gone = false }
+            slots[count] = CONNECTIONS
+            count += 1
+        }
+        const waited = wire.wait(watched[0..count], deadline)
+        if ending { break }
+        const now = wire.now()
+        var arrivals = false
+        k = 0
+        while k < count {
+            if slots[k] == CONNECTIONS {
+                arrivals = waited == wire.Waited.ready && watched[k].readable
+            } else {
+                const c = &connections[slots[k]]
+                if waited == wire.Waited.ready && c.*.stage == Stage.reading && watched[k].readable {
+                    take(c, now)
+                } else if waited == wire.Waited.ready && c.*.stage == Stage.answering && watched[k].writable {
+                    push(c, now)
+                } else if waited == wire.Waited.ready && c.*.stage == Stage.draining && watched[k].readable {
+                    drain(c)
+                }
+                if c.*.stage != Stage.free && (now >= c.*.deadline || (c.*.stage == Stage.answering && now >= c.*.end)) { expire(c, now) }
+            }
+            k += 1
+        }
+        if arrivals { acceptWaiting(listener, now) }
+        if now >= nextLook {
+            sayLinks(port, false)
+            nextLook = now + LOOK_TIME
+        }
+    }
+    // The end: every connection and the port closed.
+    k = 0
+    while k < CONNECTIONS {
+        if connections[k].stage != Stage.free { finish(&connections[k], "logserve ended") }
+        k += 1
+    }
+    wire.close(listener)
+    var line: Line = undefined
+    line.init()
+    line.add("logserve: ended (")
+    line.number(answered)
+    line.add(if answered == 1 { " request answered)" } else { " requests answered)" })
+    line.out()
+    return 0
+}
+
+// HOST's IPv4 address: written as a.b.c.d, or a name the name servers
+// know (std.net's resolver, the one there is).
+fn addressOf(host: []const u8, into: *[4]u8) -> bool {
+    var found: [4]net.Address = undefined
+    const count = net.resolve(host, 0, &found, 4, 5000)
+    var k: usize = 0
+    while k < count {
+        if found[k].family == net.Family.ipv4 {
+            into.*[0] = found[k].bytes[0]
+            into.*[1] = found[k].bytes[1]
+            into.*[2] = found[k].bytes[2]
+            into.*[3] = found[k].bytes[3]
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// `logserve send HOST PORT`: a connection out to a listener there, the
+// /all text written to it, the end.
+fn send(host: []const u8, portText: []const u8) -> u8 {
+    const port = portOf(portText)
+    var address: [4]u8 = undefined
+    if port == 0 || !addressOf(host, &address) {
+        say(if port == 0 { "logserve: PORT is a number from 1 to 65535\n" } else { "logserve: HOST has no address (give the other computer's, as 192.168.1.20)\n" })
+        return 1
+    }
+    var line: Line = undefined
+    line.init()
+    const connecting = wire.connect(address, port)
+    if connecting < 0 {
+        say(if connecting == wire.NO_NETWORK { "logserve: this machine has no network (no network device was found at boot)\n" } else { "logserve: cannot open a connection\n" })
+        return 1
+    }
+    const handle = @bitCast(usize, connecting)
+    _ = events.handle(events.Event.INTERRUPT, onEnd)
+    var everything: Text = undefined
+    everything.init()
+    _ = pages.build(pages.Page.all, &everything)
+    var sent: usize = 0
+    var made = false
+    var deadline = wire.now() + CONNECT_TIME
+    var failure: []const u8 = ""
+    while failure.length == 0 && (!made || sent < everything.length) {
+        var watched: [1]wire.Watch = [1]wire.Watch{ wire.Watch.{ .handle = handle, .wantRead = false, .wantWrite = true, .readable = false, .writable = false, .gone = false } }
+        const waited = wire.wait(watched[0..1], deadline)
+        if ending {
+            failure = "interrupted"
+        } else if waited == wire.Waited.timedOut || (waited == wire.Waited.interrupted && wire.now() >= deadline) {
+            failure = if made { "the other side took nothing for 10 s" } else { "no answer within 10 s" }
+        } else if !made && watched[0].gone {
+            failure = "nobody listens there, or it cannot be reached"
+        } else if watched[0].writable {
+            made = true
+            while sent < everything.length {
+                const taken = wire.send(handle, everything.bytes[sent..everything.length])
+                if taken == wire.WOULD_BLOCK { break }
+                if taken < 0 {
+                    failure = "the connection ended"
+                    break
+                }
+                sent += @bitCast(usize, taken)
+            }
+            deadline = wire.now() + STEP_TIME
+        }
+    }
+    wire.close(handle)
+    if failure.length > 0 {
+        line.add(if made { "logserve: only " } else { "logserve: cannot connect to " })
+        if made {
+            line.number(sent)
+            line.add(" of ")
+            line.number(everything.length)
+            line.add(" bytes went to ")
+        }
+        line.address(address)
+        line.add(":")
+        line.number(port)
+        line.add(" (")
+        line.add(failure)
+        line.add(")")
+        line.out()
+        everything.deinit()
+        return 1
+    }
+    line.add("logserve: sent ")
+    line.number(sent)
+    line.add(" bytes to ")
+    line.address(address)
+    line.add(":")
+    line.number(port)
+    line.out()
+    everything.deinit()
+    return 0
+}
+
+fn usage() -> u8 {
+    say("usage: logserve [PORT]            the kernel log and this machine's state over HTTP on PORT (8080), until Ctrl+C\n")
+    say("       logserve send HOST PORT    the same in one text to a listener there (nc -l PORT > brix.txt)\n")
+    return 1
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    _ = crash.install()
+    if arguments.length >= 2 && std.text.same(std.text.cString(arguments[1]), "send") {
+        if arguments.length != 4 { return usage() }
+        return send(std.text.cString(arguments[2]), std.text.cString(arguments[3]))
+    }
+    if arguments.length > 2 { return usage() }
+    var port = DEFAULT_PORT
+    if arguments.length == 2 {
+        port = portOf(std.text.cString(arguments[1]))
+        if port == 0 { return usage() }
+    }
+    return serve(port)
+}
