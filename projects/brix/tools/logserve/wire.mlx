@@ -1,0 +1,233 @@
+// The network as logserve uses it: a stream socket that listens, the
+// connections it takes, a connection out, and one wait over them all with
+// a deadline. On brixOS these are its own socket calls (std.os.brix: a
+// handle each, no call waits, the one wait says what is ready and ends
+// with `interrupted` when the program's upcall ran). Built for another
+// system, the same over Linux's socket calls and poll, so that the
+// program's HTTP side can be tried on the host.
+const std = @import("std")
+const builtin = @import("builtin")
+const brix = std.os.brix
+const socket = std.linux.socket
+const event = std.linux.event
+
+// What a call gives in place of a handle or a count.
+pub const WOULD_BLOCK: isize = -1
+pub const FAILED: isize = -2
+// (listen's:) the system has no network; the port is someone else's.
+pub const NO_NETWORK: isize = -3
+pub const PORT_TAKEN: isize = -4
+
+// A handle watched: what is waited for, and what the wait saw.
+pub const Watch = struct {
+    handle: usize
+    wantRead: bool
+    wantWrite: bool
+    readable: bool
+    writable: bool
+    // The peer closed its side, or the connection failed.
+    gone: bool
+}
+
+pub const Waited = enum(u8) { ready, timedOut, interrupted }
+
+// The most handles one wait watches.
+pub const MAX_WATCHED: usize = 16
+
+const EAGAIN: isize = -11
+const EINTR: isize = -4
+const EINPROGRESS: isize = -115
+
+// Nanoseconds on the clock the deadlines are on.
+pub fn now() -> usize { return std.time.monotonicNanoseconds() }
+
+// A sockaddr_in for Linux's calls.
+fn linuxAddress(raw: *[16]u8, address: [4]u8, port: usize) -> void {
+    var k: usize = 0
+    while k < 16 {
+        raw.*[k] = 0
+        k += 1
+    }
+    raw.*[0] = 2
+    raw.*[2] = @intCast(u8, (port >> 8) & 255)
+    raw.*[3] = @intCast(u8, port & 255)
+    k = 0
+    while k < 4 {
+        raw.*[4 + k] = address[k]
+        k += 1
+    }
+}
+
+// A socket listening on `port` of every address the machine has: its
+// handle, or NO_NETWORK, PORT_TAKEN, FAILED.
+pub fn listen(port: usize) -> isize {
+    if comptime builtin.os != builtin.Os.brixos {
+        const fd = socket.open(socket.AF_INET, socket.SOCK_STREAM | socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK, 0)
+        if fd < 0 { return NO_NETWORK }
+        var one: u32 = 1
+        _ = socket.setOption(fd, socket.SOL_SOCKET, socket.SO_REUSEADDR, @intFromPtr(&one), 4)
+        var raw: [16]u8 = undefined
+        linuxAddress(&raw, [4]u8{ 0, 0, 0, 0 }, port)
+        if socket.bind(fd, @intFromPtr(&raw), 16) < 0 {
+            _ = socket.close(fd)
+            return PORT_TAKEN
+        }
+        if socket.listen(fd, 8) < 0 {
+            _ = socket.close(fd)
+            return FAILED
+        }
+        return fd
+    }
+    const opened = brix.socketOpen(brix.SocketKind.STREAM)
+    if opened < 0 { return if opened == -brix.Status.unsupported { NO_NETWORK } else { FAILED } }
+    const handle = @intCast(brix.Handle, opened)
+    if brix.socketBind(handle, port) < 0 {
+        _ = brix.close(handle)
+        return PORT_TAKEN
+    }
+    if brix.socketListen(handle) < 0 {
+        _ = brix.close(handle)
+        return FAILED
+    }
+    return opened
+}
+
+// The next connection that waits at `listener`: its handle and the
+// peer's address, or WOULD_BLOCK when none does.
+pub fn accept(listener: usize, peer: *[4]u8) -> isize {
+    if comptime builtin.os != builtin.Os.brixos {
+        var raw: [16]u8 = undefined
+        var length: u32 = 16
+        const fd = socket.accept4(@bitCast(isize, listener), @intFromPtr(&raw), @intFromPtr(&length), socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK)
+        if fd == EAGAIN || fd == EINTR { return WOULD_BLOCK }
+        if fd < 0 { return FAILED }
+        var k: usize = 0
+        while k < 4 {
+            peer.*[k] = raw[4 + k]
+            k += 1
+        }
+        return fd
+    }
+    var from: brix.SocketAddress = undefined
+    const accepted = brix.socketAccept(@intCast(brix.Handle, listener), &from)
+    if accepted == -brix.Status.would_block { return WOULD_BLOCK }
+    if accepted < 0 { return FAILED }
+    peer.* = from.address
+    return accepted
+}
+
+// A connection to `address`:`port` begun: its handle (it is made when
+// the wait says writable, and failed when it says gone), or NO_NETWORK,
+// FAILED.
+pub fn connect(address: [4]u8, port: usize) -> isize {
+    if comptime builtin.os != builtin.Os.brixos {
+        const fd = socket.open(socket.AF_INET, socket.SOCK_STREAM | socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK, 0)
+        if fd < 0 { return NO_NETWORK }
+        var raw: [16]u8 = undefined
+        linuxAddress(&raw, address, port)
+        const result = socket.connect(fd, @intFromPtr(&raw), 16)
+        if result < 0 && result != EINPROGRESS && result != EINTR {
+            _ = socket.close(fd)
+            return FAILED
+        }
+        return fd
+    }
+    const opened = brix.socketOpen(brix.SocketKind.STREAM)
+    if opened < 0 { return if opened == -brix.Status.unsupported { NO_NETWORK } else { FAILED } }
+    const to = brix.SocketAddress.{ .address = address, .port = @intCast(u32, port) }
+    if brix.socketConnect(@intCast(brix.Handle, opened), &to) < 0 {
+        _ = brix.close(@intCast(brix.Handle, opened))
+        return FAILED
+    }
+    return opened
+}
+
+// Bytes of the connection into `into`: how many, 0 when the peer closed
+// its side, WOULD_BLOCK when none came yet, FAILED.
+pub fn receive(handle: usize, into: []u8) -> isize {
+    if comptime builtin.os != builtin.Os.brixos {
+        const got = socket.receive(@bitCast(isize, handle), into.pointer, into.length, 0)
+        if got == EAGAIN || got == EINTR { return WOULD_BLOCK }
+        return if got < 0 { FAILED } else { got }
+    }
+    const got = brix.socketReceive(@intCast(brix.Handle, handle), into, null)
+    if got == -brix.Status.would_block || got == -brix.Status.interrupted { return WOULD_BLOCK }
+    return if got < 0 { FAILED } else { got }
+}
+
+// Bytes to the connection: how many were taken (at least one),
+// WOULD_BLOCK when none could be yet, FAILED when it takes no more.
+pub fn send(handle: usize, bytes: []const u8) -> isize {
+    if comptime builtin.os != builtin.Os.brixos {
+        const sent = socket.send(@bitCast(isize, handle), bytes.pointer, bytes.length, socket.MSG_NOSIGNAL)
+        if sent == EAGAIN || sent == EINTR { return WOULD_BLOCK }
+        return if sent <= 0 { FAILED } else { sent }
+    }
+    const sent = brix.socketSend(@intCast(brix.Handle, handle), bytes, null)
+    if sent == -brix.Status.would_block || sent == -brix.Status.interrupted { return WOULD_BLOCK }
+    return if sent <= 0 { FAILED } else { sent }
+}
+
+// The handle let go. (A connection's bytes that are still on their way
+// go on, then its end is said to the peer.)
+pub fn close(handle: usize) -> void {
+    if comptime builtin.os != builtin.Os.brixos {
+        _ = socket.close(@bitCast(isize, handle))
+        return
+    }
+    _ = brix.close(@intCast(brix.Handle, handle))
+}
+
+// Waits until one of `watched` (MAX_WATCHED at most) is what is wanted of
+// it, or the clock passes `deadline`, or the program's upcall ran (an
+// event came); what was seen of each is written.
+pub fn wait(watched: []Watch, deadline: usize) -> Waited {
+    const count = if watched.length > MAX_WATCHED { MAX_WATCHED } else { watched.length }
+    var k: usize = 0
+    if comptime builtin.os != builtin.Os.brixos {
+        var entries: [MAX_WATCHED * 8]u8 = undefined
+        const records: [*]u8 = &entries
+        while k < count {
+            event.pollSet(records, k, @bitCast(isize, watched[k].handle), (if watched[k].wantRead { event.POLLIN } else { 0 }) | (if watched[k].wantWrite { event.POLLOUT } else { 0 }))
+            k += 1
+        }
+        const at = now()
+        const ms = if deadline <= at { 0 } else { (deadline - at + 999999) / 1000000 }
+        const result = event.poll(@intFromPtr(records), count, @bitCast(isize, ms))
+        if result == EINTR { return Waited.interrupted }
+        k = 0
+        while k < count {
+            const seen = if result > 0 { event.pollResult(records, k) } else { 0 }
+            watched[k].gone = seen & (event.POLLERR | event.POLLHUP | event.POLLNVAL) != 0
+            // (What went away is read and written once more: the call
+            // says how it ended.)
+            watched[k].readable = seen & event.POLLIN != 0 || (watched[k].gone && watched[k].wantRead)
+            watched[k].writable = seen & event.POLLOUT != 0 || (watched[k].gone && watched[k].wantWrite)
+            k += 1
+        }
+        return if result > 0 { Waited.ready } else { Waited.timedOut }
+    }
+    var items: [MAX_WATCHED]brix.WaitItem = undefined
+    while k < count {
+        // (PEER_GONE is not waited for: a peer that closed its side
+        // after its request still reads the answer, and the state would
+        // end every wait at once. A connection that failed is readable
+        // and writable for the kernel, and the call that follows says
+        // so.)
+        var want: u32 = 0
+        if watched[k].wantRead { want |= brix.State.READABLE }
+        if watched[k].wantWrite { want |= brix.State.WRITABLE }
+        items[k] = brix.WaitItem.{ .handle = @intCast(u32, watched[k].handle), .want = want, .seen = 0, .reserved = 0 }
+        k += 1
+    }
+    const result = brix.wait(items[0..count], deadline)
+    k = 0
+    while k < count {
+        watched[k].readable = watched[k].wantRead && items[k].seen & brix.State.READABLE != 0
+        watched[k].writable = watched[k].wantWrite && items[k].seen & brix.State.WRITABLE != 0
+        watched[k].gone = items[k].seen & brix.State.PEER_GONE != 0
+        k += 1
+    }
+    if result == -brix.Status.interrupted { return Waited.interrupted }
+    return if result > 0 { Waited.ready } else { Waited.timedOut }
+}

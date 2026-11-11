@@ -27,6 +27,9 @@ for p in flux:projects/shell sysinfo:projects/brix/tools/sysinfo brixfs:projects
     elif [ "$name" = impulse ]; then "$compiler" --quiet $brix "projects/init/brixos.mlx" -o "$out/$name"
     else "$compiler" --quiet $brix "$src" -o "$out/$name"; fi
 done
+# logserve: from either image's shell, the log to another computer of the
+# network (a machine these images are for has nothing else to send it by).
+"$compiler" --quiet $brix projects/brix/tools/logserve/main.mlx -o "$out/logserve"
 for p in cat ls echo mkdir sync cp rm; do
     "$compiler" --quiet $brix "projects/coreutils/$p/main.mlx" -o "$out/coreutils/$p" 2>/dev/null || true
 done
@@ -49,6 +52,7 @@ efi="$out/BOOTX64-diag.EFI"
 mlx-out/bin/brix-image "$out/kernel" "$efi" \
     flux="$out/flux" sysinfo="$out/sysinfo" brixfs="$out/brixfs" klogsave="$out/klogsave" \
     impulse="$out/impulse" impulsectl="$out/impulsectl" \
+    logserve="$out/logserve" \
     "settings/processors=$services/processors" "${firmware[@]}" \
     settings/init/services/serial-shell.service=projects/brix/settings/init/services/serial-shell.service \
     settings/init/services/klogsave.service=projects/brix/settings/init/services/klogsave.service \
@@ -79,6 +83,7 @@ console="$out/BOOTX64-console.EFI"
 mlx-out/bin/brix-image "$out/kernel" "$console" \
     flux="$out/flux" sysinfo="$out/sysinfo" brixfs="$out/brixfs" klogsave="$out/klogsave" \
     impulse="$out/impulse" impulsectl="$out/impulsectl" mlx-console="$out/mlx-console" \
+    logserve="$out/logserve" \
     "fonts/DejaVuSansMono.ttf=$font" \
     settings/init/services/serial-shell.service=projects/brix/settings/init/services/serial-shell.service \
     settings/init/services/klogsave.service=projects/brix/settings/init/services/klogsave.service \
@@ -90,3 +95,4 @@ mlx-out/bin/brix-image "$out/kernel" "$console" \
     "$out/coreutils/"
 echo "wrote $console"
 echo "Flash that one instead for a shell on the screen (USB keyboard); cat /devices/klog shows the boot log."
+echo "In its shell, logserve hands the log to another computer of the network (it says the address to open there)."

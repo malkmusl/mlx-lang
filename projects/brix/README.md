@@ -330,7 +330,8 @@ The picture's mode is the monitor's own where the firmware can set it:
 the loader (image/efi.mlx) reads what the monitor says of itself (its
 EDID: the firmware's EDID Active protocol on a handle whose Graphics
 Output Protocol is the one in use or shows the same picture's memory;
-the first timing is the mode it prefers), finds that size among the
+the first timing is the mode it prefers; an interlaced one's lines are
+doubled, its count being one field's), finds that size among the
 firmware's modes and sets it, instead of taking the mode the firmware
 was left in (often a smaller one, or one of another shape that the
 monitor stretches). Only the EDID of the display in use counts (a server
@@ -359,7 +360,13 @@ says so ("brixOS: the picture is shown on a screen of the shape
 shape and is round on a monitor that stretches the mode
 (projects/desktop/splash, tools/check_brix_shape.sh); the desktop does
 not yet (text brought together would not be readable: it waits for the
-monitor's own mode).
+monitor's own mode). That the monitor stretches is taken, not known: the
+kernel cannot see what the monitor does with a mode. One that shows it in
+the mode's own shape, with borders, gets a boot screen too narrow by as
+much, and so does a monitor behind a switch that answers with an EDID of
+its own. Nothing in the image says the screen's shape by hand yet:
+settings/display names a mode, and the monitor's word goes before it;
+ignition takes --screen WIDTH:HEIGHT, which the init does not pass.
 
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the
@@ -371,6 +378,51 @@ volumes). `console.screen(false)` keeps a long dump off the screen (in
 the log and on the serial line only). A fault of the kernel's own stops
 it with a report on the screen (trap.mlx `stop`: what, where, the
 registers, the callers), drawn over whatever is there.
+
+The log is handed to another computer of the same network, without a
+reboot and without a photograph, by logserve
+(projects/brix/tools/logserve). It is no service: a person starts it at
+a terminal when there is something to hand over, and ends it with
+Ctrl+C.
+
+    logserve [PORT]
+
+answers HTTP on the port (8080) and says where: "open
+http://10.10.36.57:8080/all on another computer of this network" (the
+link's address; a link without an address yet or without a cable is
+said, and the address when it has come). A browser or curl there gets
+
+    /all                 everything below in one text, a heading line
+                         ("==== /klog: ... ====") before each part and
+                         "==== end ====" after the last: the one to copy
+                         and send
+    /gpu                 the log's lines that begin with "gpu:" (the
+                         graphics driver's read-out)
+    /klog                the kernel log, whole
+    /boot.log            the files of these names at the top of the
+    /boot.previous.log   mounted volumes, where klogsave writes (a
+                         megabyte of each at most; in /all, a boot.log
+                         that is the beginning of the log above is
+                         named and not repeated)
+    /system              what sysinfo says, and each network link's
+                         record in words
+    /                    a page that lists these
+
+and nothing else: the pages are these fixed ones, read-only (a
+request's path is never opened as a file, every other path is 404,
+methods other than GET and HEAD are refused), and nothing is written.
+While it runs, everyone on the network can read the log; it says so
+when it starts, and each request in a line. Where the other computer
+cannot reach the machine, the machine connects out and writes the /all
+text:
+
+    nc -l 9000 > brix.txt                (on the other computer)
+    logserve send 192.168.1.20 9000      (in brixOS: its address and port)
+
+It uses brixOS's own socket calls and the one wait: several clients at
+a time, each within time limits, so one that says nothing or stops
+reading keeps nobody waiting (tools/check_brix_logserve.sh, on virtio
+and igb; tests/461_logserve_runtime.mlx).
 
 The loader hands the kernel the ACPI tables' root from the firmware's
 configuration table (a UEFI firmware keeps none in the BIOS area), so the
@@ -493,9 +545,17 @@ The kernel's stack (kernel/net) runs on it:
   waits on the handle (READABLE, WRITABLE, PEER_GONE, ENDED). A packet
   to our own address goes through the stack at once (a loopback), so a
   program may talk to itself.
-- ping (projects/ping): `ping HOST [COUNT]` on a datagram socket of
-  IPPROTO_ICMP (the kernel sets the identifier; Linux's ping sockets
-  work the same).
+- ping (projects/ping): `ping [-c COUNT] HOST` (an echo request a
+  second until Ctrl+C or COUNT of them; a line for each reply with its
+  time, one for each request without an answer, then the loss and the
+  least, mean and greatest time), on a ping socket by brixOS's own calls
+  (host.brixos.mlx: socket_open's kind 3, the one wait, the interrupt
+  event; host.mlx is Linux's datagram socket of IPPROTO_ICMP). The
+  kernel sets the identifier and gives the socket its replies, and
+  ICMP's word that a request was not delivered. The destination is the
+  address given with the send (its port means nothing); would_block
+  says the neighbour's hardware address is being asked for, and ping
+  sends again. 127.0.0.0/8 is answered by the machine's own address.
 - link.mlx: the link's state for programs. /devices/net0 is a node of a
   kind of its own (as /devices/framebuffer is the display's): a read
   gives the link's record as things are at that moment (spec
@@ -517,14 +577,34 @@ address, driver, the frames; and how to give a fixed address
 (/system/settings/network, read at boot). Nothing is changed from the
 page yet.
 
-tools/check_brix_net.sh boots with the user network: DHCP, ping to the
-gateway, wget fetching files (a small one, a 400 KiB one, a missing one)
-from an HTTP server on the host, the native calls (a stream to
-ourselves, a datagram, an echo), and the link's record as netcalls reads
-it; then again on a wire without a DHCP server (no address yet), on
-another network (192.168.76.0/26: the record has what that DHCP server
-answered, not what the stack starts with) and with a fixed address in
-the settings file. tools/check_brix_desktop.sh opens
+The top bar reads the same records (projects/desktop/topbar,
+network.brixos.mlx, in the place of the Linux bar's nexus and
+/sys/class/net) once a second on its tick: its control centre's network
+tile shows "Ethernet" with the address, lit, for the first link that has
+a cable and an address, else "No address yet", "No cable" or "No device";
+the tile's symbol stands as a sign on the bar, left of the control
+centre's toggles; a click on the tile opens the settings on the Network
+page (there is nothing to switch). The bar is drawn again only when
+that changed, and under a compositor run with --verbose it says so
+("horizon: network: net0 connected, 10.0.2.15"; tools/check_brix_nettile.sh
+pulls the cable, and boots without a card and without a DHCP server).
+
+tools/check_brix_net.sh boots with the user network: DHCP, ping as a
+person types it (tools/brix_ping_cases.sh, which the igb check goes
+through too: a neighbour not spoken to yet, the gateway, an address
+nobody has, the machine itself, a name, the count's forms, two at once,
+forty in a row, Ctrl+C; QEMU's capture of the frames says where the
+echo requests went), wget fetching files (a small one, a 400 KiB one, a
+missing one) from an HTTP server on the host, the native calls (a
+stream to ourselves, a datagram, an echo), and the link's record as
+netcalls reads it; then again on a wire without a DHCP server (no
+address yet), on another network (192.168.76.0/26: the record has what
+that DHCP server answered, not what the stack starts with), with a
+fixed address in the settings file, and on a network of the check's own
+(tools/brix_lan.py at the other end of QEMU's socket network: a name
+server, replies later than a second, a reply twice, a neighbour slow to
+say its hardware address, a router that says a host cannot be
+reached). tools/check_brix_desktop.sh opens
 the Network page and pulls the cable. Not yet: IPv6, a lease's renewal,
 a second link, the configuration changed while the system runs.
 

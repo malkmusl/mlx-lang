@@ -15,6 +15,14 @@
 # as wide for their height as in the picture the same ignition draws for
 # a screen of the mode's own shape.
 #
+# Then the way of a real monitor: one that says 3840x1080 of itself. OVMF
+# passes no monitor's word on (it has no EDID Active protocol), so the
+# word is put where the loader writes it, in the boot information of the
+# image inside the EFI application. An image that names no mode: the
+# loader takes the nearest mode on the monitor's word and the kernel the
+# screen's shape from it. An image that names 1280x960: the mode is the
+# image's, the shape still the monitor's.
+#
 #   tools/check_brix_shape.sh [compiler]
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -44,7 +52,9 @@ cleanup() {
     rm -rf -- "$work"
 }
 trap cleanup EXIT
-fail() { echo "FAIL $1" >&2; [[ -f "$work/serial.txt" ]] && cat -v "$work/serial.txt" | tail -n 40 >&2; exit 1; }
+# (The serial line of the QEMU that runs: the second boot has its own.)
+serial=$work/serial.txt
+fail() { echo "FAIL $1" >&2; [[ -f "$serial" ]] && cat -v "$serial" | tail -n 40 >&2; exit 1; }
 
 brix=--target=x86_64-brixos
 mkdir -p "$work/bin" "$work/services" "$work/esp/EFI/BOOT"
@@ -170,12 +180,12 @@ PY
 
 rm -f "$work/input"
 mkfifo "$work/input"
-: > "$work/serial.txt"
+: > "$serial"
 qemu-system-x86_64 -m 1G -cpu max -display none -monitor "unix:$work/monitor,server,nowait" -no-reboot -serial stdio -net none \
-    -bios "$firmware" -drive "format=raw,file=fat:rw:$work/esp" < "$work/input" > "$work/serial.txt" 2>&1 &
+    -bios "$firmware" -drive "format=raw,file=fat:rw:$work/esp" < "$work/input" > "$serial" 2>&1 &
 qemu_pid=$!
 exec 3> "$work/input"
-output() { sed 's/\x1b\[K//g' "$work/serial.txt" | tr '\r' '\n'; }
+output() { sed 's/\x1b\[K//g' "$serial" | tr '\r' '\n'; }
 # (The firmware takes its time where the processor is emulated.)
 wait_for() {
     local tries=0
@@ -185,6 +195,13 @@ wait_for() {
         sleep 0.1
     done
 }
+# `$1` is on the serial line by the time `$2` is, which the same writer
+# says after it: a line that is missing fails when `$2` comes, not after
+# the whole wait.
+said_by() {
+    wait_for "$2"
+    output | grep -aq -- "$1" || fail "no \"$1\" on the serial line"
+}
 for (( i = 0; i < 100; i++ )); do [[ -S $work/monitor ]] && break; sleep 0.1; done
 
 # The kernel: the nearest mode the firmware has, and the screen's shape
@@ -192,13 +209,12 @@ for (( i = 0; i < 100; i++ )); do [[ -S $work/monitor ]] && break; sleep 0.1; do
 wait_for '^brixOS: display [0-9]*x[0-9]* '
 mode=$(output | grep -a '^brixOS: display [0-9]*x[0-9]* ' | head -1 | grep -ao '[0-9][0-9]*x[0-9][0-9]*' | head -1)
 [[ $mode == 1920x1080 ]] || fail "the image that names 3840x1080 came up in $mode, not in the nearest the firmware has (1920x1080)"
-wait_for '^brixOS: the picture is shown on a screen of the shape 3840:1080 (the mode the image names); /devices/framebuffer says so to the programs that draw for it$'
+said_by '^brixOS: the picture is shown on a screen of the shape 3840:1080 (the mode the image names); /devices/framebuffer says so to the programs that draw for it$' "^impulse: brixOS's init\$"
 echo "ok   the loader sets the nearest mode the firmware has ($mode) and the kernel takes the screen's shape from the mode the image names (3840:1080)"
 
 # Ignition draws for the screen's shape. (Its notes land on the serial
 # line beside the shell's prompt: both come up at once.)
-wait_for "ignition: the screen's shape is 3840:1080, the display's mode 1920x1080: drawn 3840 wide and brought to the mode's width, so that it is round on the screen\$"
-wait_for 'ignition: up, boot, on the display$'
+said_by "ignition: the screen's shape is 3840:1080, the display's mode 1920x1080: drawn 3840 wide and brought to the mode's width, so that it is round on the screen\$" 'ignition: up, boot, on the display$'
 echo "ok   ignition draws its picture 3840 wide for the screen's shape and brings it to the mode's 1920"
 # The boot ends: the service that takes the screen draws nothing, the
 # splash's last picture stays on it, and the one it leaves for the next
@@ -243,7 +259,8 @@ for (( i = 0; i < 20; i++ )); do
     monitor "screendump $work/screen.ppm"
     sleep 0.3
     [[ -s $work/screen.ppm ]] || continue
-    read -r squeezed screen_wide screen_high < <(letters "$work/screen.ppm")
+    # (A dump not yet whole reads as none: asked for again.)
+    read -r squeezed screen_wide screen_high < <(letters "$work/screen.ppm" 2> /dev/null) || squeezed=0
     (( squeezed > 0 )) && break
     sleep 0.5
 done
@@ -251,4 +268,58 @@ done
 (( squeezed > 0 )) || fail "no letters on the screen to measure"
 (( squeezed * 100 >= plain * 42 && squeezed * 100 <= plain * 58 )) || fail "on the screen the letters' spread across over their spread down is $squeezed thousandths; drawn for a screen of the mode's shape it is $plain: not about half of it (the picture is not drawn for the screen twice as wide)"
 echo "ok   on the screen the letters lie half as wide for their height ($squeezed thousandths, $plain when drawn for a screen of the mode's own shape): round on the monitor that stretches them"
+
+# The monitor's own word, as on a real machine. The kernel alone is
+# enough of an image; 3840x1080 goes where the loader writes what the
+# monitor's EDID says (the boot information's MONITOR_WIDTH and
+# MONITOR_HEIGHT, layout.mlx; the image is found in the application by
+# its Multiboot header).
+exec 3>&-
+field() { sed -n "s/^ *pub const $1: usize = \(0x[0-9A-Fa-f]*\)\$/\1/p" projects/brix/layout.mlx | head -1; }
+# An image (what follows `$3` goes into it) started on a monitor that says
+# 3840x1080: it comes up in the mode `$1`, set as the kernel's line `$2`
+# says, and the kernel has the screen's shape from the monitor. Its files
+# and its serial line are named `$3`.
+monitor_says() {
+    local wanted=$1 by=$2 name=$3
+    shift 3
+    kill "$qemu_pid" 2> /dev/null || true
+    wait "$qemu_pid" 2> /dev/null || true
+    qemu_pid=
+    mkdir -p "$work/$name/EFI/BOOT"
+    "$work/brix-image" "$work/kernel" "$work/$name/EFI/BOOT/BOOTX64.EFI" "$@"
+    python3 - "$work/$name/EFI/BOOT/BOOTX64.EFI" "$(field BOOT_INFO)" "$(field MONITOR_WIDTH)" "$(field MONITOR_HEIGHT)" 3840 1080 <<'PY' || fail "the monitor's word could not be put into the image's boot information (layout.mlx's BOOT_INFO, MONITOR_WIDTH, MONITOR_HEIGHT)"
+import struct, sys
+path = sys.argv[1]
+info, wide_at, high_at = (int(word, 16) for word in sys.argv[2:5])
+data = bytearray(open(path, "rb").read())
+start = data.find(struct.pack("<II", 0x1BADB002, 0x00010003))
+if start < 0 or struct.unpack_from("<QQ", data, start + info + wide_at) != (0, 0):
+    sys.exit(1)
+struct.pack_into("<Q", data, start + info + wide_at, int(sys.argv[5]))
+struct.pack_into("<Q", data, start + info + high_at, int(sys.argv[6]))
+open(path, "wb").write(data)
+PY
+    serial=$work/$name.txt
+    : > "$serial"
+    qemu-system-x86_64 -m 1G -cpu max -display none -monitor none -no-reboot -serial stdio -net none \
+        -bios "$firmware" -drive "format=raw,file=fat:rw:$work/$name" < /dev/null > "$serial" 2>&1 &
+    qemu_pid=$!
+    wait_for '^brixOS: display [0-9]*x[0-9]* '
+    mode=$(output | grep -a '^brixOS: display [0-9]*x[0-9]* ' | head -1 | grep -ao '[0-9][0-9]*x[0-9][0-9]*' | head -1)
+    [[ $mode == "$wanted" ]] || fail "on a monitor that says 3840x1080 the image came up in $mode, not in $wanted"
+    # (The firmware's modes are said after the shape.)
+    said_by "^brixOS: the loader set this mode, $by; " "^brixOS: the firmware's modes:"
+    output | grep -aq "^brixOS: the picture is shown on a screen of the shape 3840:1080 (the monitor's own mode); /devices/framebuffer says so to the programs that draw for it\$" || fail "the kernel does not take the screen's shape from the monitor's own mode (3840:1080, the picture $mode)"
+}
+# An image that names no mode: the loader looks for the monitor's and
+# takes the nearest the firmware has.
+monitor_says 1920x1080 "the nearest the firmware has to the monitor's own" monitor-esp
+echo "ok   a monitor that says 3840x1080 of itself: the loader sets the nearest mode the firmware has ($mode), the kernel takes the screen's shape from the monitor (3840:1080)"
+# An image that names a mode the firmware has, of another shape: the mode
+# is the image's, the screen's shape still the monitor's (its word goes
+# before the image's).
+printf '1280x960\n' > "$work/display-named"
+monitor_says 1280x960 "the one the image names (settings/display)" named-esp "settings/display=$work/display-named"
+echo "ok   the image names $mode on that monitor: the mode is the image's, the screen's shape the monitor's (3840:1080)"
 echo PASS

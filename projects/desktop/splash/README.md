@@ -97,7 +97,9 @@ picture left for the next program is the one the display holds. With the
 monitor's own mode set (the card's driver, one day) the shapes are one
 and nothing is brought together. tools/check_brix_shape.sh measures the
 letters on the screen; tests/453_splash_squeeze_runtime.mlx the means.
-A screen narrower in shape than its mode is left as it is.
+A screen narrower in shape than its mode is left as it is, and so is one
+whose wider picture would take more than a quarter of the machine's free
+memory for its two frames (25 MiB at 3413x960, where 1280x960 takes 9).
 
 ## What it is told
 
