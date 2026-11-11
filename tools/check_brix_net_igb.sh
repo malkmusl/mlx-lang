@@ -10,9 +10,12 @@
 # requests went); brixOS's own socket calls; the link's state as a
 # program reads it from the kernel (/devices/net0's record: the cable
 # and the speed from the device's status register, also once QEMU's
-# monitor has pulled the cable, when ping says the link is down). The
-# device's frames come by its message-signalled interrupt (MSI); the
-# timer tick looks at its ring as well.
+# monitor has pulled the cable, when ping says the link is down, and
+# put it back: the address stays, its lease runs on). The device's
+# frames come by its message-signalled interrupt (MSI); the timer tick
+# looks at its ring as well. Then a boot with the cable out: no address,
+# and when the cable comes in DHCP asks at once and the kernel says the
+# address then.
 #
 #   tools/check_brix_net_igb.sh [compiler]
 set -euo pipefail
@@ -92,6 +95,30 @@ type_line() {
     wait_for '^root@brix:[^#]*# $' "$prompts"
     printf '%s\r' "$1" >&3
 }
+# Commands to QEMU's monitor.
+monitor() {
+    local tries=0
+    until [[ -S "$work/monitor" ]]; do
+        (( tries++ < 100 )) || fail "QEMU's monitor is not there"
+        sleep 0.1
+    done
+    python3 - "$work/monitor" "$@" <<'PY'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.settimeout(0.5)
+def drain():
+    try:
+        while s.recv(4096): pass
+    except socket.timeout:
+        pass
+drain()
+for command in sys.argv[2:]:
+    s.sendall((command + "\n").encode())
+    time.sleep(0.15)
+    drain()
+PY
+}
 wait_for '^brixOS: /devices/net0, [0-9a-f:]* (igb, message-signalled)$'
 wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)$'
 type_line 'cat /system/settings/resolv.conf'
@@ -105,7 +132,7 @@ done
 echo "ok   the native socket calls over igb: a stream to ourselves, a datagram, an echo answered by the gateway it was sent to"
 # The link's state, read natively from /devices/net0: the cable and the
 # speed are the device's status register's.
-for expected in '^link net0: igb 52:54:00:12:34:56 up$' '^speed 1000$' '^configured by DHCP$' '^address 10.0.2.15 mask 255.255.255.0$' '^gateway 10.0.2.2 name server 10.0.2.3$' '^frames received [1-9][0-9]* sent [1-9][0-9]*$' '^no link net1: 6$' '^record: 64 bytes, its length word 64, kind 5$'; do
+for expected in '^link net0: igb 52:54:00:12:34:56 up$' '^speed 1000$' '^configured by DHCP$' '^address 10.0.2.15 mask 255.255.255.0$' '^gateway 10.0.2.2 name server 10.0.2.3$' '^frames received [1-9][0-9]* sent [1-9][0-9]*$' '^lease 86400 s, 86[0-9][0-9][0-9] s left$' '^no link net1: 6$' '^record: 72 bytes, its length word 72, its first 64 as they were, kind 5$'; do
     wait_for "$expected"
 done
 echo "ok   a program reads the igb link's state from /devices/net0: up at 1000 Mbit/s, the address by DHCP, gateway, name server, frames"
@@ -126,21 +153,7 @@ wait_for '^device interrupts: [1-9][0-9]*$'
 echo "ok   the device's message-signalled interrupt brings its frames"
 # The cable pulled through QEMU's monitor (set_link): the device's status
 # register says so, and the link's record with it.
-python3 - "$work/monitor" <<'PY'
-import socket, sys, time
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(sys.argv[1])
-s.settimeout(0.5)
-def drain():
-    try:
-        while s.recv(4096): pass
-    except socket.timeout:
-        pass
-drain()
-s.sendall(b"set_link n0 off\n")
-time.sleep(0.15)
-drain()
-PY
+monitor "set_link n0 off"
 type_line 'netcalls links'
 wait_for '^link net0: igb 52:54:00:12:34:56 no cable$'
 echo "ok   with the cable pulled the igb link's record says no cable"
@@ -150,4 +163,56 @@ wait_for '^ping: the network link is down (no cable, or it is still coming up)$'
 wait_for '^--- 1 sent, 0 received, 100% lost$'
 wait_for '^unplugged 1$'
 echo "ok   with the cable pulled ping says the link is down, and has no answer"
+# The cable back in: the link is up again, and the address, whose lease
+# runs on, is still the link's (nothing is said: nothing changed).
+monitor "set_link n0 on"
+dones=$(output | grep -c '^done$' || true)
+for (( i = 0; i < 100; i++ )); do
+    type_line 'netcalls links'
+    dones=$((dones + 1))
+    wait_for '^done$' "$dones"
+    (( $(output | grep -c '^link net0: igb 52:54:00:12:34:56 up$') >= 2 )) && break
+    sleep 0.3
+done
+wait_for '^link net0: igb 52:54:00:12:34:56 up$' 2
+type_line 'ping -c 1 10.0.2.2; echo back $?'
+wait_for '^back 0$'
+(( $(output | grep -c '^brixOS: net0 is ') == 1 )) || fail "the kernel says the address again though nothing changed"
+echo "ok   with the cable back the link is up, the address is kept and the gateway answers"
+# The DHCP server's answer comes late: QEMU starts with the cable out
+# (set_link off before the machine runs: no frame gets through), the
+# boot says there is no address yet, and when the cable is in (the
+# card's status register says so) the kernel asks at once and says the
+# address then. (QEMU's igb says "link up" in its status register after
+# the start whatever set_link said before it, though it passes no frame:
+# the cable is pulled once more with the machine running, which the
+# register does follow.)
+exec 3>&-
+kill "$qemu_pid" 2> /dev/null || true
+wait "$qemu_pid" 2> /dev/null || true
+: > "$work/serial.txt"
+rm -f "$work/monitor"
+qemu-system-x86_64 -machine q35 -m 256M -display none -monitor "unix:$work/monitor,server,nowait" -no-reboot -cpu max -serial stdio \
+    -kernel "$work/brix.img" -S -netdev user,id=n0 -device igb,netdev=n0 < "$work/input" > "$work/serial.txt" 2>&1 &
+qemu_pid=$!
+exec 3> "$work/input"
+prompts=0
+monitor "set_link n0 off" "cont"
+wait_for '^brixOS: net0 has no address yet (DHCP is asking)$'
+wait_for '^root@brix:[^#]*# $'
+monitor "set_link n0 off"
+type_line 'netcalls links'
+for expected in '^link net0: igb 52:54:00:12:34:56 no cable$' '^not configured (DHCP is asking)$' '^gateway none name server none$' '^done$'; do
+    wait_for "$expected"
+done
+output | grep -q '^brixOS: net0 is ' && fail "the kernel says an address with the cable out"
+monitor "set_link n0 on"
+wait_for '^brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)$'
+type_line 'netcalls links'
+for expected in '^link net0: igb 52:54:00:12:34:56 up$' '^configured by DHCP$' '^address 10.0.2.15 mask 255.255.255.0$' '^gateway 10.0.2.2 name server 10.0.2.3$'; do
+    wait_for "$expected"
+done
+type_line 'ping -c 1 10.0.2.2; echo late $?'
+wait_for '^late 0$'
+echo "ok   a DHCP answer that comes after the boot, on igb (the cable in late): the kernel says the address then, and the record and a ping follow"
 echo PASS

@@ -620,15 +620,29 @@ ahead and a transmit queue, on a virtqueue of their own, virtqueue.mlx);
 The kernel's stack (kernel/net) runs on it:
 
 - stack.mlx: Ethernet, ARP (a table of the neighbours, a request when
-  one is missing: the packet is dropped and the sender tries again),
-  IPv4 (one address, netmask and gateway; no fragments) and ICMP (echo
-  answered). The addresses are QEMU's user network's (10.0.2.15/24,
-  the gateway 10.0.2.2, the name server 10.0.2.3) unless
-  /system/settings/network says otherwise (`address`, `netmask`,
-  `gateway`, `nameserver` lines); the kernel writes
-  /system/settings/resolv.conf for programs that look names up
-  ("brixOS: net0 is 10.0.2.15, gateway 10.0.2.2, name server
-  10.0.2.3").
+  one is missing: the packet waits for the answer, four packets at a
+  time, the neighbour asked three times a quarter of a second apart;
+  when nobody answers what waited is dropped, and an echo request's
+  ping socket is told in ICMP's words, "host unreachable" from the
+  machine's own address), IPv4 (one address, netmask and gateway; no
+  fragments; 127.0.0.0/8 is the machine itself: what is sent there
+  comes straight back in, from the address it was sent to, with or
+  without an address of the network's, and never goes onto the wire)
+  and ICMP (echo answered). The
+  addresses are /system/settings/network's (`address`, `netmask`,
+  `gateway`, `nameserver` lines) or DHCP's. Until one of them gives an
+  address the stack has none: it sends nothing but DHCP's messages
+  (from 0.0.0.0), takes nothing but DHCP's answers and answers no ARP
+  request. What the file or DHCP's answer leaves out is none: without
+  a gateway only the own subnet is reached (a send to anywhere else
+  fails as one that could not go: would_block for a datagram, a
+  connection that times out), without a name server resolv.conf has no
+  line and no name is looked up; a netmask left out is the one of the
+  address's class. The kernel writes /system/settings/resolv.conf for
+  programs that look names up, and says at boot "brixOS: net0 is
+  10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)" (without
+  "(DHCP)" for the file's; "none" for a gateway or a name server there
+  is not).
 - udp.mlx, tcp.mlx: datagrams; connections (active and passive open,
   segments of MSS bytes within the peer's window from a send ring,
   sent again after a timeout that doubles, data received in order into
@@ -645,10 +659,30 @@ The kernel's stack (kernel/net) runs on it:
   std.platform's paths) and std.http.client run unchanged, so does
   wget (projects/wget: `wget URL [-O FILE]`, http and https).
 
-- dhcp.mlx: at boot, unless the settings give an address, DHCP asks
-  QEMU's user network (DISCOVER, REQUEST; the ACK's address, netmask,
-  router and name server; "(DHCP)" on the boot line; the lease is not
-  renewed). settings.mlx reads the network file and writes resolv.conf.
+- lease.mlx, dhcp.mlx: unless the settings give an address, DHCP asks
+  for one (RFC 2131). lease.mlx is the client and knows no kernel (its
+  clock and its wire are two functions, so tests/455_dhcp_lease_runtime
+  drives it on the host); dhcp.mlx puts it on the kernel's clock and
+  UDP and does to the stack what it says. DISCOVER goes at boot (the
+  boot waits half a second for the answer) and again after 1, 2, 4, 8
+  and then every 16 seconds for as long as nobody answers, and at once
+  when the cable comes in (the link is looked at once a second). The
+  ACK's address, netmask, router and name server are the configuration.
+  The lease's time and its T1 and T2 are the answer's (options 51, 58,
+  59; half and seven eighths of the lease without them, or where they
+  do not lie in order inside the lease, or T1 is no seconds): at T1 a
+  REQUEST goes to the server from the own address, at T2 to everyone,
+  each again after half of what is left (a minute at least); when the
+  lease ends or a server answers NAK the address is given up (the
+  stack has none again) and discovery starts from the beginning. A
+  lease for ever is not renewed. When the answer comes after the boot
+  has said "net0 has no address yet (DHCP is asking)", the kernel says
+  "brixOS: net0 is ..., gateway ..., name server ... (DHCP)" then, on
+  a line of its own, and again only when a renewal changes the
+  configuration; an address given up is "brixOS: net0 gave up
+  10.0.2.15: its lease ran out (DHCP is asking)" (or ": the DHCP
+  server took it back"). settings.mlx reads the network file and
+  writes resolv.conf.
 - native/sockets.mlx: brixOS's own socket calls (spec calls 39 to 46:
   socket_open of a stream, datagram or ping socket, bind, connect,
   listen, accept, send, receive, info; std.os.brix's socketOpen and
@@ -663,27 +697,36 @@ The kernel's stack (kernel/net) runs on it:
   (host.brixos.mlx: socket_open's kind 3, the one wait, the interrupt
   event; host.mlx is Linux's datagram socket of IPPROTO_ICMP). The
   kernel sets the identifier and gives the socket its replies, and
-  ICMP's word that a request was not delivered. The destination is the
-  address given with the send (its port means nothing); would_block
-  says the neighbour's hardware address is being asked for, and ping
-  sends again. 127.0.0.0/8 is answered by the machine's own address.
+  ICMP's word that a request was not delivered: a router's, or the
+  kernel's own when nobody said the hardware address the request was
+  to go to (ping then says "no answer from 10.10.36.9 (its hardware
+  address is not known: nobody answered for it)", or names the
+  gateway). The destination is the address given with the send (its
+  port means nothing); would_block says the request cannot go now
+  (there is no address yet, no gateway leads there, the device is
+  busy): ping tries again for the request's second and then says which
+  it was. 127.0.0.1 is answered from 127.0.0.1.
 - link.mlx: the link's state for programs. /devices/net0 is a node of a
   kind of its own (as /devices/framebuffer is the display's): a read
   gives the link's record as things are at that moment (spec
-  `<NetworkLink>`, 64 bytes with its length first: whether the cable is
+  `<NetworkLink>`, 72 bytes with its length first: whether the cable is
   in (igb's status register, virtio-net's status word), DHCP still
   asking, where the address is from (nowhere yet, DHCP, the settings
   file), the speed where the card says it, the hardware address, the
-  driver's name, the address, netmask, gateway and name server, the
-  frames received and sent). std.os.brix's `networkLink(index, &link)`
-  reads it into a struct. A machine without a network device has no
-  such node. Until DHCP has answered the record has no address, and the
-  boot line is "brixOS: net0 has no address yet (DHCP is asking)".
+  driver's name, the address, netmask, gateway and name server
+  (0.0.0.0: none), the frames received and sent, and the seconds
+  DHCP's lease still runs and was given for). The record was 64 bytes
+  before the lease's two words: a program that asks for 64 gets those
+  as they were. std.os.brix's `networkLink(index, &link)` reads it
+  into a struct. A machine without a network device has no such node.
+  Until DHCP has answered the record has no address, and the boot line
+  is "brixOS: net0 has no address yet (DHCP is asking)".
 
 The settings app's Network page (projects/desktop/settings,
 network.brixos.mlx) shows that record for every link, read again every
 two seconds: connected or no cable, the address with its prefix length
-and "by DHCP" or "from the settings", gateway, name server, hardware
+and "by DHCP" or "from the settings", gateway and name server ("None"
+where there is none), how long DHCP's lease still runs, hardware
 address, driver, the frames; and how to give a fixed address
 (/system/settings/network, read at boot). Nothing is changed from the
 page yet.
@@ -702,22 +745,36 @@ pulls the cable, and boots without a card and without a DHCP server).
 
 tools/check_brix_net.sh boots with the user network: DHCP, ping as a
 person types it (tools/brix_ping_cases.sh, which the igb check goes
-through too: a neighbour not spoken to yet, the gateway, an address
-nobody has, the machine itself, a name, the count's forms, two at once,
-forty in a row, Ctrl+C; QEMU's capture of the frames says where the
-echo requests went), wget fetching files (a small one, a 400 KiB one, a
-missing one) from an HTTP server on the host, the native calls (a
-stream to ourselves, a datagram, an echo), and the link's record as
-netcalls reads it; then again on a wire without a DHCP server (no
-address yet), on another network (192.168.76.0/26: the record has what
-that DHCP server answered, not what the stack starts with), with a
-fixed address in the settings file, and on a network of the check's own
-(tools/brix_lan.py at the other end of QEMU's socket network: a name
-server, replies later than a second, a reply twice, a neighbour slow to
-say its hardware address, a router that says a host cannot be
-reached). tools/check_brix_desktop.sh opens
-the Network page and pulls the cable. Not yet: IPv6, a lease's renewal,
-a second link, the configuration changed while the system runs.
+through too: a neighbour not spoken to yet, whose first request the
+kernel keeps until its hardware address is known, the gateway, an
+address nobody has, the machine itself, a name, the count's forms, two
+at once, forty in a row, Ctrl+C; QEMU's capture of the frames says
+where the echo requests went), wget fetching files (a small one, a 400
+KiB one, a missing one) from an HTTP server on the host, the native
+calls (a stream to ourselves, a datagram, an echo; a stream and a
+datagram to 127.0.0.1), and the link's record as netcalls reads it,
+with the lease; then again on a wire without a DHCP server (no address:
+nothing but DHCP's questions is on the wire, a datagram sent to
+everyone is not heard, resolv.conf is empty, 127.0.0.1 is reached all
+the same), with the cable out until after the boot (the address said
+when it comes), on another network (192.168.76.0/26: the record has
+what that DHCP server answered), with a fixed address in the settings
+file (the first packet through its gateway answered), with an address
+line alone (no gateway, no name server: the own subnet and nothing
+else), with an address line of 0.0.0.0 (that is no address: DHCP
+asks), and on a network of the
+check's own (tools/brix_lan.py at the other end of QEMU's socket
+network: a name server, replies later than a second, a reply twice, a
+neighbour slow to say its hardware address, a router that says a host
+cannot be reached, a host and a gateway nobody answers for).
+tools/check_brix_net_igb.sh does the cable pulled and put back and the
+late answer on the igb card. tests/455_dhcp_lease_runtime.mlx runs the
+lease's renewal and end on a clock of its own (QEMU's user network
+gives a lease of a day, and its length cannot be set).
+tools/check_brix_desktop.sh opens the Network page and pulls the cable.
+Not yet: IPv6, a second link, the configuration changed while the
+system runs, a lease checked again when the cable comes back (it is
+kept until it ends).
 
 ## brixfs: the disk's format
 

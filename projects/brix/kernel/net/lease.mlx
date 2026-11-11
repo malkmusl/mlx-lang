@@ -1,0 +1,527 @@
+// DHCP (RFC 2131), the client: an address asked for, kept while its
+// lease runs, renewed, and given up when the lease ends. This file knows
+// no kernel: the clock and the wire are `Outside`'s two functions, so the
+// same code runs in a test built for the host
+// (tests/455_dhcp_lease_runtime.mlx); dhcp.mlx is the kernel's side.
+//
+// Without an address: DISCOVER to everyone from 0.0.0.0, again after 1,
+// 2, 4, 8 and then every 16 seconds for as long as nobody answers (a
+// cable plugged in later, a switch port that forwards late). The first
+// OFFER's address is asked for with a REQUEST (again after 1, 2, 4 and 8
+// seconds, then from the start), and the ACK's address, netmask, router
+// and name server are the configuration; what the ACK leaves out is none
+// (0.0.0.0), a netmask left out the one of the address's class.
+//
+// With an address: the lease's time and its T1 and T2 (options 51, 58,
+// 59; half and seven eighths of the lease where they are missing or do
+// not fit) count from when the REQUEST went out. At T1 a REQUEST goes to
+// the server from the own address (RENEWING), at T2 to everyone
+// (REBINDING), each again after half of what is left to the next of
+// these times, a minute at least. An ACK is a new lease. When the lease
+// ends, or a server answers NAK, the address is given up and discovery
+// starts again. A lease for ever (0xFFFFFFFF, or an answer without a
+// lease time: BOOTP's) is never renewed.
+//
+// Not here: the random part the RFC gives the pauses (for many clients
+// started together), options spilling into the sname and file fields
+// (option 52), INIT-REBOOT, DECLINE and RELEASE.
+
+pub const CLIENT_PORT: usize = 68
+pub const SERVER_PORT: usize = 67
+pub const SECOND: usize = 1000000000
+// A lease that does not end (option 51's all ones).
+pub const FOR_EVER: usize = 0xFFFFFFFF
+
+const BOOT_REQUEST: u8 = 1
+const BOOT_REPLY: u8 = 2
+const DISCOVER: u8 = 1
+const OFFER: u8 = 2
+const REQUEST: u8 = 3
+const ACK: u8 = 5
+const NAK: u8 = 6
+const MAGIC: usize = 0x63825363
+// A message's fixed part with the magic number: the options follow.
+const OPTIONS: usize = 240
+// A message as it is sent (BOOTP's least: relays drop shorter ones).
+pub const MESSAGE: usize = 300
+// The pauses between messages nobody answers, without an address.
+const FIRST_WAIT: usize = SECOND
+const LONGEST_WAIT: usize = 16 * SECOND
+// How often the offer's REQUEST goes before discovery starts again.
+const REQUESTS: usize = 4
+// With an address, a REQUEST is not sent again sooner than this.
+const RENEW_WAIT: usize = 60 * SECOND
+
+// What is outside the client.
+pub const Outside = struct {
+    // Nanoseconds, only ever more.
+    now: fn() -> usize
+    // A message (its bytes, its length) as UDP from port 68 of the first
+    // address to port 67 of the second (four bytes each): from 0.0.0.0 or
+    // the own address, to 255.255.255.255 or the server.
+    send: fn([*]const u8, usize, [*]const u8, [*]const u8) -> void
+}
+
+pub const State = enum(u8) { idle, discovering, requesting, bound, renewing, rebinding }
+
+// What a message or the clock did to the configuration: nothing; there
+// is a new one (the first, or a renewal that changed something); the
+// lease was renewed as it was; the address was given up.
+pub const Change = enum(u8) { none, configured, renewed, lost }
+
+// Why the address was given up last.
+pub const Reason = enum(u8) { none, expired, refused }
+
+fn be16(bytes: [*]const u8, at: usize) -> usize { return (@intCast(usize, bytes[at]) << 8) | @intCast(usize, bytes[at + 1]) }
+fn be32(bytes: [*]const u8, at: usize) -> usize { return (be16(bytes, at) << 16) | be16(bytes, at + 2) }
+fn putBe16(bytes: [*]u8, at: usize, value: usize) -> void {
+    bytes[at] = @intCast(u8, (value >> 8) & 255)
+    bytes[at + 1] = @intCast(u8, value & 255)
+}
+fn putBe32(bytes: [*]u8, at: usize, value: usize) -> void {
+    putBe16(bytes, at, (value >> 16) & 0xFFFF)
+    putBe16(bytes, at + 2, value & 0xFFFF)
+}
+
+// The bytes `offset` after `bytes`.
+fn after(bytes: [*]const u8, offset: usize) -> [*]const u8 {
+    unsafe { return @ptrFromInt([*]const u8, @intFromPtr(bytes) + offset) }
+}
+
+fn place(bytes: [*]u8, offset: usize) -> [*]u8 {
+    unsafe { return @ptrFromInt([*]u8, @intFromPtr(bytes) + offset) }
+}
+
+fn copy4(into: [*]u8, from: [*]const u8) -> void {
+    into[0] = from[0]
+    into[1] = from[1]
+    into[2] = from[2]
+    into[3] = from[3]
+}
+
+fn clear4(into: [*]u8) -> void {
+    into[0] = 0
+    into[1] = 0
+    into[2] = 0
+    into[3] = 0
+}
+
+fn same4(a: [*]const u8, b: [*]const u8) -> bool { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3] }
+
+// Whether the four bytes are 0.0.0.0: no address.
+pub fn none4(a: [*]const u8) -> bool { return a[0] == 0 && a[1] == 0 && a[2] == 0 && a[3] == 0 }
+
+// The netmask of an address that came without one: its class's
+// (10.1.2.3: 255.0.0.0; 172.16.1.2: 255.255.0.0; 192.168.1.2:
+// 255.255.255.0), as hosts have always taken it. An address of no class
+// with hosts in it (224.0.0.0 and above) has only itself.
+pub fn classMask(address: [*]const u8, into: [*]u8) -> void {
+    const first = address[0]
+    into[0] = 255
+    into[1] = if first < 128 { 0 } else { 255 }
+    into[2] = if first < 192 { 0 } else { 255 }
+    into[3] = if first < 224 { 0 } else { 255 }
+}
+
+pub const Client = struct {
+    outside: Outside
+    hardware: [6]u8
+    state: State
+    // The exchange's number: an answer with another is not ours.
+    xid: usize
+    // When the message sent last goes again.
+    deadline: usize
+    // The pause before the next message without an address (it doubles).
+    wait: usize
+    // REQUESTs for the offer that may still go.
+    requests: usize
+    // When the asking began (the messages say for how many seconds).
+    began: usize
+    // When the REQUEST went out whose answer is waited for: a lease runs
+    // from then.
+    requested: usize
+    // The OFFER's address and its server.
+    offered: [4]u8
+    offering: [4]u8
+    // The lease (bound, renewing, rebinding): the configuration, the
+    // server that gave it, its time in seconds (FOR_EVER: it does not
+    // end), and when it is renewed (T1), asked of everyone (T2) and over.
+    address: [4]u8
+    mask: [4]u8
+    router: [4]u8
+    nameServer: [4]u8
+    server: [4]u8
+    leaseTime: usize
+    renewAt: usize
+    rebindAt: usize
+    endsAt: usize
+    // Why the address was given up last.
+    reason: Reason
+    // The message being made.
+    message: [MESSAGE]u8
+
+    pub fn init(self: *Self, outside: Outside, hardware: [*]const u8) -> void {
+        self.*.outside = outside
+        var k: usize = 0
+        while k < 6 {
+            self.*.hardware[k] = hardware[k]
+            k += 1
+        }
+        self.*.state = State.idle
+        self.*.xid = (@intCast(usize, hardware[2]) << 24) | (@intCast(usize, hardware[3]) << 16) | (@intCast(usize, hardware[4]) << 8) | @intCast(usize, hardware[5])
+        self.*.deadline = 0
+        self.*.wait = FIRST_WAIT
+        self.*.requests = 0
+        self.*.began = 0
+        self.*.requested = 0
+        self.*.reason = Reason.none
+        clear4(&self.*.offered)
+        clear4(&self.*.offering)
+        self.forget()
+    }
+
+    fn forget(self: *Self) -> void {
+        clear4(&self.*.address)
+        clear4(&self.*.mask)
+        clear4(&self.*.router)
+        clear4(&self.*.nameServer)
+        clear4(&self.*.server)
+        self.*.leaseTime = 0
+        self.*.renewAt = 0
+        self.*.rebindAt = 0
+        self.*.endsAt = 0
+    }
+
+    fn time(self: *const Self) -> usize {
+        const now = self.*.outside.now
+        return now()
+    }
+
+    // Whether an address is asked for (none is held).
+    pub fn asking(self: *const Self) -> bool { return self.*.state == State.discovering || self.*.state == State.requesting }
+
+    // Whether an address is held.
+    pub fn has(self: *const Self) -> bool { return self.*.state == State.bound || self.*.state == State.renewing || self.*.state == State.rebinding }
+
+    // The seconds the lease still runs: 0 without one, FOR_EVER for one
+    // that does not end.
+    pub fn left(self: *const Self) -> usize {
+        if !self.has() { return 0 }
+        if self.*.leaseTime == FOR_EVER { return FOR_EVER }
+        const now = self.time()
+        if now >= self.*.endsAt { return 0 }
+        return (self.*.endsAt - now) / SECOND
+    }
+
+    // Another exchange's number (from the last, the clock and the
+    // hardware address: two machines started together differ).
+    fn renumber(self: *Self, now: usize) -> void {
+        self.*.xid = ((self.*.xid *% 1103515245) +% 12345 +% (now / 1024)) & 0xFFFFFFFF
+    }
+
+    // The asking begins: the first DISCOVER goes now.
+    pub fn start(self: *Self) -> void {
+        const now = self.time()
+        self.forget()
+        self.begin(now)
+        self.discover(now)
+    }
+
+    fn begin(self: *Self, now: usize) -> void {
+        self.renumber(now)
+        self.*.state = State.discovering
+        self.*.began = now
+        self.*.wait = FIRST_WAIT
+    }
+
+    // The link came up (a cable plugged in): without an address the next
+    // DISCOVER goes now, not when the pause is over.
+    pub fn linkUp(self: *Self) -> void {
+        if !self.asking() { return }
+        const now = self.time()
+        self.begin(now)
+        self.discover(now)
+    }
+
+    // A message's fixed part and its kind into the message: the length so
+    // far. `own`: from the address held (it goes into the message, and
+    // the answer comes to it); else the answer is asked for by broadcast.
+    fn make(self: *Self, kind: u8, now: usize, own: bool) -> usize {
+        const m: [*]u8 = &self.*.message
+        var k: usize = 0
+        while k < MESSAGE {
+            m[k] = 0
+            k += 1
+        }
+        m[0] = BOOT_REQUEST
+        m[1] = 1 // Ethernet
+        m[2] = 6
+        putBe32(m, 4, self.*.xid)
+        const seconds = (now - self.*.began) / SECOND
+        putBe16(m, 8, if seconds > 0xFFFF { 0xFFFF } else { seconds })
+        if own { copy4(place(m, 12), &self.*.address) } else { putBe16(m, 10, 0x8000) }
+        k = 0
+        while k < 6 {
+            m[28 + k] = self.*.hardware[k]
+            k += 1
+        }
+        putBe32(m, 236, MAGIC)
+        m[240] = 53
+        m[241] = 1
+        m[242] = kind
+        // What is wanted: netmask, router, name server, the lease's
+        // time, T1 and T2.
+        m[243] = 55
+        m[244] = 6
+        m[245] = 1
+        m[246] = 3
+        m[247] = 6
+        m[248] = 51
+        m[249] = 58
+        m[250] = 59
+        return 251
+    }
+
+    // The message (its options end at `length`) from `source` to
+    // `destination`.
+    fn post(self: *Self, length: usize, source: [*]const u8, destination: [*]const u8) -> void {
+        const m: [*]u8 = &self.*.message
+        m[length] = 255
+        const send = self.*.outside.send
+        send(m, MESSAGE, source, destination)
+    }
+
+    fn discover(self: *Self, now: usize) -> void {
+        const length = self.make(DISCOVER, now, false)
+        self.post(length, &nowhere, &everyone)
+        self.*.deadline = now + self.*.wait
+        self.*.wait = if self.*.wait * 2 > LONGEST_WAIT { LONGEST_WAIT } else { self.*.wait * 2 }
+    }
+
+    // The offer's address asked for (to everyone: the other servers hear
+    // whose offer was taken).
+    fn request(self: *Self, now: usize) -> void {
+        const m: [*]u8 = &self.*.message
+        var length = self.make(REQUEST, now, false)
+        m[length] = 50
+        m[length + 1] = 4
+        copy4(place(m, length + 2), &self.*.offered)
+        length += 6
+        if !none4(&self.*.offering) {
+            m[length] = 54
+            m[length + 1] = 4
+            copy4(place(m, length + 2), &self.*.offering)
+            length += 6
+        }
+        self.post(length, &nowhere, &everyone)
+        // (The lease counts from the first of them: the server may have
+        // answered that one.)
+        if self.*.requests == REQUESTS { self.*.requested = now }
+        // (1, 2, 4, 8 seconds: REQUESTS of them.)
+        self.*.deadline = now + (FIRST_WAIT << @intCast(u6, REQUESTS - self.*.requests))
+        self.*.requests -= 1
+    }
+
+    // The lease asked for again: of its server from the own address
+    // (renewing; of everyone when the server is not known), of everyone
+    // (rebinding). Again after half of what is left to the next of the
+    // lease's times, a minute at least.
+    fn renew(self: *Self, now: usize) -> void {
+        const length = self.make(REQUEST, now, true)
+        const toServer = self.*.state == State.renewing && !none4(&self.*.server)
+        if toServer { self.post(length, &self.*.address, &self.*.server) } else { self.post(length, &self.*.address, &everyone) }
+        self.*.requested = now
+        const until = if self.*.state == State.renewing { self.*.rebindAt } else { self.*.endsAt }
+        const half = if until > now { (until - now) / 2 } else { 0 }
+        self.*.deadline = now + (if half < RENEW_WAIT { RENEW_WAIT } else { half })
+    }
+
+    // The lease's renewal begins: an exchange of its own, its seconds
+    // counted from now.
+    fn again(self: *Self, now: usize) -> void {
+        self.renumber(now)
+        self.*.began = now
+    }
+
+    // The address given up: discovery from the start, the first DISCOVER
+    // now.
+    fn giveUp(self: *Self, why: Reason, now: usize) -> Change {
+        self.forget()
+        self.*.reason = why
+        self.begin(now)
+        self.discover(now)
+        return Change.lost
+    }
+
+    // The clock looked at (every tick of the kernel's timer): what is due
+    // is sent, a lease that ended is given up.
+    pub fn tick(self: *Self) -> Change {
+        if self.*.state == State.idle { return Change.none }
+        const now = self.time()
+        if self.has() {
+            if self.*.leaseTime == FOR_EVER { return Change.none }
+            // (The latest of the times first: a clock that went far ahead
+            // in one step skips what lies before.)
+            if now >= self.*.endsAt { return self.giveUp(Reason.expired, now) }
+            if self.*.state != State.rebinding && now >= self.*.rebindAt {
+                if self.*.state == State.bound { self.again(now) }
+                self.*.state = State.rebinding
+                self.renew(now)
+                return Change.none
+            }
+            if self.*.state == State.bound && now >= self.*.renewAt {
+                self.again(now)
+                self.*.state = State.renewing
+                self.renew(now)
+                return Change.none
+            }
+            if self.*.state != State.bound && now >= self.*.deadline { self.renew(now) }
+            return Change.none
+        }
+        if now < self.*.deadline { return Change.none }
+        if self.*.state == State.requesting && self.*.requests > 0 {
+            self.request(now)
+            return Change.none
+        }
+        // (Nobody answered the REQUEST: the offer is forgotten. The pause
+        // goes on doubling: only an address held or the link coming up
+        // makes it short again.)
+        if self.*.state == State.requesting {
+            self.renumber(now)
+            self.*.state = State.discovering
+        }
+        self.discover(now)
+        return Change.none
+    }
+
+    // A message that came to port 68 (the UDP payload): what it did.
+    // One that is not an answer to this client's last message (another
+    // exchange's number, another hardware address), or that is cut short
+    // or malformed, is not taken.
+    pub fn receive(self: *Self, bytes: [*]const u8, length: usize) -> Change {
+        if self.*.state == State.idle || self.*.state == State.bound { return Change.none }
+        if length < OPTIONS + 3 || bytes[0] != BOOT_REPLY || bytes[1] != 1 || bytes[2] != 6 { return Change.none }
+        if be32(bytes, 4) != self.*.xid || be32(bytes, 236) != MAGIC { return Change.none }
+        var k: usize = 0
+        while k < 6 {
+            if bytes[28 + k] != self.*.hardware[k] { return Change.none }
+            k += 1
+        }
+        // The options: where the value of each one wanted is (0: not
+        // there). One that runs past the message's end: the message is
+        // not taken.
+        var kind: u8 = 0
+        var maskAt: usize = 0
+        var routerAt: usize = 0
+        var nameServerAt: usize = 0
+        var serverAt: usize = 0
+        var leaseAt: usize = 0
+        var renewAt: usize = 0
+        var rebindAt: usize = 0
+        var at: usize = OPTIONS
+        while at < length {
+            const option = bytes[at]
+            if option == 255 { break }
+            if option == 0 {
+                at += 1
+                continue
+            }
+            if at + 1 >= length { return Change.none }
+            const size = @intCast(usize, bytes[at + 1])
+            if at + 2 + size > length { return Change.none }
+            if option == 53 && size == 1 { kind = bytes[at + 2] }
+            if option == 1 && size == 4 { maskAt = at + 2 }
+            if option == 3 && size >= 4 { routerAt = at + 2 }
+            if option == 6 && size >= 4 { nameServerAt = at + 2 }
+            if option == 54 && size == 4 { serverAt = at + 2 }
+            if option == 51 && size == 4 { leaseAt = at + 2 }
+            if option == 58 && size == 4 { renewAt = at + 2 }
+            if option == 59 && size == 4 { rebindAt = at + 2 }
+            at += 2 + size
+        }
+        const now = self.time()
+        const yours = after(bytes, 16)
+        if self.*.state == State.discovering {
+            if kind != OFFER || none4(yours) { return Change.none }
+            copy4(&self.*.offered, yours)
+            copy4(&self.*.offering, valueOr(bytes, serverAt))
+            self.*.state = State.requesting
+            self.*.requests = REQUESTS
+            self.request(now)
+            return Change.none
+        }
+        if kind == NAK {
+            if self.*.state == State.requesting {
+                // The offer is not to be had after all: from the start,
+                // when the pause is over (a server that refuses again and
+                // again is asked less and less often).
+                self.renumber(now)
+                self.*.state = State.discovering
+                self.*.deadline = now + self.*.wait
+                return Change.none
+            }
+            return self.giveUp(Reason.refused, now)
+        }
+        if kind != ACK || none4(yours) { return Change.none }
+        const lease = if leaseAt != 0 { be32(bytes, leaseAt) } else { FOR_EVER }
+        if lease == 0 { return Change.none }
+        // What the answer has: is it what is held already?
+        const held = self.has()
+        var changed = !held || !same4(&self.*.address, yours)
+        var mask: [4]u8 = undefined
+        if maskAt != 0 { copy4(&mask, after(bytes, maskAt)) } else { classMask(yours, &mask) }
+        const router = valueOr(bytes, routerAt)
+        const nameServer = valueOr(bytes, nameServerAt)
+        if !same4(&self.*.mask, &mask) || !same4(&self.*.router, router) || !same4(&self.*.nameServer, nameServer) { changed = true }
+        copy4(&self.*.address, yours)
+        copy4(&self.*.mask, &mask)
+        copy4(&self.*.router, router)
+        copy4(&self.*.nameServer, nameServer)
+        // The server: the answer's, else the offer's, else the one known.
+        if serverAt != 0 {
+            copy4(&self.*.server, after(bytes, serverAt))
+        } else if !held {
+            copy4(&self.*.server, &self.*.offering)
+        }
+        self.*.leaseTime = lease
+        if lease != FOR_EVER {
+            // T1 and T2 as the server says, where they lie in order
+            // inside the lease; else half and seven eighths of it, in
+            // nanoseconds: half of a lease of one second is half a
+            // second, not none. A T1 of no seconds is not taken either:
+            // with the renewal due the moment the answer came, every
+            // answer was followed by the next REQUEST, a hundred a
+            // second for as long as the server went on answering.
+            var renewAfter = lease * SECOND / 2
+            var rebindAfter = lease * (SECOND / 8) * 7
+            const renewSaid = if renewAt != 0 { be32(bytes, renewAt) } else { 0 }
+            const rebindSaid = if rebindAt != 0 { be32(bytes, rebindAt) } else { 0 }
+            if renewSaid != 0 && rebindAt != 0 && renewSaid < rebindSaid && rebindSaid < lease {
+                renewAfter = renewSaid * SECOND
+                rebindAfter = rebindSaid * SECOND
+            } else if renewSaid != 0 && rebindAt == 0 && renewSaid * SECOND < rebindAfter {
+                renewAfter = renewSaid * SECOND
+            } else if renewAt == 0 && rebindAt != 0 && rebindSaid * SECOND > renewAfter && rebindSaid < lease {
+                rebindAfter = rebindSaid * SECOND
+            }
+            self.*.renewAt = self.*.requested + renewAfter
+            self.*.rebindAt = self.*.requested + rebindAfter
+            self.*.endsAt = self.*.requested + lease * SECOND
+        }
+        self.*.state = State.bound
+        self.*.wait = FIRST_WAIT
+        self.*.reason = Reason.none
+        return if changed { Change.configured } else { Change.renewed }
+    }
+}
+
+// An option's value at `at` of the message, or 0.0.0.0 where the message
+// had none (`at` 0).
+fn valueOr(bytes: [*]const u8, at: usize) -> [*]const u8 {
+    if at == 0 { return &nowhere }
+    return after(bytes, at)
+}
+
+// (Static: a constant array is built where it is used.)
+var nowhere: [4]u8 = [4]u8{ 0, 0, 0, 0 } // (constant)
+var everyone: [4]u8 = [4]u8{ 255, 255, 255, 255 } // (constant)
