@@ -1,5 +1,7 @@
 // TCP: a connection per TCP socket (sockets.mlx): active open (SYN,
-// SYN+ACK, ACK), passive open for a listening socket, data in segments
+// SYN+ACK, ACK), passive open for a listening socket (what is asked of
+// it waits in halfopen.mlx's table, without a socket, until the peer's
+// ACK makes it a connection in the listener's queue), data in segments
 // of MSS bytes within the peer's window from a send ring (sent again
 // after a timeout, doubling, given up after RETRIES), data received in
 // order into the socket's ring (out of order: dropped, acknowledged
@@ -14,8 +16,9 @@ const sockets = @import("./sockets.mlx")
 const Status = @import("../status.mlx").Status
 const limits = @import("./limits.mlx")
 const rings = @import("./rings.mlx")
+const halfopen = @import("./halfopen.mlx")
 
-pub const State = enum(u8) { closed, listen, syn_sent, syn_received, established, fin_wait_1, fin_wait_2, close_wait, closing, last_ack, time_wait }
+pub const State = enum(u8) { closed, listen, syn_sent, established, fin_wait_1, fin_wait_2, close_wait, closing, last_ack, time_wait }
 
 const FIN: usize = 1
 const SYN: usize = 2
@@ -33,7 +36,16 @@ const TIME_WAIT: usize = 2 * SECOND
 // A connection its program let go of has this long, from the peer's last
 // step on, for what is left of it (see letGo).
 const ORPHAN_TIME: usize = 20 * SECOND
-const MAX_PENDING: usize = 4
+// A listener's connections made and not yet accepted. Each holds a
+// socket and its two rings (32 KiB): a program that answers eight
+// clients at a time (logserve) has twice as many waiting behind them.
+// With the queue full a SYN gets no answer (the peer asks again a second
+// later, and by then the program may have taken a connection from the
+// queue), and an ACK that would make a connection is dropped (its
+// SYN+ACK goes again by its clock, and the peer's answer to that tries
+// once more). It was 4, counted together with what was only asked: four
+// SYNs nobody followed up kept a listener deaf for over a minute.
+const MAX_PENDING: usize = 16
 const ECONNREFUSED: isize = -111
 const ECONNRESET: isize = -104
 const ETIMEDOUT: isize = -110
@@ -168,6 +180,17 @@ pub const Connection = struct {
     // sent; it is established when the SYN+ACK comes).
     pub fn open(self: *Self, localPort: usize, remote: stack.Ip, port: usize) -> isize {
         if self.*.state != State.closed { return Status.invalid }
+        // A connection is to one host: an address that is everyone's
+        // (255.255.255.255, the subnet's last) or a group's is refused
+        // (RFC 1122, 4.2.3.10). Taken, its SYN went to every host on the
+        // wire, to everyone's hardware address, again and again.
+        if stack.manyHosts(remote) { return Status.invalid }
+        // What cannot leave the machine as it is (no device, the link
+        // down, no address, no gateway to it) fails now, with the status
+        // that says so. Begun all the same, its SYN was tried again and
+        // again for over a minute, and the program heard nothing for as
+        // long as it cared to wait.
+        if !stack.reaches(remote) { return Status.unreachable }
         self.*.localPort = localPort
         self.*.remote = remote
         self.*.remotePort = port
@@ -295,7 +318,9 @@ pub const Connection = struct {
             return
         }
         if self.*.state == State.listen {
-            // The connections waiting to be accepted go.
+            // What was asked of it and not made yet, and the connections
+            // waiting to be accepted, go.
+            half.dropPort(self.*.localPort)
             var k: usize = 0
             while k < self.*.pendingCount {
                 connections[self.*.pending[k]].abort()
@@ -307,7 +332,7 @@ pub const Connection = struct {
             self.*.state = State.closed
             return
         }
-        if self.*.state == State.syn_sent || self.*.state == State.syn_received { self.abort() }
+        if self.*.state == State.syn_sent { self.abort() }
     }
 
     // The socket's last descriptor went and the connection is not over:
@@ -397,40 +422,12 @@ pub const Connection = struct {
         if self.*.state == State.syn_sent {
             if flags & SYN == 0 || flags & ACK == 0 || ack != self.*.sndNxt { return }
             self.*.rcvNxt = mask(seq + 1)
-            self.readOptions(options, optionsLength)
+            self.*.mss = mssOf(options, optionsLength)
             self.acknowledged(ack, peerWindow)
             self.*.state = State.established
             _ = self.segment(ACK, self.*.sndNxt, 0)
             sockets.Sockets.established(self.*.socket)
             return
-        }
-        if self.*.state == State.syn_received {
-            if flags & ACK == 0 || ack != self.*.sndNxt { return }
-            self.acknowledged(ack, peerWindow)
-            self.*.state = State.established
-            const listener = sockets.Sockets.listenerFor(self.*.localPort)
-            if listener != sockets.MAX {
-                const l = &connections[listener]
-                if l.*.pendingCount < MAX_PENDING {
-                    l.*.pending[l.*.pendingCount] = self.*.socket
-                    l.*.pendingCount += 1
-                    sockets.sockets().roomMade(listener)
-                } else {
-                    self.abort()
-                    self.deinit()
-                    sockets.sockets().drop(self.*.socket)
-                    return
-                }
-            } else if sockets.sockets().holdersOf(self.*.socket) == 0 {
-                // (Its listener closed meanwhile: nobody could accept it
-                // or close it, and its slot would stay.)
-                self.abort()
-                self.deinit()
-                sockets.sockets().drop(self.*.socket)
-                return
-            }
-            sockets.Sockets.established(self.*.socket)
-            // (The data of this segment, below.)
         }
         if flags & ACK == 0 { return }
         if self.*.state == State.time_wait {
@@ -467,26 +464,6 @@ pub const Connection = struct {
         self.push()
     }
 
-    fn readOptions(self: *Self, options: [*]const u8, length: usize) -> void {
-        var at: usize = 0
-        while at < length {
-            const kind = options[at]
-            if kind == 0 { return }
-            if kind == 1 {
-                at += 1
-                continue
-            }
-            if at + 1 >= length { return }
-            const size = @intCast(usize, options[at + 1])
-            if size < 2 || at + size > length { return }
-            if kind == 2 && size == 4 {
-                const mss = stack.be16(options, at + 2)
-                if mss >= 536 && mss < MSS { self.*.mss = mss }
-            }
-            at += size
-        }
-    }
-
     fn fail(self: *Self, code: isize) -> void {
         sockets.Sockets.failed(self.*.socket, code)
         self.finishedNow()
@@ -516,10 +493,6 @@ pub const Connection = struct {
             _ = self.segment(SYN, self.*.iss, 0)
             return
         }
-        if self.*.state == State.syn_received {
-            _ = self.segment(SYN | ACK, self.*.iss, 0)
-            return
-        }
         const inFlight = mask(self.*.sndNxt -% self.*.sndUna)
         const dataInFlight = if self.*.finSent && inFlight > 0 { inFlight - 1 } else { inFlight }
         if dataInFlight > 0 {
@@ -540,6 +513,101 @@ var connections: [limits.MAX_SOCKETS]Connection = undefined // (per run)
 // The reset for a segment of no connection is made in this one (static:
 // a local Connection took 200 bytes of the aggregate arena a segment).
 var stray: Connection = undefined // (per run)
+// What is asked of the listeners and not made yet.
+var half: halfopen.Table = undefined // (per run)
+
+// The largest segment a peer takes, as its SYN's options say (ours where
+// they say none, or more).
+fn mssOf(options: [*]const u8, length: usize) -> usize {
+    var at: usize = 0
+    while at < length {
+        const kind = options[at]
+        if kind == 0 { break }
+        if kind == 1 {
+            at += 1
+            continue
+        }
+        if at + 1 >= length { break }
+        const size = @intCast(usize, options[at + 1])
+        if size < 2 || at + size > length { break }
+        if kind == 2 && size == 4 {
+            const mss = stack.be16(options, at + 2)
+            if mss >= 536 && mss < MSS { return mss }
+        }
+        at += size
+    }
+    return MSS
+}
+
+// The SYN+ACK of record `h`: our sequence number, the peer's next, the
+// MSS option, the window a new connection's empty ring has; from the
+// address the peer spoke to.
+fn answer(h: *const halfopen.HalfOpen) -> void {
+    const p = stack.payloadArea()
+    const remote = stack.getIp(&h.*.remote, 0)
+    stack.putBe16(p, 0, h.*.port)
+    stack.putBe16(p, 2, h.*.remotePort)
+    stack.putBe32(p, 4, mask(h.*.iss))
+    stack.putBe32(p, 8, mask(h.*.theirs))
+    p[12] = @intCast(u8, ((HEADER + 4) / 4) << 4)
+    p[13] = @intCast(u8, SYN | ACK)
+    stack.putBe16(p, 14, if limits.RING > 65535 { 65535 } else { limits.RING })
+    stack.putBe16(p, 16, 0)
+    stack.putBe16(p, 18, 0)
+    p[20] = 2
+    p[21] = 4
+    stack.putBe16(p, 22, MSS)
+    stack.putBe16(p, 16, stack.checksum(p, HEADER + 4, stack.pseudoSum(stack.sourceFor(remote), remote, stack.PROTOCOL_TCP, HEADER + 4)))
+    _ = stack.send(stack.PROTOCOL_TCP, remote, HEADER + 4)
+}
+
+// A SYN for the listener at socket `listener`: a record of what is asked
+// (halfopen.mlx: with the table full the one that waited longest gives
+// way) and the SYN+ACK from it; no socket yet. With the listener's queue
+// full the SYN gets no answer.
+fn asked(listener: usize, port: usize, source: stack.Ip, sourcePort: usize, seq: usize, peerWindow: usize, options: [*]const u8, optionsLength: usize) -> void {
+    if connections[listener].pendingCount >= MAX_PENDING { return }
+    const now = clock.system().monotonic()
+    const index = half.begin(port, &source, sourcePort, mask(now / 64), mask(seq + 1), mssOf(options, optionsLength), peerWindow, now)
+    answer(half.at(index))
+}
+
+// The peer answered the SYN+ACK of record `found`: the connection is
+// made (a socket and its rings taken now) and put in the queue of the
+// listener at socket `listener`, and the record is over. Its socket's
+// index; sockets.MAX when the queue is full or there is no socket or no
+// memory for it: the record stays, its SYN+ACK goes again by its clock,
+// and the peer's answer to that tries once more.
+fn make(listener: usize, found: usize) -> usize {
+    const l = &connections[listener]
+    if l.*.pendingCount >= MAX_PENDING { return sockets.MAX }
+    const h = half.at(found)
+    const remote = stack.getIp(&h.*.remote, 0)
+    const opened = sockets.sockets().openAccepted(h.*.port, remote, h.*.remotePort)
+    if opened < 0 { return sockets.MAX }
+    const index = @bitCast(usize, opened)
+    const c = &connections[index]
+    if !c.init(index) {
+        sockets.sockets().abandon(index)
+        return sockets.MAX
+    }
+    c.*.localPort = h.*.port
+    c.*.remote = remote
+    c.*.remotePort = h.*.remotePort
+    c.*.iss = h.*.iss
+    c.*.sndUna = mask(h.*.iss + 1)
+    c.*.sndNxt = mask(h.*.iss + 1)
+    c.*.rcvNxt = h.*.theirs
+    c.*.mss = h.*.mss
+    c.*.peerWindow = h.*.window
+    c.*.state = State.established
+    half.drop(found)
+    l.*.pending[l.*.pendingCount] = index
+    l.*.pendingCount += 1
+    sockets.sockets().roomMade(listener)
+    sockets.Sockets.established(index)
+    return index
+}
 
 // Socket `index` out of every listener's pending connections (it goes
 // before it was accepted: accept must not hand out a slot that is free,
@@ -575,10 +643,12 @@ pub fn init() -> void {
         connections[k].state = State.closed
         k += 1
     }
+    half.init()
 }
 
 // A segment from the stack: to its connection, or to a listener (a SYN:
-// a new connection), or answered with a reset.
+// a connection is asked; the ACK that follows our SYN+ACK: it is made),
+// or answered with a reset.
 pub fn receive(source: stack.Ip, destination: stack.Ip, bytes: [*]const u8, length: usize) -> void {
     if length < HEADER { return }
     if stack.checksum(bytes, length, stack.pseudoSum(source, destination, stack.PROTOCOL_TCP, length)) != 0 { return }
@@ -604,36 +674,27 @@ pub fn receive(source: stack.Ip, destination: stack.Ip, bytes: [*]const u8, leng
         k += 1
     }
     const listener = sockets.Sockets.listenerFor(port)
-    if listener != sockets.MAX && flags & SYN != 0 && flags & ACK == 0 {
-        // No more half-open connections than the listener can hold (each
-        // takes a socket of the table's 32 for over a minute).
-        var half: usize = connections[listener].pendingCount
-        var j: usize = 0
-        while j < sockets.MAX {
-            if connections[j].state == State.syn_received && connections[j].localPort == port { half += 1 }
-            j += 1
-        }
-        if half >= MAX_PENDING { return }
-        const made = table.openAccepted(port, source, sourcePort)
-        if made < 0 { return }
-        const c = &connections[@bitCast(usize, made)]
-        if !c.init(@bitCast(usize, made)) {
-            table.abandon(@bitCast(usize, made))
+    if listener != sockets.MAX {
+        const found = half.find(port, &source, sourcePort)
+        if flags & RST != 0 {
+            // The peer takes back what it asked (with the number we
+            // expect of it: anyone can send a reset for a pair of ports).
+            if found != halfopen.MAX && seq == half.at(found).*.theirs { half.drop(found) }
             return
         }
-        c.*.localPort = port
-        c.*.remote = source
-        c.*.remotePort = sourcePort
-        c.*.iss = mask(clock.system().monotonic() / 64)
-        c.*.sndUna = c.*.iss
-        c.*.sndNxt = mask(c.*.iss + 1)
-        c.*.rcvNxt = mask(seq + 1)
-        c.*.state = State.syn_received
-        c.readOptions(options, headerLength - HEADER)
-        c.*.peerWindow = peerWindow
-        _ = c.segment(SYN | ACK, c.*.iss, 0)
-        c.arm()
-        return
+        if flags & SYN != 0 && flags & ACK == 0 {
+            asked(listener, port, source, sourcePort, seq, peerWindow, options, headerLength - HEADER)
+            return
+        }
+        if found != halfopen.MAX && flags & SYN == 0 && flags & ACK != 0 && ack == mask(half.at(found).*.iss + 1) {
+            // The peer's answer to our SYN+ACK (one that is not in
+            // order: let pass). The connection made takes the segment,
+            // with the data it may carry.
+            if seq != half.at(found).*.theirs { return }
+            const made = make(listener, found)
+            if made != sockets.MAX { connections[made].take(seq, ack, flags, peerWindow, data, dataLength, options, headerLength - HEADER) }
+            return
+        }
     }
     // Nobody's: a reset (unless it was one).
     if flags & RST == 0 {
@@ -658,5 +719,13 @@ pub fn tick() -> void {
         const s = sockets.sockets().at(k)
         if s.*.kind == sockets.Kind.tcp && !s.*.listening { connections[k].tick(now) }
         k += 1
+    }
+    // What is asked and not made yet: the SYN+ACK again, or the end.
+    if half.count > 0 {
+        k = 0
+        while k < halfopen.MAX {
+            if half.due(k, now) == halfopen.Step.again { answer(half.at(k)) }
+            k += 1
+        }
     }
 }

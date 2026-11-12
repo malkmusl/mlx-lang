@@ -1,0 +1,1311 @@
+// The interpreter for a Radeon's firmware tables (AtomBIOS command
+// tables): the card's video BIOS ROM holds, beside its data, small
+// programs in a byte code of AMD's that set the pixel clock's PLL, the
+// transmitters and the rest of what differs from board to board. Linux
+// does not write those registers itself on this controller: it runs the
+// ROM's tables (drivers/gpu/drm/amd/amdgpu/atom.c), and so does this.
+// Nothing here knows a register of the card: the tables do, and reach the
+// card through `Hands`, which the kernel fills with real hands or with
+// hands that only read, and a test with a table of numbers. Built for the
+// host too (tests/472_atom_interpreter_runtime.mlx; tools/
+// check_atom_reference.sh runs it beside Linux's own atom.c on thousands
+// of generated tables).
+//
+// HOW A TABLE IS RUN (the interface for what sets a mode):
+//   var atom: Atom                      (some 24 KiB: a global, not on a
+//                                       stack)
+//   atom.open(rom, scratch)             once: the ROM's bytes (gpu_rom.mlx
+//                                       validates them first), the frame
+//                                       buffer scratch's words
+//   atom.has(index), atom.revision(index)   whether the ROM has the table,
+//                                       its format and content revision
+//   atom.run(&hands, index, params, &limits, &result)
+// (In the kernel gpu.mlx has done the first two at boot: `gpu.tables()`
+// is the interpreter with the card's ROM open, `gpu.tableHands(writing)`
+// the card.) `index` is the table's place in the ROM's list of command tables
+// (gpu_rom.mlx names the ones a mode set needs: Command.SetPixelClock and
+// so on). `params` is the table's parameter space, 32-bit words, little
+// endian as the ROM's structures are laid out (atombios.h's
+// PIXEL_CLOCK_PARAMETERS and the like, packed): the caller fills it, the
+// table may write into it (AdjustDisplayPll answers there), and after the
+// run it holds what the table left. What the caller gives is the start of
+// the space; the rest reads as 0. `result.end` says how the run ended
+// (End.done: the table ran to its end) and, when it did not, where: the
+// table, the offset of the instruction in the ROM and its opcode; for
+// End.refused also the write the hands did not take (which space, which
+// register, which word), which is how a card that may only be read says
+// what a table would have written first; for End.unreachable the
+// register the hands do not reach. A run that does not end as
+// End.done has stopped in the middle of the table: what it wrote before
+// is written.
+//
+// A TABLE THAT IS NEVER RUN: `atom.never` names one (the kernel sets it
+// to ASIC_Init, which starts the card anew and would take the picture
+// with it). Asked for, or called by another table, it ends the run as
+// End.forbidden before anything of it is done.
+//
+// WHAT IS KEPT FROM RUN TO RUN, as Linux keeps it (atom_context; amdgpu_
+// atom_execute_table resets only the data block, the register block, the
+// scratch's window, the IO mode and the quotient and remainder): the
+// shift, the IO attributes, the two flags of the last comparison and the
+// scratch's words. Everything else starts anew with each run.
+//
+// EVERYTHING IS BOUNDED. No byte is read outside the ROM, no word outside
+// a table's work space or the parameter space or the scratch, no table or
+// data block is taken from beyond the ROM's lists, whatever the ROM says.
+// Calls nest DEPTH deep at most. A run ends after `limits.steps`
+// instructions and after `limits.time` nanoseconds whatever it does: Linux
+// stops only a jump to the same place that goes on for 20 seconds
+// (ATOM_CMD_TIMEOUT_SEC), which never stops a table that loops between
+// two places, and is long: here the kernel waits at boot with nothing
+// else running and the picture perhaps dark, so a whole run, the waits
+// the table itself asks for included, gets 2 seconds unless the caller
+// says otherwise (the tables of a mode set wait for a PLL or a
+// transmitter, some milliseconds each; ASIC_Init, which takes long, is
+// never run here), and a count of instructions should the clock stand.
+//
+// WHERE THIS DIFFERS FROM LINUX, each time towards stopping. Linux goes on
+// after what it reports and reads past the end of what it was given;
+// here a run stops (and says where) at:
+// - an opcode that is none (0, or 127 and above): Linux ends the table
+//   there without a word, and a table that called it goes on;
+// - a switch whose case does not begin with its mark (Linux: "Bad case",
+//   then runs on from that byte), an indirect register's program with a
+//   step that is none (Linux: gives 0);
+// - a read outside the ROM, a work space word the table did not ask for
+//   (Linux reads and writes the heap there), a table or data block beyond
+//   the lists' ends, calls nested deeper than DEPTH.
+// As Linux does, and counted in the result (`odd`, with the first one's
+// kind and place) so that the caller knows: a division by zero gives a
+// quotient and a remainder of 0; a register asked for through the PCI
+// configuration or an IO port reads as 0 and a write to it is dropped
+// (Linux: "PCI registers are not implemented", and the same for SYSIO;
+// its interpreter has never done them on any card, so there is nothing to
+// hold a way of doing them against: none is made up here); an indirect IO
+// mode the ROM has no program for reads as 0 and drops the write; the
+// scratch beyond its end reads as 0 and drops the write; the REPEAT,
+// SAVEREG and RESTOREREG opcodes do nothing and take no bytes
+// ("unimplemented!").
+// Where C leaves a shift's count of 32 and more open, the count's low
+// five bits are taken, which is what Linux built for x86-64 does (the
+// machine's shift instruction; the comparison on such a host holds it):
+// in SHIFT_LEFT, SHIFT_RIGHT, SHL and SHR, the work space's two masks,
+// and an indirect program's bit fields.
+// One place where Linux's answer is chance: a part of a register written
+// through an IO mode that has a program to write and none to read. Linux
+// fills the rest of the word from a variable it did not set (atom_op_
+// move's `saved` after "Undefined indirect IO read method"); here the
+// rest is 0. (The comparison with Linux's interpreter found this one.)
+//
+// The opcodes, the argument kinds, the alignments and every offset are
+// atom.c's and atom.h's of Linux 6.6 (opcode_table, atom_get_src_int,
+// atom_put_dst, atom_iio_execute, the ATOM_ constants), each looked up
+// there; tools/check_gpu_registers.py holds the numbers below against
+// those files.
+
+const M32: usize = 0xFFFFFFFF
+
+// The ROM's fixed places (atom.h): the signature of a PCI ROM, AMD's mark,
+// the pointer to the ROM's header; in the header the "ATOM" and the two
+// lists; in the list of data tables the indirect IO programs' place; in
+// a command table its work space's and parameter space's sizes and where
+// its code begins.
+pub const ATOM_BIOS_MAGIC: usize = 0xAA55
+pub const ATOM_ATI_MAGIC_PTR: usize = 0x30
+pub const ATOM_ATI_MAGIC = " 761295520"
+pub const ATOM_ROM_TABLE_PTR: usize = 0x48
+pub const ATOM_ROM_MAGIC = "ATOM"
+pub const ATOM_ROM_MAGIC_PTR: usize = 4
+pub const ATOM_ROM_CMD_PTR: usize = 0x1E
+pub const ATOM_ROM_DATA_PTR: usize = 0x20
+pub const ATOM_DATA_IIO_PTR: usize = 0x32
+pub const ATOM_CT_WS_PTR: usize = 4
+pub const ATOM_CT_PS_PTR: usize = 5
+pub const ATOM_CT_PS_MASK: usize = 0x7F
+pub const ATOM_CT_CODE_PTR: usize = 6
+pub const ATOM_OP_CNT: usize = 127
+pub const ATOM_CASE_MAGIC: usize = 0x63
+pub const ATOM_CASE_END: usize = 0x5A5A
+
+// What an argument is (the low three bits of an instruction's attribute
+// byte for the source; the opcode itself says it for the destination).
+pub const ATOM_ARG_REG: usize = 0
+pub const ATOM_ARG_PS: usize = 1
+pub const ATOM_ARG_WS: usize = 2
+pub const ATOM_ARG_FB: usize = 3
+pub const ATOM_ARG_ID: usize = 4
+pub const ATOM_ARG_IMM: usize = 5
+pub const ATOM_ARG_PLL: usize = 6
+pub const ATOM_ARG_MC: usize = 7
+
+// Which part of a 32-bit word an argument is (the next three bits).
+pub const ATOM_SRC_DWORD: usize = 0
+pub const ATOM_SRC_WORD0: usize = 1
+pub const ATOM_SRC_WORD8: usize = 2
+pub const ATOM_SRC_WORD16: usize = 3
+pub const ATOM_SRC_BYTE0: usize = 4
+pub const ATOM_SRC_BYTE8: usize = 5
+pub const ATOM_SRC_BYTE16: usize = 6
+pub const ATOM_SRC_BYTE24: usize = 7
+
+// The work space's words that are not the table's own.
+pub const ATOM_WS_QUOTIENT: usize = 0x40
+pub const ATOM_WS_REMAINDER: usize = 0x41
+pub const ATOM_WS_DATAPTR: usize = 0x42
+pub const ATOM_WS_SHIFT: usize = 0x43
+pub const ATOM_WS_OR_MASK: usize = 0x44
+pub const ATOM_WS_AND_MASK: usize = 0x45
+pub const ATOM_WS_FB_WINDOW: usize = 0x46
+pub const ATOM_WS_ATTRIBUTES: usize = 0x47
+pub const ATOM_WS_REGPTR: usize = 0x48
+
+// An indirect register program's steps.
+pub const ATOM_IIO_NOP: usize = 0
+pub const ATOM_IIO_START: usize = 1
+pub const ATOM_IIO_READ: usize = 2
+pub const ATOM_IIO_WRITE: usize = 3
+pub const ATOM_IIO_CLEAR: usize = 4
+pub const ATOM_IIO_SET: usize = 5
+pub const ATOM_IIO_MOVE_INDEX: usize = 6
+pub const ATOM_IIO_MOVE_ATTR: usize = 7
+pub const ATOM_IIO_MOVE_DATA: usize = 8
+pub const ATOM_IIO_END: usize = 9
+
+// How a register argument reaches the card.
+pub const ATOM_IO_MM: usize = 0
+pub const ATOM_IO_PCI: usize = 1
+pub const ATOM_IO_SYSIO: usize = 2
+pub const ATOM_IO_IIO: usize = 0x80
+
+// The opcodes: the first of each run in atom.c's opcode_table. A run of
+// six is one operation with each kind of destination in turn (DESTINATION
+// below).
+pub const OP_MOVE: usize = 1
+pub const OP_AND: usize = 7
+pub const OP_OR: usize = 13
+pub const OP_SHIFT_LEFT: usize = 19
+pub const OP_SHIFT_RIGHT: usize = 25
+pub const OP_MUL: usize = 31
+pub const OP_DIV: usize = 37
+pub const OP_ADD: usize = 43
+pub const OP_SUB: usize = 49
+pub const OP_SETPORT: usize = 55 // three: AMD's own port, PCI, an IO port
+pub const OP_SETREGBLOCK: usize = 58
+pub const OP_SETFBBASE: usize = 59
+pub const OP_COMPARE: usize = 60
+pub const OP_SWITCH: usize = 66
+pub const OP_JUMP: usize = 67 // seven: the conditions of JUMP_CONDITION
+pub const OP_TEST: usize = 74
+pub const OP_DELAY: usize = 80 // two: milliseconds, microseconds
+pub const OP_CALLTABLE: usize = 82
+pub const OP_REPEAT: usize = 83
+pub const OP_CLEAR: usize = 84
+pub const OP_NOP: usize = 90
+pub const OP_EOT: usize = 91
+pub const OP_MASK: usize = 92
+pub const OP_POSTCARD: usize = 98
+pub const OP_BEEP: usize = 99
+pub const OP_SAVEREG: usize = 100
+pub const OP_RESTOREREG: usize = 101
+pub const OP_SETDATABLOCK: usize = 102
+pub const OP_XOR: usize = 103
+pub const OP_SHL: usize = 109
+pub const OP_SHR: usize = 115
+pub const OP_DEBUG: usize = 121
+pub const OP_PROCESSDS: usize = 122
+pub const OP_MUL32: usize = 123 // two: the parameter space, the work space
+pub const OP_DIV32: usize = 125 // two likewise
+
+// The destination of the n-th opcode of a run of six.
+const DESTINATION = [_]usize{ 0, 1, 2, 3, 6, 7 }
+
+// A jump's condition, for OP_JUMP and the six after it: always, equal,
+// below, above, below or equal, above or equal, not equal (atom.c's
+// ATOM_COND_ numbers in the opcode table's order).
+const COND_ABOVE: usize = 0
+const COND_ABOVEOREQUAL: usize = 1
+const COND_ALWAYS: usize = 2
+const COND_BELOW: usize = 3
+const COND_BELOWOREQUAL: usize = 4
+const COND_EQUAL: usize = 5
+const COND_NOTEQUAL: usize = 6
+const JUMP_CONDITION = [_]usize{ 2, 5, 3, 0, 4, 1, 6 }
+
+// A part's bits in the word and how far they are shifted (atom_arg_mask,
+// atom_arg_shift), by ATOM_SRC_.
+const PART_MASK = [_]usize{ 0xFFFFFFFF, 0xFFFF, 0xFFFF00, 0xFFFF0000, 0xFF, 0xFF00, 0xFF0000, 0xFF000000 }
+const PART_SHIFT = [_]usize{ 0, 0, 8, 16, 0, 8, 16, 24 }
+// The part of the destination, from the source's part and the attribute
+// byte's upper two bits (atom_dst_to_src, row by row), and the
+// destination's part an instruction without those bits has
+// (atom_def_dst).
+const DST_TO_SRC = [_]usize{ 0, 0, 0, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7 }
+const DEF_DST = [_]usize{ 0, 0, 1, 2, 0, 1, 2, 3 }
+
+// How deep table calls nest, the parameter space's words (a call moves
+// the callee's space on by 31 words at most, and an index is a byte: 16
+// calls deep the last word is number 720), all the work spaces' words (a
+// table's has 255 at most), and how many steps an indirect register's
+// program gets (the ROM's are a handful).
+pub const NO_TABLE: usize = 0xFFFFFFFF
+pub const DEPTH: usize = 16
+pub const PARAMETERS: usize = 1024
+pub const WORK: usize = 4096
+const PROGRAM_STEPS: usize = 256
+
+// The card, as the tables reach it. A register by its number (a dword
+// offset into the register aperture, as Linux's cail_reg_read and
+// cail_reg_write take it), the PLL's and the memory controller's
+// registers by theirs (amdgpu's hands for those read 0 and write nothing:
+// cail_pll_read and the three beside it), a wait in microseconds, a clock
+// in nanoseconds that only goes on. A write answers whether it was taken:
+// hands that may not write answer false, and the run stops there.
+// `registers`: how many register numbers the hands reach (the kernel's:
+// the card's register aperture); a table that names one beyond is
+// stopped. (Linux goes on from there through another index and data
+// pair, amdgpu_device_rreg's pcie_rreg: not built until a table of a
+// mode set is seen to need it.)
+pub const Hands = struct {
+    registers: usize
+    read: fn(usize) -> u32
+    write: fn(usize, u32) -> bool
+    pllRead: fn(usize) -> u32
+    pllWrite: fn(usize, u32) -> bool
+    mcRead: fn(usize) -> u32
+    mcWrite: fn(usize, u32) -> bool
+    delay: fn(usize) -> void
+    now: fn() -> usize
+}
+
+// What a run may take.
+pub const Limits = struct {
+    steps: usize
+    time: usize
+
+    // 2 seconds and 4 million instructions (the file's head says why).
+    pub fn usual() -> Limits { return Limits.{ .steps = 4000000, .time = 2000000000 } }
+}
+
+// How a run ended.
+pub const End = enum(u8) {
+    // The table ran to its end.
+    done,
+    // The table is not in the ROM (its place in the list is 0 or beyond
+    // the list).
+    absent,
+    // A byte outside the ROM, a word outside a work space or the
+    // parameter space, a table or a data block beyond the lists.
+    outside,
+    // An opcode that is none.
+    unknown_opcode,
+    // A switch's case that does not begin with its mark.
+    bad_case,
+    // An indirect register's program with a step that is none, or one
+    // that does not end.
+    bad_program,
+    // Calls nested too deep.
+    depth,
+    // Stopped by the count of instructions, by the time.
+    count,
+    time,
+    // A write the hands did not take.
+    refused,
+    // A register beyond those the hands reach.
+    unreachable,
+    // The table that is never run was asked for or called.
+    forbidden
+}
+
+// Which registers a refused write was for, or a register out of reach.
+pub const Space = enum(u8) { register, pll, mc }
+
+// What Linux goes on after, and so does a run here (the file's head).
+pub const Odd = enum(u8) { none, division_by_zero, port, no_program, scratch, not_built }
+
+pub const Result = struct {
+    end: End
+    // Where it ended when not as done: the table (its place in the list),
+    // the instruction's offset in the ROM, its opcode.
+    table: usize
+    offset: usize
+    opcode: usize
+    // For refused: the write that was not taken. For unreachable: the
+    // register (and the word, if it was to be written).
+    space: Space
+    register: usize
+    value: usize
+    // What the run did: instructions, reads from and writes to the card,
+    // tables called, microseconds waited at the tables' asking.
+    steps: usize
+    reads: usize
+    writes: usize
+    calls: usize
+    waited: usize
+    // What it went on after: how many, and the first one's kind and place.
+    odd: usize
+    oddKind: Odd
+    oddTable: usize
+    oddOffset: usize
+}
+
+// A table being run: its place in the list, where it begins in the ROM,
+// where its caller goes on, its parameter space's first word and how far
+// a table it calls is moved on, its work space's first word and count.
+const Frame = struct {
+    table: usize
+    start: usize
+    back: usize
+    parameters: usize
+    shift: usize
+    work: usize
+    words: usize
+}
+
+pub const Opened = enum(u8) {
+    ok,
+    // The bytes do not begin with 55 AA; AMD's mark is not at 0x30; the
+    // header the word at 0x48 names does not say "ATOM".
+    no_signature,
+    no_mark,
+    no_atom,
+    // The header or one of the two lists is not inside the bytes.
+    outside
+}
+
+pub const Atom = struct {
+    rom: []const u8
+    // The lists of command and data tables: where each begins (its
+    // four-byte header; the entries follow) and how many entries its
+    // length gives.
+    commands: usize
+    commandCount: usize
+    data: usize
+    dataCount: usize
+    // Where each indirect register program begins, by its number (0:
+    // none); whether the programs' list ended on a step that is none.
+    programs: [256]usize
+    programsDamaged: bool
+    scratch: []u32
+    // The table that is never run (NO_TABLE: there is none).
+    never: usize
+    // Kept from run to run.
+    shift: usize
+    attributes: usize
+    equal: bool
+    above: bool
+    // A run's own.
+    dataBlock: usize
+    regBlock: usize
+    fbBase: usize
+    port: usize
+    quotient: usize
+    remainder: usize
+    parameters: [PARAMETERS]u32
+    work: [WORK]u32
+    frames: [DEPTH]Frame
+    depth: usize
+    workUsed: usize
+    // Where the next byte of code is read, the instruction being done
+    // (its offset and opcode), the whole word a destination held before
+    // its part was taken out, and what stopped the run.
+    at: usize
+    current: usize
+    opcode: usize
+    whole: usize
+    finished: bool
+    failed: End
+    result: *Result
+
+    // The ROM taken: its marks looked at as amdgpu_atom_parse looks at
+    // them, the two lists found and held inside the bytes, the indirect
+    // register programs indexed (atom_index_iio). `scratch`: the frame
+    // buffer scratch's words (Linux gives the tables as many bytes as the
+    // ROM's VRAM_UsageByFirmware asks for, 20 KiB when it asks for none).
+    pub fn open(self: *Self, rom: []const u8, scratch: []u32) -> Opened {
+        self.*.rom = rom
+        self.*.scratch = scratch
+        self.*.commands = 0
+        self.*.commandCount = 0
+        self.*.data = 0
+        self.*.dataCount = 0
+        self.*.programsDamaged = false
+        self.*.never = NO_TABLE
+        self.*.shift = 0
+        self.*.attributes = 0
+        self.*.equal = false
+        self.*.above = false
+        var k: usize = 0
+        while k < 256 {
+            self.*.programs[k] = 0
+            k += 1
+        }
+        k = 0
+        while k < scratch.length {
+            scratch[k] = 0
+            k += 1
+        }
+        if rom.length < ATOM_ROM_TABLE_PTR + 2 { return Opened.outside }
+        if peek16(rom, 0) != ATOM_BIOS_MAGIC { return Opened.no_signature }
+        if !same(rom, ATOM_ATI_MAGIC_PTR, ATOM_ATI_MAGIC) { return Opened.no_mark }
+        const header = peek16(rom, ATOM_ROM_TABLE_PTR)
+        if header == 0 || header + ATOM_ROM_DATA_PTR + 2 > rom.length { return Opened.outside }
+        if !same(rom, header + ATOM_ROM_MAGIC_PTR, ATOM_ROM_MAGIC) { return Opened.no_atom }
+        const commands = peek16(rom, header + ATOM_ROM_CMD_PTR)
+        const data = peek16(rom, header + ATOM_ROM_DATA_PTR)
+        // A list: a table's header (its length in bytes first), then a
+        // word for each table.
+        if commands == 0 || commands + 4 > rom.length { return Opened.outside }
+        const commandBytes = peek16(rom, commands)
+        if commandBytes < 4 || commands + commandBytes > rom.length { return Opened.outside }
+        if data == 0 || data + 4 > rom.length { return Opened.outside }
+        const dataBytes = peek16(rom, data)
+        if dataBytes < 4 || data + dataBytes > rom.length { return Opened.outside }
+        self.*.commands = commands
+        self.*.commandCount = (commandBytes - 4) / 2
+        self.*.data = data
+        self.*.dataCount = (dataBytes - 4) / 2
+        self.index()
+        return Opened.ok
+    }
+
+    // The indirect register programs' places: the data table the list's
+    // word at ATOM_DATA_IIO_PTR names, after its header a run of
+    // programs, each a START byte, its number, its steps and an END with
+    // two bytes more.
+    fn index(self: *Self) -> void {
+        const entry = (ATOM_DATA_IIO_PTR - 4) / 2
+        if entry >= self.*.dataCount { return }
+        const table = peek16(self.*.rom, self.*.data + ATOM_DATA_IIO_PTR)
+        if table == 0 { return }
+        const rom = self.*.rom
+        var base = table + 4
+        while base + 2 <= rom.length && @intCast(usize, rom[base]) == ATOM_IIO_START {
+            self.*.programs[@intCast(usize, rom[base + 1])] = base + 2
+            base += 2
+            while true {
+                if base >= rom.length {
+                    self.*.programsDamaged = true
+                    return
+                }
+                const step = @intCast(usize, rom[base])
+                if step == ATOM_IIO_END { break }
+                const length = programStep(step)
+                if length == 0 {
+                    self.*.programsDamaged = true
+                    return
+                }
+                base += length
+            }
+            base += 3
+        }
+    }
+
+    // Whether the ROM has the command table `table`.
+    pub fn has(self: *const Self, table: usize) -> bool { return self.command(table) != 0 }
+
+    // Where the command table `table` begins (0: the ROM has none).
+    pub fn command(self: *const Self, table: usize) -> usize {
+        if table >= self.*.commandCount { return 0 }
+        const base = peek16(self.*.rom, self.*.commands + 4 + 2 * table)
+        if base == 0 || base + ATOM_CT_CODE_PTR > self.*.rom.length { return 0 }
+        return base
+    }
+
+    // A command table's format and content revision (amdgpu_atom_parse_
+    // cmd_header: the two bytes after its length), as format * 256 +
+    // content; 0 when the ROM has no such table.
+    pub fn revision(self: *const Self, table: usize) -> usize {
+        const base = self.command(table)
+        if base == 0 { return 0 }
+        return (@intCast(usize, self.*.rom[base + 2]) << 8) | @intCast(usize, self.*.rom[base + 3])
+    }
+
+    // Where the data table `table` begins (0: none, or not inside the
+    // ROM with its four-byte header).
+    pub fn dataTable(self: *const Self, table: usize) -> usize {
+        if table >= self.*.dataCount { return 0 }
+        const base = peek16(self.*.rom, self.*.data + 4 + 2 * table)
+        if base == 0 || base + 4 > self.*.rom.length { return 0 }
+        return base
+    }
+
+    fn fail(self: *Self, end: End) -> void {
+        if self.*.failed == End.done { self.*.failed = end }
+    }
+
+    fn strange(self: *Self, kind: Odd) -> void {
+        const result = self.*.result
+        if result.*.odd == 0 {
+            result.*.oddKind = kind
+            result.*.oddTable = self.*.frames[self.*.depth].table
+            result.*.oddOffset = self.*.current
+        }
+        result.*.odd += 1
+    }
+
+    // The ROM's bytes, never beyond its end: a read outside stops the run
+    // and gives 0.
+    fn byteAt(self: *Self, at: usize) -> usize {
+        if at >= self.*.rom.length {
+            self.fail(End.outside)
+            return 0
+        }
+        return @intCast(usize, self.*.rom[at])
+    }
+
+    fn wordAt(self: *Self, at: usize) -> usize {
+        if at + 2 > self.*.rom.length {
+            self.fail(End.outside)
+            return 0
+        }
+        return peek16(self.*.rom, at)
+    }
+
+    fn longAt(self: *Self, at: usize) -> usize {
+        if at + 4 > self.*.rom.length {
+            self.fail(End.outside)
+            return 0
+        }
+        return peek16(self.*.rom, at) | (peek16(self.*.rom, at + 2) << 16)
+    }
+
+    // The code's next byte, word, long.
+    fn nextByte(self: *Self) -> usize {
+        const value = self.byteAt(self.*.at)
+        self.*.at += 1
+        return value
+    }
+
+    fn nextWord(self: *Self) -> usize {
+        const value = self.wordAt(self.*.at)
+        self.*.at += 2
+        return value
+    }
+
+    fn nextLong(self: *Self) -> usize {
+        const value = self.longAt(self.*.at)
+        self.*.at += 4
+        return value
+    }
+
+    // An immediate of the width a part has: a long, a word, a byte.
+    fn nextOfPart(self: *Self, part: usize) -> usize {
+        if part == ATOM_SRC_DWORD { return self.nextLong() }
+        if part <= ATOM_SRC_WORD16 { return self.nextWord() }
+        return self.nextByte()
+    }
+
+    // The card's registers, with the hands' answers counted; a write that
+    // is not taken stops the run and is what the result says. A run that
+    // has stopped asks nothing more of the card, not a read either (an
+    // instruction's second argument is still gone through when its first
+    // stopped the run).
+    fn cardRead(self: *Self, hands: *const Hands, space: Space, number: usize) -> usize {
+        if self.*.failed != End.done { return 0 }
+        self.*.result.*.reads += 1
+        if space == Space.pll {
+            const read = hands.*.pllRead
+            return @intCast(usize, read(number))
+        }
+        if space == Space.mc {
+            const read = hands.*.mcRead
+            return @intCast(usize, read(number))
+        }
+        if number >= hands.*.registers {
+            self.*.result.*.space = space
+            self.*.result.*.register = number
+            self.*.result.*.value = 0
+            self.fail(End.unreachable)
+            return 0
+        }
+        const read = hands.*.read
+        return @intCast(usize, read(number))
+    }
+
+    fn cardWrite(self: *Self, hands: *const Hands, space: Space, number: usize, value: usize) -> void {
+        if self.*.failed != End.done { return }
+        const word = @intCast(u32, value & M32)
+        var taken = false
+        if space == Space.pll {
+            const write = hands.*.pllWrite
+            taken = write(number, word)
+        } else if space == Space.mc {
+            const write = hands.*.mcWrite
+            taken = write(number, word)
+        } else if number >= hands.*.registers {
+            self.*.result.*.space = space
+            self.*.result.*.register = number
+            self.*.result.*.value = value & M32
+            self.fail(End.unreachable)
+            return
+        } else {
+            const write = hands.*.write
+            taken = write(number, word)
+        }
+        if taken {
+            self.*.result.*.writes += 1
+            return
+        }
+        self.*.result.*.space = space
+        self.*.result.*.register = number
+        self.*.result.*.value = value & M32
+        self.fail(End.refused)
+    }
+
+    // An indirect register's program run (atom_iio_execute): a word built
+    // up from the register's number, the data and the IO attributes by
+    // bit fields, read from and written to the card's registers the
+    // program names. What the word is at the program's END.
+    fn program(self: *Self, hands: *const Hands, begin: usize, number: usize, data: usize) -> usize {
+        var base = begin
+        var word: usize = 0xCDCDCDCD
+        var steps: usize = 0
+        while self.*.failed == End.done {
+            steps += 1
+            if steps > PROGRAM_STEPS { break }
+            const step = self.byteAt(base)
+            if step == ATOM_IIO_END { return word }
+            if step == ATOM_IIO_NOP {
+                base += 1
+            } else if step == ATOM_IIO_READ {
+                const register = self.wordAt(base + 1)
+                if self.*.failed != End.done { return 0 }
+                word = self.cardRead(hands, Space.register, register)
+                base += 3
+            } else if step == ATOM_IIO_WRITE {
+                const register = self.wordAt(base + 1)
+                self.cardWrite(hands, Space.register, register, word)
+                base += 3
+            } else if step == ATOM_IIO_CLEAR {
+                word = word & (M32 ^ shiftLeft(ones(self.byteAt(base + 1)), self.byteAt(base + 2)))
+                base += 3
+            } else if step == ATOM_IIO_SET {
+                word = word | shiftLeft(ones(self.byteAt(base + 1)), self.byteAt(base + 2))
+                base += 3
+            } else if step == ATOM_IIO_MOVE_INDEX || step == ATOM_IIO_MOVE_DATA || step == ATOM_IIO_MOVE_ATTR {
+                const bits = ones(self.byteAt(base + 1))
+                const from = self.byteAt(base + 2)
+                const to = self.byteAt(base + 3)
+                const source = if step == ATOM_IIO_MOVE_INDEX { number } else if step == ATOM_IIO_MOVE_DATA { data } else { self.*.attributes }
+                word = word & (M32 ^ shiftLeft(bits, to))
+                word = word | shiftLeft(shiftRight(source, from) & bits, to)
+                base += 4
+            } else {
+                break
+            }
+        }
+        self.fail(End.bad_program)
+        return 0
+    }
+
+    // A source argument read (atom_get_src_int): what the attribute byte
+    // names, the part of it the byte asks for, shifted down. `whole` is
+    // set to the word before the part was taken.
+    fn source(self: *Self, hands: *const Hands, attribute: usize) -> usize {
+        const kind = attribute & 7
+        const part = (attribute >> 3) & 7
+        var value: usize = 0
+        self.*.whole = 0
+        if kind == ATOM_ARG_REG {
+            const number = self.nextWord() + self.*.regBlock
+            if self.*.failed != End.done { return 0 }
+            if self.*.port == ATOM_IO_MM {
+                value = self.cardRead(hands, Space.register, number)
+            } else if self.*.port == ATOM_IO_PCI || self.*.port == ATOM_IO_SYSIO {
+                self.strange(Odd.port)
+                return 0
+            } else {
+                const begin = self.*.programs[self.*.port & 0x7F]
+                if begin == 0 {
+                    self.strange(Odd.no_program)
+                    return 0
+                }
+                value = self.program(hands, begin, number, 0)
+            }
+        } else if kind == ATOM_ARG_PS {
+            const word = self.*.frames[self.*.depth].parameters + self.nextByte()
+            if word >= PARAMETERS {
+                self.fail(End.outside)
+                return 0
+            }
+            value = @intCast(usize, self.*.parameters[word])
+        } else if kind == ATOM_ARG_WS {
+            const word = self.nextByte()
+            if word == ATOM_WS_QUOTIENT {
+                value = self.*.quotient
+            } else if word == ATOM_WS_REMAINDER {
+                value = self.*.remainder
+            } else if word == ATOM_WS_DATAPTR {
+                value = self.*.dataBlock
+            } else if word == ATOM_WS_SHIFT {
+                value = self.*.shift
+            } else if word == ATOM_WS_OR_MASK {
+                value = shiftLeft(1, self.*.shift)
+            } else if word == ATOM_WS_AND_MASK {
+                value = M32 ^ shiftLeft(1, self.*.shift)
+            } else if word == ATOM_WS_FB_WINDOW {
+                value = self.*.fbBase
+            } else if word == ATOM_WS_ATTRIBUTES {
+                value = self.*.attributes
+            } else if word == ATOM_WS_REGPTR {
+                value = self.*.regBlock
+            } else {
+                const frame = &self.*.frames[self.*.depth]
+                if word >= frame.*.words {
+                    self.fail(End.outside)
+                    return 0
+                }
+                value = @intCast(usize, self.*.work[frame.*.work + word])
+            }
+        } else if kind == ATOM_ARG_ID {
+            value = self.longAt(self.nextWord() + self.*.dataBlock)
+        } else if kind == ATOM_ARG_FB {
+            const word = self.nextByte()
+            if self.*.fbBase + word * 4 > self.*.scratch.length * 4 || self.*.fbBase / 4 + word >= self.*.scratch.length {
+                self.strange(Odd.scratch)
+                value = 0
+            } else {
+                value = @intCast(usize, self.*.scratch[self.*.fbBase / 4 + word])
+            }
+        } else if kind == ATOM_ARG_IMM {
+            // (As it stands in the code: no part is taken out of it.)
+            return self.nextOfPart(part)
+        } else if kind == ATOM_ARG_PLL {
+            value = self.cardRead(hands, Space.pll, self.nextByte())
+        } else {
+            value = self.cardRead(hands, Space.mc, self.nextByte())
+        }
+        if self.*.failed != End.done { return 0 }
+        self.*.whole = value
+        return (value & PART_MASK[part]) >> @intCast(u6, PART_SHIFT[part])
+    }
+
+    // A source argument passed over without reading it (atom_skip_src_int).
+    fn skip(self: *Self, attribute: usize) -> void {
+        const kind = attribute & 7
+        if kind == ATOM_ARG_REG || kind == ATOM_ARG_ID {
+            self.*.at += 2
+        } else if kind == ATOM_ARG_IMM {
+            const part = (attribute >> 3) & 7
+            self.*.at += if part == ATOM_SRC_DWORD { 4 } else if part <= ATOM_SRC_WORD16 { 2 } else { 1 }
+        } else {
+            self.*.at += 1
+        }
+    }
+
+    // The destination's part (atom_get_dst's and atom_put_dst's
+    // translation of the attribute byte).
+    fn destinationPart(attribute: usize) -> usize { return DST_TO_SRC[((attribute >> 3) & 7) * 4 + ((attribute >> 6) & 3)] }
+
+    // The destination read as an argument of kind `kind`.
+    fn destination(self: *Self, hands: *const Hands, kind: usize, attribute: usize) -> usize {
+        return self.source(hands, kind | (destinationPart(attribute) << 3))
+    }
+
+    // The destination written (atom_put_dst): `value` put into its part
+    // of `whole` (what the destination held), the word stored where the
+    // code at `at` names.
+    fn put(self: *Self, hands: *const Hands, kind: usize, attribute: usize, at: usize, value: usize, whole: usize) -> void {
+        if self.*.failed != End.done { return }
+        const part = destinationPart(attribute)
+        const word = ((value << @intCast(u6, PART_SHIFT[part])) & PART_MASK[part]) | (whole & (M32 ^ PART_MASK[part]))
+        if kind == ATOM_ARG_REG {
+            const number = self.wordAt(at) + self.*.regBlock
+            if self.*.failed != End.done { return }
+            if self.*.port == ATOM_IO_MM {
+                // (Register 0 is the index of the card's index and data
+                // window, and takes a byte offset: the tables count in
+                // registers.)
+                self.cardWrite(hands, Space.register, number, if number == 0 { (word << 2) & M32 } else { word })
+            } else if self.*.port == ATOM_IO_PCI || self.*.port == ATOM_IO_SYSIO {
+                self.strange(Odd.port)
+            } else {
+                // (A port's write program has the read program's number
+                // with bit 7 set.)
+                const begin = self.*.programs[self.*.port & 0xFF]
+                if begin == 0 {
+                    self.strange(Odd.no_program)
+                } else {
+                    _ = self.program(hands, begin, number, word)
+                }
+            }
+        } else if kind == ATOM_ARG_PS {
+            const index = self.*.frames[self.*.depth].parameters + self.byteAt(at)
+            if index >= PARAMETERS {
+                self.fail(End.outside)
+                return
+            }
+            self.*.parameters[index] = @intCast(u32, word)
+        } else if kind == ATOM_ARG_WS {
+            const index = self.byteAt(at)
+            if index == ATOM_WS_QUOTIENT {
+                self.*.quotient = word
+            } else if index == ATOM_WS_REMAINDER {
+                self.*.remainder = word
+            } else if index == ATOM_WS_DATAPTR {
+                self.*.dataBlock = word & 0xFFFF
+            } else if index == ATOM_WS_SHIFT {
+                self.*.shift = word & 0xFF
+            } else if index == ATOM_WS_OR_MASK || index == ATOM_WS_AND_MASK {
+                // (Read only.)
+            } else if index == ATOM_WS_FB_WINDOW {
+                self.*.fbBase = word
+            } else if index == ATOM_WS_ATTRIBUTES {
+                self.*.attributes = word & 0xFFFF
+            } else if index == ATOM_WS_REGPTR {
+                self.*.regBlock = word & 0xFFFF
+            } else {
+                const frame = &self.*.frames[self.*.depth]
+                if index >= frame.*.words {
+                    self.fail(End.outside)
+                    return
+                }
+                self.*.work[frame.*.work + index] = @intCast(u32, word)
+            }
+        } else if kind == ATOM_ARG_FB {
+            const index = self.byteAt(at)
+            if self.*.fbBase + index * 4 > self.*.scratch.length * 4 || self.*.fbBase / 4 + index >= self.*.scratch.length {
+                self.strange(Odd.scratch)
+            } else {
+                self.*.scratch[self.*.fbBase / 4 + index] = @intCast(u32, word)
+            }
+        } else if kind == ATOM_ARG_PLL {
+            self.cardWrite(hands, Space.pll, self.byteAt(at), word)
+        } else {
+            self.cardWrite(hands, Space.mc, self.byteAt(at), word)
+        }
+    }
+
+    // A table entered: its work space set aside and zeroed, its code's
+    // first byte next.
+    fn enter(self: *Self, table: usize, start: usize, back: usize, parameters: usize) -> void {
+        const words = self.byteAt(start + ATOM_CT_WS_PTR)
+        const space = self.byteAt(start + ATOM_CT_PS_PTR) & ATOM_CT_PS_MASK
+        if self.*.failed != End.done { return }
+        if self.*.workUsed + words > WORK {
+            self.fail(End.depth)
+            return
+        }
+        const frame = &self.*.frames[self.*.depth]
+        frame.*.table = table
+        frame.*.start = start
+        frame.*.back = back
+        frame.*.parameters = parameters
+        frame.*.shift = space / 4
+        frame.*.work = self.*.workUsed
+        frame.*.words = words
+        var k: usize = 0
+        while k < words {
+            self.*.work[self.*.workUsed + k] = 0
+            k += 1
+        }
+        self.*.workUsed += words
+        self.*.at = start + ATOM_CT_CODE_PTR
+    }
+
+    // One instruction.
+    fn step(self: *Self, hands: *const Hands) -> void {
+        self.*.current = self.*.at
+        const op = self.nextByte()
+        self.*.opcode = op
+        if self.*.failed != End.done { return }
+        if op == 0 || op >= ATOM_OP_CNT {
+            self.fail(End.unknown_opcode)
+            return
+        }
+        const frame = &self.*.frames[self.*.depth]
+        if op < OP_SETPORT {
+            // Nine operations with a destination and a source.
+            const kind = DESTINATION[(op - 1) % 6]
+            const operation = op - (op - 1) % 6
+            if operation == OP_SHIFT_LEFT || operation == OP_SHIFT_RIGHT {
+                // The destination's own part, shifted by a byte in the
+                // code.
+                var attribute = self.nextByte() & 0x38
+                attribute = attribute | (DEF_DST[attribute >> 3] << 6)
+                const from = self.*.at
+                const was = self.destination(hands, kind, attribute)
+                const whole = self.*.whole
+                const count = self.nextByte()
+                self.put(hands, kind, attribute, from, if operation == OP_SHIFT_LEFT { shiftLeft(was, count) } else { shiftRight(was, count) }, whole)
+                return
+            }
+            const attribute = self.nextByte()
+            const from = self.*.at
+            if operation == OP_MOVE {
+                // The destination is read only when a part of it stays.
+                var whole: usize = 0xCDCDCDCD
+                if (attribute >> 3) & 7 != ATOM_SRC_DWORD {
+                    _ = self.destination(hands, kind, attribute)
+                    whole = self.*.whole
+                } else {
+                    self.skip(kind | (destinationPart(attribute) << 3))
+                }
+                const value = self.source(hands, attribute)
+                self.put(hands, kind, attribute, from, value, whole)
+                return
+            }
+            const was = self.destination(hands, kind, attribute)
+            const whole = self.*.whole
+            const value = self.source(hands, attribute)
+            if self.*.failed != End.done { return }
+            if operation == OP_MUL {
+                self.*.quotient = (was * value) & M32
+            } else if operation == OP_DIV {
+                if value != 0 {
+                    self.*.quotient = was / value
+                    self.*.remainder = was % value
+                } else {
+                    self.*.quotient = 0
+                    self.*.remainder = 0
+                    self.strange(Odd.division_by_zero)
+                }
+            } else if operation == OP_AND {
+                self.put(hands, kind, attribute, from, was & value, whole)
+            } else if operation == OP_OR {
+                self.put(hands, kind, attribute, from, was | value, whole)
+            } else if operation == OP_ADD {
+                self.put(hands, kind, attribute, from, (was + value) & M32, whole)
+            } else {
+                self.put(hands, kind, attribute, from, (was + 0x100000000 - value) & M32, whole)
+            }
+            return
+        }
+        if op < OP_SETREGBLOCK {
+            // How register arguments reach the card from here on.
+            if op == OP_SETPORT {
+                const port = self.nextWord()
+                self.*.port = if port == 0 { ATOM_IO_MM } else { ATOM_IO_IIO | port }
+            } else {
+                self.*.port = if op == OP_SETPORT + 1 { ATOM_IO_PCI } else { ATOM_IO_SYSIO }
+                self.*.at += 1
+            }
+            return
+        }
+        if op == OP_SETREGBLOCK {
+            self.*.regBlock = self.nextWord()
+            return
+        }
+        if op == OP_SETFBBASE {
+            self.*.fbBase = self.source(hands, self.nextByte())
+            return
+        }
+        if op < OP_SWITCH || (op >= OP_TEST && op < OP_DELAY) {
+            // Two arguments held against each other: which is greater and
+            // whether they are equal, or (TEST) whether they share no bit.
+            const compare = op < OP_SWITCH
+            const kind = DESTINATION[if compare { op - OP_COMPARE } else { op - OP_TEST }]
+            const attribute = self.nextByte()
+            const left = self.destination(hands, kind, attribute)
+            const right = self.source(hands, attribute)
+            if self.*.failed != End.done { return }
+            if compare {
+                self.*.equal = left == right
+                self.*.above = left > right
+            } else {
+                self.*.equal = left & right == 0
+            }
+            return
+        }
+        if op == OP_SWITCH {
+            // Cases until the end mark: a mark, a value as wide as the
+            // source's part, where to go on when it is the source's.
+            const attribute = self.nextByte()
+            const value = self.source(hands, attribute)
+            while self.*.failed == End.done {
+                if self.wordAt(self.*.at) == ATOM_CASE_END {
+                    self.*.at += 2
+                    return
+                }
+                if self.byteAt(self.*.at) != ATOM_CASE_MAGIC {
+                    self.fail(End.bad_case)
+                    return
+                }
+                self.*.at += 1
+                const case = self.nextOfPart((attribute >> 3) & 7)
+                const target = self.nextWord()
+                if self.*.failed == End.done && case == value {
+                    self.*.at = frame.*.start + target
+                    return
+                }
+            }
+            return
+        }
+        if op < OP_TEST {
+            const target = self.nextWord()
+            const condition = JUMP_CONDITION[op - OP_JUMP]
+            var taken = true
+            if condition == COND_ABOVE {
+                taken = self.*.above
+            } else if condition == COND_ABOVEOREQUAL {
+                taken = self.*.above || self.*.equal
+            } else if condition == COND_BELOW {
+                taken = !(self.*.above || self.*.equal)
+            } else if condition == COND_BELOWOREQUAL {
+                taken = !self.*.above
+            } else if condition == COND_EQUAL {
+                taken = self.*.equal
+            } else if condition == COND_NOTEQUAL {
+                taken = !self.*.equal
+            }
+            if taken { self.*.at = frame.*.start + target }
+            return
+        }
+        if op == OP_DELAY || op == OP_DELAY + 1 {
+            const count = self.nextByte()
+            if self.*.failed != End.done { return }
+            const time = if op == OP_DELAY { count * 1000 } else { count }
+            const delay = hands.*.delay
+            delay(time)
+            self.*.result.*.waited += time
+            return
+        }
+        if op == OP_CALLTABLE {
+            const table = self.nextByte()
+            if self.*.failed != End.done { return }
+            if table >= self.*.commandCount {
+                self.fail(End.outside)
+                return
+            }
+            if table == self.*.never {
+                self.fail(End.forbidden)
+                return
+            }
+            // (A table the ROM does not have is passed over. One whose
+            // head is not inside the ROM stops the run here, in the
+            // caller, which is what the result then names.)
+            const start = self.wordAt(self.*.commands + 4 + 2 * table)
+            if start == 0 { return }
+            if start + ATOM_CT_CODE_PTR > self.*.rom.length {
+                self.fail(End.outside)
+                return
+            }
+            if self.*.depth + 1 >= DEPTH {
+                self.fail(End.depth)
+                return
+            }
+            self.*.result.*.calls += 1
+            self.*.depth += 1
+            self.enter(table, start, self.*.at, frame.*.parameters + frame.*.shift)
+            return
+        }
+        if op == OP_REPEAT || op == OP_SAVEREG || op == OP_RESTOREREG {
+            self.strange(Odd.not_built)
+            return
+        }
+        if op >= OP_CLEAR && op < OP_NOP {
+            const kind = DESTINATION[op - OP_CLEAR]
+            var attribute = self.nextByte() & 0x38
+            attribute = attribute | (DEF_DST[attribute >> 3] << 6)
+            const from = self.*.at
+            _ = self.destination(hands, kind, attribute)
+            self.put(hands, kind, attribute, from, 0, self.*.whole)
+            return
+        }
+        if op == OP_NOP || op == OP_BEEP { return }
+        if op == OP_EOT {
+            // The table's end: its work space given back, its caller
+            // goes on.
+            self.*.workUsed = frame.*.work
+            if self.*.depth == 0 {
+                self.*.finished = true
+                return
+            }
+            self.*.at = frame.*.back
+            self.*.depth -= 1
+            return
+        }
+        if op >= OP_MASK && op < OP_POSTCARD {
+            // The destination under a mask from the code, a source set
+            // into it.
+            const kind = DESTINATION[op - OP_MASK]
+            const attribute = self.nextByte()
+            const from = self.*.at
+            const was = self.destination(hands, kind, attribute)
+            const whole = self.*.whole
+            const mask = self.nextOfPart((attribute >> 3) & 7)
+            const value = self.source(hands, attribute)
+            self.put(hands, kind, attribute, from, (was & mask) | value, whole)
+            return
+        }
+        if op == OP_POSTCARD || op == OP_DEBUG {
+            self.*.at += 1
+            return
+        }
+        if op == OP_SETDATABLOCK {
+            const block = self.nextByte()
+            if self.*.failed != End.done { return }
+            if block == 0 {
+                self.*.dataBlock = 0
+            } else if block == 255 {
+                self.*.dataBlock = frame.*.start
+            } else if block >= self.*.dataCount {
+                self.fail(End.outside)
+            } else {
+                self.*.dataBlock = self.wordAt(self.*.data + 4 + 2 * block)
+            }
+            return
+        }
+        if op >= OP_XOR && op < OP_SHL {
+            const kind = DESTINATION[op - OP_XOR]
+            const attribute = self.nextByte()
+            const from = self.*.at
+            const was = self.destination(hands, kind, attribute)
+            const whole = self.*.whole
+            const value = self.source(hands, attribute)
+            self.put(hands, kind, attribute, from, was ^ value, whole)
+            return
+        }
+        if op >= OP_SHL && op < OP_DEBUG {
+            // The destination's whole word shifted by a source (its low
+            // eight bits), the destination's part of the outcome kept.
+            const left = op < OP_SHR
+            const kind = DESTINATION[if left { op - OP_SHL } else { op - OP_SHR }]
+            const attribute = self.nextByte()
+            const from = self.*.at
+            const part = destinationPart(attribute)
+            _ = self.destination(hands, kind, attribute)
+            const whole = self.*.whole
+            const count = self.source(hands, attribute) & 0xFF
+            const moved = if left { shiftLeft(whole, count) } else { shiftRight(whole, count) }
+            self.put(hands, kind, attribute, from, (moved & PART_MASK[part]) >> @intCast(u6, PART_SHIFT[part]), whole)
+            return
+        }
+        if op == OP_PROCESSDS {
+            // Data in the code: passed over.
+            const length = self.nextWord()
+            self.*.at += length
+            return
+        }
+        // Products and quotients of 64 bits: the quotient word holds the
+        // low half, the remainder word the high half.
+        const kind = if op == OP_MUL32 || op == OP_DIV32 { ATOM_ARG_PS } else { ATOM_ARG_WS }
+        const attribute = self.nextByte()
+        const left = self.destination(hands, kind, attribute)
+        const right = self.source(hands, attribute)
+        if self.*.failed != End.done { return }
+        if op < OP_DIV32 {
+            const product = left * right
+            self.*.quotient = product & M32
+            self.*.remainder = product >> 32
+        } else if right != 0 {
+            const quotient = (left | (self.*.remainder << 32)) / right
+            self.*.quotient = quotient & M32
+            self.*.remainder = quotient >> 32
+        } else {
+            self.*.quotient = 0
+            self.*.remainder = 0
+            self.strange(Odd.division_by_zero)
+        }
+    }
+
+    // The command table `table` run with `params` as the start of its
+    // parameter space (the file's head). Whether it ran to its end.
+    pub fn run(self: *Self, hands: *const Hands, table: usize, params: []u32, limits: *const Limits, result: *Result) -> bool {
+        result.* = Result.{ .end = End.done, .table = table, .offset = 0, .opcode = 0, .space = Space.register, .register = 0, .value = 0, .steps = 0, .reads = 0, .writes = 0, .calls = 0, .waited = 0, .odd = 0, .oddKind = Odd.none, .oddTable = 0, .oddOffset = 0 }
+        self.*.result = result
+        self.*.failed = End.done
+        self.*.finished = false
+        self.*.dataBlock = 0
+        self.*.regBlock = 0
+        self.*.fbBase = 0
+        self.*.port = ATOM_IO_MM
+        self.*.quotient = 0
+        self.*.remainder = 0
+        self.*.depth = 0
+        self.*.workUsed = 0
+        self.*.current = 0
+        self.*.opcode = 0
+        if table == self.*.never {
+            result.*.end = End.forbidden
+            return false
+        }
+        const start = self.command(table)
+        if start == 0 {
+            result.*.end = End.absent
+            return false
+        }
+        var k: usize = 0
+        while k < PARAMETERS {
+            self.*.parameters[k] = if k < params.length { params[k] } else { 0 }
+            k += 1
+        }
+        self.enter(table, start, 0, 0)
+        const now = hands.*.now
+        const began = now()
+        while self.*.failed == End.done && !self.*.finished {
+            if result.*.steps >= limits.*.steps {
+                self.fail(End.count)
+                break
+            }
+            const time = now()
+            if time > began && time - began > limits.*.time {
+                self.fail(End.time)
+                break
+            }
+            result.*.steps += 1
+            self.step(hands)
+        }
+        k = 0
+        while k < params.length && k < PARAMETERS {
+            params[k] = self.*.parameters[k]
+            k += 1
+        }
+        result.*.end = self.*.failed
+        if self.*.failed != End.done {
+            result.*.table = self.*.frames[self.*.depth].table
+            result.*.offset = self.*.current
+            result.*.opcode = self.*.opcode
+        }
+        return self.*.failed == End.done
+    }
+}
+
+// How a run ended, in words for the log.
+pub fn endName(end: End) -> []const u8 {
+    return match end {
+        .done => "ran to its end",
+        .absent => "is not in the ROM",
+        .outside => "reached outside the ROM or its own space",
+        .unknown_opcode => "met an opcode that is none",
+        .bad_case => "met a switch that is not one",
+        .bad_program => "met an indirect register program that is not one",
+        .depth => "called tables too deep",
+        .count => "was stopped after too many instructions",
+        .time => "was stopped after too long",
+        .refused => "was stopped at a write",
+        .unreachable => "named a register out of reach",
+        .forbidden => "is, or called, the table that is never run"
+    }
+}
+
+fn peek16(bytes: []const u8, at: usize) -> usize { return @intCast(usize, bytes[at]) | (@intCast(usize, bytes[at + 1]) << 8) }
+
+// Whether the bytes at `at` are `text` (inside the bytes).
+fn same(bytes: []const u8, at: usize, text: []const u8) -> bool {
+    if at + text.length > bytes.length { return false }
+    var k: usize = 0
+    while k < text.length {
+        if bytes[at + k] != text[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// How many bytes an indirect program's step takes (atom_iio_len); 0 for a
+// step that is none.
+fn programStep(step: usize) -> usize {
+    if step == ATOM_IIO_NOP { return 1 }
+    if step == ATOM_IIO_START { return 2 }
+    if step == ATOM_IIO_MOVE_INDEX || step == ATOM_IIO_MOVE_ATTR || step == ATOM_IIO_MOVE_DATA { return 4 }
+    if step <= ATOM_IIO_END { return 3 }
+    return 0
+}
+
+// 32-bit shifts by a count's low five bits (the file's head), and a bit
+// field's ones: 0xFFFFFFFF shifted right by 32 less its width.
+fn shiftLeft(value: usize, count: usize) -> usize { return (value << @intCast(u6, count & 31)) & M32 }
+
+fn shiftRight(value: usize, count: usize) -> usize { return (value & M32) >> @intCast(u6, count & 31) }
+
+fn ones(width: usize) -> usize { return M32 >> @intCast(u6, (288 - width) & 31) }

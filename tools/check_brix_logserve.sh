@@ -34,7 +34,9 @@
 # address said when they have come; the pages over igb), on a machine
 # with little memory (eight clients at once ask for more megabytes than
 # it has: each gets the text or a 503, and logserve goes on), and on a
-# machine without a network device (said, 1).
+# machine without a network device (logserve listens for the machine
+# itself, at 127.0.0.1, and says so; `send` to another machine says that
+# there is no network device, 1).
 #
 #   tools/check_brix_logserve.sh [compiler]
 set -euo pipefail
@@ -88,7 +90,7 @@ import os, re, select, socket, sys, threading, time
 
 HOST = "127.0.0.1"
 MIB = 1 << 20
-NO_PAGE = b"logserve has no such page. It has: / /all /gpu /klog /boot.log /boot.previous.log /system\n"
+NO_PAGE = b"logserve has no such page. It has: / /all /gpu /gpu.rom /klog /boot.log /boot.previous.log /system\n"
 
 def fail(text):
     print("FAIL " + text, file=sys.stderr)
@@ -328,7 +330,7 @@ def answer(port, raw, timeout):
 def hold(port, count, out):
     kept = []
     refused = 0
-    while len(kept) < (count or 64) and refused < 2:
+    while len(kept) < (count or 200) and refused < 2:
         s, data = answer(port, b"GET /gpu HTTP/1.1\r\nHost: brix\r\n\r\n", 2)
         if data.startswith(b"HTTP/1.1 200 OK\r\n"):
             kept.append(s)
@@ -680,7 +682,7 @@ kept=$(cat "$work/held")
 waited=$(host later "$port" 45)
 [[ "$waited" =~ ^[0-9]+$ ]] || fail "with $kept connections kept open by their clients, no request is answered any more"
 release
-echo "ok   $kept clients that keep their connection open after the answer are answered, then the kernel has no socket left (it has 32); it gives the kept ones up, and a request is answered again after $waited s while they hold on"
+echo "ok   $kept clients that keep their connection open after the answer are answered, then the kernel has no socket left (it has 128); it gives the kept ones up, and a request is answered again after $waited s while they hold on"
 interrupt_after '^10\.0\.2\.2 GET /system: 200, [0-9]* bytes$' 5
 wait_for '^logserve: ended ([0-9]* requests answered)$' 2
 
@@ -815,13 +817,21 @@ echo "ok   on a machine with little memory ($memory, 10 MiB of it free) eight cl
 stop
 memory=256M
 
-# A machine without a network device: said, and 1.
+# A machine without a network device. It reaches itself all the same
+# (127.0.0.0/8 needs no device), so logserve listens, and says where a
+# program of this machine finds it; Ctrl+C ends it with 0. What `send`
+# is to hand to another machine cannot leave this one: said, with the
+# reason, and 1. (No socket could be opened there: logserve said that
+# there is nothing to answer on, and ended with 1.)
 boot -monitor none -nic none
-type_line 'logserve; echo status $?'
-wait_for '^logserve: this machine has no network (no network device was found at boot): there is nothing to answer on$'
-wait_for '^status 1$'
 type_line 'logserve send 10.0.2.2 9; echo sending $?'
-wait_for '^logserve: this machine has no network (no network device was found at boot)$'
+wait_for '^logserve: cannot open a connection to 10\.0\.2\.2: this machine has no network device$'
 wait_for '^sending 1$'
-echo "ok   without a network device logserve says so and ends with 1"
+type_line 'logserve'
+wait_for '^  this machine has no network device: only this machine itself reaches it, at http://127\.0\.0\.1:8080/all$'
+interrupt_after '^  Ctrl+C ends it$'
+wait_for '^logserve: ended (0 requests answered)$'
+type_line 'echo status $?'
+wait_for '^status 0$'
+echo "ok   without a network device logserve listens for the machine itself and says so (Ctrl+C ends it with 0); send to another machine says that there is no network device, and ends with 1"
 echo PASS

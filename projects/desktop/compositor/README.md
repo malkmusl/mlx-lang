@@ -622,7 +622,11 @@ desktop") the compositor is the same program on the system's own
 interface, with [`drm.brixos.mlx`](drm.brixos.mlx) as its backend in
 place of DRM/KMS: the framebuffer (/devices/framebuffer, mapped) is the
 one output, composed on the CPU (`--renderer cpu`, `--backend drm` are
-the defaults there) and copied in with the damage; the keyboard
+the defaults there) and copied in with the damage (a machine's further
+displays, /devices/framebuffer1 and on, show the same picture fitted to
+their size: each frame's damage is named to std.displays, which brings
+it for 2 ms of a frame's time at most and the rest while the desktop is
+at rest; tools/check_brix_displays.sh); the keyboard
 (/devices/keyboard) gives PS/2 scancodes, mapped to evdev codes, the
 modifiers followed from the keys (no keymap is sent to clients: they type
 by their own US fallback); the mouse (/devices/mouse) gives PS/2 packets,
@@ -993,6 +997,29 @@ is writing. `tests/290_compositor_commit_damage_runtime.mlx` holds
 commits in part against whole ones (pixels and opacity), and
 `tools/check_compositor_commit.sh` the screen of the nested compositor
 with a client that fills its buffer with other pixels around its damage.
+
+The desktop's own clients name their parts (std.ui's panel,
+`std/src/ui/wayland/panel_damage.mlx`): the terminal draws the cells
+that changed and names their rectangle; the top bar and the dock draw
+whole, and the panel names the rectangle in which the frame differs from
+the one before. With `MLX_FRAMES_SAY=1` in the environment each client
+says its frames on its errors and the compositor, for every frame it
+composes on the CPU, the part of the output it composed:
+
+```
+frame: org.mlx.terminal 652x396 drawn in 153 us, changed 16x16 at 110,6
+composed 16x16 at 142,58 of 1280x960
+frame: horizon 1280x30 drawn in 310 us, changed 114x19 at 1149,0
+composed 149x30 at 1131,0 of 1280x960
+```
+
+(A character typed is its cell and the cursor's; a minute's turn is the
+clock's digits and what blurs behind them.) `tools/check_brix_draw.sh`
+reads these lines on brixOS and compares the screen frames of parts left
+with the screen drawn whole; before that it plays the panel's part on the
+host against a model of a compositor that takes only the damage
+(`tests/support/panel_damage_model.mlx`: a rectangle a pixel short would
+leave old pixels in the model's copy).
 
 Composition itself works on whole pixels
 and 64-bit words (`state.copyPixels`, `fillPixels`), copies opaque

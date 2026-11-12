@@ -36,7 +36,8 @@ the console back into text mode.
 
 `brixos.mlx` is the same console for brixOS (mlx-out/bin/brix/mlx-console,
 `--target=x86_64-brixos`): the screen is /devices/framebuffer (its
-geometry read, its pixels mapped by node_map), the keys come from
+geometry read, its pixels mapped by node_map; a machine's further
+displays show the same picture, fitted: std.displays), the keys come from
 /devices/keyboard (PS/2 scancodes, decoded as a US layout here: no XKB
 data there yet), the program runs on a session pair (`session_pair`,
 brixOS's pty) with the session as its input, output, errors and session

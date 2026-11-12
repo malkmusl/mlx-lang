@@ -4,8 +4,15 @@
 // (std.ui.gpu_canvas: commands one compute shader draws) or on the CPU:
 // the same pixels either way, on any platform (a Wayland buffer, an
 // Android window).
+//
+// On the CPU the pixel loops go by rows: an opaque fill stores words and
+// then copies blocks (storePixels); a translucent one, a row of coverage
+// (coverSpan: a line of text) and a scaled image mix the four channels of
+// a pixel in 64-bit words, nothing divided and nothing called for a
+// pixel; what is off the canvas is cut away once, before the rows. `over`
+// says what a pixel becomes, and every loop gives what calling it for each
+// pixel would (tests/470).
 const std = @import("std")
-const math = @import("std.math")
 const ui = @import("std.ui")
 const png = @import("std.png")
 const gpu_canvas = @import("std.ui.gpu_canvas")
@@ -48,54 +55,128 @@ pub fn deviceOf(canvas: *Canvas) -> *gpu_canvas.Device {
     unsafe { return @ptrFromInt(*gpu_canvas.Device, canvas.*.device) }
 }
 
-// (value + 127) / 255 without dividing: the same for every value up to
-// 255 * 255 (a product of two channels), which is all it is used for.
-fn div255(value: u32) -> u32 { return ((value + 128) * 257) >> 16 }
+// A pixel's four channels side by side in a 64-bit word, 16 bits each
+// (blue lowest): a channel times a weight (255 * 255 at most) stays in its
+// lane, so one multiplication weighs all four.
+const LANE_LOW: u64 = 0x00FF00FF00FF00FF
+const LANE_HALF: u64 = 0x0080008000800080
+const LANE_OVER: u64 = 0xFF00FF00FF00FF00
+
+inline fn spread(pixel: u32) -> u64 {
+    const word = @intCast(u64, pixel)
+    return (word & 0xFF) | ((word & 0xFF00) << 8) | ((word & 0xFF0000) << 16) | ((word & 0xFF000000) << 24)
+}
+
+// The lanes (255 at most each) as a pixel again.
+inline fn joined(lanes: u64) -> u32 {
+    return @intCast(u32, (lanes & 0xFF) | ((lanes >> 8) & 0xFF00) | ((lanes >> 16) & 0xFF0000) | ((lanes >> 24) & 0xFF000000))
+}
+
+// Each lane times `weight` (0-255) over 255, rounded: (value + 127) / 255
+// for all four and without dividing, as (v + 128 + ((v + 128) >> 8)) >> 8,
+// which is the same for every product of two channels.
+inline fn scaled(lanes: u64, weight: u64) -> u64 {
+    const sum = lanes * weight + LANE_HALF
+    return ((sum + ((sum >> 8) & LANE_LOW)) >> 8) & LANE_LOW
+}
+
+// Lanes above 255 held there (a colour with a channel above its alpha
+// sums past it; a premultiplied colour never does).
+fn held(lanes: u64) -> u64 {
+    const blue = lanes & 0xFFFF
+    const green = (lanes >> 16) & 0xFFFF
+    const red = (lanes >> 32) & 0xFFFF
+    const alpha = lanes >> 48
+    return (if blue > 255 { 255 } else { blue }) | ((if green > 255 { 255 } else { green }) << 16) | ((if red > 255 { 255 } else { red }) << 32) | ((if alpha > 255 { 255 } else { alpha }) << 48)
+}
 
 // `color` (premultiplied) over `under` at `coverage` (0-255).
 pub fn over(under: u32, color: u32, coverage: u32) -> u32 {
     if coverage == 0 { return under }
-    var alpha = color >> 24
-    var red = (color >> 16) & 255
-    var green = (color >> 8) & 255
-    var blue = color & 255
-    if coverage < 255 {
-        alpha = div255(alpha * coverage)
-        red = div255(red * coverage)
-        green = div255(green * coverage)
-        blue = div255(blue * coverage)
+    var lanes = spread(color)
+    if coverage < 255 { lanes = scaled(lanes, @intCast(u64, coverage)) }
+    const alpha = lanes >> 48
+    if alpha == 255 { return joined(lanes) }
+    const sum = lanes + scaled(spread(under), 255 - alpha)
+    if sum & LANE_OVER != 0 { return joined(held(sum)) }
+    return joined(sum)
+}
+
+// Blocks of bytes: one assigned to another is the processor's block move.
+const Block512 = struct { bytes: [512]u8 }
+const Block4096 = struct { bytes: [4096]u8 }
+
+// `count` pixels at `address` set to `stored`. A short run by words, two
+// pixels to one of 64 bits; of a long one the first 128 so, then each half
+// KiB a copy of the one before it and each page a copy of the first
+// (std.mem.set's way: several times a loop of words for what is in the
+// cache). The pixels are read as well as written: not for a display's
+// write-combining memory.
+pub fn storePixels(address: usize, count: usize, stored: u32) -> void {
+    const pair = @intCast(u64, stored) | (@intCast(u64, stored) << 32)
+    const first = if count >= 256 { 128 } else { count }
+    var index: usize = 0
+    var pairs: [*]u64 = undefined
+    var pixels: [*]u32 = undefined
+    unsafe {
+        pairs = @ptrFromInt([*]u64, address)
+        pixels = @ptrFromInt([*]u32, address)
     }
-    if alpha == 255 { return (alpha << 24) | (red << 16) | (green << 8) | blue }
-    const keep = 255 - alpha
-    const a = alpha + div255((under >> 24) * keep)
-    const r = red + div255(((under >> 16) & 255) * keep)
-    const g = green + div255(((under >> 8) & 255) * keep)
-    const b = blue + div255((under & 255) * keep)
-    return (math.minOf(u32, a, 255) << 24) | (math.minOf(u32, r, 255) << 16) | (math.minOf(u32, g, 255) << 8) | math.minOf(u32, b, 255)
+    var word: usize = 0
+    while index + 8 <= first {
+        pairs[word] = pair
+        pairs[word + 1] = pair
+        pairs[word + 2] = pair
+        pairs[word + 3] = pair
+        word += 4
+        index += 8
+    }
+    while index + 2 <= first {
+        pairs[word] = pair
+        word += 1
+        index += 2
+    }
+    if index < first {
+        pixels[index] = stored
+        index += 1
+    }
+    if count < 256 { return }
+    while index < 1024 && index + 128 <= count {
+        unsafe { @ptrFromInt(*Block512, address + index * 4).* = @ptrFromInt(*const Block512, address + index * 4 - 512).* }
+        index += 128
+    }
+    while index + 1024 <= count {
+        unsafe { @ptrFromInt(*Block4096, address + index * 4).* = @ptrFromInt(*const Block4096, address).* }
+        index += 1024
+    }
+    while index + 128 <= count {
+        unsafe { @ptrFromInt(*Block512, address + index * 4).* = @ptrFromInt(*const Block512, address).* }
+        index += 128
+    }
+    while index < count {
+        pixels[index] = stored
+        index += 1
+    }
 }
 
 // `color` over `count` pixels from `at` at full coverage, as blend does it
 // pixel by pixel (the pixels are on the canvas): an opaque colour is
-// stored, a translucent one mixed with the channels taken apart once.
+// stored, a translucent one mixed, its channels spread once. (A red-first
+// canvas takes the colour with red and blue changed over: the sums are the
+// same whichever channel is which.)
 fn fillSpan(canvas: *Canvas, at: usize, count: usize, color: u32) -> void {
     const pixels = canvas.*.pixels
-    const swap = canvas.*.swapRedBlue
-    var index = at
-    const end = at + count
     const alpha = color >> 24
+    const own = if canvas.*.swapRedBlue { swapRedBlue(color) } else { color }
     if alpha == 255 {
-        const stored = if swap { swapRedBlue(color) } else { color }
-        while index < end {
-            pixels[index] = stored
-            index += 1
-        }
+        storePixels(@intFromPtr(pixels) + at * 4, count, own)
         return
     }
     if color == 0 { return }
-    const keep = 255 - alpha
-    const red = (color >> 16) & 255
-    const green = (color >> 8) & 255
-    const blue = color & 255
+    const lanes = spread(own)
+    const keep = @intCast(u64, 255 - alpha)
+    var index = at
+    const end = at + count
     // (What is under a fill is mostly one colour, the fill's own from the
     // frame before: the pixel mixed last is reused while the pixels under
     // stay that one. Voyager's sidebar, mixed at every page frame, was a
@@ -110,19 +191,11 @@ fn fillSpan(canvas: *Canvas, at: usize, count: usize, color: u32) -> void {
             index += 1
             continue
         }
-        const under = if swap { swapRedBlue(raw) } else { raw }
         // (Each sum is at most 255 for premultiplied colours; a channel
         // above its alpha is held at 255 all the same.)
-        var a = alpha + ((((under >> 24) * keep) + 128) * 257 >> 16)
-        var r = red + (((((under >> 16) & 255) * keep) + 128) * 257 >> 16)
-        var g = green + (((((under >> 8) & 255) * keep) + 128) * 257 >> 16)
-        var b = blue + ((((under & 255) * keep) + 128) * 257 >> 16)
-        if a > 255 { a = 255 }
-        if r > 255 { r = 255 }
-        if g > 255 { g = 255 }
-        if b > 255 { b = 255 }
-        const mixed = (a << 24) | (r << 16) | (g << 8) | b
-        const stored = if swap { swapRedBlue(mixed) } else { mixed }
+        var sum = lanes + scaled(spread(raw), keep)
+        if sum & LANE_OVER != 0 { sum = held(sum) }
+        const stored = joined(sum)
         pixels[index] = stored
         lastUnder = raw
         lastStored = stored
@@ -131,10 +204,86 @@ fn fillSpan(canvas: *Canvas, at: usize, count: usize, color: u32) -> void {
     }
 }
 
+// What one colour gave over a pixel at each coverage, kept while rows of
+// it are drawn (coverSpan): text stands on one colour mostly, and a
+// glyph's edge has the same few coverages again and again, so most pixels
+// of a line are looked up, not mixed. For coverage c: `under[c]` is the
+// pixel last mixed at it and `mixed[c]` what came of it, once `seen` has
+// its bit.
+pub const Mixes = struct {
+    seen: [4]u64
+    under: [256]u32
+    mixed: [256]u32
+}
+
+// Nothing mixed yet (before the first row of a colour).
+pub fn beginMixes(mixes: *Mixes) -> void {
+    mixes.*.seen[0] = 0
+    mixes.*.seen[1] = 0
+    mixes.*.seen[2] = 0
+    mixes.*.seen[3] = 0
+}
+
+// `color` over `count` pixels from `at` (all of them on the canvas), each
+// at its own coverage (0-255, a byte each at `coverage`): what blend gives
+// pixel by pixel, for a row of text. Eight pixels nothing covers are
+// passed over at once; a covered pixel of an opaque colour is stored; the
+// others are mixed, the colour's channels spread once, or taken from
+// `mixes` (begun for this colour) when the same pixel was mixed at the
+// same coverage before.
+pub fn coverSpan(canvas: *Canvas, at: usize, coverage: [*]const u8, count: usize, color: u32, mixes: *Mixes) -> void {
+    if color == 0 { return }
+    const pixels = canvas.*.pixels
+    const own = if canvas.*.swapRedBlue { swapRedBlue(color) } else { color }
+    const lanes = spread(own)
+    const opaque = (color >> 24) == 255
+    const bytes = @intFromPtr(coverage)
+    var index: usize = 0
+    while index < count {
+        var run: usize = 1
+        if index + 8 <= count {
+            var eight: u64 = 0
+            unsafe { eight = @ptrFromInt(*const u64, bytes + index).* }
+            if eight == 0 {
+                index += 8
+                continue
+            }
+            run = 8
+        }
+        const stop = index + run
+        while index < stop {
+            const cover = @intCast(usize, coverage[index])
+            if cover == 255 && opaque {
+                pixels[at + index] = own
+            } else if cover != 0 {
+                const raw = pixels[at + index]
+                const bit = @intCast(u64, 1) << @intCast(u6, cover & 63)
+                if mixes.*.seen[cover >> 6] & bit != 0 && mixes.*.under[cover] == raw {
+                    pixels[at + index] = mixes.*.mixed[cover]
+                } else {
+                    const part = if cover == 255 { lanes } else { scaled(lanes, @intCast(u64, cover)) }
+                    const alpha = part >> 48
+                    var result = joined(part)
+                    if alpha != 255 {
+                        var sum = part + scaled(spread(raw), 255 - alpha)
+                        if sum & LANE_OVER != 0 { sum = held(sum) }
+                        result = joined(sum)
+                    }
+                    pixels[at + index] = result
+                    mixes.*.seen[cover >> 6] |= bit
+                    mixes.*.under[cover] = raw
+                    mixes.*.mixed[cover] = result
+                }
+            }
+            index += 1
+        }
+    }
+}
+
 // Blends one pixel already known to be on the canvas (its index).
 fn blendAt(canvas: *Canvas, at: usize, color: u32, coverage: u32) -> void {
     if canvas.*.swapRedBlue {
-        canvas.*.pixels[at] = swapRedBlue(over(swapRedBlue(canvas.*.pixels[at]), color, coverage))
+        canvas.*.pixels[at] = over(canvas.*.pixels[at], swapRedBlue(color), coverage)
         return
     }
     canvas.*.pixels[at] = over(canvas.*.pixels[at], color, coverage)
@@ -158,17 +307,17 @@ pub fn clear(canvas: *Canvas, color: u32) -> void {
         return
     }
     const stored = if canvas.*.swapRedBlue { swapRedBlue(color) } else { color }
-    const pixels = canvas.*.pixels
+    const pixels = @intFromPtr(canvas.*.pixels)
     const width = canvas.*.width
     const stride = canvas.*.stride
+    // Rows that follow one another without a gap are one run.
+    if stride == width {
+        storePixels(pixels, width * canvas.*.height, stored)
+        return
+    }
     var row: usize = 0
     while row < canvas.*.height {
-        var index = row * stride
-        const end = index + width
-        while index < end {
-            pixels[index] = stored
-            index += 1
-        }
+        storePixels(pixels + row * stride * 4, width, stored)
         row += 1
     }
 }
@@ -180,12 +329,7 @@ fn swapRedBlue(color: u32) -> u32 {
 // Blends one pixel on the CPU (outside the canvas: nothing).
 pub fn blend(canvas: *Canvas, x: i32, y: i32, color: u32, coverage: u32) -> void {
     if x < 0 || y < 0 || x >= @intCast(i32, canvas.*.width) || y >= @intCast(i32, canvas.*.height) { return }
-    const at = @intCast(usize, y) * canvas.*.stride + @intCast(usize, x)
-    if canvas.*.swapRedBlue {
-        canvas.*.pixels[at] = swapRedBlue(over(swapRedBlue(canvas.*.pixels[at]), color, coverage))
-        return
-    }
-    canvas.*.pixels[at] = over(canvas.*.pixels[at], color, coverage)
+    blendAt(canvas, @intCast(usize, y) * canvas.*.stride + @intCast(usize, x), color, coverage)
 }
 
 pub fn fillRect(canvas: *Canvas, x: i32, y: i32, width: i32, height: i32, given: u32) -> void {
@@ -207,6 +351,8 @@ pub fn fillRect(canvas: *Canvas, x: i32, y: i32, width: i32, height: i32, given:
 }
 
 fn smallerOf(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+
+fn largerOf(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
 
 // The part of a box at (x, y), `width` x `height`, on the canvas: its
 // first and last-plus-one row and column relative to the box.
@@ -253,6 +399,35 @@ pub fn fillRoundedRect(canvas: *Canvas, x: i32, y: i32, width: i32, height: i32,
     }
 }
 
+// The outline's pixels of the rows `row` to `row_end` and the columns
+// `column` to `column_end` of the box (all on the canvas), each worked
+// out: what the outer rounded rectangle covers of it less what the inner
+// one does.
+fn strokePixels(canvas: *Canvas, x: i32, y: i32, width: i32, height: i32, radius: i32, thickness: i32, color: u32, first_row: i32, row_end: i32, first_column: i32, column_end: i32) -> void {
+    const inner_radius = if radius > thickness { radius - thickness } else { 0 }
+    var row = first_row
+    while row < row_end {
+        const line = @intCast(usize, y + row) * canvas.*.stride
+        var column = first_column
+        while column < column_end {
+            const outer = ui.roundedCoverage(column, row, width, height, radius)
+            const inner = ui.roundedCoverage(column - thickness, row - thickness, width - thickness * 2, height - thickness * 2, inner_radius)
+            if outer > inner { blendAt(canvas, line + @intCast(usize, x + column), color, outer - inner) }
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// The pixels `from` to `to` of the box's row `row`, as far as they are in
+// `range`, at full coverage.
+fn strokeSpan(canvas: *Canvas, x: i32, y: i32, row: i32, from: i32, to: i32, range: *const [4]i32, color: u32) -> void {
+    const start = largerOf(from, range.*[2])
+    const end = smallerOf(to, range.*[3])
+    if end <= start { return }
+    fillSpan(canvas, @intCast(usize, y + row) * canvas.*.stride + @intCast(usize, x + start), @intCast(usize, end - start), color)
+}
+
 // The outline of a rounded rectangle, `thickness` wide, inside it.
 pub fn strokeRoundedRect(canvas: *Canvas, x: i32, y: i32, width: i32, height: i32, radius: i32, thickness: i32, given: u32) -> void {
     const color = faded(canvas, given)
@@ -262,14 +437,27 @@ pub fn strokeRoundedRect(canvas: *Canvas, x: i32, y: i32, width: i32, height: i3
     }
     var range: [4]i32 = undefined
     visible(canvas, x, y, width, height, &range)
+    if range[3] <= range[2] || range[1] <= range[0] { return }
+    // Only the corners' squares (as wide as the larger of the radius and
+    // the thickness) are worked out pixel by pixel. Between them the outer
+    // rectangle covers every pixel and the inner one all but the
+    // outline's: whole spans at the top and the bottom, `thickness` pixels
+    // at each side, nothing in the middle. A box too small for four such
+    // corners, or a thickness of nothing, is worked out whole.
+    const corner = largerOf(radius, thickness)
+    if thickness < 1 || radius < 0 || width < corner * 2 || height < corner * 2 {
+        strokePixels(canvas, x, y, width, height, radius, thickness, color, range[0], range[1], range[2], range[3])
+        return
+    }
     var row = range[0]
     while row < range[1] {
-        var column = range[2]
-        while column < range[3] {
-            const outer = ui.roundedCoverage(column, row, width, height, radius)
-            const inner = ui.roundedCoverage(column - thickness, row - thickness, width - thickness * 2, height - thickness * 2, if radius > thickness { radius - thickness } else { 0 })
-            if outer > inner { blend(canvas, x + column, y + row, color, outer - inner) }
-            column += 1
+        if row < corner || row >= height - corner {
+            strokePixels(canvas, x, y, width, height, radius, thickness, color, row, row + 1, range[2], smallerOf(range[3], corner))
+            if row < thickness || row >= height - thickness { strokeSpan(canvas, x, y, row, corner, width - corner, &range, color) }
+            strokePixels(canvas, x, y, width, height, radius, thickness, color, row, row + 1, largerOf(range[2], width - corner), range[3])
+        } else {
+            strokeSpan(canvas, x, y, row, 0, thickness, &range, color)
+            strokeSpan(canvas, x, y, row, largerOf(width - thickness, thickness), width, &range, color)
         }
         row += 1
     }
@@ -287,6 +475,22 @@ pub fn drawImage(canvas: *Canvas, image: *const png.Image, x: i32, y: i32, size:
     drawImageRect(canvas, image, x, y, size, size, given)
 }
 
+// Two of a pixel's channels in a 64-bit word, 32 bits each: blue and red,
+// green and alpha. A channel weighed twice by up to 256 stays in its half.
+inline fn blueRed(pixel: u32) -> u64 {
+    const word = @intCast(u64, pixel)
+    return (word & 0xFF) | ((word & 0xFF0000) << 16)
+}
+
+inline fn greenAlpha(pixel: u32) -> u64 {
+    const word = @intCast(u64, pixel)
+    return ((word >> 8) & 0xFF) | ((word >> 24) << 32)
+}
+
+// The columns of an image's row whose places in the source are worked out
+// at once (drawImageRect).
+const IMAGE_COLUMNS: usize = 512
+
 // An image scaled to `width` x `height` (on the CPU; on the GPU as a square
 // of the larger side).
 pub fn drawImageRect(canvas: *Canvas, image: *const png.Image, x: i32, y: i32, width: i32, height: i32, given: u32) -> void {
@@ -296,22 +500,74 @@ pub fn drawImageRect(canvas: *Canvas, image: *const png.Image, x: i32, y: i32, w
         gpu_upload.image(deviceOf(canvas), image, x, y, if width > height { width } else { height }, opacity)
         return
     }
+    // (At no opacity nothing changes.)
+    if opacity == 0 { return }
     const source_width = @intCast(i32, image.*.width)
     const source_height = @intCast(i32, image.*.height)
     var range: [4]i32 = undefined
     visible(canvas, x, y, width, height, &range)
-    var row = range[0]
-    while row < range[1] {
-        var column = range[2]
-        while column < range[3] {
+    if range[3] <= range[2] || range[1] <= range[0] { return }
+    const swap = canvas.*.swapRedBlue
+    const pixels = canvas.*.pixels
+    const source = image.*.pixels
+    // Where a column samples the source (its two columns there and how far
+    // between them, in 256ths) is the same in every row: worked out once,
+    // IMAGE_COLUMNS columns at a time, then the rows of those columns.
+    var left: [IMAGE_COLUMNS]u32 = undefined
+    var right: [IMAGE_COLUMNS]u32 = undefined
+    var along: [IMAGE_COLUMNS]u32 = undefined
+    var part = range[2]
+    while part < range[3] {
+        const part_end = smallerOf(part + @intCast(i32, IMAGE_COLUMNS), range[3])
+        const columns = @intCast(usize, part_end - part)
+        var column: usize = 0
+        while column < columns {
             // Sample position in 1/256 source pixels.
-            const sx = ((column * 2 + 1) * source_width * 128) / width - 128
-            const sy = ((row * 2 + 1) * source_height * 128) / height - 128
-            const pixel = sample(image, sx, sy)
-            blend(canvas, x + column, y + row, pixel, opacity)
+            const sx = (((part + @intCast(i32, column)) * 2 + 1) * source_width * 128) / width - 128
+            const x0 = clampTo(if sx < 0 { 0 } else { sx / 256 }, source_width)
+            left[column] = @intCast(u32, x0)
+            right[column] = @intCast(u32, clampTo(x0 + 1, source_width))
+            along[column] = @intCast(u32, if sx < 0 { 0 } else { sx % 256 })
             column += 1
         }
-        row += 1
+        var row = range[0]
+        while row < range[1] {
+            const sy = ((row * 2 + 1) * source_height * 128) / height - 128
+            const y0 = clampTo(if sy < 0 { 0 } else { sy / 256 }, source_height)
+            const top = @intCast(usize, y0 * source_width)
+            const bottom = @intCast(usize, clampTo(y0 + 1, source_height) * source_width)
+            const fy = @intCast(u64, if sy < 0 { 0 } else { sy % 256 })
+            const line = @intCast(usize, y + row) * canvas.*.stride + @intCast(usize, x + part)
+            column = 0
+            while column < columns {
+                const x0 = @intCast(usize, left[column])
+                const x1 = @intCast(usize, right[column])
+                const a = source[top + x0]
+                const b = source[top + x1]
+                const c = source[bottom + x0]
+                const d = source[bottom + x1]
+                // (Four of one colour mix to that colour.)
+                var pixel = a
+                if a != b || a != c || a != d {
+                    const fx = @intCast(u64, along[column])
+                    const low = ((blueRed(a) * (256 - fx) + blueRed(b) * fx) * (256 - fy) + (blueRed(c) * (256 - fx) + blueRed(d) * fx) * fy) >> 16
+                    const high = ((greenAlpha(a) * (256 - fx) + greenAlpha(b) * fx) * (256 - fy) + (greenAlpha(c) * (256 - fx) + greenAlpha(d) * fx) * fy) >> 16
+                    pixel = @intCast(u32, (low & 0xFF) | ((high & 0xFF) << 8) | (((low >> 32) & 0xFF) << 16) | (((high >> 32) & 0xFF) << 24))
+                }
+                // (Nothing over a pixel leaves it.)
+                if pixel != 0 {
+                    const own = if swap { swapRedBlue(pixel) } else { pixel }
+                    if opacity >= 255 && (pixel >> 24) == 255 {
+                        pixels[line + column] = own
+                    } else {
+                        pixels[line + column] = over(pixels[line + column], own, opacity)
+                    }
+                }
+                column += 1
+            }
+            row += 1
+        }
+        part = part_end
     }
 }
 
@@ -319,29 +575,4 @@ fn clampTo(value: i32, limit: i32) -> i32 {
     if value < 0 { return 0 }
     if value >= limit { return limit - 1 }
     return value
-}
-
-fn sample(image: *const png.Image, sx: i32, sy: i32) -> u32 {
-    const width = @intCast(i32, image.*.width)
-    const height = @intCast(i32, image.*.height)
-    const x0 = clampTo(if sx < 0 { 0 } else { sx / 256 }, width)
-    const y0 = clampTo(if sy < 0 { 0 } else { sy / 256 }, height)
-    const x1 = clampTo(x0 + 1, width)
-    const y1 = clampTo(y0 + 1, height)
-    const fx = @intCast(u32, if sx < 0 { 0 } else { sx % 256 })
-    const fy = @intCast(u32, if sy < 0 { 0 } else { sy % 256 })
-    const a = image.*.pixels[@intCast(usize, y0 * width + x0)]
-    const b = image.*.pixels[@intCast(usize, y0 * width + x1)]
-    const c = image.*.pixels[@intCast(usize, y1 * width + x0)]
-    const d = image.*.pixels[@intCast(usize, y1 * width + x1)]
-    var result: u32 = 0
-    var shift: u32 = 0
-    while shift < 32 {
-        const top = ((a >> shift) & 255) * (256 - fx) + ((b >> shift) & 255) * fx
-        const bottom = ((c >> shift) & 255) * (256 - fx) + ((d >> shift) & 255) * fx
-        const value = (top * (256 - fy) + bottom * fy) / 65536
-        result = result | (math.minOf(u32, value, 255) << shift)
-        shift += 8
-    }
-    return result
 }

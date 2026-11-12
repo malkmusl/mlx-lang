@@ -63,7 +63,9 @@ each processor).
 ignition, in the boot image): the same picture (scene.mlx and the
 drawing modules, one thread), into /devices/framebuffer (the geometry
 read, the pixels mapped by node_map; the changed tiles copied, red and
-blue swapped when the framebuffer wants them so). There is no socket: the
+blue swapped when the framebuffer wants them so), and onto a machine's
+further displays too, fitted to their size (std.displays, from the same
+changed tiles). There is no socket: the
 init starts it on two streams and sends Plymouth's requests on its
 input ("U" a service starting, "u" the progress in percent, "C", "M",
 "m", "Q" with its first argument byte set to keep the picture), each

@@ -112,7 +112,38 @@ with `device` a `std.ui.gpu_canvas.Device`: then every call is a command
 the `paint` compute shader draws, the same pixels as the CPU
 (`std.ui.gpu_upload` takes images and glyph atlases to the GPU).
 `std.ui.text` loads a font (`loadText`, `loadMonoText`: the usual places
-on Linux desktops and on Android), `measure`s and `drawText`s.
+on Linux desktops and on Android), `measure`s and `drawText`s;
+`drawCells` draws a character to a cell of a grid, each cut to its cell
+(a terminal's).
+
+On the CPU the pixel loops go by rows: an opaque fill stores words and
+copies blocks (`storePixels`), a translucent fill, a row of a glyph's
+coverage (`coverSpan`) and a scaled image mix a pixel's four channels in
+64-bit words, with nothing divided and nothing called for a pixel; what
+is off the canvas is cut away once, before the rows. `over(under, color,
+coverage)` says what a pixel becomes, and every loop gives what calling
+it pixel by pixel would (`tests/470_canvas_loops_runtime.mlx` compares
+them with such loops, bit for bit). `tools/draw-bench` times them on a
+canvas in memory.
+
+## Frames in part
+
+A window's frame costs what it changes. A `std.ui.host` app that draws
+every frame whole says nothing: its frame is compared with the one
+before (the other of the panel's two buffers still holds it), and the
+rectangle that differs is what the compositor is told changed
+(`wl_surface.damage`): a clock's digits, an icon under the pointer. An
+app that keeps what it drew calls `host.keepFrames` once; its draw then
+finds the frame before in the canvas whenever `host.kept` says so (not
+for the first frame, after a resize, or when the GPU draws), draws only
+what changed and names it with `host.damage`, or says `host.unchanged`
+(no frame goes out). `std.ui.terminal.update` is such a draw: it keeps
+what each cell shows, draws the cells that changed, moves rows of
+pixels for text that scrolled, and returns the rectangle
+(`tests/471_terminal_cells_runtime.mlx`). With `MLX_FRAMES_SAY=1` in the
+environment every frame is said in a line on the program's errors
+(`frame: org.mlx.terminal 652x396 drawn in 153 us, changed 16x16 at
+110,22`), and kepler says what it composed for it.
 `std.ui.glyphs` has the small marks widgets use (check mark, arrows,
 chevron, cross, dot, magnifier, plus). `std.ui.vector` draws shapes
 smooth (anti-aliased) into an image: paths of lines and quadratic and

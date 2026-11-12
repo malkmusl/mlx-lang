@@ -1,9 +1,10 @@
-// The network: Ethernet frames of the device (virtionet.mlx), ARP (a
+// The network: Ethernet frames of the device (netdev.mlx), ARP (a
 // table of the neighbours' addresses, requests when one is missing),
 // IPv4 (one address, netmask and gateway: a packet goes to a neighbour
-// of the subnet or to the gateway; no fragments), ICMP (echo answered;
-// echo requests sent, the replies counted) and the dispatch to UDP and
-// TCP (udp.mlx, tcp.mlx). The configuration is /system/settings/network's
+// of the subnet, to everyone on it, or to the gateway; no fragments),
+// ICMP (echo answered; a ping socket's echo requests sent, their replies
+// given to it) and the dispatch to UDP and TCP (udp.mlx, tcp.mlx). The
+// configuration is /system/settings/network's
 // (address, netmask, gateway, nameserver), else DHCP's (dhcp.mlx);
 // `source` says which it is, for the link's record (link.mlx). Until one
 // of them gives an address there is none: nothing is sent but DHCP's own
@@ -15,7 +16,12 @@
 // for it (`held`), four packets at a time; when nobody says the address,
 // the ping socket whose echo request it was is told. 127.0.0.0/8 is this
 // machine itself: what is sent there comes straight back in, with or
-// without an address, and never goes onto the wire.
+// without an address, a link or a network device at all, and never goes
+// onto the wire. What cannot leave the machine as it is (way: no device,
+// the link down, no address, no gateway to it) is not tried: sockets say
+// so to their programs at once. The link is looked at on every tick of
+// the timer; when it goes or comes the log has a line, and DHCP begins
+// again when it comes.
 const console = @import("../console.mlx")
 const clock = @import("../clock.mlx")
 const netdev = @import("../netdev.mlx")
@@ -25,6 +31,7 @@ const tcp = @import("./tcp.mlx")
 const sockets = @import("./sockets.mlx")
 const dhcp = @import("./dhcp.mlx")
 const lease = @import("./lease.mlx")
+const reach = @import("./reach.mlx")
 
 pub const Ip = [4]u8
 pub const Mac = [6]u8
@@ -75,15 +82,10 @@ var neighbours: [MAX_NEIGHBOURS]Neighbour = undefined // (per run)
 // ourselves on its way in.
 var frame: [2048]u8 = undefined // (per run)
 var loopback: [2048]u8 = undefined // (per run)
-// Echo replies that came (the boot's self-test, ping).
-var echoReplies: usize = 0 // (per run)
-var lastEchoFrom: Ip = undefined // (per run)
 
 pub fn configuration() -> *Config { return &config }
 // Whether there is an address (the file's or DHCP's).
 pub fn configured() -> bool { return config.source != Source.NONE }
-pub fn echoRepliesSeen() -> usize { return echoReplies }
-pub fn lastEchoSource() -> Ip { return lastEchoFrom }
 
 pub fn same(a: Ip, b: Ip) -> bool { return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3] }
 
@@ -100,11 +102,12 @@ pub fn itself(ip: Ip) -> bool { return ip[0] == 127 }
 pub fn sourceFor(destination: Ip) -> Ip { return if itself(destination) { destination } else { config.address } }
 
 // The network up, without an address: the settings file gives one
-// (settings), or DHCP (dhcp.mlx, through configure).
+// (settings), or DHCP (dhcp.mlx, through configure). `up` says whether
+// there is a device; without one the sockets are there all the same, for
+// the machine to speak to itself (127.0.0.0/8).
 pub fn init() -> void {
     config.up = netdev.present()
     unconfigure()
-    echoReplies = 0
     sockets.sockets().init()
     udp.init()
     tcp.init()
@@ -179,7 +182,10 @@ var fileNameServer: Ip = undefined // (per run)
 // configuration: a gateway or a name server it has no line for is none,
 // a netmask it has no line for is the one of the address's class.
 // Without an address line (or with 0.0.0.0 on it) nothing of it is used
-// (DHCP asks, and its answer is the configuration).
+// (DHCP asks, and its answer is the configuration). The same when its
+// netmask line is no netmask (one bits after zero bits, or 0.0.0.0),
+// which the log says: taken as typed, such a mask made neighbours of
+// hosts that are none, and of every host there is.
 pub fn settings(text: []const u8) -> bool {
     var given = false
     var masked = false
@@ -214,6 +220,12 @@ pub fn settings(text: []const u8) -> bool {
         at = end + 1
     }
     if !given { return false }
+    if masked && !reach.maskValid(&fileMask) {
+        console.out.write("brixOS: /system/settings/network is not used: ")
+        writeIp(fileMask, console.out)
+        console.out.write(" is no netmask\n")
+        return false
+    }
     if !masked { lease.classMask(&fileAddress, &fileMask) }
     configure(Source.SETTINGS, &fileAddress, &fileMask, &fileGateway, &fileNameServer)
     return true
@@ -620,16 +632,39 @@ fn local(ip: Ip) -> bool {
     return true
 }
 
+// The way a packet to `destination` takes from this machine as it is,
+// or what stands in it (reach.mlx): there is no device, its link is
+// down, there is no address, or the destination is not on the own subnet
+// and there is no gateway. The machine itself needs none of them.
+pub fn way(destination: Ip) -> reach.Way {
+    return reach.way(config.up, netdev.linked(), configured(), &config.address, &config.mask, &config.gateway, &destination)
+}
+
+// Whether a packet to `destination` can leave the machine as it is. A
+// socket asks before it sends: what cannot go is said to its program at
+// once (Status.unreachable), not tried again and again.
+pub fn reaches(destination: Ip) -> bool { return way(destination) == reach.Way.open }
+
+// Whether `ip` is everyone's on our wire: 255.255.255.255, or the
+// subnet's address for everyone (its last).
+fn everyones(ip: Ip) -> bool {
+    return same(ip, BROADCAST_IP) || (configured() && reach.subnetAll(&config.address, &config.mask, &ip))
+}
+
+// Whether `ip` is no one host's: everyone's on our wire, or a group's
+// address or what lies beyond them (224.0.0.0 and above). A stream is a
+// connection to one host: TCP opens none to such an address (tcp.mlx).
+pub fn manyHosts(ip: Ip) -> bool { return reach.group(&ip) || everyones(ip) }
+
 // Room for a packet's payload in the frame being made (after the IP
 // header): the caller fills it, then `send`s.
 pub fn payloadArea() -> [*]u8 { return Bytes.pointer(@intFromPtr(&frame) + ETHERNET_HEADER + IP_HEADER) }
 
 // The payload (`length` bytes at payloadArea) sent to `destination` as
 // `protocol`, from sourceFor(destination); false when it is too long,
-// there is no address to send from, the destination cannot be reached
-// (it is not on the own subnet and there is no gateway), or the device
-// is busy. True also for a packet that waits for its neighbour's
-// hardware address (hold).
+// the destination cannot be reached from this machine as it is (way),
+// or the device is busy. True also for a packet that waits for its
+// neighbour's hardware address (hold).
 pub fn send(protocol: u8, destination: Ip, length: usize) -> bool {
     if !configured() && !itself(destination) { return false }
     return sendFrom(sourceFor(destination), protocol, destination, length)
@@ -637,15 +672,23 @@ pub fn send(protocol: u8, destination: Ip, length: usize) -> bool {
 
 // The same from `source` (0.0.0.0: DHCP without an address, which
 // reaches everyone and nobody else). To this machine itself (its own
-// address, or 127.0.0.0/8, which needs no address) the packet comes
-// straight back in, and nothing goes onto the wire.
+// address, or 127.0.0.0/8, which needs no address, no link and no
+// device) the packet comes straight back in, and nothing goes onto the
+// wire. To everyone (255.255.255.255, or the subnet's address for
+// everyone) it goes to everyone's hardware address: nobody is asked for
+// one. (The subnet's was asked for like a host's: nobody answers for it,
+// and what was sent there never went.)
 pub fn sendFrom(source: Ip, protocol: u8, destination: Ip, length: usize) -> bool {
-    if !config.up || length > MAX_PAYLOAD { return false }
-    const toEveryone = same(destination, BROADCAST_IP)
+    if length > MAX_PAYLOAD { return false }
     const toOurselves = itself(destination) || (configured() && same(destination, config.address))
-    if !configured() && !toEveryone && !toOurselves { return false }
+    if !toOurselves {
+        // Without an address only what is for everyone on the wire goes
+        // (DHCP's question).
+        const how = way(destination)
+        if how != reach.Way.open && !(how == reach.Way.no_address && same(destination, BROADCAST_IP)) { return false }
+    }
+    const toEveryone = everyones(destination)
     const direct = toEveryone || toOurselves || local(destination)
-    if !direct && lease.none4(&config.gateway) { return false }
     const hop = if direct { destination } else { config.gateway }
     var mac: *const Mac = &broadcastMac
     var waits = false
@@ -694,6 +737,11 @@ fn ipReceive(bytes: [*]const u8, length: usize, inside: bool) -> void {
     // (127.0.0.0/8 is nobody's on the wire: a frame that names it, as
     // where it is from or where it goes, is not taken.)
     if !inside && (itself(source) || itself(destination)) { return }
+    // (Nor does anybody speak from an address that is everyone's or a
+    // group's: RFC 1122, 3.2.1.3. Taken, an echo request or a SYN that
+    // named the subnet's address for everyone as where it came from had
+    // our answer sent to every host on the wire.)
+    if !inside && manyHosts(source) { return }
     if !inside && !configured() {
         // Without an address nothing off the wire is ours but a DHCP
         // server's answer, which comes to everyone or to the address it
@@ -705,9 +753,16 @@ fn ipReceive(bytes: [*]const u8, length: usize, inside: bool) -> void {
         return
     }
     const ours = (configured() && same(destination, config.address)) || (inside && itself(destination))
-    if !ours && !same(destination, BROADCAST_IP) { return }
-    if protocol == PROTOCOL_ICMP { icmpReceive(source, payload, payloadLength) }
+    if !ours && !everyones(destination) { return }
     if protocol == PROTOCOL_UDP { udp.receive(source, destination, payload, payloadLength, false) }
+    // What is sent to everyone is for the datagram sockets alone. A TCP
+    // segment addressed so is discarded (RFC 1122, 4.2.3.10): taken, a
+    // SYN to everyone was answered by a listener, and with a forged
+    // source every listener on the wire answered one victim. An echo
+    // request to everyone is not answered for the same reason (RFC 1122,
+    // 3.2.2.6, lets a host be silent).
+    if !ours { return }
+    if protocol == PROTOCOL_ICMP { icmpReceive(source, payload, payloadLength) }
     if protocol == PROTOCOL_TCP { tcp.receive(source, destination, payload, payloadLength) }
 }
 
@@ -729,8 +784,6 @@ fn icmpReceive(source: Ip, bytes: [*]const u8, length: usize) -> void {
         return
     }
     if bytes[0] == 0 && bytes[1] == 0 {
-        echoReplies += 1
-        lastEchoFrom = source
         // A ping socket's (its identifier).
         sockets.Sockets.deliverDatagram(sockets.Kind.icmp, be16(bytes, 4), source, 0, bytes, length)
         return
@@ -765,29 +818,54 @@ pub fn sendEcho(identifier: usize, destination: Ip, message: [*]const u8, length
     return send(PROTOCOL_ICMP, destination, length)
 }
 
-// The timers (every tick of the first processor's timer).
+// The link's line in the log, as it is now: "net0: the link is up, 1000
+// Mbit/s full duplex" (a device that does not say its speed: "net0: the
+// link is up"), with the frames that were not sent while it was down
+// when there were some, or "net0: the link is down".
+pub fn sayLink() -> void {
+    const out = console.out
+    if !netdev.linked() {
+        out.write("net0: the link is down\n")
+        return
+    }
+    out.write("net0: the link is up")
+    const speed = netdev.speed()
+    if speed != 0 {
+        out.write(", ")
+        out.decimal(speed)
+        out.write(if netdev.fullDuplex() { " Mbit/s full duplex" } else { " Mbit/s half duplex" })
+    }
+    const unsent = netdev.takeUnsent()
+    if unsent != 0 {
+        out.write(" (")
+        out.decimal(unsent)
+        out.write(if unsent == 1 { " frame was not sent while it was down)" } else { " frames were not sent while it was down)" })
+    }
+    out.write("\n")
+}
+
+// The link went or came (the device's look on the tick): a line in the
+// log each time. When it comes, the neighbours known belonged to the
+// wire as it was before (the cable may be in another network now), and
+// DHCP begins again: at once where it is asking for an address, and with
+// an address its lease is asked for anew (dhcp.mlx).
+fn linkChanged(up: bool) -> void {
+    console.freshLine()
+    sayLink()
+    if up {
+        forgetNeighbours()
+        dhcp.linkCame()
+    }
+}
+
+// The timers (every tick of the first processor's timer), and the look
+// at the link.
 pub fn tick() -> void {
+    const change = netdev.look()
+    if change != netdev.Change.none { linkChanged(change == netdev.Change.up) }
     tcp.tick()
     dhcp.tick()
     if heldCount > 0 { heldTick() }
-}
-
-// An echo request (`identifier`, `sequence`, 32 bytes of data) to
-// `destination`; false when it could not go.
-pub fn ping(destination: Ip, identifier: usize, sequence: usize) -> bool {
-    const request = payloadArea()
-    request[0] = 8
-    request[1] = 0
-    putBe16(request, 2, 0)
-    putBe16(request, 4, identifier)
-    putBe16(request, 6, sequence)
-    var k: usize = 0
-    while k < 32 {
-        request[8 + k] = @intCast(u8, 48 + k % 10)
-        k += 1
-    }
-    putBe16(request, 2, checksum(request, 40, 0))
-    return send(PROTOCOL_ICMP, destination, 40)
 }
 
 // The device's frames taken in now (where the stack waits for an

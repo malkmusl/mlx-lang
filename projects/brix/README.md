@@ -394,6 +394,86 @@ its own. Nothing in the image says the screen's shape by hand yet:
 settings/display names a mode, and the monitor's word goes before it;
 ignition takes --screen WIDTH:HEIGHT, which the init does not pass.
 
+A machine may have more than one graphics adapter (a board's own and a
+card in a slot), and a monitor on each. All of them are the system's:
+
+- The loader goes through every graphics output the firmware offers
+  (image/efi.mlx, CODE_MORE). The first is handed over as ever (the boot
+  info's FB_* fields); every further one that has a picture of its own in
+  memory the kernel can write gets a record in a page of the image
+  (layout.Blob.DISPLAYS, layout.More; seven at most) with its
+  framebuffer, size, pixel order and its monitor's EDID where the
+  firmware has one, and the mode set that the first one's part would
+  set (the one the image names, else that monitor's own, the nearest the
+  firmware has). An output that shows another one's memory again (the
+  console's own in front of a card's) is that display, not a new one; one
+  without pixels (the console's own output over two cards, a virtual
+  adapter that only takes blocks) is passed over and counted, also
+  when it is the one the firmware lists first (the displays are then
+  the outputs behind it). A loader
+  before this one leaves the count of records zero, and a kernel before
+  this one does not look at them: either pair comes up with the first
+  display, as before. A Multiboot loader hands over none (the kernel sets
+  the Bochs adapter up itself): one display.
+- The kernel lists them (kernel/displays.mlx reads the boot information,
+  kernel/display.mlx keeps them), a line each: its number, its size, where
+  its memory is, which PCI adapter's memory that is, its node:
+
+      brixOS: the firmware offers 3 graphics outputs: 2 displays, 1 without pixels the kernel can use (passed over)
+      brixOS: display 0: 1024x768 at 0xc0000000, PCI 04:00.0 1a03:2000, /devices/framebuffer1
+      brixOS: display 1: 1280x960 at 0xe0000000, PCI 21:00.0 1002:67df, its monitor says 3840x1080, /devices/framebuffer, the main display (its monitor names the largest mode of its own)
+
+  (They are numbered in the firmware's order; "its monitor says" is
+  there when the firmware passed the monitor's EDID on. A further
+  display's lines on the mode the loader set follow its line, as
+  "brixOS: display 0: the loader set this mode, ...".) Its own console (the boot log, a stop's report) is on every one of them
+  (fbcon.mlx: a grid for each one's size), until a program maps that
+  display's node.
+- One display is the main one, /devices/framebuffer: the one whose
+  monitor names the largest mode of its own (its EDID, as the firmware
+  passed it on: a monitor that says what it is is plugged in; a board's
+  remote console says nothing), else the one with the largest picture, of
+  several alike the firmware's first. An image may name it: a line
+  "main N" in settings/display (N the display's number as the log says
+  it), or "main VVVV:DDDD" (its adapter's PCI vendor and device, which
+  holds whatever order the firmware lists them in), beside the mode's
+  line or alone ("monitor" is the mode's default, said). The log says
+  which and why, and says when the line names none that is there.
+- The others are /devices/framebuffer1, /devices/framebuffer2 and on:
+  the same ten words to read (width, height, pitch, format, the screen's
+  shape, then the display's number, how many there are, the adapter's
+  vendor and device) and the same pixels to map.
+- What draws on the screen draws on all of them: ignition, kepler and
+  mlx-console show the main display's picture on each further one too,
+  fitted to its size without distortion: as large as it goes in the
+  shape it was drawn in (a pixel of the frame is square there, also on a
+  further display whose monitor stretches its mode: that display's own
+  shape is counted in), with black bars where the shapes differ
+  (std.displays). A main monitor that stretches a mode of another shape
+  (1280x960 across a 32:9 screen) shows the desktop wider than it was
+  drawn; the further display shows it as drawn. They name what of
+  their frame changed, after the main display has it; a pixel of a
+  further display is the mean of its part of the frame; and what waits
+  is brought for 2 ms of a frame's time at most, the rest when the
+  program is at rest: a second display costs the main one that much of
+  a frame while the whole screen changes, and nothing while nothing
+  does. An extended desktop (each display its own part) is not there
+  yet.
+- The Radeon's driver works on the display in its own card's memory
+  (gpu.mlx `ownDisplay`), which need not be the main one, and takes that
+  display's monitor's EDID.
+
+tools/check_brix_displays.sh starts the EFI image under OVMF in QEMU
+with two adapters of different sizes (a Cirrus VGA, 800x600, and a
+second standard VGA, 1280x800) and dumps both screens: the log's lines,
+the boot log, the boot screen and the desktop on both, a window opened
+arriving on both, the main display named, the virtual console made
+larger on the other, and one adapter beside one without a framebuffer,
+either way round.
+tests/476_boot_displays_runtime.mlx reads boot informations with none,
+one, two, eight and too many displays and tries the rule;
+tests/477_displays_fit_runtime.mlx the fitting and the bringing.
+
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the
 firmware's framebuffer (fbcon.mlx: an 8x16 font, a grid of characters so
@@ -426,6 +506,10 @@ said, and the address when it has come). A browser or curl there gets
                          and send
     /gpu                 the log's lines that begin with "gpu:" (the
                          graphics driver's read-out)
+    /gpu.rom             the graphics card's video BIOS ROM as the
+                         kernel read it at boot (/devices/gpurom): not
+                         a text, a file to save and send
+                         (`curl -o gpu.rom http://ADDRESS:8080/gpu.rom`)
     /klog                the kernel log, whole
     /boot.log            the files of these names at the top of the
     /boot.previous.log   mounted volumes, where klogsave writes (a
@@ -540,22 +624,51 @@ registers), and only when the link the firmware trained has room for the
 new clock (lanes times rate times 8/10 over the bits a pixel; the rate
 is not in a register of its own and is worked out from the stream's M
 and N and the pixel clock). A link
-that is too slow would have to be trained again, and an HDMI or DVI
-output's clock is a PLL's; Linux sets both by the card's firmware
-tables, which are not run here: not there yet.
+that is too slow would have to be trained again, which is the card's
+firmware tables' work and not there yet.
+On an HDMI or DVI output (TMDS) the pixel clock is a PLL's and is the
+link's clock too: the output is taken down, the PLL set, the timing set
+and the output brought up again, and the PLL, the transmitter, the
+timing and the controller's stop and start are the work of small
+programs in the card's own video BIOS ROM (below), which Linux runs for
+them and so does the kernel. Such a plan is made at every boot, table
+runs among its writes, and is complete only when everything is as the
+sequence needs it: the ROM read and its tables there in the revisions
+their parameters are known for, the ROM naming the connector behind the
+encoder, the controller's clock being that encoder's PLL's, a timing the
+link carries. The monitor's own timing is taken when a TMDS link carries
+it without scrambling (HDMI below 340 MHz, below 300 MHz unless the ROM
+says the output may send more, and no more than the monitor's EDID names
+as its highest clock; DVI signalling to 165 MHz); when not, another of
+the EDID's timings of the same size that it does carry (the lowest rate
+of 50 Hz or more, else the highest), and the log says which and why.
+The signalling: DVI for a clock a DVI link carries when the firmware's
+picture is sent that way (the monitor has shown it takes that), HDMI
+above it when the monitor's EDID has the HDMI block (as Linux chooses);
+RGB at eight bits, no pixel sent twice.
 
     gpu: plan (a): the controller runs this timing already; a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 38 writes would do it
     gpu: plan (b, DisplayPort): the link has 4 lanes at 2.70 Gbit/s (by M 0x3333 over N 0x8000), room for 360000 kHz at 24 bits: 266640 kHz fits
     gpu: plan (b, DisplayPort): the pixel clock from 108000 to 266640 kHz (the DTO's phase from 108000000 to 266640000), the timing, the stream stopped and started, a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 63 writes would do it
-    gpu: plan (b): nothing would be set: HDMI: the TMDS clock's PLL must be set, not there yet
+    gpu: the monitor says it is an HDMI one, up to 300 MHz
+    gpu: plan (b, TMDS): HDMI signalling at 266640 kHz (now DVI at 107960 kHz), the clock's PLL, the timing and the transmitter by the card's own tables, a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 7 table runs and 86 writes would do it
+    gpu: plan (b, TMDS): nothing would be set: table SetPixelClock is revision 1.6 in this ROM: what it is told is known here for content revision 7 only
 
 The plan's steps, a line each ("gpu: would write 1b9d = 00000100 (the
-controller's picture blanked)"), and the registers themselves ("gpu: raw
-1b80: 00000f9f ...": a register's number, then its value and those of
-the registers after it) are in the log only (/devices/klog, boot.log); a
-shell shows them by themselves with
+controller's picture blanked)", "gpu: would set 4e47 & 00070000 =
+00030000 (the back end's mode)" for a field set in the word as it then
+stands, "gpu: would run SetPixelClock with a0 af 28 00 18 21 03 00 ...
+(the pixel clock's PLL set)" for a table with the bytes it is told),
+what a TMDS plan found on the way ("gpu: DIG 4 is UNIPHY E; the ROM puts
+a connector of the kind "HDMI" behind it, hot plug line 2 ...", the
+clock and timing the way back would ask for, the firmware's scratch
+words, what the output carries, the display clock), the table runs of
+the way back ("gpu: on the way back would run ...") and the registers
+themselves ("gpu: raw 1b80: 00000f9f ...": a register's number, then its
+value and those of the registers after it) are in the log only
+(/devices/klog, boot.log); a shell shows them by themselves with
 
-    while read l; do case "$l" in "gpu: raw"*|"gpu: would w"*) echo "$l";; esac; done < /devices/klog
+    while read l; do case "$l" in "gpu: raw"*|"gpu: would "*|"gpu: on the way back"*) echo "$l";; esac; done < /devices/klog
 
 The steps' order and locks are those of Linux's display core
 (gpu_mode.mlx names the function each one follows, and says where Linux
@@ -563,14 +676,17 @@ hands a step to the firmware's tables and the registers are written
 directly instead). (The read-out's own "next stage" and "would set"
 lines are the stage's before; the plan says more.)
 
-None of this writes to the card. A plan is carried out only by an image
-whose archive has a file settings/gpu with the word `native`:
+None of this writes to the card, and none of it runs a table of the
+card's. A plan is carried out only by an image whose archive has a file
+settings/gpu with the word `native`; the word `rehearsal` there asks for
+less (below).
 
     tools/brix-native-efi.sh
 
-makes it from the build's image: mlx-out/bin/brix/esp/EFI/BOOT/
-BOOTX64-native.EFI is BOOTX64.EFI with that one file more (`brix-image
---add`), and BOOTX64-diag-native.EFI the diagnostic image likewise when
+makes both from the build's image: mlx-out/bin/brix/esp/EFI/BOOT/
+BOOTX64-native.EFI and BOOTX64-rehearsal.EFI are BOOTX64.EFI with that
+one file more (`brix-image --add`), and BOOTX64-diag-native.EFI and
+BOOTX64-diag-rehearsal.EFI the diagnostic image likewise when
 tools/brix-diag-efi.sh has made one. With the file, and a plan that is
 complete, the kernel carries the plan out before any program runs
 (gpu_set.mlx): the new picture's memory is cleared, each write is read
@@ -583,29 +699,187 @@ kernel's display is the new picture from there on: the console is drawn
 again on it, and /devices/framebuffer gives the programs the monitor's
 own size.
 
-On the machine: start the build's image (or the diagnostic one, where
-the log stays on the screen) and photograph the "gpu:" lines: the
-monitor's timing, the controller's lines and the plan say which
-situation it is and whether the plan is complete. If it is ("... writes
-would do it"), copy BOOTX64-native.EFI to the ESP beside BOOTX64.EFI and
-start it from the firmware's boot menu. The desktop at the monitor's own
-size is the success; the log says "gpu: controller 0 shows a picture of
-3840x1080 as it is, ... the monitor's own mode is set". If the screen
-stays dark, or is as before, start the normal image again and read what
-the driver did: klogsave kept that boot's log as boot.previous.log on
-the brixfs volumes (`cat /volumes/NAME/boot.previous.log`; the boot
-after that one overwrites it, klogsave run again by hand does not).
+A TMDS output's plan is carried out with more care still, since the
+card's own tables do part of it and nobody has seen them run here on a
+card: a table that does not run to its end, or runs to it and wrote
+nothing, ends the change; so does a transmitter or a controller that
+does not follow its table, a controller that is not on the encoder's
+PLL after the pixel clock's table, timing words that are not what the
+timing's table was told, and frames that do not count at the planned
+rate while the transmitter is still off (a PLL cannot be read: there its
+clock is measured, before the monitor is sent anything). The way back is
+the same sequence towards the firmware's state: the tables are told the
+firmware's timing, signalling and clock (the clock as it was measured,
+in whole 10 kHz), and every register the kernel wrote itself gets the
+firmware's value again. What cannot be read back is said as such: the
+PLL's and the transmitter's own settings are then what the tables made
+for that clock. The screen is dark while the output is down (a tenth of
+a second at least, so that the monitor sees the signal gone); what each
+table did, each state waited for and how long it took is in the log
+alone. How long it can be dark at most is bounded whatever the card
+does, and said before the first write: a state is waited for a tenth of
+a second at most and a table is given two seconds and no more, which
+for seven tables comes to "the screen is dark meanwhile, 18 s at most
+(and 18 s more at most if the firmware's state has to be put back)".
+After that the kernel goes on starting in any case.
+
+On the machine, in three steps, each only after the one before held.
+
+1. The build's own image (or the diagnostic one, where the log stays on
+   the screen). Nothing is written. The "gpu:" lines say whether there
+   is a plan: on the screen the monitor's timing, the controller's
+   lines, the video BIOS's line and "gpu: plan (b, TMDS): ... 7 table
+   runs and 86 writes would do it", or "nothing would be set: ..." with
+   the reason. If there is none, or before going on in any case, send
+   the log and the card's ROM (logserve's /all and /gpu.rom, or boot.log
+   and gpu.rom from a brixfs volume): with the ROM every table the plan
+   runs can be run on the host first, against Linux's own interpreter
+   (tools/check_atom_reference.sh), where a table this interpreter
+   cannot run costs nothing.
+2. BOOTX64-rehearsal.EFI: the firmware's own mode set again by the same
+   steps (the plan line then begins "gpu: plan (the firmware's own mode
+   set again): ..."). The screen goes dark for a moment and comes back
+   as it was. Nothing new is asked of the monitor; it shows that the
+   card's tables run here, that the output goes off and comes back and
+   that the checks hold on this card. The line that says so: "gpu:
+   controller 0 runs the firmware's own mode again, set by the card's
+   tables, ... the picture is where it was". (It does not show that the
+   PLL takes another clock: the one asked for is the one that runs.)
+3. BOOTX64-native.EFI: the monitor's own mode. The desktop at the
+   monitor's own size is the success; the log says "gpu: controller 0
+   shows a picture of 3840x1080 as it is, ... the monitor's own mode is
+   set (7 table runs, 86 writes, each read back)".
+
+If it fails and the picture comes back, the screen says why ("gpu: step
+24 of 108 failed (...): run SetPixelClock with ...") and what came back
+("gpu: the firmware's state is back (...)"). If the screen stays dark:
+wait until the disk is quiet (the system goes on starting behind the
+dark screen, and klogsave writes that boot's log), then restart into the
+normal image, which never writes to the display: klogsave has kept the
+dark boot's log as boot.previous.log on the brixfs volumes (`cat
+/volumes/NAME/boot.previous.log`, or logserve's /boot.previous.log; the
+boot after that one overwrites it, klogsave run again by hand does not).
+That file is what to send back, whole: its "gpu:" lines say each table's
+run and where one stopped ("gpu: table SetPixelClock (...) was stopped
+after too long at 0x... of the ROM (opcode ...)"), each state waited
+for, the frames counted with the output off and the timing's words as
+the table left them, and at the end one of four things: the firmware's
+state is back (said only when everything the way back looked for was
+there and the controller counts frames as before); it is NOT known to be
+back (every register the kernel wrote has the firmware's value again,
+but something the way back looked for was not there, a transmitter that
+did not come on after its table, say: "gpu: on the way back, not as it
+should be (the way goes on): ..." names each); it is NOT all back, with
+the registers that differ; or "the way back did not come to its end: the
+output is left as that left it until a restart", after a table that
+could not be run on the way back either. A screen that stays dark although the log says the monitor's own
+mode is set means the monitor does not take the signal: nothing comes
+back from a monitor on a TMDS link, so the kernel cannot see that; the
+log with the plan's lines is what to send then too.
+
+Not done yet for a TMDS output: a clock of 340 MHz and more (HDMI
+scrambles there and the monitor has to be told over its DDC lines; there
+is no I2C here), two DVI links, more than eight bits a colour and YCbCr,
+audio, a monitor plugged in later or another one (the plan is for the
+monitor the firmware showed its picture on), and a way to take the new
+mode back when the monitor shows nothing though every register is right
+(someone would have to confirm the picture; the kernel sets the mode
+before there is a keyboard). The tables that Linux runs once at its
+start and this driver leaves to the firmware's own start (the
+transmitter's "init", the power gate) are not run.
 
 tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
 numbers on the host, tests/459_edid_timing_runtime.mlx reads EDIDs
 written from the standard's layout, and
-tests/460_gpu_mode_set_runtime.mlx holds both plans' writes against the
-sequences worked out from Linux's code, on a card that is a table and
-can fail at every step.
+tests/460_gpu_mode_set_runtime.mlx holds both register plans' writes
+against the sequences worked out from Linux's code, on a card that is a
+table and can fail at every step. For a TMDS output
+tests/474_gpu_tmds_sequence_runtime.mlx does the same with a ROM whose
+tables write down what they were told: the whole change, write for write
+and run for run, the way back from a failure at every step, tables that
+write nothing, do not end or cannot be run, the rehearsal; and
+tests/475_gpu_tmds_blocks_runtime.mlx holds what each table is told byte
+for byte against the bytes worked out from Linux's atombios.h and
+command_table.c, the timing and signalling chosen, and every reason for
+no plan.
+
+On this controller Linux does not write the pixel clock's PLL and the
+transmitter itself: it runs small programs out of the card's own video
+BIOS ROM (AtomBIOS command tables: SetPixelClock, the transmitter's and
+the encoder's control and others). So does the kernel, for a TMDS
+output's plan and only when the image asks (gpu_blocks.mlx has what
+each table is told).
+
+The ROM is read at every boot (gpu_rom.mlx), by the first of three ways
+that gives one that holds: the copy the card's UEFI driver leaves in the
+ACPI table VFCT (memory is read, nothing of the card); the PCI expansion
+ROM (the PCI configuration's ROM word is written to learn its size and
+to switch it on, and put back); the card's own ROM registers (the
+management controller's index and the ROM's index are written, and put
+back). No register of the display is touched, and gpu_rom.mlx's head
+says why the picture cannot mind. Nothing of it depends on the slot the
+card sits in or on the card being the firmware's display: the firmware's
+copy is found by the card's place on the PCI bus, the expansion ROM is
+switched on only at an address inside the window of the bridge before
+the card (not at one a firmware merely left behind), and where there is
+neither, the ROM registers give it. On a machine with a second adapter
+(a board's own) the log says whether the firmware's picture is in this
+card's memory or another adapter shows it; a card the firmware has not
+started at all has its ROM read and kept, and nothing else of it is
+read or set. A ROM holds when it begins 55 AA, has
+AMD's mark and an "ATOM" header inside its length, as Linux asks, and
+when its bytes add up to 0, which Linux does not ask: one whose bytes do
+not add up is kept to be looked at and none of its tables is run. The
+screen says which way gave it and what names it, and which of the
+ROM's connectors the running controller goes out by (the numbers here
+are a test's, not a card's):
+
+    gpu: video BIOS from the firmware's ACPI table VFCT: 2048 bytes, "TEST ROM FOR BRIXOS", part number 113-TEST-001, of 2026/11/11 12:34
+    gpu: controller 0 goes out by the ROM's connector 0: HDMI (transmitter UNIPHY E, DIG 4; hot plug pin 4; DDC line 4)
+
+and the log alone (/devices/klog, logserve's /gpu) a line for each
+table a mode set runs with its revision ("gpu: table SetPixelClock
+(12): there, revision 1.7"), the firmware information's clocks ("gpu:
+firmware information: the pixel clock PLL's reference 100000 kHz, ...")
+and each connector with its transmitter, hot plug pin and DDC line
+("gpu: connector 1: DisplayPort (transmitter UNIPHY A, DIG 0; ...)"),
+read as Linux's display core reads them.
+
+The ROM's bytes are the file /devices/gpurom. They are the best test
+there is for the next stage, so they are easy to hand over: logserve
+gives them as /gpu.rom, and klogsave writes them as gpu.rom beside
+boot.log on the brixfs volumes for a machine without the network.
+
+The tables are run by an interpreter of our own (atom.mlx: every opcode
+and argument kind of Linux's atom.c, bounded on every side: nothing is
+read outside the ROM, a run has a count and a time, calls a depth; a
+run that fails says the table, the offset and the opcode). The card is
+reached through hands the kernel fills: hands that only read stop a run
+at its first write and say what it would have written, and the hands
+that write do so only in an image that asks for the monitor's own mode.
+(With the setting off no table is run at all, not with hands that only
+read either: gpu_set.mlx's head says why.)
+Since the card cannot be tried in a VM, the interpreter is proven on the
+host: tests/472_atom_interpreter_runtime.mlx runs tables assembled by
+hand, tests/473_gpu_rom_runtime.mlx reads ROMs the test makes (damaged
+ones too) by all three ways, and
+
+    tools/check_atom_reference.sh LINUX
+
+builds Linux 6.6's own atom.c as a program of the host (LINUX: where
+its files lie; none is in this repository) and runs thousands of
+generated tables through both interpreters on the same card that is a
+table, holding every register read and write, every wait, the
+parameters afterwards and the end of each run side by side;
+`--mistakes` shows that it notices mistakes put into the interpreter on
+purpose, and `LINUX ROM TABLE:WORD,WORD...` runs a real ROM's tables
+through both (for the machine's own ROM, once it is handed over).
+tools/check_gpu_registers.py holds the numbers of both files, and of
+the parameter blocks, against Linux's.
 
 What is not there yet: disks served by their interrupts (AHCI, NVMe: a
 command is waited for), USB devices other than boot keyboards, mice and
-hubs, a network controller's link going down and up said to the stack.
+hubs.
 
 (The font's glyphs were a `const` array, a value built where it was
 used: each row of each character drawn built all 1520 bytes of it in the
@@ -630,22 +904,41 @@ The kernel's stack (kernel/net) runs on it:
   machine's own address), IPv4 (one address, netmask and gateway; no
   fragments; 127.0.0.0/8 is the machine itself: what is sent there
   comes straight back in, from the address it was sent to, with or
-  without an address of the network's, and never goes onto the wire)
-  and ICMP (echo answered). The
+  without an address of the network's, a link, or a network device at
+  all, and never goes onto the wire; what is sent to everyone,
+  255.255.255.255 or the subnet's last address, goes to everyone's
+  hardware address without a question, and what comes so addressed is
+  for datagram sockets alone: a TCP segment or an echo request to
+  everyone is not answered, and a stream's connect to such an address
+  or to a group's is refused as invalid) and ICMP (echo answered).
+  What cannot leave the machine as it is (reach.mlx works it out from
+  the configuration: no device, the link down, no address, no gateway
+  to it) is not tried: a socket's connect or send says unreachable at
+  once. The
   addresses are /system/settings/network's (`address`, `netmask`,
   `gateway`, `nameserver` lines) or DHCP's. Until one of them gives an
   address the stack has none: it sends nothing but DHCP's messages
   (from 0.0.0.0), takes nothing but DHCP's answers and answers no ARP
   request. What the file or DHCP's answer leaves out is none: without
-  a gateway only the own subnet is reached (a send to anywhere else
-  fails as one that could not go: would_block for a datagram, a
-  connection that times out), without a name server resolv.conf has no
-  line and no name is looked up; a netmask left out is the one of the
-  address's class. The kernel writes /system/settings/resolv.conf for
+  a gateway only the own subnet is reached (a send or a connection to
+  anywhere else is unreachable), without a name server resolv.conf has
+  no line and no name is looked up; a netmask left out is the one of
+  the address's class, and a file whose netmask line is none (a hole
+  in its bits, or 0.0.0.0) is not used at all ("brixOS:
+  /system/settings/network is not used: 255.0.255.0 is no netmask";
+  DHCP asks). The kernel writes /system/settings/resolv.conf for
   programs that look names up, and says at boot "brixOS: net0 is
   10.0.2.15, gateway 10.0.2.2, name server 10.0.2.3 (DHCP)" (without
   "(DHCP)" for the file's; "none" for a gateway or a name server there
-  is not).
+  is not). The link is looked at on every tick of the timer
+  (netdev.mlx): when it goes or comes the log has a line ("net0: the
+  link is down", "net0: the link is up, 1000 Mbit/s full duplex", with
+  the frames that were not sent meanwhile when there were some), while
+  it is down nothing is handed to the card, and when it comes the
+  neighbours are forgotten and DHCP begins again. At boot a link that
+  is not up yet is waited for, half a second at most (QEMU's igb has
+  it a third of a second after its start), so that the first programs
+  find it up.
 - udp.mlx, tcp.mlx: datagrams; connections (active and passive open,
   segments of MSS bytes within the peer's window from a send ring,
   sent again after a timeout that doubles, data received in order into
@@ -654,9 +947,18 @@ The kernel's stack (kernel/net) runs on it:
   closed still sends what is left and waits for the peer's end; one
   that stands still for 20 s with nothing on its way is reset (a peer
   that never closes its side, or takes no more, would keep one of the
-  32 sockets for good).
+  sockets for good). What is asked of a listener and not made yet (its
+  SYN came, our SYN+ACK went) is a record in halfopen.mlx's table and
+  takes no socket: 64 of them at a time for the machine, the one that
+  waited longest giving way to a newcomer; the SYN+ACK goes again
+  after one and three seconds, and after seven the record is dropped.
+  The peer's ACK makes the connection, which waits in the listener's
+  queue (16 at most; while it is full a SYN gets no answer) until the
+  program accepts it. (The queue was 4, counted together with what was
+  only asked, and a connection asked took a socket for 71 seconds:
+  four SYNs nobody followed up kept a listener deaf for that long.)
 - sockets.mlx, api.mlx: the sockets a process's descriptors name
-  (files.Kind.socket; 32 at most, a 16 KiB ring each), and what a call
+  (files.Kind.socket; 128 at most, a 16 KiB ring each), and what a call
   does to one. A call that has to wait leaves the process waiting for
   the socket to change (WaitKind.socket), as reads of pipes do. The
   connections a listener took do not hold its port: a program that
@@ -680,7 +982,11 @@ The kernel's stack (kernel/net) runs on it:
   UDP and does to the stack what it says. DISCOVER goes at boot (the
   boot waits half a second for the answer) and again after 1, 2, 4, 8
   and then every 16 seconds for as long as nobody answers, and at once
-  when the cable comes in (the link is looked at once a second). The
+  when the link comes up. With an address held, the link coming up
+  asks for the lease anew at once, of everyone (the cable may be in
+  another network now; again after 1, 2, 4, 8 and 16 seconds while
+  nobody answers): an ACK renews it, a NAK gives the address up, and
+  without an answer it is kept until the lease ends. The
   ACK's address, netmask, router and name server are the configuration.
   The lease's time and its T1 and T2 are the answer's (options 51, 58,
   59; half and seven eighths of the lease without them, or where they
@@ -703,7 +1009,14 @@ The kernel's stack (kernel/net) runs on it:
   the rest). A call never waits: it says would_block and the program
   waits on the handle (READABLE, WRITABLE, PEER_GONE, ENDED). A packet
   to our own address goes through the stack at once (a loopback), so a
-  program may talk to itself.
+  program may talk to itself; a machine without a network device has
+  sockets too, for 127.0.0.0/8. A connect or a send that cannot leave
+  the machine as it is says unreachable (status 27; ENETUNREACH on the
+  Linux layer), at once: the link's record says which of the reasons
+  it is, and wget says it ("cannot connect: this machine has no
+  address", "... the network link is down", "... this machine has no
+  network device", or that no gateway leads to the host). It was a
+  connection tried for over a minute, and would_block for a datagram.
 - ping (projects/ping): `ping [-c COUNT] HOST` (an echo request a
   second until Ctrl+C or COUNT of them; a line for each reply with its
   time, one for each request without an answer, then the loss and the
@@ -716,15 +1029,18 @@ The kernel's stack (kernel/net) runs on it:
   to go to (ping then says "no answer from 10.10.36.9 (its hardware
   address is not known: nobody answered for it)", or names the
   gateway). The destination is the address given with the send (its
-  port means nothing); would_block says the request cannot go now
-  (there is no address yet, no gateway leads there, the device is
-  busy): ping tries again for the request's second and then says which
-  it was; the summary counts such requests apart ("0 sent, 0 received,
-  1 could not be sent"). 127.0.0.1 is answered from 127.0.0.1. A
-  request that stays without an answer while the link is down says so
-  ("no answer for seq=7 (the network link is down)": the link as it is
-  then, so a cable that comes out during a run shows request by
-  request); a reply from another address than the one asked is marked
+  port means nothing); unreachable says the request cannot leave the
+  machine as it is (the link is down, there is no address yet, no
+  gateway leads there), would_block that the device is busy: ping
+  tries again for the request's second and then says which it was
+  ("seq=7 could not be sent: the network link is down"; the link as it
+  is then, so a cable that comes out during a run shows request by
+  request); the summary counts such requests apart ("0 sent, 0
+  received, 1 could not be sent"). 127.0.0.1 is answered from
+  127.0.0.1, also on a machine without a network device. A request
+  that went and stays without an answer while the link is down says
+  so ("no answer for seq=7 (the network link is down)"); a reply from
+  another address than the one asked is marked
   "(not the host asked)". A reply's time is from before the request
   was handed to the kernel. A name that cannot be looked up is said
   with the reason (no name server set, none answered, the server
@@ -789,24 +1105,36 @@ what that DHCP server answered), with a fixed address in the settings
 file (the first packet through its gateway answered), with an address
 line alone (no gateway, no name server: the own subnet and nothing
 else), with an address line of 0.0.0.0 (that is no address: DHCP
-asks), and on a network of the
+asks), with a netmask line that is none (the file not used), without a
+card (ping 127.0.0.1, the native calls and logserve asked by wget all
+the same; anywhere else unreachable), and on a network of the
 check's own (tools/brix_lan.py at the other end of QEMU's socket
 network: a name server, also deaf to a first question and unable to
 look a name up, replies later than a second, a reply twice, one from
 another address, a neighbour slow to say its hardware address, a
 router that says a host cannot be reached, also of one that answers, a
-host and a gateway nobody answers for).
+host and a gateway nobody answers for; the subnet's address for
+everyone; a name whose IPv6 question the name server drops, which is
+not asked: std.net.dns asks for AAAA records only on a system that has
+IPv6 sockets; and a listener, in raw frames: a connection asked of
+everyone is not answered, and behind 4 and behind 100 more connections
+begun and never finished a real request is answered within two
+seconds).
 tools/check_brix_net_igb.sh does the cable pulled and put back (also
-while a ping runs) and the late answer on the igb card.
+while a ping runs: the kernel's lines, what cannot be sent said at
+once, the lease asked for anew), the late answer on the igb card, and
+a ping at the first prompt with a fixed address.
 tools/check_ping_linux.sh runs ping's Linux build on the loopback of a
 network namespace of its own, and watches that it does not grow while
 it runs. tests/455_dhcp_lease_runtime.mlx runs the
 lease's renewal and end on a clock of its own (QEMU's user network
 gives a lease of a day, and its length cannot be set).
 tools/check_brix_desktop.sh opens the Network page and pulls the cable.
+tests/464_net_reach_runtime.mlx and tests/465_tcp_half_open_runtime.mlx
+run reach.mlx (the netmask's rule, everyone's addresses, the way a
+packet takes) and halfopen.mlx (the table's rules) on the host.
 Not yet: IPv6, a second link, the configuration changed while the
-system runs, a lease checked again when the cable comes back (it is
-kept until it ends).
+system runs.
 
 ## brixfs: the disk's format
 
@@ -1351,6 +1679,17 @@ clicks the dock's apps button (the launcher comes up), starts the
 settings app on its Network page (`control network`: what the kernel
 says of net0 on QEMU's user network, then "no cable" once QEMU's monitor
 pulls it) and powers off. Xwayland is not on brixOS.
+
+The whole picture is the processor's work here, so a frame costs what it
+changes: the terminal draws the cells that changed, the top bar's and
+the dock's frames are compared with the ones before, and kepler composes
+the rectangle a client names (`MLX_FRAMES_SAY=1` in the desktop's
+environment says every frame and what was composed for it).
+tools/check_brix_draw.sh sees a character typed be two cells drawn and
+composed, a minute's turn the clock's digits, the pointer on the dock
+less than the dock, and the screen that frames of parts left be, pixel
+for pixel, the screen drawn whole after the window was made large and
+small again.
 
 The programs carry their product names (projects/desktop and the system
 programs): the compositor is `kepler`, the terminal `vector`, the shell

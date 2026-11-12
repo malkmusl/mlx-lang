@@ -16,7 +16,21 @@
 // The host (a Wayland window through std.ui.host, a framebuffer, a pane of
 // another app) owns the screen, the font and the program on the pty; this
 // module only draws and translates.
+//
+// A cell's picture is its own: its background, its character standing in
+// it (cut to the cell where a glyph reaches over), its lines and, on it,
+// the cursor. So the view can keep what each cell shows and draw only the
+// cells that changed, where the pixels it drew last are still there:
+//
+//     const changed = ui_terminal.update(&view, canvas, area, kept)
+//
+// `kept`: the canvas still holds what the last draw or update left in this
+// area (std.ui.host.kept); `changed` is the rectangle that was drawn in
+// (empty: nothing changed). Text that scrolled is moved, rows of pixels at
+// a time, and only the lines that came in are drawn. A change of the area,
+// the size in cells, the font or the colours draws all of it.
 const std = @import("std")
+const leaks = @import("std.leaks")
 const ui = @import("std.ui")
 const canvas_module = @import("std.ui.canvas")
 const theme_module = @import("std.ui.theme")
@@ -42,7 +56,8 @@ pub const View = struct {
     cursorColor: u32
     // Drawn as a block when the window has the keyboard, an outline else.
     focused: bool
-    // Every glyph is as wide as the cell: runs of cells are drawn at once.
+    // Every glyph of the font is as wide as the cell (a character stands
+    // in its cell either way).
     monospaced: bool
     // The selection (std.ui.terminal_input): lines are counted from the
     // oldest line of the history (the live screen's top row is line
@@ -74,7 +89,49 @@ pub const View = struct {
     reportedButton: u32
     reportedLine: usize
     reportedColumn: usize
+    // What the pixels drawn last show (update): the cells as they were
+    // drawn, `shownColumns` to a row, each with its marks (MARK_*) in
+    // `reserved`, and a sum of each row (rows that moved are found by it).
+    // `shownValid` is false while nothing is known of the pixels: the
+    // next drawing is of all of it.
+    shown: [*]terminal.Cell
+    shownCapacity: usize
+    shownSums: [512]u64
+    shownValid: bool
+    // What that drawing was made for: another area, size, font or colour
+    // and all of it is drawn again.
+    shownArea: ui.Rect
+    shownColumns: usize
+    shownRows: usize
+    shownFont: usize
+    shownCellWidth: i32
+    shownCellHeight: i32
+    shownPadding: i32
+    shownForeground: u32
+    shownBackground: u32
+    shownSelection: u32
+    shownReverse: bool
+    // The cursor as it was drawn (its cells carry MARK_CURSOR): another
+    // colour, style or focus draws them again.
+    shownCursorColor: u32
+    shownCursorStyle: u8
+    shownFocused: bool
+    // What the last drawing did: how many cells it drew, and by how many
+    // rows it moved the picture first (text scrolled; positive: up).
+    drawnCells: usize
+    movedRows: isize
+    // For a test: the address of a byte for each cell of the screen
+    // (rows x columns), set to 1 for a cell that is drawn; 0: none.
+    trace: usize
 }
+
+// A drawn cell's marks: it is selected; it is the right half of the wide
+// character before it; the cursor is on it; nothing is known of it (it is
+// drawn whatever it shows).
+const MARK_SELECTED: u8 = 1
+const MARK_COVERED: u8 = 2
+const MARK_CURSOR: u8 = 4
+const MARK_UNKNOWN: u8 = 128
 
 pub const PAGE_UP: u32 = 104
 pub const PAGE_DOWN: u32 = 109
@@ -107,6 +164,21 @@ pub fn init(view: *View, screen: *terminal.Screen, font: *Text, font_height: i32
     view.*.pressTime = 0
     view.*.pressCount = 0
     view.*.reportedButton = NO_BUTTON
+    view.*.shownCapacity = 0
+    view.*.shownValid = false
+    view.*.drawnCells = 0
+    view.*.movedRows = 0
+    view.*.trace = 0
+}
+
+// Gives back what the view keeps of its last drawing (the next one is of
+// all of it; a view no longer drawn holds nothing after).
+pub fn release(view: *View) -> void {
+    if view.*.shownCapacity > 0 {
+        unsafe { view.*.screen.*.allocator.free(@ptrCast([*]u8, view.*.shown), view.*.shownCapacity * @sizeOf(terminal.Cell), 16) }
+    }
+    view.*.shownCapacity = 0
+    view.*.shownValid = false
 }
 
 // The default colours for the desktop's lightness (0 dark to 1024 light,
@@ -236,11 +308,15 @@ pub fn rowsFor(view: *const View, height: i32) -> usize {
 pub fn pixelWidth(view: *const View, columns: usize) -> i32 { return @intCast(i32, columns) * view.*.cellWidth + 2 * view.*.padding }
 pub fn pixelHeight(view: *const View, rows: usize) -> i32 { return @intCast(i32, rows) * view.*.cellHeight + 2 * view.*.padding }
 
-// A colour at half strength over the background (SGR dim).
+// A colour at half strength over the background (SGR dim): each channel
+// the mean of the two. (`&` binds looser than `+`: without the brackets
+// around each channel the sum was 255 + the background, which gave a
+// near black on any background and failed the overflow check, ending the
+// program, on a white one.)
 fn dimmed(color: u32, background: u32) -> u32 {
-    const red = ((color >> 16) & 255 + (background >> 16) & 255) / 2
-    const green = ((color >> 8) & 255 + (background >> 8) & 255) / 2
-    const blue = (color & 255 + background & 255) / 2
+    const red = (((color >> 16) & 255) + ((background >> 16) & 255)) / 2
+    const green = (((color >> 8) & 255) + ((background >> 8) & 255)) / 2
+    const blue = ((color & 255) + (background & 255)) / 2
     return 4278190080 | (red << 16) | (green << 8) | blue
 }
 
@@ -265,106 +341,518 @@ fn colorsOf(view: *const View, cell: *terminal.Cell, foreground: *u32, backgroun
     background.* = back
 }
 
-fn advance(bytes: [*]u8, by: usize) -> [*]u8 {
+// ---------------------------------------------------------------------------
+// Drawing
+
+fn sameLook(left: *const terminal.Cell, right: *const terminal.Cell) -> bool {
+    return left.*.foreground == right.*.foreground && left.*.background == right.*.background && left.*.flags == right.*.flags && (left.*.reserved & MARK_SELECTED) == (right.*.reserved & MARK_SELECTED)
+}
+
+// A cell of the screen in bytes: three words of 32 bits, the flags, the
+// width and a spare byte (std.terminal.Cell; a row of them is compared
+// and summed by words of 64 bits).
+const CELL_BYTES: usize = 16
+
+// Cell `index` of the cells at the address `cells`.
+fn cellOf(cells: usize, index: usize) -> *terminal.Cell {
+    unsafe { return @ptrFromInt(*terminal.Cell, cells + index * CELL_BYTES) }
+}
+
+fn sameBytes(left: usize, right: usize, length: usize) -> bool {
+    unsafe { return std.mem.eql(@ptrFromInt([*]const u8, left), @ptrFromInt([*]const u8, right), length) }
+}
+
+fn copyBytes(to: usize, from: usize, length: usize) -> void {
+    unsafe { std.mem.copy(@ptrFromInt([*]u8, to), @ptrFromInt([*]const u8, from), length) }
+}
+
+// A number for `count` cells at `cells`: rows of the same cells have the
+// same, others (all but never) another.
+fn rowSum(cells: usize, count: usize) -> u64 {
+    const words: [*]const u64 = unsafe { @ptrFromInt([*]const u64, cells) }
+    var sum: u64 = 14695981039346656037
+    var index: usize = 0
+    while index < count * CELL_BYTES / 8 {
+        sum = (sum ^ words[index]) *% 1099511628211
+        sum = sum ^ (sum >> 29)
+        index += 1
+    }
+    return sum
+}
+
+// What one drawing works with: the canvas, where the cells start and how
+// many of them fit the area, the page's colour, the selection and the
+// cursor as they are now, and the pixels drawn in so far.
+const Frame = struct {
+    canvas: *Canvas
+    left: i32
+    top: i32
+    columns: usize
+    rows: usize
+    page: u32
+    textOffset: i32
+    selected: bool
+    range: Range
+    firstLine: usize
+    // The cursor's cells: `cursorCells` from cursorColumn in cursorRow (0:
+    // no cursor is drawn).
+    cursorRow: usize
+    cursorColumn: usize
+    cursorCells: usize
+    // The rectangle drawn in (right and bottom are not in it; none while
+    // right is not past left).
+    drawnLeft: i32
+    drawnTop: i32
+    drawnRight: i32
+    drawnBottom: i32
+}
+
+// The pixels from (x, y), `width` x `height`, were drawn in.
+fn noteDrawn(frame: *Frame, x: i32, y: i32, width: i32, height: i32) -> void {
+    if frame.*.drawnRight <= frame.*.drawnLeft {
+        frame.*.drawnLeft = x
+        frame.*.drawnTop = y
+        frame.*.drawnRight = x + width
+        frame.*.drawnBottom = y + height
+        return
+    }
+    if x < frame.*.drawnLeft { frame.*.drawnLeft = x }
+    if y < frame.*.drawnTop { frame.*.drawnTop = y }
+    if x + width > frame.*.drawnRight { frame.*.drawnRight = x + width }
+    if y + height > frame.*.drawnBottom { frame.*.drawnBottom = y + height }
+}
+
+// `cells` cells from `column` of row `row` were drawn.
+fn noteCells(view: *View, frame: *Frame, row: usize, column: usize, cells: usize) -> void {
+    view.*.drawnCells += cells
+    noteDrawn(frame, frame.*.left + @intCast(i32, column) * view.*.cellWidth, frame.*.top + @intCast(i32, row) * view.*.cellHeight, @intCast(i32, cells) * view.*.cellWidth, view.*.cellHeight)
+    if view.*.trace == 0 { return }
+    const marks: [*]u8 = unsafe { @ptrFromInt([*]u8, view.*.trace) }
+    var index: usize = 0
+    while index < cells {
+        marks[row * view.*.screen.*.columns + column + index] = 1
+        index += 1
+    }
+}
+
+// How many of `count` cells of `size` pixels fit into `room` pixels.
+fn fitting(count: usize, room: i32, size: i32) -> usize {
+    if room <= 0 || size <= 0 { return 0 }
+    const fit = @intCast(usize, room / size)
+    return if fit < count { fit } else { count }
+}
+
+// Row `row` as it is to be shown, into the cells at `keys` (as many as the
+// frame has columns): the screen's cells, each with its marks.
+fn rowKeys(view: *View, frame: *const Frame, row: usize, keys: usize) -> void {
+    const columns = frame.*.columns
+    copyBytes(keys, @intFromPtr(terminal.visibleCell(view.*.screen, row, 0)), columns * CELL_BYTES)
+    const line = frame.*.firstLine + row
+    const selection = frame.*.selected && line >= frame.*.range.fromLine && line <= frame.*.range.toLine
+    // (A wide character takes the cell after it: that one shows nothing
+    // of its own.)
+    var covered = false
+    var column: usize = 0
+    while column < columns {
+        const cell = cellOf(keys, column)
+        var marks: u8 = 0
+        if selection && inRange(&frame.*.range, line, column) { marks |= MARK_SELECTED }
+        if covered {
+            marks |= MARK_COVERED
+            covered = false
+        } else if cell.*.width == 2 {
+            covered = true
+        }
+        cell.*.reserved = marks
+        column += 1
+    }
+    if frame.*.cursorCells > 0 && row == frame.*.cursorRow {
+        var index: usize = 0
+        while index < frame.*.cursorCells {
+            cellOf(keys, frame.*.cursorColumn + index).*.reserved |= MARK_CURSOR
+            index += 1
+        }
+    }
+}
+
+// Whether row `row` has no marks to take (no selection in its line, not
+// the cursor's): then, unless it has a wide character, it is to be shown
+// as the screen's cells are.
+fn plainRow(frame: *const Frame, row: usize) -> bool {
+    if frame.*.cursorCells > 0 && row == frame.*.cursorRow { return false }
+    const line = frame.*.firstLine + row
+    return !(frame.*.selected && line >= frame.*.range.fromLine && line <= frame.*.range.toLine)
+}
+
+// The cursor on its cells (which were just drawn): a block with the
+// character in the cell's colour when the window has the keyboard, an
+// outline else; an underline or a bar where the program asked for one.
+fn drawCursor(view: *View, frame: *Frame, keys: usize) -> void {
+    const canvas = frame.*.canvas
+    const x = frame.*.left + @intCast(i32, frame.*.cursorColumn) * view.*.cellWidth
+    const y = frame.*.top + @intCast(i32, frame.*.cursorRow) * view.*.cellHeight
+    const under = cellOf(keys, frame.*.cursorColumn)
+    const width = view.*.cellWidth * @intCast(i32, frame.*.cursorCells)
+    const style = view.*.screen.*.cursorStyle
+    if !view.*.focused {
+        canvas_module.strokeRoundedRect(canvas, x, y, width, view.*.cellHeight, 0, 1, view.*.cursorColor)
+    } else if style == 3 || style == 4 {
+        canvas_module.fillRect(canvas, x, y + view.*.cellHeight - 2, width, 2, view.*.cursorColor)
+    } else if style == 5 || style == 6 {
+        canvas_module.fillRect(canvas, x, y, 2, view.*.cellHeight, view.*.cursorColor)
+    } else {
+        canvas_module.fillRect(canvas, x, y, width, view.*.cellHeight, view.*.cursorColor)
+        if under.*.width > 0 && under.*.codepoint > 32 {
+            var glyph: [4]u8 = undefined
+            const glyph_bytes: [*]u8 = &glyph
+            const length = terminal.encodeUtf8(under.*.codepoint, glyph_bytes)
+            var foreground: u32 = 0
+            var background: u32 = 0
+            colorsOf(view, under, &foreground, &background)
+            text_module.drawCells(canvas, view.*.font, glyph_bytes[0..length], x, y + frame.*.textOffset, background, width, y, view.*.cellHeight)
+        }
+    }
+}
+
+fn at(bytes: [*]u8, by: usize) -> [*]u8 {
     const result: [*]u8 = bytes + by
     return result
 }
 
-fn sameLook(left: *terminal.Cell, right: *terminal.Cell) -> bool {
-    return left.*.foreground == right.*.foreground && left.*.background == right.*.background && left.*.flags == right.*.flags
+// Draws the cells `from` to `to` (not among them) of row `row`, which are
+// whole units (a wide character with the cell it takes), as `keys` says
+// they are to be shown: runs of cells of one look, a background and the
+// characters each, then the cursor when it stands there. `whole`: the
+// area was just filled with the page's colour (a background of that
+// colour is not filled again).
+fn drawUnits(view: *View, frame: *Frame, row: usize, from: usize, to: usize, keys: usize, whole: bool) -> void {
+    const canvas = frame.*.canvas
+    const cell_width = view.*.cellWidth
+    const cell_height = view.*.cellHeight
+    const y = frame.*.top + @intCast(i32, row) * cell_height
+    var run: [1024]u8 = undefined
+    const run_bytes: [*]u8 = &run
+    var column = from
+    while column < to {
+        const first = cellOf(keys, column)
+        const x = frame.*.left + @intCast(i32, column) * cell_width
+        if first.*.width == 0 {
+            // Nothing of its own (a cell no wide character takes): the page.
+            if !whole { canvas_module.fillRect(canvas, x, y, cell_width, cell_height, frame.*.page) }
+            noteCells(view, frame, row, column, 1)
+            column += 1
+            continue
+        }
+        // The run: cells of one look, each one cell wide, 256 at most (what
+        // std.ui.text lays out at once); a wide character alone, with the
+        // cell it takes.
+        var cells: usize = 1
+        var length: usize = terminal.encodeUtf8(first.*.codepoint, run_bytes)
+        var blank = first.*.codepoint == 32
+        if first.*.width == 2 {
+            if column + 1 < frame.*.columns { cells = 2 }
+        } else {
+            while column + cells < to && cells < 256 {
+                const next = cellOf(keys, column + cells)
+                if next.*.width != 1 || !sameLook(first, next) { break }
+                length += terminal.encodeUtf8(next.*.codepoint, at(run_bytes, length))
+                if next.*.codepoint != 32 { blank = false }
+                cells += 1
+            }
+        }
+        var foreground: u32 = 0
+        var background: u32 = 0
+        colorsOf(view, first, &foreground, &background)
+        if first.*.reserved & MARK_SELECTED != 0 { background = view.*.selectionColor }
+        const width = @intCast(i32, cells) * cell_width
+        if !whole || background != frame.*.page { canvas_module.fillRect(canvas, x, y, width, cell_height, background) }
+        // (Blank runs have nothing to draw.)
+        if !blank { text_module.drawCells(canvas, view.*.font, run_bytes[0..length], x, y + frame.*.textOffset, foreground, if first.*.width == 2 { width } else { cell_width }, y, cell_height) }
+        if first.*.flags & terminal.UNDERLINE != 0 { canvas_module.fillRect(canvas, x, y + cell_height - 2, width, 1, foreground) }
+        if first.*.flags & terminal.STRIKE != 0 { canvas_module.fillRect(canvas, x, y + cell_height / 2, width, 1, foreground) }
+        noteCells(view, frame, row, column, cells)
+        column += cells
+    }
+    if frame.*.cursorCells > 0 && row == frame.*.cursorRow && frame.*.cursorColumn >= from && frame.*.cursorColumn < to { drawCursor(view, frame, keys) }
 }
 
-// Draws the screen into `area`: its background, then each line as runs
-// of cells of one look, then the cursor.
-pub fn draw(view: *View, canvas: *Canvas, area: ui.Rect) -> void {
-    const screen = view.*.screen
-    const page_background = if screen.*.reverseVideo { view.*.foreground } else { view.*.background }
-    canvas_module.fillRect(canvas, area.x, area.y, area.width, area.height, page_background)
-    const columns = screen.*.columns
-    const rows = screen.*.rows
-    const left = area.x + view.*.padding
-    const top = area.y + view.*.padding
-    const text_offset = (view.*.cellHeight - view.*.fontHeight) / 2
-    var run: [4096]u8 = undefined
-    const run_bytes: [*]u8 = &run
-    var range: Range = undefined
-    const selected = selectionRange(view, &range)
-    const first_line = topLine(screen)
+// Where what is shown of row `row` is kept.
+fn shownRow(view: *View, row: usize) -> usize {
+    return @intFromPtr(view.*.shown) + row * view.*.shownColumns * CELL_BYTES
+}
+
+// Draws what of row `row` is not what is shown of it (`keys`: the row as
+// it is to be shown): the units of cells that differ, those side by side
+// at once; and keeps `keys` as what is shown now.
+fn drawChanges(view: *View, frame: *Frame, row: usize, keys: usize) -> void {
+    const columns = frame.*.columns
+    const shown = shownRow(view, row)
+    var span = columns
+    var column: usize = 0
+    while column < columns {
+        const cells: usize = if cellOf(keys, column).*.width == 2 && column + 1 < columns { 2 } else { 1 }
+        if !sameBytes(keys + column * CELL_BYTES, shown + column * CELL_BYTES, cells * CELL_BYTES) {
+            if span == columns { span = column }
+        } else if span != columns {
+            drawUnits(view, frame, row, span, column, keys, false)
+            span = columns
+        }
+        column += cells
+    }
+    if span != columns { drawUnits(view, frame, row, span, columns, keys, false) }
+    copyBytes(shown, keys, columns * CELL_BYTES)
+    view.*.shownSums[row] = rowSum(keys, columns)
+}
+
+// Room to keep `cells` cells of what is shown; false without the memory
+// (nothing is kept then).
+fn reserveShown(view: *View, cells: usize) -> bool {
+    if cells <= view.*.shownCapacity { return true }
+    release(view)
+    const memory = view.*.screen.*.allocator.alloc(cells * CELL_BYTES, 16)
+    if memory == null { return false }
+    // (Kept as long as the view: leak checks leave it out.)
+    leaks.keep(memory.?)
+    unsafe { view.*.shown = @ptrCast([*]terminal.Cell, memory.?) }
+    view.*.shownCapacity = cells
+    return true
+}
+
+// Whether what is shown was drawn for this area, these cells and these
+// colours.
+fn sameSetting(view: *const View, frame: *const Frame, area: ui.Rect) -> bool {
+    const was = view.*.shownArea
+    if was.x != area.x || was.y != area.y || was.width != area.width || was.height != area.height { return false }
+    if view.*.shownColumns != frame.*.columns || view.*.shownRows != frame.*.rows || view.*.shownFont != @intFromPtr(view.*.font) { return false }
+    if view.*.shownCellWidth != view.*.cellWidth || view.*.shownCellHeight != view.*.cellHeight || view.*.shownPadding != view.*.padding { return false }
+    return view.*.shownForeground == view.*.foreground && view.*.shownBackground == view.*.background && view.*.shownSelection == view.*.selectionColor && view.*.shownReverse == view.*.screen.*.reverseVideo
+}
+
+fn keepSetting(view: *View, frame: *const Frame, area: ui.Rect) -> void {
+    view.*.shownArea = ui.rect(area.x, area.y, area.width, area.height)
+    view.*.shownColumns = frame.*.columns
+    view.*.shownRows = frame.*.rows
+    view.*.shownFont = @intFromPtr(view.*.font)
+    view.*.shownCellWidth = view.*.cellWidth
+    view.*.shownCellHeight = view.*.cellHeight
+    view.*.shownPadding = view.*.padding
+    view.*.shownForeground = view.*.foreground
+    view.*.shownBackground = view.*.background
+    view.*.shownSelection = view.*.selectionColor
+    view.*.shownReverse = view.*.screen.*.reverseVideo
+    view.*.shownCursorColor = view.*.cursorColor
+    view.*.shownCursorStyle = view.*.screen.*.cursorStyle
+    view.*.shownFocused = view.*.focused
+}
+
+// By how many rows the picture is best moved before the rows that differ
+// are drawn (text scrolled; positive: up): the move that leaves the
+// fewest rows to draw, 0 unless it saves two of them and more. `sums`:
+// the rows as they are to be shown; `same`: those that are shown so
+// already. A row no row moves onto keeps its picture.
+fn bestMove(view: *const View, sums: *const [512]u64, same: *const [512]bool, rows: usize) -> isize {
+    var changed: usize = 0
     var row: usize = 0
     while row < rows {
-        const y = top + @intCast(i32, row) * view.*.cellHeight
-        if y + view.*.cellHeight > area.y + area.height { break }
-        const line = first_line + row
-        var column: usize = 0
-        while column < columns {
-            const first = terminal.visibleCell(screen, row, column)
-            if first.*.width == 0 {
-                column += 1
-                continue
+        if !same.*[row] { changed += 1 }
+        row += 1
+    }
+    if changed < 2 { return 0 }
+    var best: isize = 0
+    var fewest = changed
+    var by: usize = 1
+    while by < rows {
+        // Up by `by`: row r shows what row r + by showed.
+        var left: usize = 0
+        row = 0
+        while row < rows && left < fewest {
+            if row + by < rows {
+                if sums.*[row] != view.*.shownSums[row + by] { left += 1 }
+            } else if !same.*[row] {
+                left += 1
             }
-            const first_selected = selected && inRange(&range, line, column)
-            // The run: cells of the same look, single width when the font
-            // is monospaced (else one cell at a time), stopping before a
-            // wide character or at the line's end.
-            var count: usize = 1
-            var cells_wide: usize = @intCast(usize, first.*.width)
-            var run_length: usize = terminal.encodeUtf8(first.*.codepoint, run_bytes)
-            if view.*.monospaced && first.*.width == 1 {
-                while column + count < columns {
-                    const next = terminal.visibleCell(screen, row, column + count)
-                    if next.*.width != 1 || !sameLook(first, next) || run_length + 4 > 4096 { break }
-                    if selected && inRange(&range, line, column + count) != first_selected { break }
-                    run_length += terminal.encodeUtf8(next.*.codepoint, advance(run_bytes, run_length))
-                    count += 1
-                    cells_wide += 1
-                }
+            row += 1
+        }
+        if left < fewest {
+            fewest = left
+            best = @intCast(isize, by)
+        }
+        // Down by `by`: row r shows what row r - by showed.
+        left = 0
+        row = 0
+        while row < rows && left < fewest {
+            if row >= by {
+                if sums.*[row] != view.*.shownSums[row - by] { left += 1 }
+            } else if !same.*[row] {
+                left += 1
             }
-            var foreground: u32 = 0
-            var background: u32 = 0
-            colorsOf(view, first, &foreground, &background)
-            if first_selected { background = view.*.selectionColor }
-            const x = left + @intCast(i32, column) * view.*.cellWidth
-            const run_width = @intCast(i32, cells_wide) * view.*.cellWidth
-            if background != page_background { canvas_module.fillRect(canvas, x, y, run_width, view.*.cellHeight, background) }
-            // Blank runs have nothing to draw.
-            var blank = true
-            var index: usize = 0
-            while index < run_length && blank {
-                if run_bytes[index] != 32 { blank = false }
-                index += 1
+            row += 1
+        }
+        if left < fewest {
+            fewest = left
+            best = 0 - @intCast(isize, by)
+        }
+        by += 1
+    }
+    return if fewest + 2 <= changed { best } else { 0 }
+}
+
+// Moves the picture of the cells by `move` rows (positive: up), a row of
+// pixels at a time, and what is kept of them with it; the rows nothing
+// moved onto keep their picture.
+fn moveRows(view: *View, frame: *Frame, move: isize) -> void {
+    const canvas = frame.*.canvas
+    const rows = frame.*.rows
+    const by = @intCast(usize, if move < 0 { 0 - move } else { move })
+    const height = @intCast(usize, view.*.cellHeight)
+    const bytes = frame.*.columns * @intCast(usize, view.*.cellWidth) * 4
+    const pixels = @intFromPtr(canvas.*.pixels) + (@intCast(usize, frame.*.top) * canvas.*.stride + @intCast(usize, frame.*.left)) * 4
+    const pitch = canvas.*.stride * 4
+    const lines = (rows - by) * height
+    const row_bytes = frame.*.columns * CELL_BYTES
+    const shown = @intFromPtr(view.*.shown)
+    if move > 0 {
+        var line: usize = 0
+        while line < lines {
+            copyBytes(pixels + line * pitch, pixels + (line + by * height) * pitch, bytes)
+            line += 1
+        }
+        var row: usize = 0
+        while row + by < rows {
+            copyBytes(shown + row * row_bytes, shown + (row + by) * row_bytes, row_bytes)
+            view.*.shownSums[row] = view.*.shownSums[row + by]
+            row += 1
+        }
+    } else {
+        var line = lines
+        while line > 0 {
+            line -= 1
+            copyBytes(pixels + (line + by * height) * pitch, pixels + line * pitch, bytes)
+        }
+        var row = rows
+        while row > by {
+            row -= 1
+            copyBytes(shown + row * row_bytes, shown + (row - by) * row_bytes, row_bytes)
+            view.*.shownSums[row] = view.*.shownSums[row - by]
+        }
+    }
+    view.*.movedRows = move
+    noteDrawn(frame, frame.*.left, frame.*.top, @intCast(i32, frame.*.columns) * view.*.cellWidth, @intCast(i32, rows) * view.*.cellHeight)
+}
+
+// Draws the screen into `area` anew: its background, each line as runs of
+// cells of one look, the cursor.
+pub fn draw(view: *View, canvas: *Canvas, area: ui.Rect) -> void {
+    _ = update(view, canvas, area, false)
+}
+
+// Draws into `area` what changed since the view was last drawn there, when
+// `kept` (the canvas's pixels there are still what that drawing left);
+// all of it otherwise, as draw does. The rectangle drawn in is returned
+// (empty: nothing changed): what a host tells its compositor.
+pub fn update(view: *View, canvas: *Canvas, area: ui.Rect, kept: bool) -> ui.Rect {
+    const screen = view.*.screen
+    var frame: Frame = undefined
+    frame.canvas = canvas
+    frame.left = area.x + view.*.padding
+    frame.top = area.y + view.*.padding
+    frame.page = if screen.*.reverseVideo { view.*.foreground } else { view.*.background }
+    frame.textOffset = (view.*.cellHeight - view.*.fontHeight) / 2
+    // The cells that fit the area whole are drawn.
+    frame.rows = fitting(screen.*.rows, area.y + area.height - frame.top, view.*.cellHeight)
+    frame.columns = fitting(screen.*.columns, area.x + area.width - frame.left, view.*.cellWidth)
+    frame.selected = selectionRange(view, &frame.range)
+    frame.firstLine = topLine(screen)
+    frame.cursorRow = 0
+    frame.cursorColumn = 0
+    frame.cursorCells = 0
+    if terminal.cursorShown(screen) && screen.*.cursorRow < frame.rows && screen.*.cursorColumn < frame.columns {
+        frame.cursorRow = screen.*.cursorRow
+        frame.cursorColumn = screen.*.cursorColumn
+        frame.cursorCells = if terminal.visibleCell(screen, frame.cursorRow, frame.cursorColumn).*.width == 2 && frame.cursorColumn + 1 < frame.columns { 2 } else { 1 }
+    }
+    frame.drawnLeft = 0
+    frame.drawnTop = 0
+    frame.drawnRight = 0
+    frame.drawnBottom = 0
+    view.*.drawnCells = 0
+    view.*.movedRows = 0
+    const rows = frame.rows
+    const columns = frame.columns
+    const row_bytes = columns * CELL_BYTES
+    var keys: [terminal.MAX_COLUMNS]terminal.Cell = undefined
+    const row_keys = @intFromPtr(&keys)
+
+    // All of it: nothing is known of the pixels, or they were drawn for
+    // another area, size or colours (or the GPU draws: every frame whole).
+    const partial = kept && view.*.shownValid && canvas.*.device == 0 && sameSetting(view, &frame, area)
+    const keeping = reserveShown(view, rows * columns)
+    if !partial || !keeping {
+        canvas_module.fillRect(canvas, area.x, area.y, area.width, area.height, frame.page)
+        keepSetting(view, &frame, area)
+        var row: usize = 0
+        while row < rows {
+            rowKeys(view, &frame, row, row_keys)
+            drawUnits(view, &frame, row, 0, columns, row_keys, true)
+            if keeping {
+                copyBytes(shownRow(view, row), row_keys, row_bytes)
+                view.*.shownSums[row] = rowSum(row_keys, columns)
             }
-            if !blank { text_module.drawText(canvas, view.*.font, run_bytes[0..run_length], x, y + text_offset, foreground, 0) }
-            if first.*.flags & terminal.UNDERLINE != 0 { canvas_module.fillRect(canvas, x, y + view.*.cellHeight - 2, run_width, 1, foreground) }
-            if first.*.flags & terminal.STRIKE != 0 { canvas_module.fillRect(canvas, x, y + view.*.cellHeight / 2, run_width, 1, foreground) }
-            column += count + (if first.*.width == 2 { 1 } else { 0 })
+            row += 1
+        }
+        view.*.shownValid = keeping && canvas.*.device == 0
+        return ui.rect(area.x, area.y, area.width, area.height)
+    }
+
+    // The cursor's look changed: its cells are drawn again.
+    if view.*.shownCursorColor != view.*.cursorColor || view.*.shownCursorStyle != screen.*.cursorStyle || view.*.shownFocused != view.*.focused {
+        var index: usize = 0
+        while index < rows * columns {
+            const cell = cellOf(@intFromPtr(view.*.shown), index)
+            if cell.*.reserved & MARK_CURSOR != 0 { cell.*.reserved |= MARK_UNKNOWN }
+            index += 1
+        }
+    }
+    keepSetting(view, &frame, area)
+
+    // Which rows are shown as they are to be, and a sum of each as it is to
+    // be: rows that scrolled are found by the sums.
+    var same: [512]bool = undefined
+    var sums: [512]u64 = undefined
+    var changed: usize = 0
+    var row: usize = 0
+    while row < rows {
+        const shown = shownRow(view, row)
+        same[row] = plainRow(&frame, row) && sameBytes(@intFromPtr(terminal.visibleCell(screen, row, 0)), shown, row_bytes)
+        if !same[row] {
+            rowKeys(view, &frame, row, row_keys)
+            same[row] = sameBytes(row_keys, shown, row_bytes)
+        }
+        sums[row] = if same[row] { view.*.shownSums[row] } else { rowSum(row_keys, columns) }
+        if !same[row] { changed += 1 }
+        row += 1
+    }
+    if changed == 0 { return ui.rect(area.x, area.y, 0, 0) }
+
+    // Text that scrolled: its rows of pixels moved, when all of them are
+    // on the canvas, and then only the rows that still differ drawn.
+    const right = frame.left + @intCast(i32, columns) * view.*.cellWidth
+    const bottom = frame.top + @intCast(i32, rows) * view.*.cellHeight
+    const on_canvas = frame.left >= 0 && frame.top >= 0 && right <= @intCast(i32, canvas.*.width) && bottom <= @intCast(i32, canvas.*.height)
+    const move = if on_canvas { bestMove(view, &sums, &same, rows) } else { 0 }
+    if move != 0 { moveRows(view, &frame, move) }
+    row = 0
+    while row < rows {
+        if move != 0 || !same[row] {
+            const shown = shownRow(view, row)
+            if !(plainRow(&frame, row) && sameBytes(@intFromPtr(terminal.visibleCell(screen, row, 0)), shown, row_bytes)) {
+                rowKeys(view, &frame, row, row_keys)
+                if !sameBytes(row_keys, shown, row_bytes) { drawChanges(view, &frame, row, row_keys) }
+            }
         }
         row += 1
     }
-    if terminal.cursorShown(screen) && screen.*.cursorRow < rows && screen.*.cursorColumn < columns {
-        const x = left + @intCast(i32, screen.*.cursorColumn) * view.*.cellWidth
-        const y = top + @intCast(i32, screen.*.cursorRow) * view.*.cellHeight
-        const under = terminal.visibleCell(screen, screen.*.cursorRow, screen.*.cursorColumn)
-        const width = view.*.cellWidth * (if under.*.width == 2 { 2 } else { 1 })
-        const style = screen.*.cursorStyle
-        if !view.*.focused {
-            canvas_module.strokeRoundedRect(canvas, x, y, width, view.*.cellHeight, 0, 1, view.*.cursorColor)
-        } else if style == 3 || style == 4 {
-            canvas_module.fillRect(canvas, x, y + view.*.cellHeight - 2, width, 2, view.*.cursorColor)
-        } else if style == 5 || style == 6 {
-            canvas_module.fillRect(canvas, x, y, 2, view.*.cellHeight, view.*.cursorColor)
-        } else {
-            canvas_module.fillRect(canvas, x, y, width, view.*.cellHeight, view.*.cursorColor)
-            if under.*.width > 0 && under.*.codepoint > 32 {
-                var glyph: [4]u8 = undefined
-                const glyph_bytes: [*]u8 = &glyph
-                const length = terminal.encodeUtf8(under.*.codepoint, glyph_bytes)
-                var foreground: u32 = 0
-                var background: u32 = 0
-                colorsOf(view, under, &foreground, &background)
-                text_module.drawText(canvas, view.*.font, glyph_bytes[0..length], x, y + text_offset, background, 0)
-            }
-        }
-    }
+    return ui.rect(frame.drawnLeft, frame.drawnTop, frame.drawnRight - frame.drawnLeft, frame.drawnBottom - frame.drawnTop)
 }
 
 // The bytes a key sends to the program (at most 16 into `out`), or 0.

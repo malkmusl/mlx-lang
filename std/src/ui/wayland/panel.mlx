@@ -36,6 +36,7 @@ const panel_menu_module = @import("./panel_menu.mlx")
 const panel_drag_module = @import("./panel_drag.mlx")
 const panel_clipboard_module = @import("./panel_clipboard.mlx")
 const panel_primary_module = @import("./panel_primary.mlx")
+const panel_damage_module = @import("./panel_damage.mlx")
 const appearance_module = @import("std.ui.appearance")
 
 const Allocator = std.allocator.Allocator
@@ -196,8 +197,14 @@ pub const Panel = struct {
     hasPointer: bool
     hasKeyboard: bool
     keyboard: keyboard_module.Keyboard
-    // Buffers: two of width x height in one pool.
+    // Buffers: two of width x height in one pool; or, where one piece of
+    // shared memory cannot hold both (a memory object of brixOS is 16 MiB
+    // at most: a window across a wide screen), the second in a pool of
+    // its own (`second`: slotAddress says where a slot's pixels are).
     memory: wl.SharedMemory
+    secondMemory: wl.SharedMemory
+    secondPool: wl.wl_shm_pool.Proxy
+    second: bool
     // Bytes from one frame to the next in the pool (a GPU importing it
     // wants them aligned).
     slotBytes: usize
@@ -232,6 +239,30 @@ pub const Panel = struct {
     damageRects: [64]i32
     damageCount: usize
     damageAll: bool
+    // The draw said its frame changed nothing (unchanged).
+    damageNone: bool
+    // A configure was acknowledged and no commit made since: the next
+    // frame goes out even when it changed nothing (the compositor takes
+    // the acknowledgement with a commit).
+    owesCommit: bool
+    // What a frame changed against the one before (panel_damage.mlx).
+    // `keptSlot`: the slot holding the frame the compositor was given last
+    // (-1: none, the buffers are new). A client that keeps its frames
+    // (keepFrames) gets a canvas holding that frame (`kept` says so while
+    // it draws) and draws only what changed; `stale` is, for each slot,
+    // the rectangle drawn since it was last drawn into (x, y, width,
+    // height; `staleAll`: all of it), copied over before the next draw
+    // into it.
+    keepsFrames: bool
+    kept: bool
+    keptSlot: isize
+    stale: [8]i32
+    staleAll: [2]bool
+    // MLX_FRAMES_SAY: each frame is said in a line on the errors, under
+    // this name (the layer's namespace, the window's app id).
+    saysFrames: bool
+    frameName: [48]u8
+    frameNameLength: usize
     running: bool
     closed: bool
     // A panel that stays: the compositor closing its surface hides it (the
@@ -416,7 +447,13 @@ pub fn contextOf(panel: *Panel) -> *anyopaque {
 // there is none; its size is the panel's.
 pub fn shownPixels(panel: *Panel) -> usize {
     if panel.*.shownFrames == 0 || !panel.*.hasPool { return 0 }
-    return panel.*.memory.address + panel.*.shownSlot * panel.*.slotBytes
+    return slotAddress(panel, panel.*.shownSlot)
+}
+
+// Where the pixels of slot `slot` (0 or 1) are.
+pub fn slotAddress(panel: *Panel, slot: usize) -> usize {
+    if slot == 1 && panel.*.second { return panel.*.secondMemory.address }
+    return panel.*.memory.address + slot * panel.*.slotBytes
 }
 
 pub fn milliseconds() -> usize { return std.time.milliseconds() }
@@ -523,6 +560,7 @@ fn onLayerSurface(context: *anyopaque, event: wl.client.Event) -> void {
     if event.opcode == wl.zwlr_layer_surface_v1.EVENT_CONFIGURE {
         const configure = decoded.configure
         panel.*.layerSurface.ackConfigure(configure.serial)
+        panel.*.owesCommit = true
         if configure.width > 0 { panel.*.width = @intCast(usize, configure.width) }
         if configure.height > 0 { panel.*.height = @intCast(usize, configure.height) }
         panel.*.configured = true
@@ -549,6 +587,7 @@ fn onXdgSurface(context: *anyopaque, event: wl.client.Event) -> void {
     if width > 0 { panel.*.width = @intCast(usize, width) }
     if height > 0 { panel.*.height = @intCast(usize, height) }
     panel.*.xdgSurface.ackConfigure(decoded.configure.serial)
+    panel.*.owesCommit = true
     panel.*.configured = true
     panel.*.dirty = true
     panel.*.event(panel.*.context, EVENT_CONFIGURED, @intCast(u32, panel.*.width), @intCast(i32, panel.*.height))
@@ -591,6 +630,7 @@ fn noLock() -> Failure!void { return Failure.NoLock }
 // follow the compositor's windows.
 pub fn open(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, namespace: []const u8, layer: u32, anchor: u32, width: u32, height: u32, zone: i32, margin: i32, keyboard: u32, windows: bool) -> !void {
     try connect(panel, allocator, arguments, width, height, windows)
+    panel_damage_module.name(panel, namespace)
     if !showLayer(panel, namespace, layer, anchor, width, height, zone, margin, keyboard) { return noLayerShell() }
     try panel.*.display.roundtrip()
 }
@@ -643,9 +683,11 @@ fn hideNow(panel: *Panel) -> void {
     panel.*.surface.destroy()
     panel.*.hasSurface = false
     panel.*.configured = false
-    // Nothing shows the buffers any more, and no frame callback will come.
+    // Nothing shows the buffers any more, and no frame callback will come;
+    // the surface that comes next has no frame of ours yet.
     panel.*.busy[0] = false
     panel.*.busy[1] = false
+    panel_damage_module.forget(panel)
     panel.*.framePending = false
     panel.*.repeatKey = 0
 }
@@ -655,6 +697,7 @@ fn hideNow(panel: *Panel) -> void {
 // another size.
 pub fn openWindow(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, title: []const u8, app_id: []const u8, width: u32, height: u32) -> !void {
     try connect(panel, allocator, arguments, width, height, false)
+    panel_damage_module.name(panel, if app_id.length > 0 { app_id } else { title })
     if !panel.*.hasWmBase { return noWindows() }
     const display = panel.*.display
     panel.*.isWindow = true
@@ -678,6 +721,7 @@ pub fn openWindow(panel: *Panel, allocator: Allocator, arguments: [][*]const u8,
 // stops). unlock ends the lock.
 pub fn openLock(panel: *Panel, allocator: Allocator, arguments: [][*]const u8) -> !void {
     try connect(panel, allocator, arguments, 1, 1, false)
+    panel_damage_module.name(panel, "lock")
     if !panel.*.hasLockManager || !panel.*.hasOutput { return noLock() }
     panel.*.isLock = true
     panel.*.width = 0
@@ -721,6 +765,7 @@ fn onLockSurface(context: *anyopaque, event: wl.client.Event) -> void {
     if event.opcode != wl.ext_session_lock_surface_v1.EVENT_CONFIGURE { return }
     const configure = decoded.configure
     panel.*.lockSurface.ackConfigure(configure.serial)
+    panel.*.owesCommit = true
     panel.*.width = @intCast(usize, configure.width)
     panel.*.height = @intCast(usize, configure.height)
     panel.*.configured = true
@@ -754,6 +799,15 @@ pub fn connect(panel: *Panel, allocator: Allocator, arguments: [][*]const u8, wi
     panel.*.nextTick = 0
     panel.*.damageCount = 0
     panel.*.damageAll = false
+    panel.*.damageNone = false
+    panel.*.owesCommit = false
+    panel.*.keepsFrames = false
+    panel.*.kept = false
+    panel.*.keptSlot = -1
+    panel.*.second = false
+    const says = std.process.environmentFrom(std.process.environmentEntries(arguments), "MLX_FRAMES_SAY")
+    panel.*.saysFrames = says != null && says.?.length > 0 && says.?.pointer[0] != 48
+    panel.*.frameNameLength = 0
     appearance_module.init(appearanceOf(panel), std.process.environmentEntries(arguments))
     panel.*.hasWmBase = false
     panel.*.isWindow = false
@@ -1015,6 +1069,48 @@ pub fn roundedRects(rects: [*]i32, x: i32, y: i32, width: i32, height: i32, radi
 // ---------------------------------------------------------------------------
 // Drawing and the loop
 
+// Shared memory for two frames of `slot_bytes` each: what is there when it
+// is large enough, else new: one piece for both or, where none that large
+// is to be had, one for each. False without the memory; no pool is left
+// then (the next size asks anew: a pool taken down was once used again
+// when a window got smaller after a size that found no memory).
+fn fitPools(panel: *Panel, slot_bytes: usize) -> bool {
+    if panel.*.hasPool && slot_bytes * (if panel.*.second { 1 } else { 2 }) <= panel.*.poolSize { return true }
+    if panel.*.hasPool {
+        panel.*.pool.destroy()
+        panel.*.memory.release()
+        if panel.*.second {
+            panel.*.secondPool.destroy()
+            panel.*.secondMemory.release()
+        }
+        panel.*.hasPool = false
+    }
+    panel.*.poolSize = 0
+    panel.*.second = false
+    var memory: wl.SharedMemory = undefined
+    if wl.transport.createSharedMemory(&memory, slot_bytes * 2) {
+        panel.*.memory = memory
+        panel.*.pool = panel.*.shm.createPool(memory.handle, @intCast(i32, slot_bytes * 2))
+        panel.*.poolSize = slot_bytes * 2
+        panel.*.hasPool = true
+        return true
+    }
+    var other: wl.SharedMemory = undefined
+    if !wl.transport.createSharedMemory(&memory, slot_bytes) { return false }
+    if !wl.transport.createSharedMemory(&other, slot_bytes) {
+        memory.release()
+        return false
+    }
+    panel.*.memory = memory
+    panel.*.secondMemory = other
+    panel.*.pool = panel.*.shm.createPool(memory.handle, @intCast(i32, slot_bytes))
+    panel.*.secondPool = panel.*.shm.createPool(other.handle, @intCast(i32, slot_bytes))
+    panel.*.poolSize = slot_bytes
+    panel.*.second = true
+    panel.*.hasPool = true
+    return true
+}
+
 // Makes sure there are two buffers of the configured size.
 fn fitBuffers(panel: *Panel) -> bool {
     const width = panel.*.width
@@ -1023,6 +1119,8 @@ fn fitBuffers(panel: *Panel) -> bool {
     panel_frames_module.dropBuffers(panel)
     panel.*.busy[0] = false
     panel.*.busy[1] = false
+    // (New buffers hold no frame.)
+    panel_damage_module.forget(panel)
     if panel.*.frames == FRAMES_DMABUF {
         if panel_frames_module.makeDmabufs(panel) {
             panel.*.bufferWidth = width
@@ -1040,23 +1138,15 @@ fn fitBuffers(panel: *Panel) -> bool {
         const alignment = gpu_canvas.context(panel_frames_module.deviceOf(panel)).*.hostAlignment
         slot_bytes = (frame + alignment - 1) / alignment * alignment
     }
-    if slot_bytes * 2 > panel.*.poolSize {
-        if panel.*.hasPool {
-            panel.*.pool.destroy()
-            panel.*.memory.release()
-            panel.*.hasPool = false
-        }
-        var memory: wl.SharedMemory = undefined
-        if !wl.transport.createSharedMemory(&memory, slot_bytes * 2) { return false }
-        panel.*.memory = memory
-        panel.*.pool = panel.*.shm.createPool(memory.handle, @intCast(i32, slot_bytes * 2))
-        panel.*.poolSize = slot_bytes * 2
-        panel.*.hasPool = true
-    }
+    if !fitPools(panel, slot_bytes) { return false }
     panel.*.slotBytes = slot_bytes
     const format = @intFromEnum(wl.wl_shm.Format.argb8888)
     panel.*.buffers[0] = panel.*.pool.createBuffer(0, @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
-    panel.*.buffers[1] = panel.*.pool.createBuffer(@intCast(i32, slot_bytes), @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
+    if panel.*.second {
+        panel.*.buffers[1] = panel.*.secondPool.createBuffer(0, @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
+    } else {
+        panel.*.buffers[1] = panel.*.pool.createBuffer(@intCast(i32, slot_bytes), @intCast(i32, width), @intCast(i32, height), @intCast(i32, width * 4), format)
+    }
     panel.*.buffers[0].setHandler(onBuffer, contextOf(panel))
     panel.*.buffers[1].setHandler(onBuffer, contextOf(panel))
     panel.*.bufferWidth = width
@@ -1069,7 +1159,7 @@ fn fitBuffers(panel: *Panel) -> bool {
             const target = panel_frames_module.targetOf(panel, slot)
             target.*.fd = -1
             if panel.*.frames == FRAMES_SHM_DIRECT {
-                made = gpu.importHostMemory(context, target, panel.*.memory.address + slot * slot_bytes, slot_bytes)
+                made = gpu.importHostMemory(context, target, slotAddress(panel, slot), slot_bytes)
             } else {
                 made = gpu.createReadbackBuffer(context, target, frame)
             }
@@ -1088,26 +1178,30 @@ fn fitBuffers(panel: *Panel) -> bool {
 fn redraw(panel: *Panel) -> void {
     if !panel.*.hasSurface || !panel.*.configured || panel.*.framePending || !panel.*.dirty || panel.*.width == 0 || panel.*.height == 0 { return }
     if !fitBuffers(panel) { return }
-    var slot: usize = 0
-    if panel.*.busy[0] {
-        if panel.*.busy[1] { return }
-        slot = 1
-    }
+    // The slot to draw into (none while the compositor holds both).
+    const picked = panel_damage_module.pickSlot(panel)
+    if picked < 0 { return }
+    const slot = @intCast(usize, picked)
     const width = panel.*.width
     const height = panel.*.height
     // Before drawing: a draw may ask for the next frame (a std.ui widget
-    // took what changed), and say what it changed (damage).
+    // took what changed), and say what it changed (damage, unchanged).
     panel.*.dirty = false
     panel.*.damageCount = 0
     panel.*.damageAll = false
+    panel.*.damageNone = false
     // MLX_FRAMES: the frame's time on the processor (and std.gpu's on the
     // GPU) for the frame timeline.
     _ = diagnostics.frameBegin()
     defer diagnostics.frameEnd()
+    const begun = if panel.*.saysFrames { std.time.monotonicNanoseconds() } else { 0 }
     if panel.*.frames == FRAMES_CPU {
-        const pixels: [*]u32 = unsafe { @ptrFromInt([*]u32, panel.*.memory.address + slot * panel.*.slotBytes) }
+        // (A client that keeps its frames finds the last one in the canvas.)
+        panel_damage_module.bringUp(panel, slot)
+        const pixels: [*]u32 = unsafe { @ptrFromInt([*]u32, slotAddress(panel, slot)) }
         var canvas = Canvas.{ .pixels = pixels, .width = width, .height = height, .stride = width, .swapRedBlue = false, .device = 0, .opacity = 255 }
         panel.*.draw(panel.*.context, &canvas)
+        panel.*.kept = false
     } else {
         // Recorded, then drawn by the GPU into the slot's buffer.
         const device = panel_frames_module.deviceOf(panel)
@@ -1130,32 +1224,61 @@ fn redraw(panel: *Panel) -> void {
             return
         }
         if panel.*.frames == FRAMES_SHM_COPY {
-            gpu_upload.copyBytes(panel.*.memory.address + slot * panel.*.slotBytes, target.*.address, width * height * 4)
+            gpu_upload.copyBytes(slotAddress(panel, slot), target.*.address, width * height * 4)
         }
     }
+    // What of the frame the compositor is told changed (panel_damage.mlx):
+    // what the client named, else what differs from the frame before. A
+    // frame the client says changed nothing is not given at all, unless a
+    // configure waits for its commit.
+    var change = panel_damage_module.ALL
+    var part: [4]i32 = [4]i32{ 0, 0, @intCast(i32, width), @intCast(i32, height) }
+    if panel.*.frames == FRAMES_CPU { change = panel_damage_module.changed(panel, slot, &part) }
+    if panel.*.saysFrames { panel_damage_module.say(panel, (std.time.monotonicNanoseconds() - begun) / 1000, change, &part) }
+    if change == panel_damage_module.NOTHING {
+        if !panel.*.owesCommit { return }
+        // (An acknowledged configure wants its commit: a pixel's damage.)
+        change = panel_damage_module.SAME
+        part = [4]i32{ 0, 0, 1, 1 }
+    }
+    panel.*.owesCommit = false
     panel.*.busy[slot] = true
     panel.*.shownSlot = slot
     panel.*.shownFrames += 1
     const buffer = panel.*.buffers[slot]
     panel.*.surface.attach(&buffer, 0, 0)
-    if panel.*.damageCount == 0 || panel.*.damageAll || panel.*.frames != FRAMES_CPU {
+    if change == panel_damage_module.ALL {
         panel.*.surface.damage(0, 0, @intCast(i32, width), @intCast(i32, height))
-    } else {
+    } else if change == panel_damage_module.NAMED {
         var rect: usize = 0
         while rect < panel.*.damageCount {
             panel.*.surface.damage(panel.*.damageRects[rect * 4], panel.*.damageRects[rect * 4 + 1], panel.*.damageRects[rect * 4 + 2], panel.*.damageRects[rect * 4 + 3])
             rect += 1
         }
+    } else {
+        panel.*.surface.damage(part[0], part[1], part[2], part[3])
     }
+    if panel.*.frames == FRAMES_CPU { panel_damage_module.given(panel, slot, change, &part) }
     const callback = panel.*.surface.frame()
     callback.setHandler(onFrame, contextOf(panel))
     panel.*.framePending = true
     panel.*.surface.commit()
 }
 
+// From now on the canvas a draw gets holds the frame drawn before, whenever
+// `kept` says so during the draw (it does not after a resize, for the
+// first frame, or when the GPU draws): the client then draws only what
+// changed and names it with damage, or says unchanged.
+pub fn keepFrames(panel: *Panel) -> void { panel.*.keepsFrames = true }
+
+// The frame being drawn changed nothing (said by a client that keeps its
+// frames, from its draw): nothing is given to the compositor.
+pub fn unchanged(panel: *Panel) -> void { panel.*.damageNone = true }
+
 // What the frame being drawn changed (a draw's rectangle, in the surface's
-// coordinates): only the rectangles given are damaged for the compositor;
-// a draw that gives none damages all of it.
+// coordinates): only the rectangles given are damaged for the compositor.
+// A draw that gives none (and does not say unchanged) has its frame
+// compared with the one before (panel_damage.mlx).
 pub fn damage(panel: *Panel, x: i32, y: i32, width: i32, height: i32) -> void {
     if width <= 0 || height <= 0 { return }
     if panel.*.damageCount >= 16 {
