@@ -1,0 +1,682 @@
+// The kernel's reading of a Radeon's video BIOS ROM
+// (projects/brix/kernel/gpu_rom.mlx, built for the host) on ROMs the test
+// makes (tests/support/atom_rom.mlx; nothing of a real card's ROM is in
+// them) and a card that is a table.
+//
+// A ROM as a Polaris card's is laid out: held to be one, its size, name,
+// part number and date; the tables a mode set runs, each with its
+// revision; the firmware information's clocks; the board's connectors
+// with their transmitters, hot plug pins and DDC lines, and which
+// connector a DIG block is; the scratch it asks for; the log's lines word
+// for word.
+// The three ways to the ROM: out of an ACPI table VFCT that holds another
+// card's image first, one that is cut short, one without this card's,
+// one whose image is longer than a ROM's most bytes (its beginning is
+// taken);
+// through the PCI expansion ROM (the configuration's word 0x30 written
+// four times and holding afterwards what it held, a ROM without an
+// address or a card that does not answer in memory not touched at all,
+// an address outside the bridge's window (the all ones a firmware
+// leaves) or on the card's registers not switched on, bytes that are no
+// ROM, a ROM whose beginning is had and whose whole is not); through the
+// card's ROM registers (the pair's
+// index and the ROM's index put back). And the ways one after another,
+// as the kernel goes through them: the firmware's copy taken and nothing
+// of the card touched; no copy, or only another adapter's, and the
+// expansion ROM read; no address for it either and the ROM registers
+// read; a copy whose bytes do not add up passed over for the card's own
+// ROM, and kept when there is nothing better; a card in another slot; a
+// card nothing can be read from.
+// Damaged ROMs: a wrong checksum (kept, not sound), no 55 AA, no mark, a
+// length byte of 0 and one beyond what was read, a header outside, no
+// "ATOM"; a list of command tables that is too short (the tables beyond
+// are not there), a list of data tables too short for the object table,
+// a data table's pointer outside the image, an object table whose parts
+// lie outside, a display path of no size, records without an end. And
+// what deliberate mistakes showed missing: the image's last byte in the
+// sum, a path with two encoders, a connector without a DDC line before
+// one that has one.
+// With an argument, each failing check and the log are printed.
+// Exits 13.
+const std = @import("std")
+const atom = @import("../projects/brix/kernel/atom.mlx")
+const scanout = @import("../projects/brix/kernel/gpu_display.mlx")
+const gpurom = @import("../projects/brix/kernel/gpu_rom.mlx")
+const rom = @import("./support/atom_rom.mlx")
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+
+fn sayNumber(value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var at: usize = 20
+    var rest = value
+    while true {
+        at -= 1
+        digits[at] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    say(digits[at..20])
+}
+
+var builder: rom.Builder = undefined
+var machine: atom.Atom = undefined
+var scratch: [5120]u32 = undefined
+var found: gpurom.Rom = undefined
+var firmware: gpurom.Firmware = undefined
+var board: gpurom.Board = undefined
+var failed: u8 = 0
+var show = false
+
+fn check(number: u8, holds: bool) -> void {
+    if holds { return }
+    if show {
+        say("check ")
+        sayNumber(@intCast(usize, number))
+        say(" failed\n")
+    }
+    if failed == 0 { failed = number }
+}
+
+// The log, and its lines held against what they must be, one after
+// another.
+const LOG: usize = 16384
+var log: [LOG]u8 = undefined
+var logged: usize = 0
+var cursor: usize = 0
+
+fn write(text: []const u8) -> void {
+    if show { say(text) }
+    var k: usize = 0
+    while k < text.length && logged < LOG {
+        log[logged] = text[k]
+        logged += 1
+        k += 1
+    }
+}
+
+fn nothing(number: usize) -> u32 { return 0 }
+
+fn never() -> usize { return 0 }
+
+fn line(text: []const u8) -> bool {
+    if cursor + text.length > logged { return false }
+    var k: usize = 0
+    while k < text.length {
+        if log[cursor + k] != text[k] { return false }
+        k += 1
+    }
+    cursor += text.length
+    return true
+}
+
+fn sameText(bytes: []const u8, text: []const u8) -> bool {
+    if bytes.length != text.length { return false }
+    var k: usize = 0
+    while k < text.length {
+        if bytes[k] != text[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// The card: its PCI configuration (the ROM's word holds only the bits
+// its size leaves and the enable bit), the expansion ROM that answers at
+// its address while it is switched on, and the management controller's
+// pair with the ROM's index and data behind it. Every write is counted,
+// and the configuration's written down.
+var command: usize = 0x0007
+var romWord: usize = 0
+var romMask: usize = 0xFFFE0000
+var configWrites: [16]usize = undefined
+var configWritten: usize = 0
+var otherConfigWritten: usize = 0
+var windows: usize = 0
+var cardRom: [rom.ROOM]u8 = undefined
+var cardRomLength: usize = 0
+var smcIndex: usize = 0
+var romIndex: usize = 0
+var registerWrites: usize = 0
+var strayWrites: usize = 0
+
+fn config(offset: usize) -> usize {
+    if offset == gpurom.PCI_ROM_ADDRESS { return romWord }
+    if offset == gpurom.PCI_COMMAND { return command }
+    return 0
+}
+
+fn setConfig(offset: usize, value: usize) -> void {
+    if offset != gpurom.PCI_ROM_ADDRESS {
+        otherConfigWritten += 1
+        return
+    }
+    if configWritten < 16 { configWrites[configWritten] = value }
+    configWritten += 1
+    romWord = (value & romMask) | (value & 1)
+}
+
+// The bridge before the card passes 0xFE800000 to 0xFE9FFFFF on; the
+// card's registers are the 256 KiB at 0xFE940000.
+const BRIDGE: usize = 0xFE90FE80
+const REGISTERS = [_]gpurom.Stretch{gpurom.Stretch.{ .from = 0xFE940000, .bytes = 0x40000 }}
+
+fn clear(address: usize, size: usize) -> bool {
+    const passed = gpurom.windowOf(BRIDGE)
+    return gpurom.mayAnswer(address, size, &passed, REGISTERS[0..])
+}
+
+// (`windowMost`: the most bytes the ROM's memory can be had at once; a
+// test makes it small to have the second, longer read fail.)
+var windowMost: usize = 0xFFFFFFFF
+
+fn window(address: usize, into: []u8) -> bool {
+    windows += 1
+    if romWord & 1 == 0 || romWord & gpurom.PCI_ROM_ADDRESS_MASK != address { return false }
+    if into.length > windowMost { return false }
+    var k: usize = 0
+    while k < into.length {
+        into[k] = if k < cardRomLength { cardRom[k] } else { 0xFF }
+        k += 1
+    }
+    return true
+}
+
+fn registerRead(number: usize) -> u32 {
+    if number == gpurom.SMC_IND_INDEX_11 { return @intCast(u32, smcIndex) }
+    if number != gpurom.SMC_IND_DATA_11 { return 0 }
+    if smcIndex == gpurom.ROM_INDEX { return @intCast(u32, romIndex) }
+    if smcIndex != gpurom.ROM_DATA { return 0x5A5A5A5A }
+    var value: usize = 0
+    var k: usize = 0
+    while k < 4 {
+        const at = romIndex + k
+        value = value | ((if at < cardRomLength { @intCast(usize, cardRom[at]) } else { 0xFF }) << @intCast(u6, k * 8))
+        k += 1
+    }
+    romIndex += 4
+    return @intCast(u32, value)
+}
+
+fn registerWrite(number: usize, value: u32) -> void {
+    registerWrites += 1
+    if number == gpurom.SMC_IND_INDEX_11 {
+        smcIndex = @intCast(usize, value)
+    } else if number == gpurom.SMC_IND_DATA_11 && smcIndex == gpurom.ROM_INDEX {
+        romIndex = @intCast(usize, value) & 0xFFFFFF
+    } else {
+        strayWrites += 1
+    }
+}
+
+var into: [gpurom.ROOM]u8 = undefined
+var image: [gpurom.ROOM]u8 = undefined
+var table: [200000]u8 = undefined
+
+fn sameBytes(count: usize) -> bool {
+    if count != builder.size { return false }
+    var k: usize = 0
+    while k < count {
+        if into[k] != builder.bytes[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// Whether the image the ways gave is the builder's ROM, but for the byte
+// at `but` (none: 0), which is the other way round in bit 4.
+fn sameImage(count: usize, but: usize) -> bool {
+    if count != builder.size { return false }
+    var k: usize = 0
+    while k < count {
+        const wanted = if but != 0 && k == but { builder.bytes[k] ^ 0x10 } else { builder.bytes[k] }
+        if image[k] != wanted { return false }
+        k += 1
+    }
+    return true
+}
+
+fn untouched() -> bool { return configWritten == 0 && otherConfigWritten == 0 && windows == 0 && registerWrites == 0 }
+
+fn forget() -> void {
+    configWritten = 0
+    otherConfigWritten = 0
+    windows = 0
+    registerWrites = 0
+    strayWrites = 0
+}
+
+fn put32(at: usize, value: usize) -> void {
+    table[at] = @intCast(u8, value & 0xFF)
+    table[at + 1] = @intCast(u8, (value >> 8) & 0xFF)
+    table[at + 2] = @intCast(u8, (value >> 16) & 0xFF)
+    table[at + 3] = @intCast(u8, (value >> 24) & 0xFF)
+}
+
+// An image's header in a VFCT at `at`, for the card bus:device.function
+// vendor:product, and `length` bytes of the builder's ROM behind it;
+// where the next header goes.
+fn vfctImage(at: usize, bus: usize, device: usize, function: usize, vendor: usize, product: usize, length: usize) -> usize {
+    put32(at, bus)
+    put32(at + 4, device)
+    put32(at + 8, function)
+    put32(at + 12, vendor | (product << 16))
+    put32(at + 16, 0)
+    put32(at + 20, 0)
+    put32(at + 24, length)
+    var k: usize = 0
+    while k < length {
+        table[at + 28 + k] = if k < builder.size { builder.bytes[k] } else { 0 }
+        k += 1
+    }
+    return at + 28 + length
+}
+
+const END = [_]u8{0x5B}
+// The board's DDC lines with the first connector's left out.
+const NO_LINE_FIRST = [_]usize{ 0xFF, 1, 4 }
+
+fn build() -> void {
+    rom.polaris(&builder, END[0..])
+    // (Four blocks, so that the places the checks damage are inside.)
+    builder.at = 0x7F0
+    builder.finish()
+}
+
+fn open() -> bool { return machine.open(builder.image(), scratch[0..]) == atom.Opened.ok }
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    show = std.process.count(arguments) > 1
+    const card = scanout.Card.{ .read = nothing, .now = never, .write = write }
+    const bus = gpurom.Bus.{ .config = config, .setConfig = setConfig, .clear = clear, .window = window, .read = registerRead, .write = registerWrite }
+    build()
+
+    // The ROM as it is made.
+    found.way = gpurom.Way.vfct
+    check(1, gpurom.check(builder.image(), &found) == gpurom.State.found && found.sound() && found.kept())
+    check(2, found.size == builder.size && found.sum == 0 && found.header == rom.HEADER)
+    check(3, sameText(found.name[0..found.nameLength], "TEST ROM FOR BRIXOS"))
+    check(4, sameText(found.part[0..found.partLength], "113-TEST-001"))
+    check(5, sameText(found.date[0..found.dateLength], "2026/11/11 12:34"))
+    check(6, gpurom.imageSize(builder.image()[0..64]) == builder.size && gpurom.imageSize(builder.image()[0..40]) == 0)
+    check(7, open())
+    gpurom.sayRom(&card, &found)
+    check(8, gpurom.sayTables(&card, &machine) == 12 && gpurom.neededTables() == 12)
+    gpurom.readFirmware(&machine, &firmware)
+    gpurom.sayFirmware(&card, &firmware)
+    gpurom.readBoard(&machine, &board)
+    gpurom.sayBoard(&card, &board)
+    check(9, firmware.found && firmware.revision == 0x202 && firmware.reference == 100000 && firmware.inputLeast == 6000 && firmware.inputMost == 200000)
+    check(10, firmware.outputLeast == 16000 && firmware.outputMost == 600000 && firmware.engine == 625000 && firmware.displayPortReference == 0 && firmware.firmwareRevision == 0x0F320100)
+    check(11, board.found && board.paths == 3 && board.count == 3)
+    check(12, board.connectors[0].kind == gpurom.CONNECTOR_OBJECT_ID_HDMI_TYPE_A && board.connectors[0].transmitter == 4 && board.connectors[0].hotPlug == 4 && board.connectors[0].ddc == 4 && board.connectors[0].agrees)
+    check(14, board.connectors[1].kind == gpurom.CONNECTOR_OBJECT_ID_DISPLAYPORT && board.connectors[1].transmitter == 0 && board.connectors[1].hotPlug == 1 && board.connectors[1].ddc == 1 && board.connectors[1].ddcHardware)
+    check(15, board.connectors[2].kind == gpurom.CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_D && board.connectors[2].transmitter == 3 && board.connectors[2].hotPlug == 6 && board.connectors[2].ddc == gpurom.NONE)
+    // The user's machine goes out by DIG 4: that is the HDMI connector.
+    check(16, board.byBlock(4) == 0 && board.byBlock(0) == 1 && board.byBlock(3) == 2 && board.byBlock(5) == gpurom.NONE)
+    check(17, gpurom.scratchBytes(&machine) == 65536)
+    check(18, line("gpu: video BIOS from the firmware's ACPI table VFCT: 2048 bytes, \"TEST ROM FOR BRIXOS\", part number 113-TEST-001, of 2026/11/11 12:34\n"))
+    check(19, line("gpu: table SetPixelClock (12): there, revision 1.7\n"))
+    check(20, line("gpu: table DIG1TransmitterControl (the UNIPHY transmitter) (76): there, revision 1.6\n"))
+    check(21, line("gpu: table DIGxEncoderControl (4): there, revision 1.5\n"))
+    check(22, line("gpu: table EnableCRTC (35): there, revision 1.1\n"))
+    check(23, line("gpu: table BlankCRTC (34): there, revision 1.1\n"))
+    check(24, line("gpu: table SetCRTC_UsingDTDTiming (49): there, revision 1.1\n"))
+    check(25, line("gpu: table EnableDispPowerGating (13): there, revision 2.1\n"))
+    check(26, line("gpu: table AdjustDisplayPll (17): there, revision 1.1\n"))
+    check(27, line("gpu: table EnableSpreadSpectrumOnPPLL (65): there, revision 1.1\n"))
+    check(28, line("gpu: table SetDCEClock (46): there, revision 1.1\n"))
+    check(29, line("gpu: table SelectCRTC_Source (42): there, revision 1.1\n"))
+    check(30, line("gpu: table EnableCRTCMemReq (6): there, revision 1.1\n"))
+    check(31, line("gpu: table ASIC_Init (0): there, and never run (it starts the card anew)\n"))
+    check(32, line("gpu: firmware information: the pixel clock PLL's reference 100000 kHz, into the PLL 6000..200000 kHz, out of it 16000..600000 kHz; the display engine's clock 625000 kHz; DisplayPort's reference the PLL's\n"))
+    check(33, line("gpu: connector 0: HDMI (transmitter UNIPHY E, DIG 4; hot plug pin 4; DDC line 4)\n"))
+    check(34, line("gpu: connector 1: DisplayPort (transmitter UNIPHY A, DIG 0; hot plug pin 1; DDC line 1)\n"))
+    check(35, line("gpu: connector 2: DVI-D (dual link) (transmitter UNIPHY D, DIG 3; hot plug pin 6; no DDC line)\n"))
+    check(36, cursor == logged)
+
+    // Out of a VFCT: another card's image first, then this card's.
+    var k: usize = 0
+    while k < 200000 {
+        table[k] = 0
+        k += 1
+    }
+    put32(gpurom.UEFI_ACPI_VFCT__VBIOSImageOffset, gpurom.UEFI_ACPI_VFCT__size)
+    var next = vfctImage(gpurom.UEFI_ACPI_VFCT__size, 0, 2, 0, 0x1002, 0x15D8, 1024)
+    const end = vfctImage(next, 0x41, 0, 0, 0x1002, 0x67DF, builder.size)
+    check(40, sameBytes(gpurom.fromVfct(table[0..end], 0x41, 0, 0, 0x1002, 0x67DF, into[0..])))
+    // Not this card's place, not its numbers; a table cut short in the
+    // image and in its header; less room than the image has (its
+    // beginning is taken, and does not hold as a ROM).
+    check(41, gpurom.fromVfct(table[0..end], 0x42, 0, 0, 0x1002, 0x67DF, into[0..]) == 0)
+    check(42, gpurom.fromVfct(table[0..end], 0x41, 0, 0, 0x1002, 0x67EF, into[0..]) == 0)
+    check(43, gpurom.fromVfct(table[0..end - 1], 0x41, 0, 0, 0x1002, 0x67DF, into[0..]) == 0)
+    check(44, gpurom.fromVfct(table[0..next + 20], 0x41, 0, 0, 0x1002, 0x67DF, into[0..]) == 0)
+    check(45, gpurom.fromVfct(table[0..end], 0x41, 0, 0, 0x1002, 0x67DF, into[0..1000]) == 1000 && into[0] == 0x55 && into[999] == builder.bytes[999] && gpurom.check(into[0..1000], &found) == gpurom.State.short)
+    check(46, gpurom.fromVfct(table[0..40], 0x41, 0, 0, 0x1002, 0x67DF, into[0..]) == 0)
+    // An image of no bytes before this card's is passed over.
+    next = vfctImage(gpurom.UEFI_ACPI_VFCT__size, 0, 2, 0, 0x1002, 0x15D8, 0)
+    const shorter = vfctImage(next, 0x41, 0, 0, 0x1002, 0x67DF, builder.size)
+    check(47, sameBytes(gpurom.fromVfct(table[0..shorter], 0x41, 0, 0, 0x1002, 0x67DF, into[0..])))
+    // An image longer than a ROM's most bytes (the whole chip, say: more
+    // follows the ROM's own image): as much as there is room for is
+    // taken, and the ROM in it holds.
+    const longer = vfctImage(gpurom.UEFI_ACPI_VFCT__size, 0x41, 0, 0, 0x1002, 0x67DF, gpurom.ROOM + 4096)
+    check(111, gpurom.fromVfct(table[0..longer], 0x41, 0, 0, 0x1002, 0x67DF, into[0..]) == gpurom.ROOM && gpurom.check(into[0..], &found) == gpurom.State.found && found.size == builder.size)
+    const longPlace = gpurom.Place.{ .bus = 0x41, .device = 0, .function = 0, .vendor = 0x1002, .product = 0x67DF }
+    romWord = 0
+    gpurom.read(table[0..longer], &longPlace, &bus, false, image[0..], into[0..], &found)
+    check(112, found.sound() && found.way == gpurom.Way.vfct && found.vfct == gpurom.Tried.read && sameImage(found.size, 0) && untouched())
+    k = gpurom.UEFI_ACPI_VFCT__size
+    while k < longer {
+        table[k] = 0
+        k += 1
+    }
+
+    // Through the PCI expansion ROM: a ROM of 128 KiB at 0xFE900000,
+    // switched off as the firmware left it.
+    k = 0
+    while k < builder.size {
+        cardRom[k] = builder.bytes[k]
+        k += 1
+    }
+    cardRomLength = builder.size
+    romWord = 0xFE900000
+    var tried = gpurom.Tried.not_tried
+    check(50, sameBytes(gpurom.fromExpansion(&bus, into[0..], &tried)) && tried == gpurom.Tried.read)
+    check(51, configWritten == 4 && configWrites[0] == 0xFFFFF800 && configWrites[1] == 0xFE900000 && configWrites[2] == 0xFE900001 && configWrites[3] == 0xFE900000)
+    check(52, romWord == 0xFE900000 && otherConfigWritten == 0 && registerWrites == 0 && windows == 2)
+    // Left switched on by the firmware: it stays on.
+    configWritten = 0
+    romWord = 0xFE900001
+    check(53, sameBytes(gpurom.fromExpansion(&bus, into[0..], &tried)) && romWord == 0xFE900001 && configWrites[3] == 0xFE900001)
+    // No address; a card that does not answer in memory: nothing is
+    // written.
+    configWritten = 0
+    windows = 0
+    romWord = 0
+    check(54, gpurom.fromExpansion(&bus, into[0..], &tried) == 0 && tried == gpurom.Tried.not_there && configWritten == 0 && windows == 0)
+    romWord = 0xFE900000
+    command = 0x0005
+    check(55, gpurom.fromExpansion(&bus, into[0..], &tried) == 0 && tried == gpurom.Tried.not_there && configWritten == 0 && windows == 0)
+    command = 0x0007
+    // Bytes that are no ROM (the card shows nothing there): the word is
+    // put back all the same.
+    cardRomLength = 0
+    check(56, gpurom.fromExpansion(&bus, into[0..], &tried) == 0 && tried == gpurom.Tried.not_a_rom && romWord == 0xFE900000 && configWritten == 4)
+    cardRomLength = builder.size
+    // The ROM's beginning is had and the whole of it is not: nothing is
+    // said to be read, and the word is put back.
+    configWritten = 0
+    windowMost = 512
+    check(113, gpurom.fromExpansion(&bus, into[0..], &tried) == 0 && tried == gpurom.Tried.does_not_hold && romWord == 0xFE900000 && configWritten == 4 && configWrites[3] == 0xFE900000)
+    windowMost = 0xFFFFFFFF
+    // An address the firmware only left behind: the all ones of its own
+    // sizing (outside every bridge's window), and a place inside the
+    // window that is the card's registers now. The size is learned, the
+    // ROM is not switched on, and the word holds what it held.
+    configWritten = 0
+    windows = 0
+    romWord = 0xFFFE0000
+    check(58, gpurom.fromExpansion(&bus, into[0..], &tried) == 0 && tried == gpurom.Tried.not_there && configWritten == 2 && configWrites[1] == 0xFFFE0000 && windows == 0 && romWord == 0xFFFE0000)
+    configWritten = 0
+    romWord = 0xFE940000
+    check(59, gpurom.fromExpansion(&bus, into[0..], &tried) == 0 && tried == gpurom.Tried.not_there && configWritten == 2 && windows == 0 && romWord == 0xFE940000)
+    // (The window's own arithmetic: its last MiB is inside, the next is
+    // not; a bridge that passes nothing on; a ROM that ends on the
+    // registers' first byte, and one a byte into them.)
+    const passed = gpurom.windowOf(BRIDGE)
+    const nothing = gpurom.windowOf(0x0000FFF0)
+    check(48, passed.from == 0xFE800000 && passed.bytes == 0x200000 && nothing.bytes == 0)
+    check(49, gpurom.mayAnswer(0xFE9E0000, 0x20000, &passed, REGISTERS[0..]) && !gpurom.mayAnswer(0xFE9F0000, 0x20000, &passed, REGISTERS[0..]) && !gpurom.mayAnswer(0xFE7F0000, 0x20000, &passed, REGISTERS[0..]) && !gpurom.mayAnswer(0xFE900000, 0x20000, &nothing, REGISTERS[0..]))
+    check(39, gpurom.mayAnswer(0xFE920000, 0x20000, &passed, REGISTERS[0..]) && !gpurom.mayAnswer(0xFE930000, 0x20000, &passed, REGISTERS[0..]) && !gpurom.mayAnswer(0xFE970000, 0x10000, &passed, REGISTERS[0..]) && gpurom.mayAnswer(0xFE980000, 0x20000, &passed, REGISTERS[0..]))
+
+    // A ROM word that holds no address bit: no size, not switched on.
+    configWritten = 0
+    windows = 0
+    romMask = 0
+    romWord = 0xFE900000
+    check(57, gpurom.fromExpansion(&bus, into[0..], &tried) == 0 && tried == gpurom.Tried.not_there && windows == 0)
+    romMask = 0xFFFE0000
+
+    // Through the card's ROM registers: the pair showed another register
+    // and the ROM's index stood somewhere; both are as they were.
+    smcIndex = 0xC0200000
+    romIndex = 0x1234
+    registerWrites = 0
+    check(60, sameBytes(gpurom.fromRegisters(&bus, into[0..], &tried)) && tried == gpurom.Tried.read)
+    check(61, smcIndex == 0xC0200000 && romIndex == 0x1234 && strayWrites == 0 && registerWrites == 10 && otherConfigWritten == 0)
+    cardRomLength = 0
+    check(62, gpurom.fromRegisters(&bus, into[0..], &tried) == 0 && tried == gpurom.Tried.not_a_rom && smcIndex == 0xC0200000 && romIndex == 0x1234)
+    cardRomLength = builder.size
+    // (No room for the image: its start is read, no more.)
+    check(63, gpurom.fromRegisters(&bus, into[0..1024], &tried) == 0 && smcIndex == 0xC0200000 && romIndex == 0x1234)
+
+    // The ways one after another. The firmware's table has this card's
+    // image (behind the board's own adapter's): it is taken, and nothing
+    // of the card is touched.
+    const here = gpurom.Place.{ .bus = 0x41, .device = 0, .function = 0, .vendor = 0x1002, .product = 0x67DF }
+    next = vfctImage(gpurom.UEFI_ACPI_VFCT__size, 4, 0, 0, 0x1A03, 0x2000, 512)
+    const whole = vfctImage(next, 0x41, 0, 0, 0x1002, 0x67DF, builder.size)
+    romWord = 0xFE900000
+    forget()
+    gpurom.read(table[0..whole], &here, &bus, true, image[0..], into[0..], &found)
+    check(64, found.sound() && found.way == gpurom.Way.vfct && sameImage(found.size, 0) && untouched())
+    check(65, found.vfct == gpurom.Tried.read && found.expansion == gpurom.Tried.not_tried && found.registers == gpurom.Tried.not_tried)
+    // No table from the firmware: the expansion ROM. The ROM registers
+    // are not asked.
+    gpurom.read(table[0..0], &here, &bus, true, image[0..], into[0..], &found)
+    check(66, found.sound() && found.way == gpurom.Way.expansion && sameImage(found.size, 0) && romWord == 0xFE900000 && registerWrites == 0)
+    check(67, found.vfct == gpurom.Tried.not_there && found.expansion == gpurom.Tried.read && found.registers == gpurom.Tried.not_tried)
+    // A table with only the other adapter's image, and no address for
+    // the ROM (the card is not the firmware's display, in whichever
+    // slot): the ROM registers, and the PCI configuration is not written.
+    forget()
+    romWord = 0
+    gpurom.read(table[0..next], &here, &bus, true, image[0..], into[0..], &found)
+    check(68, found.sound() && found.way == gpurom.Way.registers && sameImage(found.size, 0) && configWritten == 0 && smcIndex == 0xC0200000 && romIndex == 0x1234)
+    check(69, found.vfct == gpurom.Tried.not_there && found.expansion == gpurom.Tried.not_there && found.registers == gpurom.Tried.read)
+    // The card in another slot: its image is found by its place there.
+    const there = gpurom.Place.{ .bus = 0x81, .device = 0, .function = 0, .vendor = 0x1002, .product = 0x67DF }
+    forget()
+    _ = vfctImage(next, 0x81, 0, 0, 0x1002, 0x67DF, builder.size)
+    gpurom.read(table[0..whole], &there, &bus, true, image[0..], into[0..], &found)
+    check(85, found.sound() && found.way == gpurom.Way.vfct && untouched())
+    gpurom.read(table[0..whole], &here, &bus, true, image[0..], into[0..], &found)
+    check(86, found.sound() && found.way == gpurom.Way.registers && found.vfct == gpurom.Tried.not_there)
+    // The firmware's copy with a byte changed (its bytes do not add up):
+    // passed over for the card's own ROM.
+    _ = vfctImage(next, 0x41, 0, 0, 0x1002, 0x67DF, builder.size)
+    table[next + 28 + 0x700] = table[next + 28 + 0x700] ^ 0x10
+    romWord = 0xFE900000
+    gpurom.read(table[0..whole], &here, &bus, true, image[0..], into[0..], &found)
+    check(87, found.sound() && found.way == gpurom.Way.expansion && sameImage(found.size, 0) && found.vfct == gpurom.Tried.does_not_hold && found.expansion == gpurom.Tried.read)
+    // The card's own ROM changed the same way: nothing holds, and the
+    // first of them is kept to be looked at.
+    cardRom[0x700] = cardRom[0x700] ^ 0x10
+    gpurom.read(table[0..whole], &here, &bus, true, image[0..], into[0..], &found)
+    check(88, !found.sound() && found.kept() && found.state == gpurom.State.bad_sum && found.way == gpurom.Way.vfct && sameImage(found.size, 0x700))
+    check(89, found.vfct == gpurom.Tried.does_not_hold && found.expansion == gpurom.Tried.does_not_hold && found.registers == gpurom.Tried.does_not_hold)
+    cardRom[0x700] = cardRom[0x700] ^ 0x10
+    // Nothing anywhere: no table, no address, the card's registers not
+    // in reach (a card the firmware gave no memory); and registers in
+    // reach that show no ROM. Nothing is written but the pair that is
+    // put back.
+    forget()
+    romWord = 0
+    gpurom.read(table[0..0], &here, &bus, false, image[0..], into[0..], &found)
+    check(96, !found.kept() && found.state == gpurom.State.none && found.way == gpurom.Way.none && untouched())
+    check(97, found.vfct == gpurom.Tried.not_there && found.expansion == gpurom.Tried.not_there && found.registers == gpurom.Tried.not_there)
+    cardRomLength = 0
+    gpurom.read(table[0..0], &here, &bus, true, image[0..], into[0..], &found)
+    check(98, !found.kept() && found.registers == gpurom.Tried.not_a_rom && smcIndex == 0xC0200000 && romIndex == 0x1234 && strayWrites == 0)
+    cardRomLength = builder.size
+    romWord = 0xFE900000
+
+    // Damaged ROMs. A wrong checksum: kept, named, not sound, and said.
+    found.way = gpurom.Way.vfct
+    builder.poke(0x700, builder.peek(0x700) ^ 0x10)
+    check(70, gpurom.check(builder.image(), &found) == gpurom.State.bad_sum && found.kept() && !found.sound() && (found.sum == 0x10 || found.sum == 0xF0))
+    check(71, sameText(found.part[0..found.partLength], "113-TEST-001"))
+    cursor = logged
+    gpurom.sayRom(&card, &found)
+    check(72, line("gpu: video BIOS from the firmware's ACPI table VFCT: 2048 bytes, \"TEST ROM FOR BRIXOS\", part number 113-TEST-001, of 2026/11/11 12:34\n"))
+    check(73, line("gpu: video BIOS: its bytes do not add up to 0 (they come to ") && line(if found.sum == 0x10 { "0x10" } else { "0xf0" }) && line("): it is kept to be looked at, none of its tables is run\n"))
+    builder.resum()
+    check(74, gpurom.check(builder.image(), &found) == gpurom.State.found)
+    // (The image's last byte counts in the sum as every other.)
+    builder.poke(builder.size - 1, 0x5A)
+    check(114, gpurom.check(builder.image(), &found) == gpurom.State.bad_sum && found.sum == 0x5A)
+    builder.resum()
+    check(115, gpurom.check(builder.image(), &found) == gpurom.State.found)
+    builder.poke(builder.size - 1, 0)
+    builder.resum()
+    builder.poke(0, 0x54)
+    check(75, gpurom.check(builder.image(), &found) == gpurom.State.no_signature && !found.kept())
+    builder.poke(0, 0x55)
+    builder.poke(0x33, 0x30)
+    check(76, gpurom.check(builder.image(), &found) == gpurom.State.no_mark)
+    builder.poke(0x33, 0x31)
+    builder.poke(2, 0)
+    check(77, gpurom.check(builder.image(), &found) == gpurom.State.short)
+    builder.poke(2, 5)
+    check(78, gpurom.check(builder.image(), &found) == gpurom.State.short)
+    builder.poke(2, 4)
+    check(79, gpurom.check(builder.image()[0..0x40], &found) == gpurom.State.short)
+    builder.poke16(0x48, 0x7F0)
+    check(80, gpurom.check(builder.image(), &found) == gpurom.State.outside)
+    builder.poke16(0x48, 0)
+    check(81, gpurom.check(builder.image(), &found) == gpurom.State.outside)
+    builder.poke16(0x48, rom.HEADER)
+    builder.poke(rom.HEADER + 7, 0x4E)
+    check(82, gpurom.check(builder.image(), &found) == gpurom.State.no_atom)
+    cursor = logged
+    found.vfct = gpurom.Tried.not_there
+    found.expansion = gpurom.Tried.not_a_rom
+    found.registers = gpurom.Tried.does_not_hold
+    gpurom.sayRom(&card, &found)
+    check(83, line("gpu: video BIOS not read (the ACPI table VFCT: not there; the PCI expansion ROM: no ROM there; the card's ROM registers: a ROM that does not hold): the card's tables cannot be run\n"))
+    builder.poke(rom.HEADER + 7, 0x4D)
+    builder.resum()
+    check(84, gpurom.check(builder.image(), &found) == gpurom.State.found)
+
+    // A list of command tables that is too short: the tables beyond its
+    // end are not there, whatever stands behind it.
+    builder.poke16(rom.COMMANDS, 4 + 2 * 50)
+    check(90, open())
+    cursor = logged
+    check(91, gpurom.sayTables(&card, &machine) == 10)
+    check(92, line("gpu: table SetPixelClock (12): there, revision 1.7\ngpu: table DIG1TransmitterControl (the UNIPHY transmitter) (76): not in this ROM\n"))
+    builder.poke16(rom.COMMANDS, 4 + 2 * 81)
+    // A list of data tables too short for the object table and the
+    // scratch's size.
+    builder.poke16(rom.DATA, 4 + 2 * 10)
+    check(93, open())
+    gpurom.readBoard(&machine, &board)
+    gpurom.readFirmware(&machine, &firmware)
+    check(94, !board.found && board.count == 0 && firmware.found && gpurom.scratchBytes(&machine) == gpurom.DEFAULT_SCRATCH)
+    cursor = logged
+    gpurom.sayBoard(&card, &board)
+    check(95, line("gpu: the ROM's object table is not there: its connectors are not known\n"))
+    builder.poke16(rom.DATA, 4 + 2 * 35)
+
+    // Pointers outside: the firmware information's, the object table's.
+    const firmwareAt = builder.peek16(rom.DATA + 4 + 2 * 4)
+    const objectsAt = builder.peek16(rom.DATA + 4 + 2 * 22)
+    builder.poke16(rom.DATA + 4 + 2 * 4, 0x7FE)
+    builder.poke16(rom.DATA + 4 + 2 * 22, 0x7FA)
+    check(100, open())
+    gpurom.readFirmware(&machine, &firmware)
+    gpurom.readBoard(&machine, &board)
+    check(101, !firmware.found && !board.found)
+    builder.poke16(rom.DATA + 4 + 2 * 4, firmwareAt)
+    builder.poke16(rom.DATA + 4 + 2 * 22, objectsAt)
+    // The firmware information of another format, and one cut short.
+    builder.poke(firmwareAt + 3, 1)
+    gpurom.readFirmware(&machine, &firmware)
+    check(102, !firmware.found && firmware.revision == 0x201)
+    cursor = logged
+    gpurom.sayFirmware(&card, &firmware)
+    check(103, line("gpu: firmware information of format 2.1: not read (2.2 is)\n"))
+    builder.poke(firmwareAt + 3, 2)
+    builder.poke16(firmwareAt, 60)
+    gpurom.readFirmware(&machine, &firmware)
+    check(104, !firmware.found)
+    builder.poke16(firmwareAt, 108)
+    // The object table's display paths outside the image; its connectors
+    // outside (the paths are still read, without pins and lines).
+    const pathsOffset = builder.peek16(objectsAt + 14)
+    builder.poke16(objectsAt + 14, 0xF000)
+    gpurom.readBoard(&machine, &board)
+    check(105, !board.found)
+    builder.poke16(objectsAt + 14, pathsOffset)
+    const connectorsOffset = builder.peek16(objectsAt + 6)
+    builder.poke16(objectsAt + 6, 0xF000)
+    gpurom.readBoard(&machine, &board)
+    check(106, board.found && board.count == 3 && board.connectors[0].transmitter == 4 && board.connectors[0].hotPlug == gpurom.NONE && !board.connectors[0].agrees)
+    builder.poke16(objectsAt + 6, connectorsOffset)
+    // The second display path of no size: the first is read, no more.
+    const secondPath = objectsAt + pathsOffset + 4 + 10
+    builder.poke16(secondPath + 2, 0)
+    gpurom.readBoard(&machine, &board)
+    check(107, board.found && board.paths == 3 && board.count == 1)
+    // One that says it is longer than the image.
+    builder.poke16(secondPath + 2, 0x4000)
+    gpurom.readBoard(&machine, &board)
+    check(108, board.count == 1)
+    builder.poke16(secondPath + 2, 10)
+    // More paths counted than there are: what follows them is not taken
+    // for connectors (it holds no connector's number) or ends the walk.
+    builder.poke(objectsAt + pathsOffset, 200)
+    gpurom.readBoard(&machine, &board)
+    check(109, board.found && board.count >= 3 && board.count <= gpurom.CONNECTORS && board.connectors[2].transmitter == 3)
+    builder.poke(objectsAt + pathsOffset, 3)
+    // The first connector's records without an end (each says 2 bytes,
+    // none is the last): the walk ends by itself, no pin, no line.
+    const firstRecords = objectsAt + builder.peek16(objectsAt + connectorsOffset + 4 + 4)
+    k = 0
+    while firstRecords + k + 1 < builder.size {
+        builder.poke(firstRecords + k, 7)
+        builder.poke(firstRecords + k + 1, 2)
+        k += 2
+    }
+    gpurom.readBoard(&machine, &board)
+    check(110, board.found && board.connectors[0].hotPlug == gpurom.NONE && board.connectors[0].ddc == gpurom.NONE)
+
+    // A connector that is none of the card's own transmitters, in the
+    // log's words.
+    build()
+    builder.poke16(builder.peek16(rom.DATA + 4 + 2 * 22) + builder.peek16(builder.peek16(rom.DATA + 4 + 2 * 22) + 14) + 4 + 8, 0x2115)
+    check(120, open())
+    gpurom.readBoard(&machine, &board)
+    cursor = logged
+    gpurom.sayBoard(&card, &board)
+    check(121, line("gpu: connector 0: HDMI (encoder object 0x2115, not a transmitter of the card's own; hot plug pin 4; DDC line 4) (the connector's own source is another encoder than its display path's)\n"))
+    check(122, board.byBlock(4) == gpurom.NONE)
+    check(123, gpurom.transmitterOf(0x211E) == 0 && gpurom.transmitterOf(0x221E) == 1 && gpurom.transmitterOf(0x2120) == 2 && gpurom.transmitterOf(0x2220) == 3 && gpurom.transmitterOf(0x2121) == 4 && gpurom.transmitterOf(0x2221) == 5 && gpurom.transmitterOf(0x2125) == 6)
+    check(124, gpurom.transmitterOf(0x2225) == gpurom.NONE && gpurom.transmitterOf(0x231E) == gpurom.NONE && gpurom.transmitterOf(0x311E) == gpurom.NONE)
+
+    // A display path with two encoders, the card's transmitter and behind
+    // it an encoder that is none of the card's own (the bytes behind the
+    // last path are taken for it): the transmitter is the path's.
+    build()
+    const objectTable = builder.peek16(rom.DATA + 4 + 2 * 22)
+    const lastPath = objectTable + builder.peek16(objectTable + 14) + 4 + 2 * 10
+    builder.poke16(lastPath + 2, 12)
+    builder.poke16(lastPath + 10, 0x2114)
+    check(118, open())
+    gpurom.readBoard(&machine, &board)
+    check(119, board.count == 3 && board.connectors[2].encoder == 0x2220 && board.connectors[2].transmitter == 3 && board.byBlock(3) == 2)
+
+    // A connector without a DDC line before one that has one: the walk
+    // through its records ends at their end mark, and the next
+    // connector's line is not taken for its own.
+    builder.begin(81, 35)
+    _ = builder.objects(rom.BOARD_CONNECTORS[0..], rom.BOARD_ENCODERS[0..], rom.BOARD_PINS[0..], NO_LINE_FIRST[0..])
+    builder.finish()
+    check(116, open())
+    gpurom.readBoard(&machine, &board)
+    check(117, board.found && board.count == 3 && board.connectors[0].ddc == gpurom.NONE && board.connectors[0].hotPlug == 4 && board.connectors[1].ddc == 1 && board.connectors[2].ddc == 4)
+
+    if failed != 0 { return failed }
+    return 13
+}

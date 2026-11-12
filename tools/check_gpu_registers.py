@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Holds every register number and field mask of the kernel's Radeon display
-# code (projects/brix/kernel/gpu_display.mlx and gpu_mode.mlx) against
-# Linux's headers, so that none is from memory:
+# code (projects/brix/kernel/gpu_display.mlx and gpu_mode.mlx), and every
+# number of its video BIOS reading and table interpreter (gpu_rom.mlx and
+# atom.mlx), against Linux's files, so that none is from memory:
 #
 #   tools/check_gpu_registers.py HEADERS
 #
@@ -12,6 +13,14 @@
 #   include/asic_reg/gmc/gmc_8_1_d.h           MC_VM_FB_LOCATION
 #   amdgpu/vid.h                               the controllers' and
 #                                              encoders' offsets
+# and for the video BIOS and its tables:
+#   include/asic_reg/smu/smu_7_1_1_d.h         the ROM registers
+#   amdgpu/atom.h amdgpu/atom.c                the interpreter's numbers,
+#                                              its opcode table
+#   include/atombios.h include/atomfirmware.h  the ROM's structures
+#   amdgpu/ObjectID.h                          the objects' numbers
+#   include/uapi/linux/pci_regs.h              (of the kernel's tree) the
+#                                              PCI configuration's ROM word
 #
 # Checked: each `const NAME: usize = 0x...` that is a register is the
 # header's mmNAME; a controller's register is at each controller's offset
@@ -20,8 +29,14 @@
 # the header's REGISTER__FIELD_MASK; the fields gpu_display.mlx decodes
 # with numbers written in place (listed below) are the header's masks and
 # shifts; every number of the raw dump's runs is a register in each
-# controller's block. Prints what it held and ends with 1 when anything
-# differs.
+# controller's block. Of the video BIOS code: each constant named as
+# Linux names it is Linux's number; each `STRUCT__field` is the field's
+# offset in atombios.h's packed structure (`STRUCT__size` its size); the
+# tables' places in the ROM's two lists are the fields' places in
+# ATOM_MASTER_LIST_OF_COMMAND_TABLES and ..._DATA_TABLES; each opcode is
+# where atom.c's opcode_table has its function, with the destinations,
+# the jumps' conditions and the tables of parts in that file's order.
+# Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
 if len(sys.argv) != 2:
@@ -217,4 +232,195 @@ for register, field, mask, shift in IN_PLACE:
         print("FIELD differs %s: the header has mask %#x shift %d, the code mask %#x shift %d" % (mk, sh[mk], sh[sk], mask << shift, shift))
 
 print("%d register constants and %d field constants read; %d numbers held against the headers, %d wrong; %d fields decoded in place held, %d differ" % (registers, fields, held, bad, len(IN_PLACE), wrong))
-sys.exit(1 if bad or wrong else 0)
+display_bad = bad
+bad = 0
+held = 0
+
+# ---- The video BIOS reading and the table interpreter.
+needed = ("smu_7_1_1_d.h", "atom.h", "atom.c", "atombios.h", "atomfirmware.h", "ObjectID.h", "pci_regs.h")
+missing = [name for name in needed if not os.path.exists(os.path.join(hdr, name))]
+if missing:
+    print("the video BIOS code is not held: not in %s: %s" % (hdr, " ".join(missing)))
+    sys.exit(1)
+
+def text_of(name):
+    return open(os.path.join(hdr, name), errors="replace").read()
+
+atom_h = defines(os.path.join(hdr, "atom.h"))
+atom_c = text_of("atom.c")
+bios_h = text_of("atombios.h")
+bios_defines = {}
+for m in re.finditer(r"#define\s+(\w+)\s+(0x[0-9a-fA-F]+|\d+)L?\b", bios_h):
+    bios_defines.setdefault(m.group(1), int(m.group(2), 0))
+objects = defines(os.path.join(hdr, "ObjectID.h"))
+smu = defines(os.path.join(hdr, "smu_7_1_1_d.h"))
+pci = {}
+for m in re.finditer(r"#define\s+(\w+)\s+\(?(~?)(0x[0-9a-fA-F]+|\d+)U?\)?", text_of("pci_regs.h")):
+    pci.setdefault(m.group(1), (~int(m.group(3), 0) & 0xFFFFFFFF) if m.group(2) else int(m.group(3), 0))
+image = {}
+for m in re.finditer(r"^\s*(\w+)\s*=\s*(0x[0-9a-fA-F]+|\d+),", text_of("atomfirmware.h"), re.M):
+    image.setdefault(m.group(1), int(m.group(2), 0))
+for m in re.finditer(r"#define\s+(BIOS_STRING_LENGTH)\s+(\d+)", text_of("atomfirmware.h")):
+    image[m.group(1)] = int(m.group(2))
+
+def constants(text):
+    # (name, value, the struct it stands in) of each number.
+    out = []
+    inside = None
+    for line in text.split("\n"):
+        m = re.match(r"pub const (\w+) = struct \{", line)
+        if m:
+            inside = m.group(1)
+        elif line.startswith("}"):
+            inside = None
+        m = re.match(r"\s*(?:pub )?const (\w+): usize = (0x[0-9A-Fa-f]+|\d+)\b", line)
+        if m:
+            out.append((m.group(1), int(m.group(2), 0), inside))
+    return out
+
+# The packed structures of atombios.h: a field's offset, a structure's
+# size.
+bios_plain = re.sub(r"//[^\n]*", "", bios_h)
+SIZES = {"UCHAR": 1, "USHORT": 2, "ULONG": 4, "ATOM_FIRMWARE_CAPABILITY_ACCESS": 2, "PRODUCT_BRANDING": 1, "ATOM_I2C_ID_CONFIG": 1}
+
+def layout(name):
+    m = re.search(r"typedef\s+struct\s*\w*\s*\{([^{}]*)\}\s*%s\s*;" % name, bios_plain)
+    if not m:
+        return None
+    fields, at = [], 0
+    for line in m.group(1).split("\n"):
+        line = line.split("//")[0]
+        f = re.match(r"\s*(\w+)\s+(\w+)\s*(?:\[\s*(\w*)\s*\])?\s*;", line)
+        if not f:
+            continue
+        kind, field, count = f.group(1), f.group(2), f.group(3)
+        size = SIZES.get(kind)
+        if size is None:
+            size = layout(kind)[1]
+        if count is not None:
+            size *= 0 if count == "" else (int(count) if count.isdigit() else bios_defines[count])
+        fields.append((field, at, kind))
+        at += size
+    return fields, at
+
+def offset_of(name, field):
+    got = layout(name)
+    if got is None:
+        return None
+    for one, at, kind in got[0]:
+        if one == field:
+            return at
+    for one, at, kind in got[0]:
+        if kind not in SIZES:
+            inner = offset_of(kind, field)
+            if inner is not None:
+                return at + inner
+    return None
+
+def list_index(struct, field):
+    got = layout(struct)
+    for n, (one, at, kind) in enumerate(got[0]):
+        if one == field:
+            return n
+    return None
+
+# gpu_rom.mlx: numbers of its own (a ROM's most bytes, "none", how many
+# connectors are kept, amdgpu_atombios_allocate_fb_scratch's 20 KiB).
+OWN = {"ROOM", "NONE", "CONNECTORS", "DEFAULT_SCRATCH"}
+rom_text = open(os.path.join(here, "gpu_rom.mlx")).read()
+for name, value, inside in constants(rom_text):
+    if name in OWN:
+        continue
+    if inside == "Command":
+        hold("Command." + name, value, list_index("ATOM_MASTER_LIST_OF_COMMAND_TABLES", name))
+    elif inside == "Data":
+        hold("Data." + name, value, list_index("ATOM_MASTER_LIST_OF_DATA_TABLES", name))
+    elif "__" in name:
+        struct, field = name.split("__")
+        hold(name, value, layout(struct)[1] if field == "size" else offset_of(struct, field))
+    elif name.startswith("PCI_"):
+        hold(name, value, pci.get(name))
+    elif name.startswith("SMC_IND_"):
+        hold(name, value, smu.get("mm" + name))
+    elif name in ("ROM_INDEX", "ROM_DATA"):
+        hold(name, value, smu.get("ix" + name))
+    elif name.startswith("OFFSET_TO_") or name == "BIOS_STRING_LENGTH":
+        hold(name, value, image.get(name))
+    elif name == "STRLEN_LONG":
+        hold(name, value, atom_h.get(name))
+    elif name in objects:
+        hold(name, value, objects[name])
+    else:
+        hold(name, value, bios_defines.get(name))
+
+# atom.mlx: atom.h's numbers and marks.
+atom_text = open(os.path.join(here, "atom.mlx")).read()
+ops = {}
+for name, value, inside in constants(atom_text):
+    if name.startswith("ATOM_"):
+        hold(name, value, atom_h.get(name))
+    elif name.startswith("OP_"):
+        ops[name] = value
+for name in ("ATOM_ATI_MAGIC", "ATOM_ROM_MAGIC"):
+    ours = re.search(r'pub const %s = "([^"]*)"' % name, atom_text)
+    theirs = re.search(r'#define\s+%s\s+"([^"]*)"' % name, text_of("atom.h"))
+    held += 1
+    if not ours or not theirs or ours.group(1) != theirs.group(1):
+        bad += 1
+        print("WRONG %s: not atom.h's text" % name)
+
+# The opcodes: atom.c's opcode_table, entry by entry (function,
+# argument).
+body = atom_c[atom_c.index("opcode_table[ATOM_OP_CNT] = {"):]
+body = body[:body.index("};")]
+entries = re.findall(r"(NULL|atom_op_\w+)\s*,\s*(\w+)\s*\}", body)
+hold("the opcode table's length", len(entries), atom_h.get("ATOM_OP_CNT"))
+cond = dict((m.group(1), int(m.group(2))) for m in re.finditer(r"#define\s+(ATOM_COND_\w+)\s+(\d+)", atom_c))
+SIX_ARGS = ["ATOM_ARG_REG", "ATOM_ARG_PS", "ATOM_ARG_WS", "ATOM_ARG_FB", "ATOM_ARG_PLL", "ATOM_ARG_MC"]
+RUNS = {"SETPORT": ["ATOM_PORT_ATI", "ATOM_PORT_PCI", "ATOM_PORT_SYSIO"], "DELAY": ["ATOM_UNIT_MILLISEC", "ATOM_UNIT_MICROSEC"],
+        "MUL32": ["ATOM_ARG_PS", "ATOM_ARG_WS"], "DIV32": ["ATOM_ARG_PS", "ATOM_ARG_WS"]}
+destination = table(atom_text, "DESTINATION")
+jumps = table(atom_text, "JUMP_CONDITION")
+for name, first in sorted(ops.items(), key=lambda item: item[1]):
+    function = "atom_op_" + name[3:].lower()
+    count = sum(1 for entry in entries if entry[0] == function)
+    held += 1
+    if first >= len(entries) or entries[first][0] != function or entries[first - 1][0] == function:
+        bad += 1
+        print("WRONG %s: atom.c's opcode_table does not begin %s at %d" % (name, function, first))
+        continue
+    arguments = [entry[1] for entry in entries[first:first + count]]
+    if count == 6:
+        hold(name + "'s destinations", int(arguments == SIX_ARGS and destination == [atom_h[a] for a in SIX_ARGS]), 1)
+    elif name == "OP_JUMP":
+        hold("the jumps' conditions", int(jumps == [cond[a] for a in arguments]), 1)
+    elif name[3:] in RUNS:
+        hold(name + "'s run", int(arguments == RUNS[name[3:]]), 1)
+    else:
+        hold(name + " alone", count, 1)
+hold("opcodes named", sum(sum(1 for entry in entries if entry[0] == "atom_op_" + name[3:].lower()) for name in ops), len(entries) - 1)
+
+# The tables of parts.
+def c_table(name):
+    m = re.search(r"%s(?:\[\d*\])+\s*=\s*\{(.*?)\};" % name, atom_c, re.S)
+    return [int(x, 0) for x in re.findall(r"0x[0-9A-Fa-f]+|\d+", re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S))]
+
+for ours, theirs in (("PART_MASK", "atom_arg_mask"), ("PART_SHIFT", "atom_arg_shift"), ("DST_TO_SRC", "atom_dst_to_src"), ("DEF_DST", "atom_def_dst")):
+    hold(ours, int(table(atom_text, ours) == c_table(theirs)), 1)
+lengths = c_table("atom_iio_len")
+steps = dict((atom_h[name], name) for name in atom_h if name.startswith("ATOM_IIO_"))
+m = re.search(r"fn programStep\(step: usize\) -> usize \{(.*?)\n\}", atom_text, re.S)
+def step_length(step):
+    for line in m.group(1).split("\n"):
+        f = re.match(r"\s*if (.*) \{ return (\d) \}", line)
+        if not f:
+            continue
+        for clause in f.group(1).split("||"):
+            g = re.match(r"\s*step (==|<=) (ATOM_IIO_\w+)\s*", clause)
+            if (g.group(1) == "==" and atom_h[g.group(2)] == step) or (g.group(1) == "<=" and step <= atom_h[g.group(2)]):
+                return int(f.group(2))
+    return 0
+hold("the indirect programs' step lengths", int([step_length(k) for k in range(len(lengths))] == lengths), 1)
+
+print("video BIOS and tables: %d numbers of gpu_rom.mlx and atom.mlx held against Linux's files, %d wrong" % (held, bad))
+sys.exit(1 if bad or wrong or display_bad else 0)

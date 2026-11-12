@@ -90,7 +90,7 @@ import os, re, select, socket, sys, threading, time
 
 HOST = "127.0.0.1"
 MIB = 1 << 20
-NO_PAGE = b"logserve has no such page. It has: / /all /gpu /klog /boot.log /boot.previous.log /system\n"
+NO_PAGE = b"logserve has no such page. It has: / /all /gpu /gpu.rom /klog /boot.log /boot.previous.log /system\n"
 
 def fail(text):
     print("FAIL " + text, file=sys.stderr)

@@ -506,6 +506,10 @@ said, and the address when it has come). A browser or curl there gets
                          and send
     /gpu                 the log's lines that begin with "gpu:" (the
                          graphics driver's read-out)
+    /gpu.rom             the graphics card's video BIOS ROM as the
+                         kernel read it at boot (/devices/gpurom): not
+                         a text, a file to save and send
+                         (`curl -o gpu.rom http://ADDRESS:8080/gpu.rom`)
     /klog                the kernel log, whole
     /boot.log            the files of these names at the top of the
     /boot.previous.log   mounted volumes, where klogsave writes (a
@@ -682,6 +686,78 @@ written from the standard's layout, and
 tests/460_gpu_mode_set_runtime.mlx holds both plans' writes against the
 sequences worked out from Linux's code, on a card that is a table and
 can fail at every step.
+
+The plan for HDMI ("plan (b): nothing would be set: HDMI: ...") needs
+the pixel clock's PLL and the transmitter set, and on this controller
+Linux does not write those registers itself: it runs small programs out
+of the card's own video BIOS ROM (AtomBIOS command tables: SetPixelClock,
+the transmitter's and the encoder's control and others). The ground for
+doing the same is there; no table is run on the card yet.
+
+The ROM is read at every boot (gpu_rom.mlx), by the first of three ways
+that gives one that holds: the copy the card's UEFI driver leaves in the
+ACPI table VFCT (memory is read, nothing of the card); the PCI expansion
+ROM (the PCI configuration's ROM word is written to learn its size and
+to switch it on, and put back); the card's own ROM registers (the
+management controller's index and the ROM's index are written, and put
+back). No register of the display is touched, and gpu_rom.mlx's head
+says why the picture cannot mind. Nothing of it depends on the slot the
+card sits in or on the card being the firmware's display: the firmware's
+copy is found by the card's place on the PCI bus, the expansion ROM is
+switched on only at an address inside the window of the bridge before
+the card (not at one a firmware merely left behind), and where there is
+neither, the ROM registers give it. On a machine with a second adapter
+(a board's own) the log says whether the firmware's picture is in this
+card's memory or another adapter shows it; a card the firmware has not
+started at all has its ROM read and kept, and nothing else of it is
+read or set. A ROM holds when it begins 55 AA, has
+AMD's mark and an "ATOM" header inside its length, as Linux asks, and
+when its bytes add up to 0, which Linux does not ask: one whose bytes do
+not add up is kept to be looked at and none of its tables is run. The
+screen says which way gave it and what names it, and which of the
+ROM's connectors the running controller goes out by (the numbers here
+are a test's, not a card's):
+
+    gpu: video BIOS from the firmware's ACPI table VFCT: 2048 bytes, "TEST ROM FOR BRIXOS", part number 113-TEST-001, of 2026/11/11 12:34
+    gpu: controller 0 goes out by the ROM's connector 0: HDMI (transmitter UNIPHY E, DIG 4; hot plug pin 4; DDC line 4)
+
+and the log alone (/devices/klog, logserve's /gpu) a line for each
+table a mode set runs with its revision ("gpu: table SetPixelClock
+(12): there, revision 1.7"), the firmware information's clocks ("gpu:
+firmware information: the pixel clock PLL's reference 100000 kHz, ...")
+and each connector with its transmitter, hot plug pin and DDC line
+("gpu: connector 1: DisplayPort (transmitter UNIPHY A, DIG 0; ...)"),
+read as Linux's display core reads them.
+
+The ROM's bytes are the file /devices/gpurom. They are the best test
+there is for the next stage, so they are easy to hand over: logserve
+gives them as /gpu.rom, and klogsave writes them as gpu.rom beside
+boot.log on the brixfs volumes for a machine without the network.
+
+The tables are run by an interpreter of our own (atom.mlx: every opcode
+and argument kind of Linux's atom.c, bounded on every side: nothing is
+read outside the ROM, a run has a count and a time, calls a depth; a
+run that fails says the table, the offset and the opcode). The card is
+reached through hands the kernel fills: hands that only read stop a run
+at its first write and say what it would have written, and the hands
+that write do so only in an image that asks for the monitor's own mode.
+Since the card cannot be tried in a VM, the interpreter is proven on the
+host: tests/472_atom_interpreter_runtime.mlx runs tables assembled by
+hand, tests/473_gpu_rom_runtime.mlx reads ROMs the test makes (damaged
+ones too) by all three ways, and
+
+    tools/check_atom_reference.sh LINUX
+
+builds Linux 6.6's own atom.c as a program of the host (LINUX: where
+its files lie; none is in this repository) and runs thousands of
+generated tables through both interpreters on the same card that is a
+table, holding every register read and write, every wait, the
+parameters afterwards and the end of each run side by side;
+`--mistakes` shows that it notices mistakes put into the interpreter on
+purpose, and `LINUX ROM TABLE:WORD,WORD...` runs a real ROM's tables
+through both (for the machine's own ROM, once it is handed over).
+tools/check_gpu_registers.py holds the numbers of both files against
+Linux's.
 
 What is not there yet: disks served by their interrupts (AHCI, NVMe: a
 command is waited for), USB devices other than boot keyboards, mice and

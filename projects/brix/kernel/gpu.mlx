@@ -17,14 +17,42 @@
 // order), still without a write. Only an image that asks for it
 // (settings/gpu: "native") has the plan carried out (gpu_set.mlx), each
 // write read back and the firmware's state put back when anything fails;
-// the kernel's display then is the new picture. QEMU has no such card, so
-// on a VM it finds none. The register reads can only be seen on the real
-// hardware (the "gpu:" lines).
+// the kernel's display then is the new picture. Stage 2d reads the card's
+// video BIOS ROM at every boot (gpu_rom.mlx says by which ways, what is
+// written to read it and why the picture cannot mind), says what names
+// it, the tables a mode set runs, its clocks and its connectors, and
+// makes the ROM's command tables ready to be run (atom.mlx, the
+// interpreter); no table is run yet. The ROM's bytes are the file
+// /devices/gpurom. The card may sit in any slot and need not be the
+// firmware's display: the log says whether the firmware's picture is in
+// this card's memory or another adapter shows it, and a card the
+// firmware has not started at all has only its ROM read (its tables are
+// not lent: `tables()` is null). QEMU has no such card, so on a VM it
+// finds none. The register reads can only be seen on the real hardware
+// (the "gpu:" lines).
 //
 // That the default boot writes no register of the display can be read
 // here: gpu_display.mlx and gpu_mode.mlx reach the card by `displayRead`
-// alone, and `displayWriteRegister` below, the one place such a register
-// is written, does nothing unless `native` (the image's settings/gpu).
+// alone, and a register of the display is written in two places below,
+// both of which do nothing unless `native` (the image's settings/gpu):
+// `displayWriteRegister` (gpu_set.mlx's) and `tableWrite` (the hands a
+// ROM's table is run with). What a default boot does write, none of it
+// the display's: the scratch register and the index of the index and
+// data window (`report`), and to read the ROM, when the firmware's ACPI
+// table does not have it, the PCI configuration's ROM word or the
+// management controller's index and the ROM's (`romSetConfig`,
+// `romSetRegister`), each put back as it was.
+//
+// FOR WHAT SETS A MODE WITH THE ROM'S TABLES: `tables()` is the
+// interpreter with the ROM open (null: there is no ROM that holds, or
+// the card is not started; the log says which), `tableHands(true)` the
+// card for it (writes are taken only when the image asks for the
+// monitor's own mode; `tableHands(false)` takes none, so that a run
+// stops at its first write and says what it would have written),
+// `firmwareInformation()` the clocks and `outputs()` the connectors (by
+// the DIG block the read-out names: `outputs().byBlock(...)`, whichever
+// block, transmitter and connector that is on this board); a table is
+// run as atom.mlx's head says, with gpu_rom.mlx's `Command` numbers.
 //
 // What the next stages stand on here: the VRAM aperture mapped
 // write-combining (`vramView`; the firmware's picture, which the kernel's
@@ -73,6 +101,9 @@ const edid = @import("./edid.mlx")
 const cpu = @import("./cpu.mlx")
 const archive = @import("./archive.mlx")
 const vfs = @import("./vfs.mlx")
+const atom = @import("./atom.mlx")
+const videorom = @import("./gpu_rom.mlx")
+const acpi = @import("./acpi.mlx")
 const Page = memory.Page
 
 const VENDOR_AMD: usize = 0x1002
@@ -356,6 +387,9 @@ fn ownDisplay() -> *display.Display { return display.inMemory(gpu.vram, gpu.vram
 // log and is drawn with the rest.
 fn takePicture(offset: usize, width: usize, height: usize, pitch: usize) -> void {
     const screen = ownDisplay()
+    // (No display of the loader's is in this card's memory: there is no
+    // record to make the new picture's, and nothing to draw a console on.)
+    if !screen.*.present { return }
     screen.retake(gpu.vram + offset, width, height, pitch * 4)
     gpu.consoleOffset = offset
     gpu.consoleBytes = screen.size()
@@ -402,6 +436,236 @@ fn setDisplay() -> void {
     if !modeset.attempt(&card, &hands, &planned, native, &outcome) { return }
     takePicture(planned.offset, planned.width, planned.height, planned.pitch)
 }
+
+// The card's video BIOS ROM (gpu_rom.mlx): where the card is on the PCI
+// bus, the image's bytes in the kernel's view (videorom.ROOM of them; 0:
+// none), what was found, and the ROM's tables: the interpreter with the
+// ROM open, its scratch (64 KiB at most), the clocks and the connectors.
+var romDevice: usize = 0 // (per run)
+var romBytes: usize = 0 // (per run)
+var rom: videorom.Rom = undefined // (per run)
+var machine: atom.Atom = undefined // (per run)
+var tablesOpen = false // (per run)
+var firmware: videorom.Firmware = undefined // (per run)
+var board: videorom.Board = undefined // (per run)
+const SCRATCH_WORDS: usize = 16384
+var scratch: [SCRATCH_WORDS]u32 = undefined // (per run)
+
+// The card as gpu_rom.mlx reads the ROM from it. These are the writes a
+// default boot makes to read the ROM (the file's head; gpu_rom.mlx puts
+// each word back).
+fn romConfig(offset: usize) -> usize { return Pci.read(romDevice, offset) }
+
+fn romSetConfig(offset: usize, value: usize) -> void { Pci.write(romDevice, offset, value) }
+
+// Whether the card's ROM may be switched on at `address` (gpu_rom.mlx's
+// `mayAnswer`): inside the memory window of the bridge whose secondary
+// bus is the card's (a card on bus 0 has none: its ROM is not read this
+// way), and on none of the card's own memories (the registers, the VRAM
+// aperture, the doorbells, and the first memory of the card's second
+// function, its HDMI audio: of a memory whose size is not known, as much
+// as its address's lowest set bit allows).
+fn romClear(address: usize, size: usize) -> bool {
+    const bus = (romDevice >> 16) & 0xFF
+    var window = videorom.Stretch.{ .from = 0, .bytes = 0 }
+    var found = false
+    var at: usize = 0
+    while at < 256 && !found && bus != 0 {
+        var slot: usize = 0
+        while slot < 32 && !found {
+            var function: usize = 0
+            while function < 8 && !found {
+                const bridge = Pci.atBus(at, slot, function)
+                const id = Pci.read(bridge, Pci.VENDOR_DEVICE)
+                const header = if id & 0xFFFF != 0xFFFF { Pci.read(bridge, Pci.HEADER_TYPE) } else { 0 }
+                // (Header type 1: a PCI bridge.)
+                if id & 0xFFFF != 0xFFFF && (header >> 16) & 0x7F == 1 && (Pci.read(bridge, Pci.SECONDARY_BUS) >> 8) & 0xFF == bus {
+                    window = videorom.windowOf(Pci.read(bridge, videorom.PCI_MEMORY_BASE))
+                    found = true
+                }
+                if function == 0 && (id & 0xFFFF == 0xFFFF || header & 0x800000 == 0) { break }
+                function += 1
+            }
+            slot += 1
+        }
+        at += 1
+    }
+    const audio = Pci.memBase(romDevice | (1 << 8), 0)
+    const taken = [_]videorom.Stretch{
+        videorom.Stretch.{ .from = gpu.registersPhysical, .bytes = gpu.registersSize },
+        videorom.Stretch.{ .from = gpu.vram, .bytes = gpu.vramSize },
+        videorom.Stretch.{ .from = gpu.doorbells, .bytes = if gpu.doorbells != 0 { gpu.doorbells & (~gpu.doorbells + 1) } else { 0 } },
+        videorom.Stretch.{ .from = audio, .bytes = if audio != 0 { audio & (~audio + 1) } else { 0 } }
+    }
+    return videorom.mayAnswer(address, size, &window, taken[0..])
+}
+
+fn romWindow(physical: usize, into: []u8) -> bool {
+    const view = memory.Device.map(physical, into.length, memory.Device.UNCACHED)
+    if view == 0 { return false }
+    const bytes = unsafe { @ptrFromInt([*]const u8, view) }
+    var k: usize = 0
+    while k < into.length {
+        into[k] = bytes[k]
+        k += 1
+    }
+    return true
+}
+
+fn romRegister(number: usize) -> u32 {
+    if (number << 2) + 4 > gpu.registersSize { return 0xFFFFFFFF }
+    return gpu.at(number << 2).*
+}
+
+fn romSetRegister(number: usize, value: u32) -> void {
+    if (number << 2) + 4 > gpu.registersSize { return }
+    gpu.at(number << 2).* = value
+}
+
+// How many ROMs were put in /devices (a second card's is "gpurom1").
+var romFiles: usize = 0 // (per run)
+
+// The card's video BIOS ROM read (gpu_rom.mlx's `read`: the firmware's
+// ACPI table, the PCI expansion ROM, the card's ROM registers), said, its
+// bytes put where programs find them and, for a card the firmware has
+// started (`started`), its tables made ready. On the screen: what the ROM
+// is, and what is wrong with it; the tables, clocks and connectors in the
+// log alone.
+fn readRom(address: usize, started: bool) -> void {
+    const card = scanout.Card.{ .read = displayRead, .now = displayNow, .write = displayWrite }
+    const bus = videorom.Bus.{ .config = romConfig, .setConfig = romSetConfig, .clear = romClear, .window = romWindow, .read = romRegister, .write = romSetRegister }
+    romDevice = address
+    tablesOpen = false
+    // Twice a ROM's most bytes: the image that is kept, and room to read
+    // into.
+    const pages = Page.up(2 * videorom.ROOM) / Page.SIZE
+    const frames = memory.allFrames().allocateContiguous(pages)
+    if frames == 0 {
+        console.out.write("gpu: video BIOS not read (no memory for it)\n")
+        return
+    }
+    romBytes = layout.Memory.virtual(frames)
+    const image = Bytes.pointer(romBytes)[0..videorom.ROOM]
+    const work = Bytes.pointer(romBytes + videorom.ROOM)[0..videorom.ROOM]
+    // The firmware's table, when it has one (all of it is in the kernel's
+    // view; nothing of the card is touched for it).
+    const identity = Pci.read(address, 0)
+    const place = videorom.Place.{ .bus = (address >> 16) & 0xFF, .device = (address >> 11) & 0x1F, .function = (address >> 8) & 0x7, .vendor = identity & 0xFFFF, .product = (identity >> 16) & 0xFFFF }
+    const table = acpi.table(acpi.root(), "VFCT", 0)
+    const length = if table != 0 { acpi.lengthOf(table) } else { 0 }
+    const vfct = Bytes.pointer(if table != 0 { table } else { romBytes })[0..length]
+    videorom.read(vfct, &place, &bus, gpu.registers != 0 && gpu.registersSize != 0, image, work, &rom)
+    videorom.sayRom(&card, &rom)
+    if !rom.kept() { return }
+    if romFiles < 2 && vfs.fileSystem().addDeviceBytes(if romFiles == 0 { "gpurom" } else { "gpurom1" }, image.pointer, rom.size) {
+        romFiles += 1
+    } else {
+        console.out.write("gpu: video BIOS: no file of it could be made in /devices\n")
+    }
+    if !rom.sound() { return }
+    if machine.open(image[0..rom.size], scratch[0..]) != atom.Opened.ok {
+        console.out.write("gpu: video BIOS: its lists of tables do not lie inside it: none of its tables is run\n")
+        return
+    }
+    // The scratch the ROM asks for, as far as there is room.
+    const asked = videorom.scratchBytes(&machine) / 4
+    const words = if asked < SCRATCH_WORDS { asked } else { SCRATCH_WORDS }
+    machine.scratch = scratch[0..words]
+    videorom.readFirmware(&machine, &firmware)
+    videorom.readBoard(&machine, &board)
+    const was = console.screen(false)
+    const there = videorom.sayTables(&card, &machine)
+    if asked > SCRATCH_WORDS {
+        card.field("gpu: video BIOS: its tables ask for ", asked * 4 / 1024)
+        card.field(" KiB of scratch, they are given ", SCRATCH_WORDS * 4 / 1024)
+        card.say("\n")
+    }
+    videorom.sayFirmware(&card, &firmware)
+    videorom.sayBoard(&card, &board)
+    _ = console.screen(was)
+    if there != videorom.neededTables() {
+        card.field("gpu: video BIOS: only ", there)
+        card.field(" of the ", videorom.neededTables())
+        card.say(" tables a mode set runs are in it\n")
+    }
+    // ASIC_Init starts the card anew: it is never run, whoever asks.
+    machine.never = videorom.Command.ASIC_Init
+    // A card the firmware has not started needs just that table run
+    // first: none of its tables is lent.
+    if !started {
+        console.out.write("gpu: video BIOS: the card is not started, so none of its tables is run\n")
+        return
+    }
+    tablesOpen = true
+}
+
+// Which of the ROM's connectors each running controller goes out by (the
+// read-out's DIG block is the transmitter's number).
+fn sayOutputs() -> void {
+    if !tablesOpen || !board.found { return }
+    const card = scanout.Card.{ .read = displayRead, .now = displayNow, .write = displayWrite }
+    var n: usize = 0
+    while n < scanout.CONTROLLERS {
+        const controller = &shown.controllers[n]
+        if controller.*.on && controller.*.encoder.found {
+            const which = board.byBlock(controller.*.encoder.backEnd)
+            card.controller(n)
+            if which == videorom.NONE {
+                card.field(" goes out by DIG ", controller.*.encoder.backEnd)
+                card.say(", which is none of the ROM's connectors\n")
+            } else {
+                card.field(" goes out by the ROM's connector ", which)
+                card.say(": ")
+                videorom.sayConnector(&card, &board.connectors[which])
+                card.say("\n")
+            }
+        }
+        n += 1
+    }
+}
+
+// The card as a ROM's table reaches it (atom.mlx's Hands): the registers
+// in the aperture; the PLL's and the memory controller's registers as
+// Linux's amdgpu has them for the tables (reads of 0, writes that do
+// nothing: cail_pll_read and the three beside it); waits; the clock. A
+// register is written only when the image asks for the monitor's own
+// mode.
+fn tableRead(number: usize) -> u32 { return gpu.at(number << 2).* }
+
+fn tableWrite(number: usize, value: u32) -> bool {
+    if !native { return false }
+    gpu.at(number << 2).* = value
+    return true
+}
+
+fn tableWriteRefused(number: usize, value: u32) -> bool { return false }
+
+fn tableOtherRead(number: usize) -> u32 { return 0 }
+
+fn tableOtherWrite(number: usize, value: u32) -> bool { return true }
+
+fn tableDelay(microseconds: usize) -> void { clock.pause(microseconds) }
+
+// The interpreter with the card's ROM open; null when there is no ROM
+// that holds.
+pub fn tables() -> ?*atom.Atom {
+    if tablesOpen { return &machine }
+    return null
+}
+
+// The card for a table's run: `writing` false gives hands that take no
+// write (a run stops at its first and says what it would have written).
+pub fn tableHands(writing: bool) -> atom.Hands {
+    var hands = atom.Hands.{ .registers = gpu.registersSize / 4, .read = tableRead, .write = tableWriteRefused, .pllRead = tableOtherRead, .pllWrite = tableOtherWrite, .mcRead = tableOtherRead, .mcWrite = tableOtherWrite, .delay = tableDelay, .now = displayNow }
+    if writing { hands.write = tableWrite }
+    return hands
+}
+
+// The ROM's clocks and connectors (found: false when they were not
+// read).
+pub fn firmwareInformation() -> *const videorom.Firmware { return &firmware }
+
+pub fn outputs() -> *const videorom.Board { return &board }
 
 // What the monitor of the firmware's display says of itself: its EDID as
 // the EFI loader passed it on (layout.Blob.EDID, Info.EDID_BYTES bytes of
@@ -477,7 +741,13 @@ fn take(address: usize) -> bool {
     gpu.registers = memory.Device.map(gpu.registersPhysical, gpu.registersSize, memory.Device.UNCACHED)
     if gpu.registers == 0 { return false }
     if !gpu.posted() {
-        console.out.write("gpu: an AMD display device that does not answer as a started card (left alone)\n")
+        // A card the firmware has not started (it is not the firmware's
+        // display, and the firmware did not run its driver): nothing of
+        // it is read or set but its ROM, which says what card it is.
+        console.out.write("gpu: an AMD display device that the firmware has not started (its registers do not answer as a started card's): left alone, but for reading its ROM\n")
+        firmware.found = false
+        board.found = false
+        if gpu.polaris() { readRom(address, false) }
         return false
     }
     // The VRAM aperture write-combining, as the console's part of it is
@@ -514,8 +784,17 @@ fn take(address: usize) -> bool {
         console.out.write(" KiB at ")
         console.out.hex(gpu.consoleOffset)
         console.out.write(" of the aperture\n")
+    } else if display.screen().*.present {
+        // (Another adapter shows the firmware's picture, the board's own,
+        // say, and no display the loader passed on is in this card's
+        // memory. This card is started all the same.)
+        console.out.write("gpu: the firmware's picture is not in this card's memory: another adapter shows it\n")
+    } else {
+        console.out.write("gpu: the firmware gave no picture\n")
     }
     gpu.report()
+    firmware.found = false
+    board.found = false
     // (The monitor read at the start is the one of the firmware's first
     // display. When this card's display is a further one, the monitor to
     // plan for is that display's: its EDID as the loader passed it on.)
@@ -525,7 +804,9 @@ fn take(address: usize) -> bool {
         edid.say(displayWrite, &monitor)
     }
     if gpu.polaris() {
+        readRom(address, true)
         readDisplay()
+        sayOutputs()
         planDisplay()
         setDisplay()
     } else {
