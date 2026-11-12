@@ -1,0 +1,584 @@
+// std.displays: a brixOS machine's further displays, for a program that
+// draws on the screen itself (the boot screen, the compositor, the
+// virtual console).
+//
+// A machine may have more than one display (a board's own graphics
+// adapter and a card in a slot, a monitor on each). The main one is
+// /devices/framebuffer, the one such a program draws on; the others are
+// /devices/framebuffer1, /devices/framebuffer2 and so on (spec/04-stdlib/
+// os/brix.xml): the same geometry to read, the same pixels to map. This
+// module shows the main display's picture on each of them too: the same
+// picture, fitted to the display's size without distortion (as large as
+// it goes in the shape it was drawn in, in the middle, black bars where
+// the shapes differ). The shape it was drawn in is the frame's own, its
+// pixels square, unless the program says another (one that draws a frame
+// to be stretched); a further display whose monitor stretches its mode
+// says its screen's shape with its geometry, and that is counted in: a
+// circle of the frame is round on every screen.
+//
+// The program keeps its frame in memory of its own (it does anyway: video
+// memory is only ever written) and says what of it changed:
+//
+//     var further: displays.Further = undefined
+//     displays.begin(&further, width, height, 0, 0)
+//     _ = displays.open(&further)         // none on most machines
+//     ... each frame, after the main display has it:
+//     displays.damage(&further, x, y, w, h)
+//     _ = displays.serve(&further, frame, stride, displays.FRAME_SLICE)
+//
+// It costs what changed: `damage` notes the rows and columns of each
+// further display the changed part falls on, and `serve` brings them up
+// to date from the frame, row by row, for no longer than the time it is
+// given, going on where it stopped at the next call. So a second display
+// takes a bounded slice of each frame's time from the main one however
+// much changed (a whole screen that changes sixty times a second arrives
+// on the further display at a lower rate, in bands), and what is left
+// over is brought when the program has nothing else to do (`waiting`
+// says there is some: the program's loop then comes back without
+// sleeping). With no further display every call returns at once.
+//
+// A pixel of a further display is the mean of the part of the frame it
+// stands for (the frame's pixels under it, each counted by how much of
+// it lies inside): a picture made smaller keeps its thin lines and its
+// text as grey, one made larger is as sharp as its pixels. A plain
+// colour stays exactly itself. Where the display has the frame's size,
+// the rows are copied.
+//
+// `attach` puts a display at an address of the caller's (what `open`
+// does with a mapped node): tests/477_displays_fit_runtime.mlx runs the
+// fitting and the bringing against ordinary memory on the host.
+const std = @import("std")
+
+const brix = std.os.brix
+
+// The most further displays served.
+pub const MAX: usize = 7
+
+// The time `serve` is given, in microseconds: after a frame of the main
+// display (an eighth of a frame at sixty a second), and when the program
+// is at rest (short enough that a key or the pointer is not kept
+// waiting).
+pub const FRAME_SLICE: usize = 2000
+pub const REST_SLICE: usize = 4000
+
+// A frame larger than this many times a display's fitted picture, across
+// or down, is not shown there (the sums of a pixel's part of the frame
+// are kept in twenty bits a channel).
+const SHRINK: usize = 15
+
+// Positions in the frame have eight bits below the point.
+const ONE: usize = 256
+
+// Where the picture lies on a display, in the display's pixels.
+pub const Fit = struct {
+    x: usize
+    y: usize
+    width: usize
+    height: usize
+}
+
+// The largest rectangle inside a display of `width` by `height` pixels
+// (shown on a screen of the shape `shapeWidth`:`shapeHeight`) that has
+// the shape `pictureWidth`:`pictureHeight` on that screen, in the middle
+// of it. A side is never less than a pixel.
+pub fn fit(pictureWidth: usize, pictureHeight: usize, width: usize, height: usize, shapeWidth: usize, shapeHeight: usize) -> Fit {
+    var result = Fit.{ .x = 0, .y = 0, .width = width, .height = height }
+    if pictureWidth == 0 || pictureHeight == 0 || width == 0 || height == 0 { return result }
+    const acrossShape = if shapeWidth == 0 || shapeHeight == 0 { width } else { shapeWidth }
+    const downShape = if shapeWidth == 0 || shapeHeight == 0 { height } else { shapeHeight }
+    // The picture's shape against the screen's: wider, it takes the
+    // whole width and a part of the height; else the reverse.
+    const wide = pictureWidth * downShape
+    const high = pictureHeight * acrossShape
+    if wide >= high {
+        result.height = (height * high + wide / 2) / wide
+        if result.height == 0 { result.height = 1 }
+        if result.height > height { result.height = height }
+        result.y = (height - result.height) / 2
+    } else {
+        result.width = (width * wide + high / 2) / high
+        if result.width == 0 { result.width = 1 }
+        if result.width > width { result.width = width }
+        result.x = (width - result.width) / 2
+    }
+    return result
+}
+
+// A further display.
+pub const Screen = struct {
+    // Its node (0: attached at an address of the caller's), its pixels,
+    // its size in pixels and the bytes from one row to the next; red and
+    // blue change places on their way (a red-first display).
+    handle: brix.Handle
+    address: usize
+    width: usize
+    height: usize
+    pitch: usize
+    swap: bool
+    // Where the picture lies on it.
+    fit: Fit
+    // Where in the frame each column of the fitted picture begins (and,
+    // one more, where the last ends), and each row: positions with eight
+    // bits below the point. And for each column 2^32 over the length of
+    // its stretch (rounded up).
+    xEdge: [*]u32
+    yEdge: [*]u32
+    xInverse: [*]u64
+    // What of the fitted picture waits to be brought: for each of its
+    // rows the columns from `left` up to `right` (none: left >= right),
+    // how many rows have some, and the row the next slice begins at.
+    left: [*]u32
+    right: [*]u32
+    rows: usize
+    cursor: usize
+    // The sums of a row being made: three to a column (blue, green, red).
+    sums: [*]u64
+    // Everything above in one piece (given back at close).
+    memory: [*]u8
+    memorySize: usize
+}
+
+pub const Further = struct {
+    count: usize
+    screens: [MAX]Screen
+    // The frame's size in pixels and the shape it was drawn in, as a
+    // width and a height (its size, where its pixels are square).
+    width: usize
+    height: usize
+    shapeWidth: usize
+    shapeHeight: usize
+    // What it cost, for whoever measures: the microseconds spent
+    // bringing (in calls that were given a time), the calls, the longest
+    // one, and the pixels of the further displays written.
+    spent: usize
+    slices: usize
+    longest: usize
+    pixels: usize
+}
+
+// No further displays yet, for a frame of `width` by `height` pixels
+// drawn in the shape `shapeWidth`:`shapeHeight` (0: the frame's own, its
+// pixels square: what a program draws that knows of no screen's shape;
+// one that draws a frame to be stretched across a screen of another
+// shape says that shape).
+pub fn begin(self: *Further, width: usize, height: usize, shapeWidth: usize, shapeHeight: usize) -> void {
+    self.*.count = 0
+    self.*.width = width
+    self.*.height = height
+    self.*.shapeWidth = if shapeWidth == 0 || shapeHeight == 0 { width } else { shapeWidth }
+    self.*.shapeHeight = if shapeWidth == 0 || shapeHeight == 0 { height } else { shapeHeight }
+    self.*.spent = 0
+    self.*.slices = 0
+    self.*.longest = 0
+    self.*.pixels = 0
+}
+
+fn word(bytes: [*]const u8, at: usize) -> usize {
+    var value: usize = 0
+    var k: usize = 8
+    while k > 0 {
+        k -= 1
+        value = (value << 8) | @intCast(usize, bytes[at + k])
+    }
+    return value
+}
+
+// Every further display the system has (/devices/framebuffer1 and on),
+// opened, mapped and attached; how many. Their pictures are whatever was
+// on them (the kernel's console, the program before's last frame) until
+// `serve` has brought the frame; the bars beside the picture are black
+// from here on. Mapping a display takes it from the kernel's console.
+pub fn open(self: *Further) -> usize {
+    var number: usize = 1
+    while number <= MAX {
+        var path: [32]u8 = undefined
+        const stem = "/devices/framebuffer"
+        var length: usize = 0
+        while length < stem.length {
+            path[length] = stem[length]
+            length += 1
+        }
+        path[length] = @intCast(u8, 48 + number)
+        length += 1
+        const opened = brix.open(0, path[0..length], brix.Open.READ | brix.Open.WRITE, 0)
+        // (They are numbered without gaps: the first that is not there
+        // ends the list.)
+        if opened < 0 { break }
+        const handle = @intCast(u32, opened)
+        var record: [48]u8 = undefined
+        const got = brix.read(handle, record[0..48], 0)
+        const words: [*]const u8 = &record
+        var taken = false
+        if got >= 32 {
+            const width = word(words, 0)
+            const height = word(words, 8)
+            const pitch = word(words, 16)
+            const swap = word(words, 24) == 2
+            const shapeWidth = if got >= 48 { word(words, 32) } else { 0 }
+            const shapeHeight = if got >= 48 { word(words, 40) } else { 0 }
+            if width != 0 && height != 0 && pitch >= width * 4 && usable(self, width, height, shapeWidth, shapeHeight) {
+                const mapped = brix.mapNode(handle, 0, pitch * height)
+                if mapped >= 0 {
+                    if attach(self, @bitCast(usize, mapped), width, height, pitch, swap, shapeWidth, shapeHeight) {
+                        self.*.screens[self.*.count - 1].handle = handle
+                        taken = true
+                    } else {
+                        _ = brix.unmap(@bitCast(usize, mapped), pitch * height)
+                    }
+                }
+            }
+        }
+        if !taken { _ = brix.close(handle) }
+        number += 1
+    }
+    return self.*.count
+}
+
+// Whether the frame can be shown on a display of this size and shape (it
+// is not too many times larger than its picture there).
+fn usable(self: *const Further, width: usize, height: usize, shapeWidth: usize, shapeHeight: usize) -> bool {
+    const place = fit(self.*.shapeWidth, self.*.shapeHeight, width, height, shapeWidth, shapeHeight)
+    return self.*.width != 0 && self.*.height != 0 && self.*.width <= place.width * SHRINK && self.*.height <= place.height * SHRINK
+}
+
+// A display at `address` (its rows `pitch` bytes apart, `width` by
+// `height` pixels, shown on a screen of the shape `shapeWidth`:
+// `shapeHeight`; 0: its own) as a further display: the bars beside the
+// picture painted black, the whole picture waiting to be brought. False
+// when there are MAX already, the frame is too many times larger than
+// its picture there, or memory is out.
+pub fn attach(self: *Further, address: usize, width: usize, height: usize, pitch: usize, swap: bool, shapeWidth: usize, shapeHeight: usize) -> bool {
+    if self.*.count >= MAX || width == 0 || height == 0 || !usable(self, width, height, shapeWidth, shapeHeight) { return false }
+    const s = &self.*.screens[self.*.count]
+    s.*.handle = 0
+    s.*.address = address
+    s.*.width = width
+    s.*.height = height
+    s.*.pitch = pitch
+    s.*.swap = swap
+    s.*.fit = fit(self.*.shapeWidth, self.*.shapeHeight, width, height, shapeWidth, shapeHeight)
+    const across = s.*.fit.width
+    const down = s.*.fit.height
+    // The tables, in one piece: the columns' and the rows' edges, the
+    // columns' inverses, the rows' waiting columns, a row's sums.
+    const edges = (across + 1 + down + 1 + down + down) * 4
+    const size = ((edges + 7) & ~@intCast(usize, 7)) + across * 8 + across * 24
+    const memory = std.heap.allocator().alloc(size, 16)
+    if memory == null { return false }
+    s.*.memory = unsafe { @ptrCast([*]u8, memory.?) }
+    s.*.memorySize = size
+    const base = @intFromPtr(s.*.memory)
+    unsafe {
+        s.*.xEdge = @ptrFromInt([*]u32, base)
+        s.*.yEdge = @ptrFromInt([*]u32, base + (across + 1) * 4)
+        s.*.left = @ptrFromInt([*]u32, base + (across + 1 + down + 1) * 4)
+        s.*.right = @ptrFromInt([*]u32, base + (across + 1 + down + 1 + down) * 4)
+        s.*.xInverse = @ptrFromInt([*]u64, base + ((edges + 7) & ~@intCast(usize, 7)))
+        s.*.sums = @ptrFromInt([*]u64, base + ((edges + 7) & ~@intCast(usize, 7)) + across * 8)
+    }
+    var k: usize = 0
+    while k <= across {
+        s.*.xEdge[k] = @intCast(u32, k * self.*.width * ONE / across)
+        k += 1
+    }
+    k = 0
+    while k <= down {
+        s.*.yEdge[k] = @intCast(u32, k * self.*.height * ONE / down)
+        k += 1
+    }
+    k = 0
+    while k < across {
+        const stretch = @intCast(usize, s.*.xEdge[k + 1] - s.*.xEdge[k])
+        s.*.xInverse[k] = ((1 << 32) + stretch - 1) / stretch
+        k += 1
+    }
+    k = 0
+    while k < down {
+        s.*.left[k] = 0
+        s.*.right[k] = 0
+        k += 1
+    }
+    s.*.rows = 0
+    s.*.cursor = 0
+    self.*.count += 1
+    bars(s)
+    mark(s, 0, 0, across, down)
+    return true
+}
+
+// The display's pixels outside the picture, black.
+fn bars(s: *const Screen) -> void {
+    var y: usize = 0
+    while y < s.*.height {
+        const row = s.*.address + y * s.*.pitch
+        if y < s.*.fit.y || y >= s.*.fit.y + s.*.fit.height {
+            std.mem.set(unsafe { @ptrFromInt([*]u8, row) }, 0, s.*.width * 4)
+        } else {
+            if s.*.fit.x != 0 { std.mem.set(unsafe { @ptrFromInt([*]u8, row) }, 0, s.*.fit.x * 4) }
+            const after = s.*.fit.x + s.*.fit.width
+            if after < s.*.width { std.mem.set(unsafe { @ptrFromInt([*]u8, row + after * 4) }, 0, (s.*.width - after) * 4) }
+        }
+        y += 1
+    }
+}
+
+// The columns `from` up to `to` of the fitted picture's rows `top` up to
+// `bottom` wait to be brought.
+fn mark(s: *Screen, from: usize, top: usize, to: usize, bottom: usize) -> void {
+    if from >= to { return }
+    var row = top
+    while row < bottom {
+        if s.*.left[row] >= s.*.right[row] {
+            s.*.left[row] = @intCast(u32, from)
+            s.*.right[row] = @intCast(u32, to)
+            s.*.rows += 1
+        } else {
+            if @intCast(usize, s.*.left[row]) > from { s.*.left[row] = @intCast(u32, from) }
+            if @intCast(usize, s.*.right[row]) < to { s.*.right[row] = @intCast(u32, to) }
+        }
+        row += 1
+    }
+}
+
+// The first of `count` stretches (their edges in `edges`, one more than
+// there are) that reaches beyond the frame's position `at` (eight bits
+// below the point): the first one a change from there on touches.
+fn firstAt(edges: [*]const u32, count: usize, at: usize, whole: usize) -> usize {
+    var k = at * count / (whole * ONE)
+    if k >= count { k = count - 1 }
+    while k > 0 && @intCast(usize, edges[k]) > at { k -= 1 }
+    while k + 1 < count && @intCast(usize, edges[k + 1]) <= at { k += 1 }
+    return k
+}
+
+// The first of the stretches that begins at the position `at` or beyond
+// (`count` when none does): where a change that ends there stops.
+fn endAt(edges: [*]const u32, count: usize, at: usize, whole: usize) -> usize {
+    var k = (at * count + whole * ONE - 1) / (whole * ONE)
+    if k > count { k = count }
+    while k < count && @intCast(usize, edges[k]) < at { k += 1 }
+    while k > 0 && @intCast(usize, edges[k - 1]) >= at { k -= 1 }
+    return k
+}
+
+// The frame's pixels from (x, y), `width` across and `height` down,
+// changed: the pixels of every further display they are a part of wait to
+// be brought. What reaches beyond the frame is cut off.
+pub fn damage(self: *Further, x: usize, y: usize, width: usize, height: usize) -> void {
+    if self.*.count == 0 || width == 0 || height == 0 || x >= self.*.width || y >= self.*.height { return }
+    const right = if x + width > self.*.width { self.*.width } else { x + width }
+    const bottom = if y + height > self.*.height { self.*.height } else { y + height }
+    var k: usize = 0
+    while k < self.*.count {
+        const s = &self.*.screens[k]
+        const from = firstAt(s.*.xEdge, s.*.fit.width, x * ONE, self.*.width)
+        const to = endAt(s.*.xEdge, s.*.fit.width, right * ONE, self.*.width)
+        const top = firstAt(s.*.yEdge, s.*.fit.height, y * ONE, self.*.height)
+        const end = endAt(s.*.yEdge, s.*.fit.height, bottom * ONE, self.*.height)
+        mark(s, from, top, to, end)
+        k += 1
+    }
+}
+
+// The whole frame changed.
+pub fn damageAll(self: *Further) -> void { damage(self, 0, 0, self.*.width, self.*.height) }
+
+// Whether something waits to be brought to a further display.
+pub fn waiting(self: *const Further) -> bool {
+    var k: usize = 0
+    while k < self.*.count {
+        if self.*.screens[k].rows != 0 { return true }
+        k += 1
+    }
+    return false
+}
+
+// The lanes of a pixel's three channels in a word, twenty bits each:
+// blue from bit 0, green from bit 20, red from bit 40.
+const LANE: u64 = 0xFFFFF
+
+// The columns `from` up to `to` of the fitted picture's row `row`, made
+// from the frame at `source` (its rows `stride` bytes apart) and written
+// to the display.
+fn bring(self: *const Further, s: *const Screen, source: usize, stride: usize, row: usize, from: usize, to: usize) -> void {
+    const target: [*]u32 = unsafe { @ptrFromInt([*]u32, s.*.address + (s.*.fit.y + row) * s.*.pitch + s.*.fit.x * 4) }
+    const top = @intCast(usize, s.*.yEdge[row])
+    const bottom = @intCast(usize, s.*.yEdge[row + 1])
+    // The frame's own size: its row as it is.
+    if s.*.fit.width == self.*.width && s.*.fit.height == self.*.height {
+        const origin: [*]const u32 = unsafe { @ptrFromInt([*]const u32, source + row * stride) }
+        if s.*.swap {
+            var c = from
+            while c < to {
+                const pixel = origin[c]
+                target[c] = (pixel & 0xFF00FF00) | ((pixel & 255) << 16) | ((pixel >> 16) & 255)
+                c += 1
+            }
+        } else {
+            unsafe { std.mem.copy(@ptrFromInt([*]u8, @intFromPtr(target) + from * 4), @ptrFromInt([*]const u8, @intFromPtr(origin) + from * 4), (to - from) * 4) }
+        }
+        return
+    }
+    // The sums over the frame's rows the display's row stands for, each
+    // counted by the part of it inside (`part`, of ONE). (The loops call
+    // nothing and keep the tables at hand: every pixel of a further
+    // display goes through them.)
+    const sums = s.*.sums
+    const edges = s.*.xEdge
+    var c = from
+    var k = from * 3
+    while c < to {
+        sums[k] = 0
+        sums[k + 1] = 0
+        sums[k + 2] = 0
+        k += 3
+        c += 1
+    }
+    var line = top / ONE
+    const lastLine = (bottom - 1) / ONE
+    while line <= lastLine {
+        const lineTop = if line * ONE > top { line * ONE } else { top }
+        const lineBottom = if (line + 1) * ONE < bottom { (line + 1) * ONE } else { bottom }
+        const part: u64 = lineBottom - lineTop
+        const origin: [*]const u32 = unsafe { @ptrFromInt([*]const u32, source + line * stride) }
+        c = from
+        k = from * 3
+        var begin = @intCast(usize, edges[from])
+        while c < to {
+            // The stretch of the frame's row this column stands for: its
+            // first pixel by the part inside, whole pixels, the last by
+            // its part (one pixel alone by the stretch's length). A
+            // pixel's channels go into their lanes (spread, written out).
+            const end = @intCast(usize, edges[c + 1])
+            var at = begin >> 8
+            const last = (end - 1) >> 8
+            var p = @intCast(u64, origin[at])
+            var sum: u64 = (p & 0xFF) | ((p & 0xFF00) << 12) | ((p & 0xFF0000) << 24)
+            if at == last {
+                sum = sum * @intCast(u64, end - begin)
+            } else {
+                sum = sum * @intCast(u64, ONE - (begin & (ONE - 1)))
+                at += 1
+                var whole: u64 = 0
+                while at < last {
+                    p = @intCast(u64, origin[at])
+                    whole += (p & 0xFF) | ((p & 0xFF00) << 12) | ((p & 0xFF0000) << 24)
+                    at += 1
+                }
+                p = @intCast(u64, origin[last])
+                sum += (whole << 8) + ((p & 0xFF) | ((p & 0xFF00) << 12) | ((p & 0xFF0000) << 24)) * @intCast(u64, end - (last << 8))
+            }
+            sums[k] += (sum & LANE) * part
+            sums[k + 1] += ((sum >> 20) & LANE) * part
+            sums[k + 2] += ((sum >> 40) & LANE) * part
+            k += 3
+            c += 1
+            begin = end
+        }
+        line += 1
+    }
+    // Each sum over the stretch's length and the rows' (their inverses,
+    // 32 bits down each, the second with a half added: the nearest whole
+    // number, and a plain colour comes out as it went in).
+    const depth: u64 = bottom - top
+    const inverse: u64 = ((1 << 32) + depth - 1) / depth
+    const half: u64 = depth / 2
+    const inverses = s.*.xInverse
+    const swap = s.*.swap
+    c = from
+    k = from * 3
+    while c < to {
+        const across = inverses[c]
+        const blue = ((((sums[k] * across) >> 32) + half) * inverse) >> 32
+        const green = ((((sums[k + 1] * across) >> 32) + half) * inverse) >> 32
+        const red = ((((sums[k + 2] * across) >> 32) + half) * inverse) >> 32
+        target[c] = @intCast(u32, if swap { 0xFF000000 | (blue << 16) | (green << 8) | red } else { 0xFF000000 | (red << 16) | (green << 8) | blue })
+        k += 3
+        c += 1
+    }
+}
+
+// How many of the frame's pixels are read for a display between two
+// looks at the clock (a pixel of a display that shows the frame smaller
+// stands for several).
+const LOOK: usize = 32768
+
+// Brings rows that wait to the display `s`, from the row it stopped at
+// on, until about `most` of the frame's pixels were read for them (0:
+// until none waits; a row at least).
+fn some(self: *Further, s: *Screen, source: usize, stride: usize, most: usize) -> void {
+    // (What a pixel written costs: the frame's pixels under it.)
+    const under = (self.*.width / s.*.fit.width + 1) * (self.*.height / s.*.fit.height + 1)
+    var read: usize = 0
+    while s.*.rows != 0 {
+        if s.*.cursor >= s.*.fit.height { s.*.cursor = 0 }
+        const row = s.*.cursor
+        s.*.cursor += 1
+        const from = @intCast(usize, s.*.left[row])
+        const to = @intCast(usize, s.*.right[row])
+        if from < to {
+            bring(self, s, source, stride, row, from, to)
+            s.*.left[row] = 0
+            s.*.right[row] = 0
+            s.*.rows -= 1
+            self.*.pixels += to - from
+            read += (to - from) * under
+            if most != 0 && read >= most { return }
+        }
+    }
+}
+
+// Brings some of what waits to every further display from the frame at
+// `source` (its rows `stride` bytes apart; the picture it holds now):
+// rows of each until about `most` of the frame's pixels were read for
+// that display (0: everything). Whether something still waits.
+pub fn bringSome(self: *Further, source: usize, stride: usize, most: usize) -> bool {
+    var still = false
+    var k: usize = 0
+    while k < self.*.count {
+        const s = &self.*.screens[k]
+        if s.*.rows != 0 {
+            some(self, s, source, stride, most)
+            if s.*.rows != 0 { still = true }
+        }
+        k += 1
+    }
+    return still
+}
+
+// Brings what waits to the further displays from the frame at `source`
+// (its rows `stride` bytes apart; the picture it holds now), for about
+// `micros` microseconds at most, the displays in turn (0: until nothing
+// waits, with no look at the clock). Where it stops it goes on at the
+// next call. Whether something still waits.
+pub fn serve(self: *Further, source: usize, stride: usize, micros: usize) -> bool {
+    if !waiting(self) { return false }
+    if micros == 0 { return bringSome(self, source, stride, 0) }
+    const begun = brix.clock(brix.Clock.MONOTONIC) / 1000
+    var took: usize = 0
+    var still = true
+    while still && took < micros {
+        still = bringSome(self, source, stride, LOOK)
+        took = brix.clock(brix.Clock.MONOTONIC) / 1000 - begun
+    }
+    self.*.spent += took
+    self.*.slices += 1
+    if took > self.*.longest { self.*.longest = took }
+    return still
+}
+
+// The further displays let go: unmapped and closed (their pictures stay
+// on them), the tables given back.
+pub fn close(self: *Further) -> void {
+    var k: usize = 0
+    while k < self.*.count {
+        const s = &self.*.screens[k]
+        if s.*.handle != 0 {
+            _ = brix.unmap(s.*.address, s.*.pitch * s.*.height)
+            _ = brix.close(s.*.handle)
+        }
+        std.heap.allocator().free(s.*.memory, s.*.memorySize, 16)
+        k += 1
+    }
+    self.*.count = 0
+}

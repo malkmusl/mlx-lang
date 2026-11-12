@@ -199,6 +199,14 @@ is a layer over it; see `docs/reference/truetype.md`.
 rectangles, insets, alignment, containers, stacks and reserved bars; see
 `docs/reference/ui.md`.
 
+`displays.mlx` (`std.displays`) is for a brixOS program that draws on the
+screen itself (the boot screen, the compositor, the virtual console): the
+machine's further displays (`/devices/framebuffer1` and on, a second
+graphics adapter's monitor) show the main display's picture too, fitted
+to their size. The program names what of its frame changed; the module
+brings that, a pixel the mean of its part of the frame, for a bounded
+part of a frame's time (tests/477_displays_fit_runtime.mlx).
+
 `crash.mlx` (`std.crash`) reports a program's crash (signal, function,
 callers from the compiler's symbol table) and keeps it in
 `$XDG_STATE_HOME/mlx/crashes.log`; `wayland/crash.mlx`

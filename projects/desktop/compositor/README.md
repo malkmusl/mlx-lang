@@ -622,7 +622,11 @@ desktop") the compositor is the same program on the system's own
 interface, with [`drm.brixos.mlx`](drm.brixos.mlx) as its backend in
 place of DRM/KMS: the framebuffer (/devices/framebuffer, mapped) is the
 one output, composed on the CPU (`--renderer cpu`, `--backend drm` are
-the defaults there) and copied in with the damage; the keyboard
+the defaults there) and copied in with the damage (a machine's further
+displays, /devices/framebuffer1 and on, show the same picture fitted to
+their size: each frame's damage is named to std.displays, which brings
+it for 2 ms of a frame's time at most and the rest while the desktop is
+at rest; tools/check_brix_displays.sh); the keyboard
 (/devices/keyboard) gives PS/2 scancodes, mapped to evdev codes, the
 modifiers followed from the keys (no keymap is sent to clients: they type
 by their own US fallback); the mouse (/devices/mouse) gives PS/2 packets,

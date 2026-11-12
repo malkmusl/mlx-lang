@@ -394,6 +394,86 @@ its own. Nothing in the image says the screen's shape by hand yet:
 settings/display names a mode, and the monitor's word goes before it;
 ignition takes --screen WIDTH:HEIGHT, which the init does not pass.
 
+A machine may have more than one graphics adapter (a board's own and a
+card in a slot), and a monitor on each. All of them are the system's:
+
+- The loader goes through every graphics output the firmware offers
+  (image/efi.mlx, CODE_MORE). The first is handed over as ever (the boot
+  info's FB_* fields); every further one that has a picture of its own in
+  memory the kernel can write gets a record in a page of the image
+  (layout.Blob.DISPLAYS, layout.More; seven at most) with its
+  framebuffer, size, pixel order and its monitor's EDID where the
+  firmware has one, and the mode set that the first one's part would
+  set (the one the image names, else that monitor's own, the nearest the
+  firmware has). An output that shows another one's memory again (the
+  console's own in front of a card's) is that display, not a new one; one
+  without pixels (the console's own output over two cards, a virtual
+  adapter that only takes blocks) is passed over and counted, also
+  when it is the one the firmware lists first (the displays are then
+  the outputs behind it). A loader
+  before this one leaves the count of records zero, and a kernel before
+  this one does not look at them: either pair comes up with the first
+  display, as before. A Multiboot loader hands over none (the kernel sets
+  the Bochs adapter up itself): one display.
+- The kernel lists them (kernel/displays.mlx reads the boot information,
+  kernel/display.mlx keeps them), a line each: its number, its size, where
+  its memory is, which PCI adapter's memory that is, its node:
+
+      brixOS: the firmware offers 3 graphics outputs: 2 displays, 1 without pixels the kernel can use (passed over)
+      brixOS: display 0: 1024x768 at 0xc0000000, PCI 04:00.0 1a03:2000, /devices/framebuffer1
+      brixOS: display 1: 1280x960 at 0xe0000000, PCI 21:00.0 1002:67df, its monitor says 3840x1080, /devices/framebuffer, the main display (its monitor names the largest mode of its own)
+
+  (They are numbered in the firmware's order; "its monitor says" is
+  there when the firmware passed the monitor's EDID on. A further
+  display's lines on the mode the loader set follow its line, as
+  "brixOS: display 0: the loader set this mode, ...".) Its own console (the boot log, a stop's report) is on every one of them
+  (fbcon.mlx: a grid for each one's size), until a program maps that
+  display's node.
+- One display is the main one, /devices/framebuffer: the one whose
+  monitor names the largest mode of its own (its EDID, as the firmware
+  passed it on: a monitor that says what it is is plugged in; a board's
+  remote console says nothing), else the one with the largest picture, of
+  several alike the firmware's first. An image may name it: a line
+  "main N" in settings/display (N the display's number as the log says
+  it), or "main VVVV:DDDD" (its adapter's PCI vendor and device, which
+  holds whatever order the firmware lists them in), beside the mode's
+  line or alone ("monitor" is the mode's default, said). The log says
+  which and why, and says when the line names none that is there.
+- The others are /devices/framebuffer1, /devices/framebuffer2 and on:
+  the same ten words to read (width, height, pitch, format, the screen's
+  shape, then the display's number, how many there are, the adapter's
+  vendor and device) and the same pixels to map.
+- What draws on the screen draws on all of them: ignition, kepler and
+  mlx-console show the main display's picture on each further one too,
+  fitted to its size without distortion: as large as it goes in the
+  shape it was drawn in (a pixel of the frame is square there, also on a
+  further display whose monitor stretches its mode: that display's own
+  shape is counted in), with black bars where the shapes differ
+  (std.displays). A main monitor that stretches a mode of another shape
+  (1280x960 across a 32:9 screen) shows the desktop wider than it was
+  drawn; the further display shows it as drawn. They name what of
+  their frame changed, after the main display has it; a pixel of a
+  further display is the mean of its part of the frame; and what waits
+  is brought for 2 ms of a frame's time at most, the rest when the
+  program is at rest: a second display costs the main one that much of
+  a frame while the whole screen changes, and nothing while nothing
+  does. An extended desktop (each display its own part) is not there
+  yet.
+- The Radeon's driver works on the display in its own card's memory
+  (gpu.mlx `ownDisplay`), which need not be the main one, and takes that
+  display's monitor's EDID.
+
+tools/check_brix_displays.sh starts the EFI image under OVMF in QEMU
+with two adapters of different sizes (a Cirrus VGA, 800x600, and a
+second standard VGA, 1280x800) and dumps both screens: the log's lines,
+the boot log, the boot screen and the desktop on both, a window opened
+arriving on both, the main display named, the virtual console made
+larger on the other, and one adapter beside one without a framebuffer,
+either way round.
+tests/476_boot_displays_runtime.mlx reads boot informations with none,
+one, two, eight and too many displays and tries the rule;
+tests/477_displays_fit_runtime.mlx the fitting and the bringing.
+
 The machine is started by UEFI (EFI/BOOT/BOOTX64.EFI, image/efi.mlx) and
 often has no serial line, so the kernel's messages are also drawn on the
 firmware's framebuffer (fbcon.mlx: an 8x16 font, a grid of characters so

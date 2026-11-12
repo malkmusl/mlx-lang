@@ -1507,6 +1507,48 @@ fn onUser(record: events.Record) -> void { ... }
 _ = events.handle(events.Event.USER, onUser)
 ```
 
+## Further displays on brixOS (`std.displays`)
+
+**Implementation:** `std/src/displays.mlx`
+**Source tests:** `477_displays_fit_runtime.mlx` (run by
+`tests/run_std_modules.sh`); `tools/check_brix_displays.sh` (two display
+adapters in QEMU)
+
+A brixOS machine may have several displays (spec/04-stdlib/os/brix.xml:
+/devices/framebuffer is the main one, /devices/framebuffer1 and on the
+others). A program that draws on the screen itself (the boot screen, the
+compositor, the virtual console) shows its picture on the others too:
+
+- `begin(&further, width, height, shapeWidth, shapeHeight)` says the
+  frame's size and the shape it was drawn for (0, 0: its own size, the
+  pixels square, as the boot screen's, the compositor's and the virtual
+  console's frames are; a program that draws a frame to be stretched
+  says the shape it is meant to be seen in); `open(&further)`
+  opens and maps every further display and says how many (none on most
+  machines: every later call then returns at once).
+- `fit(pictureWidth, pictureHeight, width, height, shapeWidth,
+  shapeHeight)` is where a picture lies on a display: as large as it goes
+  in its shape, in the middle, black bars beside it.
+- `damage(&further, x, y, width, height)` names a part of the frame that
+  changed (`damageAll`: all of it); `serve(&further, frame, stride,
+  micros)` brings what waits from the frame's memory, a pixel the mean of
+  the part of the frame it stands for, for about `micros` microseconds at
+  most (`FRAME_SLICE` after a frame, `REST_SLICE` while the program is at
+  rest; 0: everything), and says whether something still waits
+  (`waiting`): the program's loop then comes back without sleeping.
+- `close(&further)` lets the displays go; their pictures stay.
+
+```mlx
+const displays = @import("std.displays")
+
+var further: displays.Further = undefined
+displays.begin(&further, width, height, shapeWidth, shapeHeight)
+_ = displays.open(&further)
+// each frame, after the main display has it:
+displays.damage(&further, x, y, w, h)
+_ = displays.serve(&further, @intFromPtr(frame), width * 4, displays.FRAME_SLICE)
+```
+
 ## Git repositories (`std.git`)
 
 **Implementation:** `std/src/git.mlx`, `std/src/git/pack.mlx`
