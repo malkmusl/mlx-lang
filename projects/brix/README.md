@@ -624,22 +624,51 @@ registers), and only when the link the firmware trained has room for the
 new clock (lanes times rate times 8/10 over the bits a pixel; the rate
 is not in a register of its own and is worked out from the stream's M
 and N and the pixel clock). A link
-that is too slow would have to be trained again, and an HDMI or DVI
-output's clock is a PLL's; Linux sets both by the card's firmware
-tables, which are not run here: not there yet.
+that is too slow would have to be trained again, which is the card's
+firmware tables' work and not there yet.
+On an HDMI or DVI output (TMDS) the pixel clock is a PLL's and is the
+link's clock too: the output is taken down, the PLL set, the timing set
+and the output brought up again, and the PLL, the transmitter, the
+timing and the controller's stop and start are the work of small
+programs in the card's own video BIOS ROM (below), which Linux runs for
+them and so does the kernel. Such a plan is made at every boot, table
+runs among its writes, and is complete only when everything is as the
+sequence needs it: the ROM read and its tables there in the revisions
+their parameters are known for, the ROM naming the connector behind the
+encoder, the controller's clock being that encoder's PLL's, a timing the
+link carries. The monitor's own timing is taken when a TMDS link carries
+it without scrambling (HDMI below 340 MHz, below 300 MHz unless the ROM
+says the output may send more, and no more than the monitor's EDID names
+as its highest clock; DVI signalling to 165 MHz); when not, another of
+the EDID's timings of the same size that it does carry (the lowest rate
+of 50 Hz or more, else the highest), and the log says which and why.
+The signalling: DVI for a clock a DVI link carries when the firmware's
+picture is sent that way (the monitor has shown it takes that), HDMI
+above it when the monitor's EDID has the HDMI block (as Linux chooses);
+RGB at eight bits, no pixel sent twice.
 
     gpu: plan (a): the controller runs this timing already; a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 38 writes would do it
     gpu: plan (b, DisplayPort): the link has 4 lanes at 2.70 Gbit/s (by M 0x3333 over N 0x8000), room for 360000 kHz at 24 bits: 266640 kHz fits
     gpu: plan (b, DisplayPort): the pixel clock from 108000 to 266640 kHz (the DTO's phase from 108000000 to 266640000), the timing, the stream stopped and started, a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 63 writes would do it
-    gpu: plan (b): nothing would be set: HDMI: the TMDS clock's PLL must be set, not there yet
+    gpu: the monitor says it is an HDMI one, up to 300 MHz
+    gpu: plan (b, TMDS): HDMI signalling at 266640 kHz (now DVI at 107960 kHz), the clock's PLL, the timing and the transmitter by the card's own tables, a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 7 table runs and 86 writes would do it
+    gpu: plan (b, TMDS): nothing would be set: table SetPixelClock is revision 1.6 in this ROM: what it is told is known here for content revision 7 only
 
 The plan's steps, a line each ("gpu: would write 1b9d = 00000100 (the
-controller's picture blanked)"), and the registers themselves ("gpu: raw
-1b80: 00000f9f ...": a register's number, then its value and those of
-the registers after it) are in the log only (/devices/klog, boot.log); a
-shell shows them by themselves with
+controller's picture blanked)", "gpu: would set 4e47 & 00070000 =
+00030000 (the back end's mode)" for a field set in the word as it then
+stands, "gpu: would run SetPixelClock with a0 af 28 00 18 21 03 00 ...
+(the pixel clock's PLL set)" for a table with the bytes it is told),
+what a TMDS plan found on the way ("gpu: DIG 4 is UNIPHY E; the ROM puts
+a connector of the kind "HDMI" behind it, hot plug line 2 ...", the
+clock and timing the way back would ask for, the firmware's scratch
+words, what the output carries, the display clock), the table runs of
+the way back ("gpu: on the way back would run ...") and the registers
+themselves ("gpu: raw 1b80: 00000f9f ...": a register's number, then its
+value and those of the registers after it) are in the log only
+(/devices/klog, boot.log); a shell shows them by themselves with
 
-    while read l; do case "$l" in "gpu: raw"*|"gpu: would w"*) echo "$l";; esac; done < /devices/klog
+    while read l; do case "$l" in "gpu: raw"*|"gpu: would "*|"gpu: on the way back"*) echo "$l";; esac; done < /devices/klog
 
 The steps' order and locks are those of Linux's display core
 (gpu_mode.mlx names the function each one follows, and says where Linux
@@ -647,14 +676,17 @@ hands a step to the firmware's tables and the registers are written
 directly instead). (The read-out's own "next stage" and "would set"
 lines are the stage's before; the plan says more.)
 
-None of this writes to the card. A plan is carried out only by an image
-whose archive has a file settings/gpu with the word `native`:
+None of this writes to the card, and none of it runs a table of the
+card's. A plan is carried out only by an image whose archive has a file
+settings/gpu with the word `native`; the word `rehearsal` there asks for
+less (below).
 
     tools/brix-native-efi.sh
 
-makes it from the build's image: mlx-out/bin/brix/esp/EFI/BOOT/
-BOOTX64-native.EFI is BOOTX64.EFI with that one file more (`brix-image
---add`), and BOOTX64-diag-native.EFI the diagnostic image likewise when
+makes both from the build's image: mlx-out/bin/brix/esp/EFI/BOOT/
+BOOTX64-native.EFI and BOOTX64-rehearsal.EFI are BOOTX64.EFI with that
+one file more (`brix-image --add`), and BOOTX64-diag-native.EFI and
+BOOTX64-diag-rehearsal.EFI the diagnostic image likewise when
 tools/brix-diag-efi.sh has made one. With the file, and a plan that is
 complete, the kernel carries the plan out before any program runs
 (gpu_set.mlx): the new picture's memory is cleared, each write is read
@@ -667,32 +699,116 @@ kernel's display is the new picture from there on: the console is drawn
 again on it, and /devices/framebuffer gives the programs the monitor's
 own size.
 
-On the machine: start the build's image (or the diagnostic one, where
-the log stays on the screen) and photograph the "gpu:" lines: the
-monitor's timing, the controller's lines and the plan say which
-situation it is and whether the plan is complete. If it is ("... writes
-would do it"), copy BOOTX64-native.EFI to the ESP beside BOOTX64.EFI and
-start it from the firmware's boot menu. The desktop at the monitor's own
-size is the success; the log says "gpu: controller 0 shows a picture of
-3840x1080 as it is, ... the monitor's own mode is set". If the screen
-stays dark, or is as before, start the normal image again and read what
-the driver did: klogsave kept that boot's log as boot.previous.log on
-the brixfs volumes (`cat /volumes/NAME/boot.previous.log`; the boot
-after that one overwrites it, klogsave run again by hand does not).
+A TMDS output's plan is carried out with more care still, since the
+card's own tables do part of it and nobody has seen them run here on a
+card: a table that does not run to its end, or runs to it and wrote
+nothing, ends the change; so does a transmitter or a controller that
+does not follow its table, a controller that is not on the encoder's
+PLL after the pixel clock's table, timing words that are not what the
+timing's table was told, and frames that do not count at the planned
+rate while the transmitter is still off (a PLL cannot be read: there its
+clock is measured, before the monitor is sent anything). The way back is
+the same sequence towards the firmware's state: the tables are told the
+firmware's timing, signalling and clock (the clock as it was measured,
+in whole 10 kHz), and every register the kernel wrote itself gets the
+firmware's value again. What cannot be read back is said as such: the
+PLL's and the transmitter's own settings are then what the tables made
+for that clock. The screen is dark while the output is down (a tenth of
+a second at least, so that the monitor sees the signal gone); what each
+table did, each state waited for and how long it took is in the log
+alone. How long it can be dark at most is bounded whatever the card
+does, and said before the first write: a state is waited for a tenth of
+a second at most and a table is given two seconds and no more, which
+for seven tables comes to "the screen is dark meanwhile, 18 s at most
+(and 18 s more at most if the firmware's state has to be put back)".
+After that the kernel goes on starting in any case.
+
+On the machine, in three steps, each only after the one before held.
+
+1. The build's own image (or the diagnostic one, where the log stays on
+   the screen). Nothing is written. The "gpu:" lines say whether there
+   is a plan: on the screen the monitor's timing, the controller's
+   lines, the video BIOS's line and "gpu: plan (b, TMDS): ... 7 table
+   runs and 86 writes would do it", or "nothing would be set: ..." with
+   the reason. If there is none, or before going on in any case, send
+   the log and the card's ROM (logserve's /all and /gpu.rom, or boot.log
+   and gpu.rom from a brixfs volume): with the ROM every table the plan
+   runs can be run on the host first, against Linux's own interpreter
+   (tools/check_atom_reference.sh), where a table this interpreter
+   cannot run costs nothing.
+2. BOOTX64-rehearsal.EFI: the firmware's own mode set again by the same
+   steps (the plan line then begins "gpu: plan (the firmware's own mode
+   set again): ..."). The screen goes dark for a moment and comes back
+   as it was. Nothing new is asked of the monitor; it shows that the
+   card's tables run here, that the output goes off and comes back and
+   that the checks hold on this card. The line that says so: "gpu:
+   controller 0 runs the firmware's own mode again, set by the card's
+   tables, ... the picture is where it was". (It does not show that the
+   PLL takes another clock: the one asked for is the one that runs.)
+3. BOOTX64-native.EFI: the monitor's own mode. The desktop at the
+   monitor's own size is the success; the log says "gpu: controller 0
+   shows a picture of 3840x1080 as it is, ... the monitor's own mode is
+   set (7 table runs, 86 writes, each read back)".
+
+If it fails and the picture comes back, the screen says why ("gpu: step
+24 of 108 failed (...): run SetPixelClock with ...") and what came back
+("gpu: the firmware's state is back (...)"). If the screen stays dark:
+wait until the disk is quiet (the system goes on starting behind the
+dark screen, and klogsave writes that boot's log), then restart into the
+normal image, which never writes to the display: klogsave has kept the
+dark boot's log as boot.previous.log on the brixfs volumes (`cat
+/volumes/NAME/boot.previous.log`, or logserve's /boot.previous.log; the
+boot after that one overwrites it, klogsave run again by hand does not).
+That file is what to send back, whole: its "gpu:" lines say each table's
+run and where one stopped ("gpu: table SetPixelClock (...) was stopped
+after too long at 0x... of the ROM (opcode ...)"), each state waited
+for, the frames counted with the output off and the timing's words as
+the table left them, and at the end one of four things: the firmware's
+state is back (said only when everything the way back looked for was
+there and the controller counts frames as before); it is NOT known to be
+back (every register the kernel wrote has the firmware's value again,
+but something the way back looked for was not there, a transmitter that
+did not come on after its table, say: "gpu: on the way back, not as it
+should be (the way goes on): ..." names each); it is NOT all back, with
+the registers that differ; or "the way back did not come to its end: the
+output is left as that left it until a restart", after a table that
+could not be run on the way back either. A screen that stays dark although the log says the monitor's own
+mode is set means the monitor does not take the signal: nothing comes
+back from a monitor on a TMDS link, so the kernel cannot see that; the
+log with the plan's lines is what to send then too.
+
+Not done yet for a TMDS output: a clock of 340 MHz and more (HDMI
+scrambles there and the monitor has to be told over its DDC lines; there
+is no I2C here), two DVI links, more than eight bits a colour and YCbCr,
+audio, a monitor plugged in later or another one (the plan is for the
+monitor the firmware showed its picture on), and a way to take the new
+mode back when the monitor shows nothing though every register is right
+(someone would have to confirm the picture; the kernel sets the mode
+before there is a keyboard). The tables that Linux runs once at its
+start and this driver leaves to the firmware's own start (the
+transmitter's "init", the power gate) are not run.
 
 tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
 numbers on the host, tests/459_edid_timing_runtime.mlx reads EDIDs
 written from the standard's layout, and
-tests/460_gpu_mode_set_runtime.mlx holds both plans' writes against the
-sequences worked out from Linux's code, on a card that is a table and
-can fail at every step.
+tests/460_gpu_mode_set_runtime.mlx holds both register plans' writes
+against the sequences worked out from Linux's code, on a card that is a
+table and can fail at every step. For a TMDS output
+tests/474_gpu_tmds_sequence_runtime.mlx does the same with a ROM whose
+tables write down what they were told: the whole change, write for write
+and run for run, the way back from a failure at every step, tables that
+write nothing, do not end or cannot be run, the rehearsal; and
+tests/475_gpu_tmds_blocks_runtime.mlx holds what each table is told byte
+for byte against the bytes worked out from Linux's atombios.h and
+command_table.c, the timing and signalling chosen, and every reason for
+no plan.
 
-The plan for HDMI ("plan (b): nothing would be set: HDMI: ...") needs
-the pixel clock's PLL and the transmitter set, and on this controller
-Linux does not write those registers itself: it runs small programs out
-of the card's own video BIOS ROM (AtomBIOS command tables: SetPixelClock,
-the transmitter's and the encoder's control and others). The ground for
-doing the same is there; no table is run on the card yet.
+On this controller Linux does not write the pixel clock's PLL and the
+transmitter itself: it runs small programs out of the card's own video
+BIOS ROM (AtomBIOS command tables: SetPixelClock, the transmitter's and
+the encoder's control and others). So does the kernel, for a TMDS
+output's plan and only when the image asks (gpu_blocks.mlx has what
+each table is told).
 
 The ROM is read at every boot (gpu_rom.mlx), by the first of three ways
 that gives one that holds: the copy the card's UEFI driver leaves in the
@@ -741,6 +857,8 @@ run that fails says the table, the offset and the opcode). The card is
 reached through hands the kernel fills: hands that only read stop a run
 at its first write and say what it would have written, and the hands
 that write do so only in an image that asks for the monitor's own mode.
+(With the setting off no table is run at all, not with hands that only
+read either: gpu_set.mlx's head says why.)
 Since the card cannot be tried in a VM, the interpreter is proven on the
 host: tests/472_atom_interpreter_runtime.mlx runs tables assembled by
 hand, tests/473_gpu_rom_runtime.mlx reads ROMs the test makes (damaged
@@ -756,8 +874,8 @@ parameters afterwards and the end of each run side by side;
 `--mistakes` shows that it notices mistakes put into the interpreter on
 purpose, and `LINUX ROM TABLE:WORD,WORD...` runs a real ROM's tables
 through both (for the machine's own ROM, once it is handed over).
-tools/check_gpu_registers.py holds the numbers of both files against
-Linux's.
+tools/check_gpu_registers.py holds the numbers of both files, and of
+the parameter blocks, against Linux's.
 
 What is not there yet: disks served by their interrupts (AHCI, NVMe: a
 command is waited for), USB devices other than boot keyboards, mice and

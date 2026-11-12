@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # Holds every register number and field mask of the kernel's Radeon display
-# code (projects/brix/kernel/gpu_display.mlx and gpu_mode.mlx), and every
+# code (projects/brix/kernel/gpu_display.mlx and gpu_mode.mlx), every
 # number of its video BIOS reading and table interpreter (gpu_rom.mlx and
-# atom.mlx), against Linux's files, so that none is from memory:
+# atom.mlx), and every offset and value of the parameter blocks its mode
+# set gives the card's tables (gpu_blocks.mlx), against Linux's files, so
+# that none is from memory:
 #
 #   tools/check_gpu_registers.py HEADERS
 #
@@ -21,6 +23,17 @@
 #   amdgpu/ObjectID.h                          the objects' numbers
 #   include/uapi/linux/pci_regs.h              (of the kernel's tree) the
 #                                              PCI configuration's ROM word
+# and for a TMDS output's mode set (gpu_mode.mlx's part of it and
+# gpu_blocks.mlx):
+#   include/asic_reg/bif/bif_5_0_d.h           the firmware's scratch words
+#   display/dc/dce112/dce112_resource.c        the HDMI strap's number and
+#                                              bit
+#   display/include/signal_types.h             a TMDS link's clocks
+#   display/dc/dce/dce_stream_encoder.c        where HDMI scrambles from
+#   display/dc/dce/dce_link_encoder.c          where HDMI needs the ROM's
+#                                              word
+#   display/dc/inc/hw/clk_mgr_internal.h       the display clock's dividers
+#   display/dc/clk_mgr/dce100/dce_clk_mgr.c    the clock generator's default
 #
 # Checked: each `const NAME: usize = 0x...` that is a register is the
 # header's mmNAME; a controller's register is at each controller's offset
@@ -35,7 +48,13 @@
 # tables' places in the ROM's two lists are the fields' places in
 # ATOM_MASTER_LIST_OF_COMMAND_TABLES and ..._DATA_TABLES; each opcode is
 # where atom.c's opcode_table has its function, with the destinations,
-# the jumps' conditions and the tables of parts in that file's order.
+# the jumps' conditions and the tables of parts in that file's order. Of
+# a TMDS output's mode set: the words for each PHY's PLL and each hot plug
+# line, with their fields the same in all six; the per-controller clock
+# words' fields in all six; the scratch words and the strap; the bits of
+# the scratch words, the link's clocks and the dividers as Linux's files
+# have them; and gpu_blocks.mlx's `STRUCT__field` offsets and its values
+# named as atombios.h names them.
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -62,7 +81,36 @@ vid = open(os.path.join(hdr, "vid.h")).read()
 # placing of a surface, Linux's values.
 NOT_REGISTERS = {"CONTROLLERS", "BACK_ENDS", "FRONT_ENDS", "MODE_DISPLAYPORT", "MODE_LVDS", "MODE_DVI", "MODE_HDMI",
     "MODE_DISPLAYPORT_MST", "FIRST_FRAME", "COUNTED", "FRAMES", "PLACED", "ROW", "MAX_WATERMARK", "VID_N", "TAKEN",
-    "STREAM_GONE", "ENCODER_PRIMED", "STEPS"}
+    "STREAM_GONE", "ENCODER_PRIMED", "STEPS", "SIGNAL_GONE", "BLOCKS", "NO_BLOCK", "TIMING_WORDS"}
+
+# What a TMDS output's mode set has from other files than the display's
+# two headers: registers by their mm names, fields by their _MASK names,
+# and plain values (the name in the code: what Linux's file gives).
+tmds_needed = ("bif_5_0_d.h", "dce112_resource.c", "signal_types.h", "dce_stream_encoder.c", "dce_link_encoder.c",
+               "clk_mgr_internal.h", "dce_clk_mgr.c", "atombios.h")
+tmds_missing = [name for name in tmds_needed if not os.path.exists(os.path.join(hdr, name))]
+if tmds_missing:
+    sys.exit("a TMDS output's mode set is not held: not in %s: %s" % (hdr, " ".join(tmds_missing)))
+
+def source(name):
+    return open(os.path.join(hdr, name), errors="replace").read()
+
+def one(pattern, text):
+    m = re.search(pattern, text)
+    return int(m.group(1), 0) if m else None
+
+elsewhere = dict(defines(os.path.join(hdr, "bif_5_0_d.h")))
+elsewhere.update(defines(os.path.join(hdr, "dce112_resource.c")))
+scratch_bits = {}
+for m in re.finditer(r"#define\s+(ATOM_S\d_\w+)\s+(0x[0-9a-fA-F]+)L?\b", source("atombios.h")):
+    scratch_bits.setdefault(m.group(1), int(m.group(2), 0))
+LINUX_VALUES = dict(scratch_bits)
+LINUX_VALUES.update(defines(os.path.join(hdr, "signal_types.h")))
+for m in re.finditer(r"^\s*(DENTIST_\w+)\s*=\s*(0x[0-9a-fA-F]+|\d+)", source("clk_mgr_internal.h"), re.M):
+    LINUX_VALUES[m.group(1)] = int(m.group(2), 0)
+LINUX_VALUES["HDMI_SCRAMBLED"] = one(r"#define\s+HDMI_CLOCK_CHANNEL_RATE_MORE_340M\s+(\d+)", source("dce_stream_encoder.c"))
+LINUX_VALUES["HDMI_FAST"] = one(r"HDMI_6GB_EN[^;]*?adjusted_pix_clk_khz >= (\d+)", source("dce_link_encoder.c"))
+LINUX_VALUES["GENERATOR_DEFAULT"] = one(r"dentist_vco_freq_khz == 0\)\s*clk_mgr_dce->base\.dentist_vco_freq_khz = (\d+);", source("dce_clk_mgr.c"))
 
 bad = 0
 held = 0
@@ -109,13 +157,28 @@ for path in ("gpu_display.mlx", "gpu_mode.mlx"):
         name, value = m.group(1), int(m.group(2), 0)
         if name in NOT_REGISTERS:
             continue
+        if name in LINUX_VALUES or name.startswith(("ATOM_S", "DENTIST_DIVIDER", "DENTIST_BASE", "DENTIST_MAX")):
+            hold(name, value, LINUX_VALUES.get(name))
+            continue
         if "__" in name:
             fields += 1
-            hold(name, value, sh.get(name + "_MASK"))
+            hold(name, value, sh.get(name + "_MASK", elsewhere.get(name + "_MASK")))
+            # A field of one of several words alike is at the same bits
+            # in each: the PHYs' PLLs' (A to F), the controllers' clock
+            # words (0 to 5).
+            if name.startswith("PHYPLLA_"):
+                for letter in "BCDEF":
+                    hold(name.replace("PHYPLLA", "PHYPLL" + letter), value, sh.get(name.replace("PHYPLLA", "PHYPLL" + letter) + "_MASK"))
+            if re.match(r"CRTC0_(PIXEL_RATE|PHYPLL_PIXEL_RATE)_CNTL__", name):
+                for n in range(1, 6):
+                    other = name.replace("CRTC0", "CRTC%d" % n).replace("DTO0", "DTO%d" % n)
+                    hold(other, value, sh.get(other + "_MASK"))
             continue
         registers += 1
         if name == "MC_VM_FB_LOCATION":
             hold(name, value, gmc.get("mm" + name))
+        elif name in ("CC_DC_HDMI_STRAPS", "BIOS_SCRATCH_2", "BIOS_SCRATCH_6"):
+            hold(name, value, elsewhere.get("mm" + name))
         elif re.match(r"(CRTC0_|DP_DTO0_|PIPE0_)", name):
             # One register for each controller, not at the offsets: a
             # step of 4 (the clock words) or of 1 (the buffers).
@@ -137,6 +200,15 @@ for path in ("gpu_display.mlx", "gpu_mode.mlx"):
             elif value >= 0x1A00 and value < 0x1C00:
                 bad += 1
                 print("WRONG %s: no register of each controller by that name" % name)
+
+# The words that are one for each PHY's PLL, and for each hot plug line.
+mode_text = open(os.path.join(here, "gpu_mode.mlx")).read()
+for n, number in enumerate(table(mode_text, "PHYPLL_PIXCLK_RESYNC_CNTL")):
+    hold("PHYPLL%s_PIXCLK_RESYNC_CNTL" % "ABCDEF"[n], number, d.get("mmPHYPLL%s_PIXCLK_RESYNC_CNTL" % "ABCDEF"[n]))
+for n, number in enumerate(table(mode_text, "DC_HPD_INT_STATUS")):
+    hold("HPD%d_DC_HPD_INT_STATUS" % n, number, d.get("mmHPD%d_DC_HPD_INT_STATUS" % n))
+hold("the PHYs' PLLs' words", len(table(mode_text, "PHYPLL_PIXCLK_RESYNC_CNTL")), 6)
+hold("the hot plug lines' words", len(table(mode_text, "DC_HPD_INT_STATUS")), 6)
 
 # Every number of the raw dump's runs is a register, in each controller's
 # block.
@@ -281,18 +353,52 @@ def constants(text):
 # The packed structures of atombios.h: a field's offset, a structure's
 # size.
 bios_plain = re.sub(r"//[^\n]*", "", bios_h)
-SIZES = {"UCHAR": 1, "USHORT": 2, "ULONG": 4, "ATOM_FIRMWARE_CAPABILITY_ACCESS": 2, "PRODUCT_BRANDING": 1, "ATOM_I2C_ID_CONFIG": 1}
+SIZES = {"UCHAR": 1, "USHORT": 2, "ULONG": 4, "ATOM_FIRMWARE_CAPABILITY_ACCESS": 2, "PRODUCT_BRANDING": 1, "ATOM_I2C_ID_CONFIG": 1,
+         "ATOM_MODE_MISC_INFO_ACCESS": 2}
 
-def layout(name):
-    m = re.search(r"typedef\s+struct\s*\w*\s*\{([^{}]*)\}\s*%s\s*;" % name, bios_plain)
+def body_of(name):
+    # The text between the braces of `typedef struct ... { ... } name;`
+    # (the braces of unions inside it counted).
+    m = re.search(r"\}\s*%s\s*;" % name, bios_plain)
     if not m:
         return None
-    fields, at = [], 0
-    for line in m.group(1).split("\n"):
-        line = line.split("//")[0]
-        f = re.match(r"\s*(\w+)\s+(\w+)\s*(?:\[\s*(\w*)\s*\])?\s*;", line)
-        if not f:
+    depth, at = 0, m.start()
+    while True:
+        if bios_plain[at] == "}":
+            depth += 1
+        elif bios_plain[at] == "{":
+            depth -= 1
+            if depth == 0:
+                break
+        at -= 1
+    if not re.search(r"typedef\s+struct\s*\w*\s*$", bios_plain[:at]):
+        return None
+    return bios_plain[at + 1:m.start()]
+
+def members(text, at):
+    # The fields of a structure's text from offset `at` on: (field,
+    # offset, kind), and the offset behind them. The members of a union
+    # without a name all lie where the union begins, which is as long as
+    # its longest.
+    fields = []
+    while True:
+        u = re.search(r"\bunion\s*\{", text)
+        f = re.search(r"(\w+)\s+(\w+)\s*(?:\[\s*(\w*)\s*\])?\s*;", text)
+        if u and (not f or u.start() < f.start()):
+            depth, end = 1, u.end()
+            while depth:
+                depth += {"{": 1, "}": -1}.get(text[end], 0)
+                end += 1
+            longest = at
+            for statement in text[u.end():end - 1].split(";"):
+                inner, behind = members(statement + ";", at)
+                fields += inner
+                longest = max(longest, behind)
+            at = longest
+            text = text[end:].lstrip().lstrip(";")
             continue
+        if not f:
+            return fields, at
         kind, field, count = f.group(1), f.group(2), f.group(3)
         size = SIZES.get(kind)
         if size is None:
@@ -301,7 +407,13 @@ def layout(name):
             size *= 0 if count == "" else (int(count) if count.isdigit() else bios_defines[count])
         fields.append((field, at, kind))
         at += size
-    return fields, at
+        text = text[f.end():]
+
+def layout(name):
+    text = body_of(name)
+    if text is None:
+        return None
+    return members(text, 0)
 
 def offset_of(name, field):
     got = layout(name)
@@ -328,10 +440,16 @@ def list_index(struct, field):
 # connectors are kept, amdgpu_atombios_allocate_fb_scratch's 20 KiB).
 OWN = {"ROOM", "NONE", "CONNECTORS", "DEFAULT_SCRATCH"}
 rom_text = open(os.path.join(here, "gpu_rom.mlx")).read()
+# The hot plug pins' register and the six lines' bits in it.
+for n, shift in enumerate(table(rom_text, "HPD_PIN_SHIFTS")):
+    hold("DC_GPIO_HPD%d_A's bit" % (n + 1), shift, sh.get("DC_GPIO_HPD_A__DC_GPIO_HPD%d_A__SHIFT" % (n + 1)))
+hold("the hot plug pins", len(table(rom_text, "HPD_PIN_SHIFTS")), 6)
 for name, value, inside in constants(rom_text):
     if name in OWN:
         continue
-    if inside == "Command":
+    if name == "DC_GPIO_HPD_A":
+        hold(name, value, d.get("mm" + name))
+    elif inside == "Command":
         hold("Command." + name, value, list_index("ATOM_MASTER_LIST_OF_COMMAND_TABLES", name))
     elif inside == "Data":
         hold("Data." + name, value, list_index("ATOM_MASTER_LIST_OF_DATA_TABLES", name))
@@ -352,6 +470,28 @@ for name, value, inside in constants(rom_text):
         hold(name, value, objects[name])
     else:
         hold(name, value, bios_defines.get(name))
+
+# gpu_blocks.mlx: the parameter structures' offsets and sizes, and the
+# values named as atombios.h names them (its own numbers: the longest
+# block's words and a TMDS link's lanes).
+blocks_text = open(os.path.join(here, "gpu_blocks.mlx")).read()
+blocks_held = held
+for name, value, inside in constants(blocks_text):
+    if name in ("WORDS", "LANES"):
+        continue
+    if "__" in name:
+        struct, field = name.split("__")
+        got = layout(struct)
+        hold(name, value, None if got is None else (got[1] if field == "size" else offset_of(struct, field)))
+    else:
+        hold(name, value, bios_defines.get(name))
+blocks_held = held - blocks_held
+# (Each block's structure is as long as its bytes are laid out: nothing
+# of a structure is behind what the code fills.)
+for struct in sorted(set(name.split("__")[0] for name, value, inside in constants(blocks_text) if "__" in name)):
+    got = layout(struct)
+    filled = [value for name, value, inside in constants(blocks_text) if name.startswith(struct + "__") and not name.endswith("__size")]
+    hold(struct + "'s fields lie inside it", int(got is not None and max(filled) < got[1]), 1)
 
 # atom.mlx: atom.h's numbers and marks.
 atom_text = open(os.path.join(here, "atom.mlx")).read()
@@ -422,5 +562,5 @@ def step_length(step):
     return 0
 hold("the indirect programs' step lengths", int([step_length(k) for k in range(len(lengths))] == lengths), 1)
 
-print("video BIOS and tables: %d numbers of gpu_rom.mlx and atom.mlx held against Linux's files, %d wrong" % (held, bad))
+print("video BIOS and tables: %d numbers of gpu_rom.mlx, gpu_blocks.mlx (%d of them) and atom.mlx held against Linux's files, %d wrong" % (held, blocks_held, bad))
 sys.exit(1 if bad or wrong or display_bad else 0)
