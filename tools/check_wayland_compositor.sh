@@ -112,6 +112,10 @@ export XDG_CONFIG_HOME="$work/config"
 # Which apps asked for which permission (MLXIPC keeps it there).
 export XDG_STATE_HOME="$work/state"
 mkdir -p "$XDG_CONFIG_HOME/mlx"
+# The look the scenarios that find windows by their frames' colours pin:
+# opaque frames, the focused one blue, the others grey (the default is a
+# translucent glass whose pixels depend on what is behind it).
+classic_look='border-color = #5aa0ff\ninactive-border-color = #505060\ntitle-opacity = 100\n'
 # GTK's document portal may have mounted itself under the runtime directory.
 trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT
 
@@ -181,7 +185,10 @@ echo "ok   greeter mode starts only its trusted client and gives only it input"
 if [[ ${MLX_WAYLAND_GREETER_ONLY:-0} == 1 ]]; then exit 0; fi
 
 # Scenario 1: Mlx terminals (the terminal's title follows its shell once
-# bash names it, so the log lines are matched by their kind alone).
+# bash names it, so the log lines are matched by their kind alone). The
+# frames are made opaque blue here (the default is a translucent glass),
+# so the focused one's pixels are known.
+printf 'border-color = #5aa0ff\ntitle-opacity = 100\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/terminal.script" <<SCRIPT
 wait 2500
 pointer 200 200
@@ -220,6 +227,7 @@ shot $work/terminals.ppm
 close
 SCRIPT
 run_scenario terminal "$work/terminal.script" --terminal "$work/vector" --run "$work/vector"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 [[ "$(cat "$work/first.marker" 2> /dev/null)" == "mlx-typed" ]] || { echo "keyboard input did not reach the first terminal's shell" >&2; cat "$work/terminal-compositor.log" >&2; exit 1; }
 echo "ok   keys typed on the host reached the shell in the Mlx terminal"
 [[ $(grep -c "^map: Mlx Terminal" "$work/terminal-compositor.log") -eq 2 ]] || { echo "Alt+Enter did not open a second terminal" >&2; exit 1; }
@@ -245,7 +253,9 @@ PY
 echo "ok   Alt+drag moved the focused window by the pointer's travel"
 
 # Scenario 2: the compositor's own title bars (std.truetype titles, when
-# the default font is installed): dragging one moves its window.
+# the default font is installed): dragging one moves its window. The bar
+# is made opaque blue and without buttons here, so its pixels are known.
+printf 'border-color = #5aa0ff\ntitle-opacity = 100\ntitle-buttons = none\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/title.script" <<SCRIPT
 wait 1500
 pointer 120 12
@@ -258,9 +268,10 @@ shot $work/title.ppm
 close
 SCRIPT
 run_scenario title "$work/title.script" --terminal "$work/vector" --run "$work/vector"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 grep -q "^move: " "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
 # The window starts at (24, 24) and moves by (+100, +100): its frame's left
-# edge is at x = 122, its title bar spans y = 102..121 (rounded above
+# edge is at x = 122, its title bar spans y = 102..123 (rounded above
 # y = 116).
 font=0
 [[ -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ]] && font=1
@@ -281,6 +292,44 @@ if sys.argv[2] == "1":
     assert light > 50, "no title text in the title bar (%d light pixels)" % light
 PY
 echo "ok   dragging the compositor's title bar moved the window"
+
+# Scenario 2b: the title bar's buttons (the defaults: minimize, maximize
+# and close on the right). The terminal's bar spans x 22..677, y 0..21:
+# maximize is the middle circle (636..647); maximized, the window's bar
+# spans the output and close is the last circle (1002..1013).
+cat > "$work/buttons.script" <<SCRIPT
+wait 1500
+pointer 641 11
+press 272
+release 272
+wait 800
+shot $work/buttons.ppm
+pointer 1007 11
+press 272
+release 272
+wait 800
+close
+SCRIPT
+run_scenario buttons "$work/buttons.script" --terminal "$work/vector" --run "$work/vector"
+log="$work/buttons-compositor.log"
+grep -q "^title button: maximize" "$log" && grep -q "^maximize: " "$log" || { echo "the maximize button did not maximize the window" >&2; cat "$log" >&2; exit 1; }
+grep -q "^title button: close" "$log" || { echo "the close button did not close the window" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/buttons.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+_, size, _, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def rgb(x, y):
+    offset = (y * width + x) * 3
+    return tuple(pixels[offset:offset + 3])
+# The close button's red in the maximized window's bar, the minimize
+# button's amber two places before it.
+close = rgb(1007, 11)
+assert close[0] > 200 and close[1] < 140, close
+minimize = rgb(967, 11)
+assert minimize[0] > 200 and minimize[1] > 150 and minimize[2] < 120, minimize
+PY
+echo "ok   the title bar's maximize and close buttons work"
 
 # Scenario 3: resizing. The Mlx terminal (652x396 at 24,24: 80x24 cells)
 # snaps to whole cells, so every size is exact: its bottom-right border
@@ -509,7 +558,7 @@ PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
 
 # Scenario 10c: Aero snap. The terminal opens at (24, 24) and moves below
-# the top bar (its title bar at y 30..49). Dragged to the left edge, the
+# the top bar (its title bar at y 30..51). Dragged to the left edge, the
 # left half of the work area shows the preview (the focus colour, three
 # eighths over what is there) and the window snaps there when let go;
 # Super+Right puts it in the right half; dragging its title bar away
@@ -548,7 +597,7 @@ SCRIPT
 run_scenario snap "$work/snap.script" --no-fps --topbar "$work/bar/horizon" --terminal "$work/vector" --run "$work/vector"
 log="$work/snap-compositor.log"
 # (The work area: 1024x738 below the bar; its halves 512 wide.)
-grep -q "^snap: left " "$log" && grep -q "^snapped: 512x738 at 0,30" "$log" && grep -q "^window: 508x[0-9]* at 2,52" "$log" || { echo "dragging the window to the left edge did not snap it to the left half" >&2; cat "$log" >&2; exit 1; }
+grep -q "^snap: left " "$log" && grep -q "^snapped: 512x738 at 0,30" "$log" && grep -q "^window: 508x[0-9]* at 2,54" "$log" || { echo "dragging the window to the left edge did not snap it to the left half" >&2; cat "$log" >&2; exit 1; }
 grep -q "^snap: right " "$log" && grep -q "^snapped: 512x738 at 512,30" "$log" || { echo "Super+Right did not snap the window to the right half" >&2; cat "$log" >&2; exit 1; }
 [[ $(grep -c "^window: 652x396 " "$log") -ge 2 ]] || { echo "dragging a snapped window away did not bring back its size" >&2; cat "$log" >&2; exit 1; }
 grep -q "^maximize: " "$log" || { echo "dragging the window to the top edge did not maximize it" >&2; cat "$log" >&2; exit 1; }
@@ -667,7 +716,7 @@ echo "ok   workspaces and scrollable tiling: the bar's buttons and the hotkeys s
 # way (left of 600, not yet gone). Back on workspace 1, Super+Right snaps it
 # to the right half: 300 ms in, its left edge glides between where it was
 # and x = 511, where it rests in the end.
-printf 'animations = slow\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
+printf "${classic_look}animations = slow\n" > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/animations.script" <<SCRIPT
 wait 3000
 down 125
@@ -721,6 +770,7 @@ echo "ok   animations: workspaces slide, snapped windows glide into place"
 # at 16); they lift and it settles with the second column at x = 8, which
 # takes the focus. Super+Ctrl+wheel goes to workspace 2, Super+wheel up on
 # that (floating) one back to 1, the wheel over the top bar to 2 again.
+printf "$classic_look" > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/wheel.script" <<SCRIPT
 wait 5000
 pointer 500 400
@@ -776,6 +826,7 @@ wait 1000
 close
 SCRIPT
 run_scenario wheel "$work/wheel.script" --no-fps --topbar "$work/bar/horizon" --terminal "$work/vector" --run "$work/vector"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 log="$work/wheel-compositor.log"
 grep -q "^settled on column 2: " "$log" || { echo "the strip did not settle on the second column when the fingers lifted" >&2; cat "$log" >&2; exit 1; }
 [[ "$(grep "^workspace: " "$log" | tr '\n' ' ')" == "workspace: 2 workspace: 1 workspace: 2 " ]] || { echo "Super+Ctrl+wheel, Super+wheel and the wheel over the bar did not switch workspaces 2, 1, 2" >&2; cat "$log" >&2; exit 1; }
@@ -802,6 +853,7 @@ echo "ok   the wheel walks columns and switches workspaces, fingers drag the str
 # their way up: nothing of them at y = 600) and lifting goes there; 100
 # pixels down and a rest spring back; sideways on that floating workspace
 # goes back to workspace 1.
+printf "$classic_look" > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/gestures.script" <<SCRIPT
 wait 5000
 pointer 500 400

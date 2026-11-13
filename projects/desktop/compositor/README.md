@@ -31,6 +31,21 @@ goes from the splash to the desktop with no text console in between.
 - Animated: windows glide where the compositor puts them, workspaces
   slide, new windows grow open, the snap preview grows out of the window
   (see Animations).
+- Title bars are frosted glass: translucent (`title-opacity`, 84% by
+  default) over what is behind them, blurred (`title-blur`), with close,
+  minimize and maximize buttons that show their symbols under the
+  pointer and act when the button is let go over them. Which buttons
+  there are and where is `title-buttons` (`minimize,maximize,close` on
+  the right by default; names before a `:` go on the left, `none` drops
+  them); control's Windows page arranges them with arrows and previews
+  the bar.
+- The keyboard layout is `keyboard-layout` and `keyboard-variant` in
+  compositor.conf (control's Language page offers US, Colemak,
+  Colemak-DH, Dvorak, German, Neo 2, UK, French and Swiss German):
+  freestanding, the keymap is made again at once and handed to every
+  client; unset, XKB_DEFAULT_LAYOUT decides as before. brixOS has a
+  keymap file for each of them in /system/settings/keyboard
+  (LAYOUT-VARIANT.xkb).
 - Windows resize by dragging their border (the cursor shows the
   direction; near a corner, the corner), with Alt+right-drag from the
   nearest corner, or from the client's own edges (`xdg_toplevel.resize`,
