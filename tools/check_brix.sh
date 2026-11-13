@@ -315,7 +315,7 @@ errors is descriptor 2
 session kind (session) 6
 no directory role
 no network link (not found) 6
-a few processes
+itself and its shell at least
 itself, running
 named native
 with memory and a parent
