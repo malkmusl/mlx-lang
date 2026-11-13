@@ -165,7 +165,8 @@ host.
 ## Memory and the machine's figures
 
 The kernel hands out all of the machine's memory as 4 KiB frames, from
-Memory.FREE (96 MiB: the image and the kernel's arena come first) on, in
+Memory.FREE (112 MiB: the image, up to 80 MiB, and the kernel's arena
+come first) on, in
 spans: the Multiboot memory map's RAM regions (the one below the hole
 under 4 GiB, the ones above it, where a machine with more than 4 GiB has
 most of its memory). The BIOS loader and the EFI loader both pass the
@@ -1727,6 +1728,27 @@ dragging), and at an app installed while the desktop runs (all three read
 the apps again when an application directory changes, the user's own
 /users/NAME/.local/share/apps before the system's);
 tests/run_desktop_apps.sh asks the same of apps.mlx on the host.
+
+Two more apps ship as bundles. **Pulsar.app** (projects/desktop/pulsar) is
+the task manager: four cards on the window's glass (the processors' load
+and its last minute as a curve, the memory, the processes, the time since
+the start) above a table of the processes, sorted by any column, each
+with its load as a bar of the prism; End process sends TERMINATE, Force
+quit KILL. Its figures are the kernel's own, natively: process_list (call
+57: a 64-byte record a process, its pid, parent, user, state, processor
+time and resident memory, its program's name) and process_open (call 58:
+a handle to a process of the caller's user, or any for user 0), to which
+event_send ends it. The scheduler counts each process's processor time as
+it switches (Scheduler.charge); the memory is its space's present pages
+that are not a device's. On Linux the same app reads /proc
+(processes.mlx; processes.brixos.mlx is the native path).
+**Comet.app** (projects/desktop/comet) is the text editor, on MLX
+Observatory's editor model (projects/desktop/shared/editor.mlx, now
+shared: initSized gives an app with several documents smaller buffers):
+the open documents in the sidebar, the text in a card with its line
+numbers, Mlx's tokens in the prism's colours, Find, Save and Save as in
+the header, std.ui.chooser for Open. tools/check_brix.sh's native test
+lists the processes and opens itself.
 
 ## The login
 

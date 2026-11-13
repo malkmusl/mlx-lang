@@ -315,6 +315,12 @@ errors is descriptor 2
 session kind (session) 6
 no directory role
 no network link (not found) 6
+a few processes
+itself, running
+named native
+with memory and a parent
+a handle to itself
+no such process (not found) 6
 END
 output | sed -n '/^@@ native$/,/^@@ end 7$/p' | sed '1d;$d' | grep -v '^$' > "$work/native.brix"
 diff "$work/native.expected" "$work/native.brix" > "$work/native.diff" || fail "the native calls answer otherwise (< expected, > brixOS): $(cat "$work/native.diff")"
