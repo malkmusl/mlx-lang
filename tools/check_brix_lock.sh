@@ -172,7 +172,10 @@ type_line() {
 # screen outside the card has the top left pixel's colour (per mille; the
 # lock's flat background: 1000), the accent pixels of the button's place,
 # the red pixels of the message's place, and how much of the screen is
-# the same as in a second dump (per mille; 1000 without one).
+# the same as in a second dump (per mille; 1000 without one). The lock's
+# backdrop is the desktop's, blurred: no edge of a window, text or bar
+# shows in it, so "flat" counts the pixels outside the card that differ
+# from their right neighbour by at most 4 in each channel (per mille).
 measure() {
     python3 - "$@" <<'PY'
 import sys
@@ -184,16 +187,19 @@ def load(path):
 width, height, pixels = load(sys.argv[1])
 left, top = (width - 430) // 2, (height - 292) // 2
 corner = pixels[0:3]
-flat = outside = accent = red = 0
+flat = outside = accent = red = bar = 0
 for y in range(height):
     row = y * width * 3
     for x in range(width):
         i = row + x * 3
         r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
         inside = left <= x < left + 430 and top <= y < top + 292
-        if not inside:
+        if not inside and x + 1 < width:
             outside += 1
-            if pixels[i:i + 3] == corner: flat += 1
+            if all(abs(pixels[i + c] - pixels[i + 3 + c]) <= 4 for c in range(3)): flat += 1
+            # The top bar's sharp edges (its clock, its symbols): the
+            # desktop is shown, not the lock.
+            elif y < 30 and any(abs(pixels[i + c] - pixels[i + 3 + c]) > 48 for c in range(3)): bar += 1
         elif left + 40 <= x < left + 390:
             if top + 218 <= y < top + 258 and abs(r - 0x5a) < 24 and abs(g - 0xa0) < 24 and b > 220: accent += 1
             if top + 190 <= y < top + 216 and r > 180 and g < 130 and b < 130: red += 1
@@ -205,7 +211,7 @@ if len(sys.argv) > 2:
     else:
         equal = sum(1 for i in range(0, width * height * 3, 3) if pixels[i:i + 3] == other[2][i:i + 3])
         same = equal * 1000 // (width * height)
-print(flat * 1000 // outside, accent, red, same)
+print(flat * 1000 // outside, accent, red, same, bar)
 PY
 }
 
@@ -254,12 +260,13 @@ flat=0
 accent=0
 red=0
 same=0
+bar=0
 screen_until() {
     local i
     for (( i = 0; i < 30; i++ )); do
         monitor "screendump $1"
         sleep 0.3
-        read -r flat accent red same < <(measure "$1" ${3:+"$3"})
+        read -r flat accent red same bar < <(measure "$1" ${3:+"$3"})
         if eval "$2"; then return 0; fi
         sleep 0.3
     done
@@ -283,7 +290,7 @@ wait_for '^root@brix:[^#]*# '
 wait_log 'layer: horizon 1024x30 at 0,0 in layer 2'
 wait_log 'layer: orbit .*'
 sleep 1
-screen_until "$work/desktop.ppm" '(( flat < 900 ))' || fail "the desktop is not on the display after the login"
+screen_until "$work/desktop.ppm" '(( bar > 40 ))' || fail "the desktop is not on the display after the login"
 echo "ok   brix logs in through the greeter (the check's password); the session's desktop is on the display"
 
 # Super+L, the lock hotkey: the compositor starts the locker
@@ -297,7 +304,7 @@ echo "ok   Super+L starts umbra (process_spawn); it locks the session: the compo
 # The card on the screen: nothing of the desktop around it, its Unlock
 # button in the accent colour, no refusal yet.
 screen_until "$work/locked.ppm" '(( flat > 990 && accent > 9000 && red == 0 ))' || fail "the lock card is not on the display ($flat per mille of the screen around it flat, $accent accent pixels in its button, $red red)"
-echo "ok   the lock card is on the display: the desktop is hidden behind a flat background ($flat per mille), the Unlock button is there ($accent accent pixels)"
+echo "ok   the lock card is on the display: the desktop is hidden behind its blurred backdrop ($flat per mille smooth), the Unlock button is there ($accent accent pixels)"
 
 # A wrong password, while another user's program on the bus answers
 # "true" in the login service's place (it waits for umbra's connection,
@@ -328,7 +335,7 @@ type_line "$right"
 wait_for 'login: unlock allowed$'
 wait_log 'umbra: unlocked'
 wait_log 'lock: unlocked'
-screen_until "$work/after.ppm" '(( flat < 900 && same > 950 ))' "$work/desktop.ppm" || fail "the desktop is not back after the right password ($same per mille of the screen as before the lock)"
+screen_until "$work/after.ppm" '(( bar > 40 && same > 950 ))' "$work/desktop.ppm" || fail "the desktop is not back after the right password ($same per mille of the screen as before the lock)"
 echo "ok   the right password: sentinel allows, umbra unlocks, the desktop is back ($same per mille of the screen as before the lock)"
 
 # Who may ask: umbra's request with the right password from another user
@@ -365,7 +372,7 @@ screen_until "$work/relocked.ppm" '(( flat > 990 && accent > 9000 ))' || fail "t
 type_line "$right"
 wait_for 'login: unlock allowed$' 3
 wait_log 'lock: unlocked' 2
-screen_until "$work/again.ppm" '(( flat < 900 && same > 950 ))' "$work/desktop.ppm" || fail "the desktop is not back after the second lock ($same per mille of the screen as before the lock)"
+screen_until "$work/again.ppm" '(( bar > 40 && same > 950 ))' "$work/desktop.ppm" || fail "the desktop is not back after the second lock ($same per mille of the screen as before the lock)"
 echo "ok   a locker that dies without unlocking leaves the session locked; the lock hotkey starts umbra again and the right password brings the desktop back ($same per mille)"
 
 # Neither password reached the serial line: not the kernel's, the bus's

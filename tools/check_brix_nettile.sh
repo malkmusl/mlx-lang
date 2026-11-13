@@ -22,6 +22,7 @@
 #
 #   tools/check_brix_nettile.sh [compiler]
 set -euo pipefail
+. "$(dirname "$0")/brix_classic_look.sh"
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
@@ -65,12 +66,13 @@ mkdir -p "$work/services"
 cp projects/brix/settings/init/services/serial-shell.service "$work/services/"
 # The desktop service as shipped, its log on the serial console
 # (--verbose: windows, and the helpers say what they show).
+classic_look "$work"
 sed -e 's/^exec = kepler$/exec = kepler --verbose/' -e '/^disabled = yes$/d' -e '$a log = console' -e '$a env = MLX_COMPOSITOR_LOG=-' \
-    projects/brix/settings/init/services/desktop.service > "$work/services/desktop.service"
+    -e "\$a $classic_env" projects/brix/settings/init/services/desktop.service > "$work/services/desktop.service"
 grep -q '^exec = kepler --verbose$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
 entries=()
 for service in "$work"/services/*.service; do entries+=("settings/init/services/$(basename "$service")=$service"); done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "control=$work/control" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "control=$work/control" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "${entries[@]}" "${classic_entries[@]}"
 echo "ok   the kernel, the desktop with the top bar and control, and a boot image with the desktop service build"
 
 # The QEMU monitor on a socket: screen dumps, the mouse, the cable.
