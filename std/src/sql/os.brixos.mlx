@@ -1,0 +1,410 @@
+// std.sql.os on brixOS (os.mlx is Linux's): files through std's native
+// descriptors (node calls at offsets, node_set's size, node_sync), the
+// time from clock_read, random bytes from random_fill, a sleep as a wait
+// on nothing. A brixOS process runs one thread, so the locks between
+// threads are taken without ever waiting. brixOS has no advisory locks
+// between processes yet: SQLite's lock bytes are granted here, and the
+// process's own record of each file (below) keeps its connections apart,
+// not another process's.
+//
+// (Linux's notes on the record of a file:)
+// POSIX locks belong to a process and a file, not to a descriptor, and
+// closing any descriptor of a file drops them all. So every connection of
+// the process to one file shares one descriptor and one record of the
+// locks the process holds on it (an Inode, found by device and inode
+// number), as SQLite's unixInodeInfo does: the process takes the locks
+// its connections need together, and they settle among themselves who
+// may write.
+const mem = @import("./mem.mlx")
+const host = @import("../../bootstrap/os/host.mlx")
+const brix = @import("../../bootstrap/os/brix.mlx")
+
+// ---------------------------------------------------------------------------
+// Locks between threads: a futex word (0 free, 1 held, 2 held and waited
+// for), and a recursive lock of an owner, a word and a depth.
+
+// (One thread: nobody else holds a word, so the first try takes it.)
+pub fn lock(word: *u32) -> void {
+    while true {
+        const first = @cmpxchgStrong(u32, word, 0, 1, acquire, monotonic)
+        if first.0 { return }
+    }
+}
+
+pub fn unlock(word: *u32) -> void { @atomicStore(u32, word, 0, release) }
+
+pub fn threadId() -> u32 { return 1 }
+
+pub const Mutex = struct {
+    owner: u32
+    word: u32
+    depth: u32
+}
+
+pub fn initMutex(m: *Mutex) -> void {
+    m.*.owner = 0
+    m.*.word = 0
+    m.*.depth = 0
+}
+
+pub fn enter(m: *Mutex) -> void {
+    const me = threadId()
+    if @atomicLoad(u32, &m.*.owner, acquire) == me {
+        m.*.depth += 1
+        return
+    }
+    lock(&m.*.word)
+    @atomicStore(u32, &m.*.owner, me, release)
+    m.*.depth = 1
+}
+
+pub fn leave(m: *Mutex) -> void {
+    if m.*.depth > 1 {
+        m.*.depth -= 1
+        return
+    }
+    m.*.depth = 0
+    @atomicStore(u32, &m.*.owner, 0, release)
+    unlock(&m.*.word)
+}
+
+// Whether the calling thread holds the lock.
+pub fn held(m: *Mutex) -> bool { return @atomicLoad(u32, &m.*.owner, acquire) == threadId() }
+
+// ---------------------------------------------------------------------------
+// Time.
+
+// Milliseconds since the Unix epoch.
+pub fn nowMilliseconds() -> i64 { return @bitCast(i64, brix.clock(brix.Clock.REAL_TIME) / 1000000) }
+
+pub fn monotonicMilliseconds() -> i64 { return @bitCast(i64, brix.clock(brix.Clock.MONOTONIC) / 1000000) }
+
+pub fn sleepMilliseconds(milliseconds: i64) -> void {
+    if milliseconds <= 0 { return }
+    _ = host.sleep(@bitCast(usize, milliseconds) * 1000000)
+}
+
+// Random bytes from the kernel.
+pub fn randomBytes(into: usize, count: usize) -> void {
+    const bytes = unsafe { @ptrFromInt([*]u8, into) }
+    _ = brix.randomFill(bytes[0..count])
+}
+
+// ---------------------------------------------------------------------------
+// Files.
+
+pub const OK: i32 = 0
+pub const BUSY: i32 = 5
+pub const IOERR: i32 = 10
+pub const CANTOPEN: i32 = 14
+pub const READONLY: i32 = 8
+
+// A path as a C string (0 after it) in a block of its own.
+pub fn cPath(path: []const u8) -> usize { return mem.dupText(path) }
+
+fn text(path: usize) -> [*]const u8 { return unsafe { @ptrFromInt([*]const u8, path) } }
+
+pub fn exists(path: usize) -> bool { return host.access(text(path), 0) == 0 }
+
+pub fn remove(path: usize) -> bool { return host.removeAt(host.AT_FDCWD, text(path), 0) == 0 }
+
+// (open's flags as Linux numbers them: std's descriptors take them.)
+const O_RDONLY: usize = 0
+const O_RDWR: usize = 2
+const O_CREAT: usize = 64
+
+// Opens `path` (a C string): read and write (made when `create`), or read
+// only; the descriptor or a negative errno.
+pub fn openFile(path: usize, write: bool, create: bool) -> isize {
+    var flags = if write { O_RDWR } else { O_RDONLY }
+    if create { flags = flags | O_CREAT }
+    return host.open(text(path), flags, 420)
+}
+
+pub fn closeFile(fd: isize) -> void { _ = host.close(fd) }
+
+// Reads `count` bytes at `offset` (zeros past the end of the file):
+// whether it could.
+pub fn readAt(fd: isize, into: usize, count: usize, offset: u64) -> bool {
+    var done: usize = 0
+    while done < count {
+        const got = host.readAt(fd, into + done, count - done, @intCast(usize, offset) + done)
+        if got == -4 { continue }
+        if got < 0 { return false }
+        if got == 0 {
+            mem.zero(into + done, count - done)
+            return true
+        }
+        done += @bitCast(usize, got)
+    }
+    return true
+}
+
+pub fn writeAt(fd: isize, from: usize, count: usize, offset: u64) -> bool {
+    var done: usize = 0
+    while done < count {
+        const wrote = host.writeAt(fd, from + done, count - done, @intCast(usize, offset) + done)
+        if wrote == -4 { continue }
+        if wrote <= 0 { return false }
+        done += @bitCast(usize, wrote)
+    }
+    return true
+}
+
+pub fn sync(fd: isize) -> bool { return host.syncFile(fd, true) == 0 }
+
+pub fn truncate(fd: isize, length: u64) -> bool { return host.truncate(fd, @intCast(usize, length)) == 0 }
+
+// The size of an open file, and its device and inode numbers.
+pub const FileId = struct {
+    device: u64
+    inode: u64
+    size: u64
+}
+
+pub fn identify(fd: isize, out: *FileId) -> bool {
+    const buffer = mem.alloc(256)
+    const result = host.fileStatus(fd, buffer)
+    out.*.device = mem.get64(buffer)
+    out.*.inode = mem.get64(buffer + 8)
+    out.*.size = mem.get64(buffer + 48)
+    mem.free(buffer)
+    return result == 0
+}
+
+pub fn sizeOf(fd: isize) -> u64 {
+    var id: FileId = undefined
+    if !identify(fd, &id) { return 0 }
+    return id.size
+}
+
+// ---------------------------------------------------------------------------
+// SQLite's locks: bytes at 1 GiB in the database file. A SHARED lock is a
+// read lock on one of 510 bytes (all of them, here), RESERVED a write lock
+// on the byte before them, PENDING a write lock on the byte before that,
+// EXCLUSIVE a write lock on all 510.
+
+pub const NO_LOCK: u8 = 0
+pub const SHARED_LOCK: u8 = 1
+pub const RESERVED_LOCK: u8 = 2
+pub const PENDING_LOCK: u8 = 3
+pub const EXCLUSIVE_LOCK: u8 = 4
+
+pub const PENDING_BYTE: u64 = 1073741824
+pub const RESERVED_BYTE: u64 = 1073741825
+pub const SHARED_FIRST: u64 = 1073741826
+pub const SHARED_SIZE: u64 = 510
+
+const F_RDLCK: u64 = 0
+const F_WRLCK: u64 = 1
+const F_UNLCK: u64 = 2
+
+// A lock on a range: granted (no locks between processes on brixOS yet;
+// the process's record of the file orders its own connections).
+fn fileLock(fd: isize, kind: u64, start: u64, length: u64) -> bool { return true }
+
+// Whether another process holds a lock on the range: none it could.
+fn othersLock(fd: isize, start: u64, length: u64) -> bool { return false }
+
+// A file the process has open, shared by its connections to it.
+pub const Inode = struct {
+    device: u64
+    inode: u64
+    fd: isize
+    writable: bool
+    // Connections using it.
+    references: usize
+    // The strongest lock the process holds, how many connections hold a
+    // SHARED lock or more, and how many hold any.
+    level: u8
+    shared: usize
+    locks: usize
+    // Guards the fields above.
+    word: u32
+    // What the pager keeps per file (its shared write-ahead log index).
+    extra: usize
+    next: usize
+}
+
+var inodes: usize = 0
+var inodesWord: u32 = 0
+
+pub fn inodeOf(address: usize) -> *Inode { unsafe { return @ptrFromInt(*Inode, address) } }
+
+// The process's shared record of the file at `path`, opened (and made,
+// when `create`) if no connection has it open yet; 0 and the error in
+// `error` when it cannot be opened.
+pub fn acquire(path: usize, write: bool, create: bool, failure: *i32) -> usize {
+    var fd = openFile(path, write, create)
+    var writable = write
+    if fd < 0 && write && !create {
+        fd = openFile(path, false, false)
+        writable = false
+    }
+    if fd < 0 && write {
+        // A file we may only read is opened read only (SQLite does so too).
+        fd = openFile(path, false, false)
+        writable = false
+    }
+    if fd < 0 {
+        failure.* = CANTOPEN
+        return 0
+    }
+    var id: FileId = undefined
+    if !identify(fd, &id) {
+        closeFile(fd)
+        failure.* = CANTOPEN
+        return 0
+    }
+    lock(&inodesWord)
+    var at = inodes
+    while at != 0 {
+        const n = inodeOf(at)
+        if n.*.device == id.device && n.*.inode == id.inode {
+            n.*.references += 1
+            if writable && !n.*.writable {
+                // Keep the stronger descriptor: the process's locks stay
+                // (they belong to the file), so swapping is safe while
+                // this lock is held... but only if nobody holds a lock
+                // through the old one, which a close would drop.
+                if n.*.locks == 0 {
+                    closeFile(n.*.fd)
+                    n.*.fd = fd
+                    n.*.writable = true
+                    unlock(&inodesWord)
+                    return at
+                }
+            }
+            unlock(&inodesWord)
+            closeFile(fd)
+            return at
+        }
+        at = n.*.next
+    }
+    const fresh = mem.alloc(@sizeOf(Inode))
+    const n = inodeOf(fresh)
+    n.*.device = id.device
+    n.*.inode = id.inode
+    n.*.fd = fd
+    n.*.writable = writable
+    n.*.references = 1
+    n.*.next = inodes
+    inodes = fresh
+    unlock(&inodesWord)
+    return fresh
+}
+
+// One connection less; the descriptor is closed with the last.
+pub fn releaseInode(address: usize) -> void {
+    lock(&inodesWord)
+    const n = inodeOf(address)
+    n.*.references -= 1
+    if n.*.references == 0 {
+        var link = &inodes
+        while link.* != 0 {
+            if link.* == address {
+                link.* = n.*.next
+                break
+            }
+            link = &inodeOf(link.*).*.next
+        }
+        closeFile(n.*.fd)
+        mem.free(address)
+    }
+    unlock(&inodesWord)
+}
+
+// Raises a connection's lock (`held`, its current level) to `level`, as
+// SQLite's unixLock does: OK or BUSY.
+pub fn raiseLock(address: usize, held: *u8, level: u8) -> i32 {
+    if held.* >= level { return OK }
+    const n = inodeOf(address)
+    lock(&n.*.word)
+    var rc = OK
+    // Another connection of this process holds a lock that keeps this
+    // one out.
+    if held.* != n.*.level && (n.*.level >= PENDING_LOCK || level > SHARED_LOCK) {
+        unlock(&n.*.word)
+        return BUSY
+    }
+    if level == SHARED_LOCK && (n.*.level == SHARED_LOCK || n.*.level == RESERVED_LOCK) {
+        held.* = SHARED_LOCK
+        n.*.shared += 1
+        n.*.locks += 1
+        unlock(&n.*.word)
+        return OK
+    }
+    // PENDING first, for SHARED (then let go) and for EXCLUSIVE.
+    if level == SHARED_LOCK || (level == EXCLUSIVE_LOCK && held.* == RESERVED_LOCK) {
+        if !fileLock(n.*.fd, if level == SHARED_LOCK { F_RDLCK } else { F_WRLCK }, PENDING_BYTE, 1) {
+            unlock(&n.*.word)
+            return BUSY
+        }
+        if level == EXCLUSIVE_LOCK {
+            held.* = PENDING_LOCK
+            n.*.level = PENDING_LOCK
+        }
+    }
+    if level == SHARED_LOCK {
+        const got = fileLock(n.*.fd, F_RDLCK, SHARED_FIRST, SHARED_SIZE)
+        _ = fileLock(n.*.fd, F_UNLCK, PENDING_BYTE, 1)
+        if !got {
+            unlock(&n.*.word)
+            return BUSY
+        }
+        held.* = SHARED_LOCK
+        n.*.locks += 1
+        n.*.shared = 1
+        n.*.level = SHARED_LOCK
+        unlock(&n.*.word)
+        return OK
+    }
+    if level == EXCLUSIVE_LOCK && n.*.shared > 1 {
+        rc = BUSY
+    } else if level == RESERVED_LOCK {
+        if !fileLock(n.*.fd, F_WRLCK, RESERVED_BYTE, 1) { rc = BUSY }
+    } else {
+        if !fileLock(n.*.fd, F_WRLCK, SHARED_FIRST, SHARED_SIZE) { rc = BUSY }
+    }
+    if rc == OK {
+        held.* = level
+        n.*.level = level
+    }
+    unlock(&n.*.word)
+    return rc
+}
+
+// Lowers a connection's lock to SHARED or to none (posixUnlock).
+pub fn lowerLock(address: usize, held: *u8, level: u8) -> void {
+    if held.* <= level { return }
+    const n = inodeOf(address)
+    lock(&n.*.word)
+    if held.* > SHARED_LOCK {
+        if level == SHARED_LOCK {
+            _ = fileLock(n.*.fd, F_RDLCK, SHARED_FIRST, SHARED_SIZE)
+        }
+        _ = fileLock(n.*.fd, F_UNLCK, PENDING_BYTE, 2)
+        n.*.level = SHARED_LOCK
+    }
+    if level == NO_LOCK {
+        n.*.shared -= 1
+        if n.*.shared == 0 {
+            _ = fileLock(n.*.fd, F_UNLCK, 0, 0)
+            n.*.level = NO_LOCK
+        }
+        n.*.locks -= 1
+    }
+    held.* = level
+    unlock(&n.*.word)
+}
+
+// Whether some connection, of this process or another, holds RESERVED
+// or more (a writer is busy, or left a hot journal behind it if none).
+pub fn reservedByAnyone(address: usize) -> bool {
+    const n = inodeOf(address)
+    lock(&n.*.word)
+    var reserved = n.*.level > SHARED_LOCK
+    if !reserved { reserved = othersLock(n.*.fd, RESERVED_BYTE, 1) }
+    unlock(&n.*.word)
+    return reserved
+}

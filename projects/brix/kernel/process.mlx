@@ -18,6 +18,7 @@ const wait = @import("./wait.mlx")
 const signals_module = @import("./linux/signals.mlx")
 const events_module = @import("./events.mlx")
 const vfs = @import("./vfs.mlx")
+const console = @import("./console.mlx")
 const archive = @import("./archive.mlx")
 const Bytes = @import("./bytes.mlx").Bytes
 const Status = @import("./status.mlx").Status
@@ -68,6 +69,12 @@ pub const Process = struct {
     // processor one by one; above, all of the space's at once.
     pub const FORGET_ONE_BY_ONE: usize = 32
     pub const MMAP_BASE: usize = 0x100000000000
+    // Where a position-independent program (ET_DYN run by itself: mlxlibc
+    // as `libmlxc.so.1 PROGRAM`) is loaded, and the dynamic loader a
+    // program's PT_INTERP names: below the mappings, far above any static
+    // program's segments and its break.
+    pub const SHARED_BASE: usize = 0x40000000000
+    pub const INTERPRETER_BASE: usize = 0x80000000000
     pub const USER_LIMIT: usize = 0x800000000000
     pub const MAX_REGIONS: usize = 256
     // How many argv and envp strings a program gets at most.
@@ -78,6 +85,7 @@ pub const Process = struct {
     const AT_PHENT: usize = 4
     const AT_PHNUM: usize = 5
     const AT_PAGESZ: usize = 6
+    const AT_BASE: usize = 7
     const AT_ENTRY: usize = 9
     const AT_UID: usize = 11
     const AT_RANDOM: usize = 25
@@ -122,6 +130,11 @@ pub const Process = struct {
     // The processor time it used (nanoseconds, the monotonic clock's;
     // the scheduler adds each turn when it switches away: process_list).
     cpuTime: usize
+    // Which of Linux's calls (the translation layer: numbers below 512)
+    // its program made, a bit each: the kernel's log names each the first
+    // time (noteLinuxCall), so a brixOS program of ours that still takes
+    // the compatibility path shows.
+    linuxCalls: [8]u64
     // Its user and group (0: the system's).
     user: usize
     group_id: usize
@@ -133,6 +146,10 @@ pub const Process = struct {
     mmapNext: usize
     programHeaders: usize
     programHeaderCount: usize
+    // The program's own entry (AT_ENTRY), and where its dynamic loader is
+    // (AT_BASE; 0: none, `entry` is the program's).
+    programEntry: usize
+    interpreterBase: usize
     regions: [MAX_REGIONS]Region
     regionCount: usize
     files: files.Descriptors
@@ -164,6 +181,7 @@ pub const Process = struct {
         self.*.programDirectory = vfs.Vfs.NONE
         self.*.umask = 0x12
         self.*.cpuTime = 0
+        self.clearLinuxCalls()
         self.*.user = 0
         self.*.group_id = 0
         self.*.space = Space.{ .root = 0 }
@@ -230,6 +248,8 @@ pub const Process = struct {
         self.*.mmapNext = parent.*.mmapNext
         self.*.programHeaders = parent.*.programHeaders
         self.*.programHeaderCount = parent.*.programHeaderCount
+        self.*.programEntry = parent.*.programEntry
+        self.*.interpreterBase = parent.*.interpreterBase
         var k: usize = 0
         while k < parent.*.regionCount {
             self.*.regions[k].start = parent.*.regions[k].start
@@ -283,7 +303,58 @@ pub const Process = struct {
         return k
     }
 
+    pub fn clearLinuxCalls(self: *Self) -> void {
+        var k: usize = 0
+        while k < 8 {
+            self.*.linuxCalls[k] = 0
+            k += 1
+        }
+    }
+
+    // A call of Linux's (the translation layer) it made: the first time
+    // since its program started, a line in the kernel's log alone
+    // (/devices/klog, not the serial line, where it would land in a
+    // program's output): "linux call: PROGRAM PID NUMBER at ADDRESS from
+    // CALLERS" (the instruction after the call and the return addresses
+    // the frame pointers lead to, four at most: a crash report's tools
+    // name their functions).
+    pub fn noteLinuxCall(self: *Self, number: usize, address: usize, framePointer: usize) -> void {
+        if number >= 512 { return }
+        const bit = @intCast(u64, 1) << @intCast(u6, number % 64)
+        if self.*.linuxCalls[number / 64] & bit != 0 { return }
+        self.*.linuxCalls[number / 64] |= bit
+        var name: [64]u8 = undefined
+        const name_bytes: [*]u8 = &name
+        var length: usize = 0
+        if self.*.program != vfs.Vfs.NONE { length = vfs.fileSystem().nameIn(self.*.programDirectory, self.*.program, name_bytes, 64) }
+        const was = console.logOnly(true)
+        console.out.write("linux call: ")
+        console.out.writeBytes(name_bytes, length)
+        console.out.write(" ")
+        console.out.decimal(self.*.pid)
+        console.out.write(" ")
+        console.out.decimal(number)
+        console.out.write(" at ")
+        console.out.hex(address)
+        var frame = framePointer
+        var depth: usize = 0
+        while depth < 4 && frame != 0 && frame % 8 == 0 && self.prepare(frame, 16) {
+            const returnAddress = Bytes.read64(Bytes.pointer(frame), 8)
+            if returnAddress == 0 { break }
+            console.out.write(if depth == 0 { " from " } else { " " })
+            console.out.hex(returnAddress)
+            const next = Bytes.read64(Bytes.pointer(frame), 0)
+            if next <= frame { break }
+            frame = next
+            depth += 1
+        }
+        console.out.write("\n")
+        _ = console.logOnly(was)
+    }
+
     pub fn setProgram(self: *Self, node: usize, directory: usize) -> void {
+        // Another program: its Linux calls are its own.
+        self.clearLinuxCalls()
         const tree = vfs.fileSystem()
         if node != vfs.Vfs.NONE { tree.retain(node) }
         if directory != vfs.Vfs.NONE { tree.retain(directory) }
@@ -331,6 +402,21 @@ pub const Process = struct {
         if address >= USER_LIMIT { return PAGE_NONE }
         if self.*.space.translate(address) != 0 { return PAGE_PRESENT }
         return if self.inRegion(address) { PAGE_ABSENT } else { PAGE_NONE }
+    }
+
+    // The region holding `address` (its start and end), false when none
+    // does (memory_region).
+    pub fn regionOf(self: *const Self, address: usize, start: *usize, end: *usize) -> bool {
+        var k: usize = 0
+        while k < self.*.regionCount {
+            if self.*.regions[k].contains(address) {
+                start.* = self.*.regions[k].start
+                end.* = self.*.regions[k].end
+                return true
+            }
+            k += 1
+        }
+        return false
     }
 
     fn addRegion(self: *Self, start: usize, end: usize) -> bool {
@@ -461,13 +547,24 @@ pub const Process = struct {
 
     // ---- system calls on memory ----
 
-    pub fn mmap(self: *Self, address: usize, length: usize, fixed: bool) -> isize {
+    pub fn mmap(self: *Self, address: usize, length: usize, fixed: bool) -> isize { return self.mmapAt(address, length, fixed, false) }
+
+    // `keep`: a fixed place that is (partly) mapped already stays as it
+    // is, and the answer is Status.exists (memory_map's flag 2).
+    pub fn mmapAt(self: *Self, address: usize, length: usize, fixed: bool, keep: bool) -> isize {
         if length == 0 { return Status.invalid }
         const size = Page.up(length)
         var start: usize = 0
         if fixed {
             if address & (Page.SIZE - 1) != 0 || address >= USER_LIMIT || size > USER_LIMIT - address { return Status.invalid }
             start = address
+            if keep {
+                var k: usize = 0
+                while k < self.*.regionCount {
+                    if self.*.regions[k].start < start + size && self.*.regions[k].end > start { return Status.exists }
+                    k += 1
+                }
+            }
             self.removeRange(start, start + size)
         } else {
             start = self.*.mmapNext
@@ -538,16 +635,19 @@ pub const Process = struct {
 
     // ---- loading ----
 
-    // The segments of `elf` into `target`; the end of the highest, or 0
-    // when one does not fit or memory is out.
-    fn loadSegments(self: *Self, target: Space, elf: *const Elf) -> usize {
+    // The segments of `elf` into `target`, `bias` added to their addresses
+    // (a shared object's); the end of the highest, or 0 when one does not
+    // fit or memory is out. The program's own (`program`) say where its
+    // program headers are (AT_PHDR).
+    fn loadSegments(self: *Self, target: Space, elf: *const Elf, bias: usize, program: bool) -> usize {
         var highest: usize = 0
         var k: usize = 0
         while k < elf.headerCount() {
             var segment: Segment = undefined
             if elf.segment(k, &segment) {
+                segment.address += bias
                 if segment.offset + segment.fileSize > elf.*.size || segment.address >= MMAP_BASE { return 0 }
-                if segment.offset == 0 { self.*.programHeaders = segment.address + elf.headerOffset() }
+                if program && segment.offset == 0 { self.*.programHeaders = segment.address + elf.headerOffset() }
                 if !elf.copy(segment.offset, segment.fileSize, target, segment.address) { return 0 }
                 // The rest of the segment: zero pages.
                 var page = Page.up(segment.address + segment.fileSize)
@@ -585,8 +685,8 @@ pub const Process = struct {
             if !target.writeWord(random + r * 8, seed) { return 0 }
             r += 1
         }
-        // argc, argv and its NULL, envp and its NULL, 8 auxiliary pairs.
-        const words = 1 + arguments.count + 1 + environment.count + 1 + 16
+        // argc, argv and its NULL, envp and its NULL, 9 auxiliary pairs.
+        const words = 1 + arguments.count + 1 + environment.count + 1 + 18
         var top = random - words * 8
         top -= top % 16
         var at = top
@@ -608,9 +708,9 @@ pub const Process = struct {
         }
         if !target.writeWord(at, 0) { return 0 }
         at += 8
-        const auxiliary = [16]usize{ AT_PHDR, self.*.programHeaders, AT_PHENT, Elf.HEADER_SIZE, AT_PHNUM, self.*.programHeaderCount, AT_PAGESZ, Page.SIZE, AT_ENTRY, self.*.entry, AT_UID, 0, AT_RANDOM, random, AT_NULL, 0 }
+        const auxiliary = [18]usize{ AT_PHDR, self.*.programHeaders, AT_PHENT, Elf.HEADER_SIZE, AT_PHNUM, self.*.programHeaderCount, AT_PAGESZ, Page.SIZE, AT_BASE, self.*.interpreterBase, AT_ENTRY, self.*.programEntry, AT_UID, 0, AT_RANDOM, random, AT_NULL, 0 }
         var a: usize = 0
-        while a < 16 {
+        while a < 18 {
             if !target.writeWord(at, auxiliary[a]) { return 0 }
             at += 8
             a += 1
@@ -648,16 +748,44 @@ pub const Process = struct {
         if arguments.count == 0 { return Loaded.not_a_program }
         const elf = Elf.open(node)
         if !elf.isProgram() { return Loaded.not_a_program }
+        // The dynamic loader the program names (PT_INTERP): a shared
+        // object, found from the root. One that is not there (Linux's
+        // ld.so, which our own programs name for a dlopen there and start
+        // without) is no loader: the program starts at its own entry.
+        var path: [256]u8 = undefined
+        var interpreter: Elf = undefined
+        var named = elf.interpreter(&path, 256)
+        if named > 0 {
+            const found = if path[0] == 47 { vfs.fileSystem().resolve(vfs.Vfs.ROOT, &path) } else { @intCast(isize, -1) }
+            if found < 0 {
+                named = 0
+            } else {
+                interpreter = Elf.open(@bitCast(usize, found))
+                if !interpreter.isProgram() || !interpreter.isShared() { return Loaded.not_a_program }
+            }
+        }
         const target = Space.create()
         if !target.isValid() { return Loaded.no_memory }
-        const highest = self.loadSegments(target, &elf)
-        const entry = elf.entry()
-        const savedEntry = self.*.entry
-        self.*.entry = entry
+        const bias = if elf.isShared() { SHARED_BASE } else { @intCast(usize, 0) }
+        const highest = self.loadSegments(target, &elf, bias, true)
+        const saved = [4]usize{ self.*.entry, self.*.programEntry, self.*.interpreterBase, self.*.programHeaderCount }
+        self.*.programEntry = elf.entry() + bias
+        self.*.entry = self.*.programEntry
+        self.*.interpreterBase = 0
         self.*.programHeaderCount = elf.headerCount()
-        const stack = if highest == 0 { 0 } else { self.buildStack(target, arguments, environment) }
+        var loaded = highest != 0
+        if loaded && named > 0 {
+            // It starts first (with the program's own entry in AT_ENTRY).
+            loaded = self.loadSegments(target, &interpreter, INTERPRETER_BASE, false) != 0
+            self.*.interpreterBase = INTERPRETER_BASE
+            self.*.entry = interpreter.entry() + INTERPRETER_BASE
+        }
+        const stack = if !loaded { 0 } else { self.buildStack(target, arguments, environment) }
         if stack == 0 {
-            self.*.entry = savedEntry
+            self.*.entry = saved[0]
+            self.*.programEntry = saved[1]
+            self.*.interpreterBase = saved[2]
+            self.*.programHeaderCount = saved[3]
             target.destroy()
             return Loaded.no_memory
         }
