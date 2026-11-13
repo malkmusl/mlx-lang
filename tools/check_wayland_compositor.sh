@@ -944,7 +944,7 @@ PY
 echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up and down or sideways, and spring back"
 
 # Scenario 11: control (its window at (24, 24); the categories in
-# its sidebar 26 pixels apart from y 30: General, Network, Display, Sound,
+# its sidebar 26 pixels apart from y 8: General, Network, Display, Sound,
 # Apps, Window management, Top bar, Appearance, Language; on the Window management page the
 # hotkey rows 34 pixels apart from y 414, on the General page the
 # terminal's at y 353, under the dock's three choices and its workspace
@@ -955,7 +955,7 @@ echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up 
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 124 197
+pointer 124 175
 press 272
 release 272
 wait 300
@@ -979,7 +979,7 @@ down 103
 up 103
 up 125
 wait 300
-pointer 124 67
+pointer 124 45
 press 272
 release 272
 wait 300
@@ -1292,7 +1292,7 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/pages.script" <<SCRIPT
 wait 2500
-pointer 124 145
+pointer 124 123
 press 272
 release 272
 wait 1200
@@ -1308,7 +1308,7 @@ pointer 600 198
 wait 100
 release 272
 wait 600
-pointer 124 119
+pointer 124 97
 press 272
 release 272
 wait 800
@@ -1339,7 +1339,7 @@ grep -q "night light 4000 K" "$work/pages-compositor.log" || { echo "the composi
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 echo "ok   control' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
 
-# Scenario 14b: control' Network page (the category at y 93) on a
+# Scenario 14b: control' Network page (the category at y 71) on a
 # system bus of its own (synapse --address) with tools/network-test's
 # fakenetd in nexus's place: a cable and a Wi-Fi card that sees four
 # networks (Zuhause at y 332 needs a passphrase). Zuhause is chosen, a
@@ -1386,7 +1386,7 @@ netd_pid=$!
 for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fakenetd.log" && break; sleep 0.1; done
 cat > "$work/network.script" <<SCRIPT
 wait 2500
-pointer 124 93
+pointer 124 71
 press 272
 release 272
 wait 1500
@@ -1420,7 +1420,7 @@ echo "ok   control' Network page joins a Wi-Fi network (a wrong passphrase is re
 # dialog opens on the compositor (at (24, 24); the question takes two
 # lines: "Remember this decision" at y 153, Allow at (422, 198)). Both are
 # clicked: the app records and ipc.conf keeps the answer. Then
-# control' Apps page (the category at y 171) lists the app's
+# control' Apps page (the category at y 149) lists the app's
 # microphone as allowed; Deny (at (662, 186)) is clicked: ipc.conf says
 # so.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
@@ -1464,7 +1464,7 @@ SCRIPT
     echo "ok   the permission dialog asks the user; Allow with Remember lets the app record and becomes a rule"
     cat > "$work/apps.script" <<SCRIPT
 wait 2500
-pointer 124 171
+pointer 124 149
 press 272
 release 272
 wait 1000
