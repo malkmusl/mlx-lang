@@ -325,11 +325,15 @@ header, size, depth, pixels = data.split(b'\n', 3)
 width, height = map(int, size.split())
 def at(x, y): return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
 # The stack above the folder: a grid (two files: the first cell has an
-# icon, the third is empty) under a header with the Open button.
-assert at(577, 640) == (30, 33, 42), at(577, 640)
-assert at(393, 622) != (30, 33, 42), at(393, 622)
-assert at(742, 566) == (58, 62, 74), at(742, 566)
-assert at(577, 500) != (30, 33, 42), at(577, 500)
+# icon, the third is empty) under a header with the Open button. Its
+# background is translucent glass over the blurred desktop (the shared
+# palette's popup), so it is measured in the empty cell: dark, and
+# different from the icon, the button and what lies above the stack.
+glass = at(577, 640)
+assert max(glass) < 90, glass
+assert at(393, 622) != glass, (at(393, 622), glass)
+assert at(742, 566) != glass, (at(742, 566), glass)
+assert at(577, 500) != glass, (at(577, 500), glass)
 PY
     echo "ok   $renderer: the dock shows the Downloads folder as a stack and empties the trash"
 
