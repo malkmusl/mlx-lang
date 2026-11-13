@@ -281,7 +281,7 @@ run_scenario title "$work/title.script" --terminal "$work/vector" --run "$work/v
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 grep -q "^move: " "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
 # The window starts at (24, 24) and moves by (+100, +100): its frame's left
-# edge is at x = 122, its title bar spans y = 102..123 (rounded above
+# edge is at x = 122, its title bar spans y = 102..121 (rounded above
 # y = 116).
 font=0
 [[ -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ]] && font=1
@@ -304,18 +304,19 @@ PY
 echo "ok   dragging the compositor's title bar moved the window"
 
 # Scenario 2b: the title bar's buttons (the defaults: minimize, maximize
-# and close on the right, chips 22 x 16 two pixels apart, four from the
-# bar's edge, y 4..19). The terminal's bar spans x 22..677: maximize is
-# the middle chip (628..649). Maximized, the bar spans the output: close
-# is the last chip (998..1019), lit red under the pointer, minimize's
-# white line runs across x 956..964 at y 11.
+# and close on the right, chips 20 x 14 two pixels apart, four from the
+# bar's edge, y 6..19). The terminal's bar spans x 22..677: maximize is
+# the middle chip (632..651). Maximized, the bar spans the output (y
+# 0..19, the chips at 4..17): close is the last chip (1000..1019), lit
+# red under the pointer, minimize's white line runs across x 961..969 at
+# y 10.
 cat > "$work/buttons.script" <<SCRIPT
 wait 1500
-pointer 638 11
+pointer 641 12
 press 272
 release 272
 wait 800
-pointer 1008 11
+pointer 1010 11
 wait 500
 shot $work/buttons.ppm
 press 272
@@ -336,9 +337,9 @@ def rgb(x, y):
     offset = (y * width + x) * 3
     return tuple(pixels[offset:offset + 3])
 # The close chip lit red under the pointer, minimize's symbol white.
-close = rgb(1001, 11)
+close = rgb(1002, 11)
 assert close[0] > 200 and close[1] < 120 and close[2] < 120, close
-line = rgb(960, 11)
+line = rgb(965, 10)
 assert min(line) > 200, line
 PY
 echo "ok   the title bar's maximize and close buttons work"
@@ -570,7 +571,7 @@ PY
 echo "ok   a pointer lock holds the cursor and relative motion reaches the client"
 
 # Scenario 10c: Aero snap. The terminal opens at (24, 24) and moves below
-# the top bar (its title bar at y 30..51). Dragged to the left edge, the
+# the top bar (its title bar at y 30..49). Dragged to the left edge, the
 # left half of the work area shows the preview (the focus colour, three
 # eighths over what is there) and the window snaps there when let go;
 # Super+Right puts it in the right half; dragging its title bar away
@@ -611,7 +612,7 @@ run_scenario snap "$work/snap.script" --no-fps --topbar "$work/bar/horizon" --te
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 log="$work/snap-compositor.log"
 # (The work area: 1024x738 below the bar; its halves 512 wide.)
-grep -q "^snap: left " "$log" && grep -q "^snapped: 512x738 at 0,30" "$log" && grep -q "^window: 508x[0-9]* at 2,54" "$log" || { echo "dragging the window to the left edge did not snap it to the left half" >&2; cat "$log" >&2; exit 1; }
+grep -q "^snap: left " "$log" && grep -q "^snapped: 512x738 at 0,30" "$log" && grep -q "^window: 508x[0-9]* at 2,52" "$log" || { echo "dragging the window to the left edge did not snap it to the left half" >&2; cat "$log" >&2; exit 1; }
 grep -q "^snap: right " "$log" && grep -q "^snapped: 512x738 at 512,30" "$log" || { echo "Super+Right did not snap the window to the right half" >&2; cat "$log" >&2; exit 1; }
 [[ $(grep -c "^window: 652x396 " "$log") -ge 2 ]] || { echo "dragging a snapped window away did not bring back its size" >&2; cat "$log" >&2; exit 1; }
 grep -q "^maximize: " "$log" || { echo "dragging the window to the top edge did not maximize it" >&2; cat "$log" >&2; exit 1; }
@@ -943,10 +944,10 @@ PY
 echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up and down or sideways, and spring back"
 
 # Scenario 11: control (its window at (24, 24); the categories in
-# its sidebar 28 pixels apart from y 44: General, Network, Display, Sound,
+# its sidebar 26 pixels apart from y 30: General, Network, Display, Sound,
 # Apps, Window management, Top bar, Appearance, Language; on the Window management page the
-# hotkey rows 34 pixels apart from y 436, on the General page the
-# terminal's at y 375, under the dock's three choices and its workspace
+# hotkey rows 34 pixels apart from y 414, on the General page the
+# terminal's at y 353, under the dock's three choices and its workspace
 # switch). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
@@ -954,11 +955,11 @@ echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up 
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 124 222
+pointer 124 197
 press 272
 release 272
 wait 300
-pointer 524 475
+pointer 524 453
 press 272
 release 272
 wait 300
@@ -969,7 +970,7 @@ up 50
 up 42
 up 125
 wait 300
-pointer 524 509
+pointer 524 487
 press 272
 release 272
 wait 300
@@ -978,11 +979,11 @@ down 103
 up 103
 up 125
 wait 300
-pointer 124 82
+pointer 124 67
 press 272
 release 272
 wait 300
-pointer 524 375
+pointer 524 353
 press 272
 release 272
 wait 300
@@ -1008,7 +1009,7 @@ rm -f "$conf"
 echo "ok   control records hotkeys (the compositor's too) and the compositor uses them at once"
 
 # Scenario 11b: control' Top bar page, opened by its argument (the
-# rows' middles 50 pixels apart from y 229: what plays, the tray, the sound,
+# rows' middles 50 pixels apart from y 207: what plays, the tray, the sound,
 # the battery, the control centre, the clock; a row's up arrow at x 670).
 # The sound moves up a place, a click on the battery's row hides it.
 cat > "$work/topbar-page.sh" <<SCRIPT
@@ -1019,11 +1020,11 @@ chmod +x "$work/topbar-page.sh"
 rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
 cat > "$work/topbar-page.script" <<SCRIPT
 wait 2500
-pointer 670 329
+pointer 670 307
 press 272
 release 272
 wait 600
-pointer 420 374
+pointer 420 352
 press 272
 release 272
 wait 800
@@ -1271,10 +1272,10 @@ fi
 
 # Scenario 14: control' Sound and Display pages. MLXIPC is the
 # session bus and starts MLX Audio (into a file) when control first
-# asks for it. On the Sound page (no sound card: Automatic at y 141, None
-# at y 179, the volume slider at y 220) None is chosen and the volume
+# asks for it. On the Sound page (no sound card: Automatic at y 119, None
+# at y 157, the volume slider at y 198) None is chosen and the volume
 # dragged from 100% to about half; on the Display page the night light
-# switch (y 371) is turned on.
+# switch (y 349) is turned on.
 "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
 "$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/resonance"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$work/mlx-audio"
@@ -1291,27 +1292,27 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/pages.script" <<SCRIPT
 wait 2500
-pointer 124 166
+pointer 124 145
 press 272
 release 272
 wait 1200
-pointer 300 179
+pointer 300 157
 press 272
 release 272
 wait 600
-pointer 718 220
+pointer 718 198
 press 272
-pointer 650 220
+pointer 650 198
 wait 50
-pointer 600 220
+pointer 600 198
 wait 100
 release 272
 wait 600
-pointer 124 138
+pointer 124 119
 press 272
 release 272
 wait 800
-pointer 753 371
+pointer 753 349
 press 272
 release 272
 wait 1500
@@ -1338,12 +1339,12 @@ grep -q "night light 4000 K" "$work/pages-compositor.log" || { echo "the composi
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 echo "ok   control' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
 
-# Scenario 14b: control' Network page (the category at y 110) on a
+# Scenario 14b: control' Network page (the category at y 93) on a
 # system bus of its own (synapse --address) with tools/network-test's
 # fakenetd in nexus's place: a cable and a Wi-Fi card that sees four
-# networks (Zuhause at y 354 needs a passphrase). Zuhause is chosen, a
+# networks (Zuhause at y 332 needs a passphrase). Zuhause is chosen, a
 # wrong passphrase is typed (refused: the field asks again, empty), then
-# the right one (joined), then Forget (at (374, 393)). The passphrase
+# the right one (joined), then Forget (at (374, 371)). The passphrase
 # reaches fakenetd only as its length.
 "$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
 "$work/synapse" --address "$XDG_RUNTIME_DIR/system" > "$work/system-ipc.log" 2>&1 &
@@ -1385,11 +1386,11 @@ netd_pid=$!
 for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fakenetd.log" && break; sleep 0.1; done
 cat > "$work/network.script" <<SCRIPT
 wait 2500
-pointer 124 110
+pointer 124 93
 press 272
 release 272
 wait 1500
-pointer 400 354
+pointer 400 332
 press 272
 release 272
 wait 800
@@ -1399,7 +1400,7 @@ wait 2000
 type correct horse battery
 enter
 wait 2500
-pointer 374 393
+pointer 374 371
 press 272
 release 272
 wait 1500
@@ -1419,8 +1420,8 @@ echo "ok   control' Network page joins a Wi-Fi network (a wrong passphrase is re
 # dialog opens on the compositor (at (24, 24); the question takes two
 # lines: "Remember this decision" at y 153, Allow at (422, 198)). Both are
 # clicked: the app records and ipc.conf keeps the answer. Then
-# control' Apps page (the category at y 194) lists the app's
-# microphone as allowed; Deny (at (662, 208)) is clicked: ipc.conf says
+# control' Apps page (the category at y 171) lists the app's
+# microphone as allowed; Deny (at (662, 186)) is clicked: ipc.conf says
 # so.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
     "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/scope"
@@ -1463,11 +1464,11 @@ SCRIPT
     echo "ok   the permission dialog asks the user; Allow with Remember lets the app record and becomes a rule"
     cat > "$work/apps.script" <<SCRIPT
 wait 2500
-pointer 124 194
+pointer 124 171
 press 272
 release 272
 wait 1000
-pointer 662 208
+pointer 662 186
 press 272
 release 272
 wait 1500
