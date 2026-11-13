@@ -1750,6 +1750,21 @@ numbers, Mlx's tokens in the prism's colours, Find, Save and Save as in
 the header, std.ui.chooser for Open. tools/check_brix.sh's native test
 lists the processes and opens itself.
 
+**Default apps.** brixOS has no xdg-open; a file opens with the app its
+type has (projects/desktop/shared/defaults.mlx). A bundle says which
+types it takes (MimeType= in app.ini: Comet text/*, Polaris
+inode/directory, Voyager text/html and images); the user's choices are
+lines "TYPE = APP_ID" in ~/.config/mlx/defaults.conf, over the system's
+/system/settings/defaults.conf (the image's: text to Comet, folders to
+Polaris). A double click in Polaris opens a file with its default app;
+its menu names it (Open with Comet), offers the other apps that take
+the type, and Always open ... with one of them, which writes the user's
+line for that type. Control's Apps page starts with Default apps: each
+kind of file (text and code, folders, web pages, images, music, videos,
+PDF) with the apps that take it, the one that opens it now chosen. Off
+brixOS a file no bundle takes still goes to xdg-open, the gateway to the
+foreign desktop's handlers.
+
 ## The login
 
 Instead of the desktop as root, the boot image can start a login, all on
