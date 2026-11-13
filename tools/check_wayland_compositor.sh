@@ -1174,11 +1174,16 @@ sw, sh, sc, screen = load(work + '/capture-screen.png')
 ww, wh, wc, window = load(work + '/capture-window.png')
 assert sc == 3 and wc == 4, (sc, wc)
 assert ww < sw and wh < sh, (sw, sh, ww, wh)
-# Opaque content of the window, where the screen shows it.
-for x, y in ((ww - 60, wh - 60), (ww // 2, wh // 2)):
-    on_window = window[y][x * 4:x * 4 + 3]
-    on_screen = screen[24 + y][(24 + x) * 3:(24 + x) * 3 + 3]
-    assert window[y][x * 4 + 3] == 255 and on_window == on_screen, (x, y, on_window, on_screen)
+# The window's opaque pixels (its content is a translucent surface over
+# the blurred desktop; its text, switches and fields are opaque) are the
+# screen's where it shows them (its content at (24, 24)).
+opaque = same = 0
+for y in range(0, wh, 2):
+    for x in range(0, ww, 2):
+        if window[y][x * 4 + 3] != 255: continue
+        opaque += 1
+        if window[y][x * 4:x * 4 + 3] == screen[24 + y][(24 + x) * 3:(24 + x) * 3 + 3]: same += 1
+assert opaque > 500 and same * 100 >= opaque * 98, (opaque, same)
 PY
 damage=$(grep "^frame 2: damage" "$work/capture.log" | sed 's/.* damage //')
 [[ -n "$damage" && "$damage" != "0,0 "* ]] || { echo "the second frame did not wait for a change, or carried full damage ($damage)" >&2; cat "$work/capture.log" >&2; exit 1; }
