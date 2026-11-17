@@ -651,6 +651,17 @@ The signalling: DVI for a clock a DVI link carries when the firmware's
 picture is sent that way (the monitor has shown it takes that), HDMI
 above it when the monitor's EDID has the HDMI block (as Linux chooses);
 RGB at eight bits, no pixel sent twice.
+The HDMI block is in an extension block of the EDID, and a firmware may
+give the loader the first block alone (the user's machine does: "gpu:
+whether the monitor is an HDMI one was not read: its EDID has 1
+extension block, the loader passed on 0"). Until the driver reads the
+EDID itself, this is the rule for that case, ours: on an HDMI connector
+(one link) a monitor whose own timing needs more than a DVI link's
+165 MHz is taken to be an HDMI one, and the log says that this was not
+read ("gpu: the monitor's HDMI block was not read ...: taken to be an
+HDMI monitor"). Not when every block was there and none said HDMI, not
+on a DVI connector or through an adapter, not against the card's
+straps, and not for a timing a DVI link carries.
 
     gpu: plan (a): the controller runs this timing already; a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 38 writes would do it
     gpu: plan (b, DisplayPort): the link has 4 lanes at 2.70 Gbit/s (by M 0x3333 over N 0x8000), room for 360000 kHz at 24 bits: 266640 kHz fits
