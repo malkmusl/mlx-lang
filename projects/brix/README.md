@@ -1001,6 +1001,135 @@ kernel's arena, which was full after 173 characters. That, not a driver,
 was the freeze after "probing storage". The table is a `var` now, and
 mlx4 reads a `const` table from static data as well.)
 
+### Where the monitor is: the connectors, hot plug, the monitor asked
+
+Nobody chooses the output. No key, no setting and no word in the image
+names HDMI or DisplayPort: the Radeon's driver looks (gpu_plug.mlx). The
+card's ROM names the connectors; each connector's hot plug line says
+whether something is plugged in; the encoder blocks say by which
+connector the firmware's picture goes out and what is sent there. All of
+that is read, nothing is written for it, so it is said at every boot,
+one that keeps the firmware's picture too (the numbers here are a
+test's, not a card's):
+
+    gpu: connector 0 (HDMI, DIG 4, hot plug line 2): a monitor is plugged in; the firmware's picture goes out here
+    gpu: connector 1 (DisplayPort, DIG 0, hot plug line 1): nothing is plugged in
+    gpu: connector 3 (HDMI, DIG 1, hot plug line 4): something is plugged in; the firmware did not start this output
+    gpu: the monitor is on the HDMI connector 0 (DIG 4, hot plug line 2): the TMDS path
+
+The last line is the detection: where the monitor is and which path
+follows. The path goes by what the output sends, not by the connector's
+kind ("... the DisplayPort connector 1 (DIG 0, hot plug line 1), which
+sends TMDS (an adapter is behind it): the TMDS path"). The other cases,
+each said as plainly: something on a connector the firmware did not
+start ("gpu: something is plugged into connector 3 (HDMI), which the
+firmware did not start: this driver does not bring it up yet": bringing
+an output up from nothing, and following a monitor that is moved, is
+the next stage), nothing where the firmware's picture goes out, nothing
+anywhere, several connectors with something, a firmware that started no
+output of this card, a ROM without connector records.
+
+A hot plug line is read as Linux reads it on this card (the line's
+block of registers, its two sense bits), and it is judged only when
+what Linux counts on stands: the block is on and the pin is the
+block's. Where it does not, the line says so ("... whether something is
+plugged in is not known: the line's block is off, and Linux's display
+core counts on the firmware having left it on") and nothing is
+concluded: the plan goes on as the firmware left things. Each line's
+own words are in the log alone ("gpu: hot plug line 2: status 0x12,
+control 0x10001000, filter 0xa00032 ..."). One thing follows from a
+line for certain: as Linux sets no mode on an output whose line is low,
+this driver does not either ("gpu: the monitor's own mode is not set:
+nothing is plugged into connector 0 (HDMI), where the picture goes out
+...").
+
+The monitor is then asked for its EDID by the driver itself, over the
+connector's DDC line with the card's I2C engine (gpu_ddc.mlx: the
+engine as Linux's display core drives it): on every connector that
+sends TMDS, and on an HDMI or DVI connector the firmware did not start
+when something is plugged in. That writes words of the I2C engine and
+of the line's two pins, each put back as it was found, and nothing of
+a controller, a clock or a transmitter; at a boot that keeps the
+firmware's picture (F) nobody is asked ("gpu: no monitor is asked for
+its EDID at this boot ..."). What a monitor said:
+
+    gpu: connector 0 (HDMI): the monitor says 3840x1080 at 60 Hz, HDMI, up to 300 MHz (EDID of 2 blocks over DDC line 2, the card's DDC2)
+    gpu: connector 0 (HDMI): it is the EDID the loader passed on
+
+("DDC line 2" is the ROM's number for the line, the same that the "gpu:
+connector N: ..." line of the video BIOS says; "the card's DDC2" is
+which of the card's six lines that is, the one whose pins and words are
+used. The two numbers are not the same thing: on the machine this is
+built on the ROM's line 0 is the card's DDC1.) The EDID read from the
+connector the picture goes out by is held against the one the EFI
+loader got from the firmware, and a line says which of the two the plan
+is made from. The same (the line above). The same, but the firmware
+gave the loader less of it:
+
+    gpu: connector 2 (HDMI): the loader passed on the first 1 block of it alone: the plan goes by all 2, read from the connector now
+
+(the machine this is built on does that, and what says that a monitor
+is an HDMI one is in the second block: without it the plan took the
+monitor for a DVI one and found no timing that fits). Another one
+("... differs from the one the loader passed on (from byte 12 on): the
+one read now counts, it is the monitor that is there"). Or the driver's
+reading failed ("gpu: connector 0 (HDMI): nothing answers on DDC line 2,
+the card's DDC2: no EDID (a monitor that is off, or none)", "... its
+EDID could not be read over DDC line 2, the card's DDC2: the I2C engine
+stayed busy (the engine's status 0x1)"), and the loader's counts. Where the plan goes by other bytes than
+before, the monitor's own timing is said anew. A monitor's own mode no
+longer needs the firmware to have read the EDID.
+
+While brixOS runs the lines are looked at ten times a second, from the
+timer's tick: two registers a line and one for all, nothing written,
+and nothing at all on a machine without the card. A change is said
+once, when two looks in a row agree and it has lasted as long as
+Linux's filter waits (a plug on an HDMI or DVI connector half a second,
+an unplug a tenth; on a DisplayPort connector the two looks), so a
+bounce or a short pulse says nothing:
+
+    gpu: the monitor was unplugged from connector 0 (HDMI): the picture still goes out there, to nothing
+    gpu: something was plugged into connector 3 (HDMI)
+    gpu: connector 3 (HDMI): the monitor says 3840x1080 at 60 Hz, HDMI, up to 300 MHz (EDID of 2 blocks over DDC line 3, the card's DDC6)
+
+A line that stops saying anything is said once too, and nothing is
+concluded from it until it can be read again: its block gone off, or
+its two sense bits differing for longer than a filter of the block's
+own could hold them apart (0.6 s, or more where the block's filter word
+holds more) ("gpu: connector 0 (HDMI): its hot plug line cannot be
+read any more: its two sense bits differ"; later "... can be read now:
+nothing is plugged in"). The record never keeps a level the line no
+longer says.
+
+What is plugged into an HDMI or DVI connector is asked for its EDID then
+(a piece of the reading each tick, some 60 ms in all; never a wait in
+the timer's interrupt), once more a second later when nothing answers
+at first; a reading that was under way while its monitor was pulled and
+another plugged in is dropped, and the one that is there is asked. The
+driver knows of every change and says it; nothing is done about one
+yet. Not there yet either: what is behind a DisplayPort
+connector the firmware did not start (a monitor or an adapter: Linux
+switches a pin of the DDC line to tell), an adapter's own word about
+itself, and the EDID with the two pins driven by hand where the card's
+I2C engine may not be used (the log says when that is so).
+
+None of it can be tried without the card, so it is proven on the host
+against a card that is a table: tests/483_gpu_plug_detect_runtime.mlx
+(every connector and line state at boot, every case of the detection,
+changes over time against a clock of the test's: pulses of every length
+around Linux's times, lines toggled at random with no change lost or
+said twice, an hour of looks; not one write) and
+tests/484_gpu_ddc_edid_runtime.mlx (the I2C engine's transfers write for
+write and wait for wait as worked out from Linux's dce_i2c_hw.c, EDIDs
+of one to eight blocks, everything that can go wrong on the line, on
+every line and whatever the engine's words held beforehand, every word
+put back). tools/check_gpu_registers.py holds the numbers of both
+files against Linux's. From the machine the lines above are what tells
+whether the card's hot plug blocks and its I2C engine are as Linux's
+code expects: every line that begins "gpu: connector", "gpu: hot plug
+line", "gpu: the monitor is", and what is said when the cable is pulled
+and put back.
+
 ## The network
 
 A virtio network device (QEMU's `-netdev user,id=n0 -device

@@ -34,6 +34,13 @@
 #                                              word
 #   display/dc/inc/hw/clk_mgr_internal.h       the display clock's dividers
 #   display/dc/clk_mgr/dce100/dce_clk_mgr.c    the clock generator's default
+# and for the hot plug lines and the EDID over DDC (gpu_plug.mlx and
+# gpu_ddc.mlx):
+#   display/dc/link/protocols/link_hpd.c       the hot plug filter's times
+#   display/dc/dce/dce_i2c_hw.h dce_i2c_hw.c   the I2C engine's numbers
+#   display/dc/gpio/hw_ddc.c                   the pad's time to settle
+#   drivers/gpu/drm/drm_edid.c                 (of the kernel's tree) the
+#   include/drm/drm_edid.h                     EDID's addresses and tries
 #
 # Checked: each `const NAME: usize = 0x...` that is a register is the
 # header's mmNAME; a controller's register is at each controller's offset
@@ -54,7 +61,13 @@
 # words' fields in all six; the scratch words and the strap; the bits of
 # the scratch words, the link's clocks and the dividers as Linux's files
 # have them; and gpu_blocks.mlx's `STRUCT__field` offsets and its values
-# named as atombios.h names them.
+# named as atombios.h names them. Of the hot plug lines and the EDID over
+# DDC: each register of a hot plug line's block at all six blocks, the
+# pins' mask bits, the filter's times; the I2C engine's registers (each
+# line's words at all six lines, each message's word), every field (the
+# same bits in each line's word and each message's), the pins' words,
+# the engine's numbers, the EDID's addresses and how often Linux tries,
+# and the ROM's table of DDC lines.
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -563,4 +576,134 @@ def step_length(step):
 hold("the indirect programs' step lengths", int([step_length(k) for k in range(len(lengths))] == lengths), 1)
 
 print("video BIOS and tables: %d numbers of gpu_rom.mlx, gpu_blocks.mlx (%d of them) and atom.mlx held against Linux's files, %d wrong" % (held, blocks_held, bad))
-sys.exit(1 if bad or wrong or display_bad else 0)
+rom_bad = bad
+bad = 0
+held = 0
+
+# ---- The hot plug lines and the EDID over DDC (gpu_plug.mlx and
+# gpu_ddc.mlx). Beside the display's two headers and atombios.h, from
+# drivers/gpu/drm/amd/display/dc of the kernel's tree and drivers/gpu/drm:
+#   link/protocols/link_hpd.c     the hot plug filter's times
+#   dce/dce_i2c_hw.h dce_i2c_hw.c the I2C engine's numbers
+#   gpio/hw_ddc.c                 the pad's time to settle
+#   dce112/dce112_resource.c      the speed, how many DDC lines
+#   drm_edid.c include/drm/drm_edid.h   the EDID's addresses and tries
+plug_needed = ("link_hpd.c", "dce_i2c_hw.h", "dce_i2c_hw.c", "hw_ddc.c", "drm_edid.c", "drm_edid.h")
+plug_missing = [name for name in plug_needed if not os.path.exists(os.path.join(hdr, name))]
+if plug_missing:
+    print("the hot plug lines and the EDID over DDC are not held: not in %s: %s" % (hdr, " ".join(plug_missing)))
+    sys.exit(1)
+plug_text = open(os.path.join(here, "gpu_plug.mlx")).read()
+ddc_text = open(os.path.join(here, "gpu_ddc.mlx")).read()
+
+def number_of(text, name):
+    m = re.search(r"^pub const %s: usize = (0x[0-9A-Fa-f]+|\d+)\s*$" % name, text, re.M)
+    return int(m.group(1), 0) if m else None
+
+# gpu_plug.mlx. Its own numbers: "none", the count of lines, the step
+# from one line's block to the next (held below, block by block), its
+# looks' times and counts.
+PLUG_OWN = {"NONE", "LINES", "HPD_STEP", "INTERVAL", "BOOT_SETTLE", "BOOT_LOOKS", "ASK_AGAIN", "AGREE", "PIECES"}
+m = re.search(r"case SIGNAL_TYPE_HDMI_TYPE_A:.*?delay_on_connect_in_ms = (\d+);\s*delay_on_disconnect_in_ms = (\d+);.*?"
+              r"case SIGNAL_TYPE_DISPLAY_PORT_MST:.*?delay_on_connect_in_ms = (\d+);\s*delay_on_disconnect_in_ms = (\d+);", source("link_hpd.c"), re.S)
+PLUG_LINUX = dict(zip(("CONNECT_TMDS", "DISCONNECT_TMDS", "CONNECT_DP", "DISCONNECT_DP"), [int(x) for x in m.groups()])) if m else {}
+hpd_step = number_of(plug_text, "HPD_STEP")
+for name, value, inside in constants(plug_text):
+    if name in PLUG_OWN:
+        continue
+    if name in ("CONNECT_TMDS", "DISCONNECT_TMDS", "CONNECT_DP", "DISCONNECT_DP"):
+        hold(name, value, PLUG_LINUX.get(name))
+    elif "__" in name:
+        hold(name, value, sh.get(name + "_MASK"))
+    elif name == "DC_GPIO_HPD_MASK":
+        hold(name, value, d.get("mm" + name))
+    else:
+        # A register of a hot plug line's block: at each of the six.
+        hold(name, value, d.get("mm" + name))
+        for n in range(6):
+            hold("HPD%d_%s" % (n, name), value + hpd_step * n, d.get("mmHPD%d_%s" % (n, name)))
+pin_masks = table(plug_text, "HPD_PIN_MASKS")
+for n, mask in enumerate(pin_masks):
+    hold("DC_GPIO_HPD%d_MASK" % (n + 1), mask, sh.get("DC_GPIO_HPD_MASK__DC_GPIO_HPD%d_MASK_MASK" % (n + 1)))
+hold("the hot plug pins' mask bits", len(pin_masks), 6)
+hold("LINES of gpu_plug.mlx", number_of(plug_text, "LINES"), 6)
+# (The one shift gpu_plug.mlx writes in place, for the log.)
+hold("DC_HPD_DISCONNECT_INT_DELAY's shift", 20, sh.get("DC_HPD_TOGGLE_FILT_CNTL__DC_HPD_DISCONNECT_INT_DELAY__SHIFT"))
+hold("DC_HPD_CONNECT_INT_DELAY's shift", 0, sh.get("DC_HPD_TOGGLE_FILT_CNTL__DC_HPD_CONNECT_INT_DELAY__SHIFT"))
+
+# gpu_ddc.mlx. Its own numbers: "none", how many blocks and bytes are
+# kept, the reading's time, how many messages a transfer has.
+DDC_OWN = {"NONE", "BLOCKS", "ROOM", "BUDGET", "MESSAGES"}
+i2c_h = source("dce_i2c_hw.h")
+i2c_c = source("dce_i2c_hw.c")
+resource_c = source("dce112_resource.c")
+edid_c = source("drm_edid.c")
+edid_h = source("drm_edid.h")
+DDC_LINUX = {}
+for m in re.finditer(r"^\s*(I2C_\w+|TRANSACTION_TIMEOUT_IN_I2C_CLOCKS)\s*=\s*(\d+),", i2c_h, re.M):
+    DDC_LINUX[m.group(1)] = int(m.group(2))
+# (The status fields' values: an enum in its order.)
+body = re.search(r"enum dc_i2c_status \{(.*?)\};", i2c_h, re.S).group(1)
+at = 0
+for entry in [e.strip() for e in body.split(",") if e.strip()]:
+    m = re.match(r"(\w+)\s*(?:=\s*(\d+))?$", entry)
+    if m.group(2) is not None:
+        at = int(m.group(2))
+    DDC_LINUX[m.group(1)] = at
+    at += 1
+DDC_LINUX["SPEED"] = one(r"dc->caps\.i2c_speed_in_khz = (\d+);", resource_c)
+DDC_LINUX["LINES"] = one(r"polaris_10_resource_cap = \{[^}]*?\.num_ddc = (\d+)", resource_c)
+DDC_LINUX["LINES_SMALL"] = one(r"polaris_11_resource_cap = \{[^}]*?\.num_ddc = (\d+)", resource_c)
+DDC_LINUX["THRESHOLD"] = one(r"DC_I2C_DDC1_THRESHOLD\), (\d+),", i2c_c)
+DDC_LINUX["START_STOP_TIMING"] = one(r"DC_I2C_DDC1_START_STOP_TIMING_CNTL\), speed > 50 \? (\d+):", i2c_c)
+settle = one(r"clock_en_bit_present\)\s*(?:/\*.*?\*/\s*)?msleep\((\d+)\);", re.sub(r"\n", " ", source("hw_ddc.c")))
+DDC_LINUX["PAD_SETTLE"] = None if settle is None else settle * 1000
+DDC_LINUX["DDC_ADDR"] = one(r"#define\s+DDC_ADDR\s+(0x[0-9a-fA-F]+)", edid_h)
+DDC_LINUX["DDC_SEGMENT_ADDR"] = one(r"#define\s+DDC_SEGMENT_ADDR\s+(0x[0-9a-fA-F]+)", edid_c)
+DDC_LINUX["EDID_LENGTH"] = one(r"#define\s+EDID_LENGTH\s+(\d+)", edid_h)
+DDC_LINUX["TRANSFER_TRIES"] = one(r"int ret, retries = (\d+);", edid_c)
+DDC_LINUX["BLOCK_READS"] = one(r"for \(try = 0; try < (\d+); try\+\+\)", edid_c)
+# (The table of DDC lines: an I2C record's byte is a union of one byte,
+# and the table's count of lines is an expression in atombios.h:
+# ATOM_DEVICE_RESERVEDF_INDEX+1.)
+SIZES["ATOM_I2C_ID_CONFIG_ACCESS"] = 1
+if re.search(r"#define\s+ATOM_MAX_SUPPORTED_DEVICE\s+\(ATOM_DEVICE_RESERVEDF_INDEX\+1\)", bios_h):
+    bios_defines.setdefault("ATOM_MAX_SUPPORTED_DEVICE", bios_defines["ATOM_DEVICE_RESERVEDF_INDEX"] + 1)
+ddc_registers = 0
+for name, value, inside in constants(ddc_text):
+    if name in DDC_OWN:
+        continue
+    if name in DDC_LINUX:
+        hold(name, value, DDC_LINUX[name])
+    elif name == "GPIO_I2C_Info":
+        hold(name, value, list_index("ATOM_MASTER_LIST_OF_DATA_TABLES", name))
+    elif name.startswith("ATOM_"):
+        struct, field = name.split("__")
+        hold(name, value, layout(struct)[1] if field == "size" else offset_of(struct, field))
+    elif "__" in name:
+        hold(name, value, sh.get(name + "_MASK"))
+        # A field of a line's word is at the same bits in each line's
+        # (the pad's mode bit is named after the line too); a message's
+        # in each message's.
+        if "DDC1" in name:
+            for n in range(2, 7):
+                other = name.replace("DDC1", "DDC%d" % n).replace("AUX_PAD1", "AUX_PAD%d" % n)
+                hold(other, value, sh.get(other + "_MASK"))
+        if name.startswith("DC_I2C_TRANSACTION0__"):
+            for k in range(1, 4):
+                other = "DC_I2C_TRANSACTION%d__%s%d" % (k, name.split("__")[1][:-1], k)
+                hold(other, value, sh.get(other + "_MASK"))
+    else:
+        ddc_registers += 1
+        hold(name, value, d.get("mm" + name))
+        # One word for each line: a number apart (the hardware's status),
+        # two (speed and setup), four (the pins').
+        if "DDC1" in name:
+            step = 4 if name.startswith("DC_GPIO_") else (1 if name.endswith("HW_STATUS") else 2)
+            for n in range(1, 7):
+                hold(name.replace("DDC1", "DDC%d" % n), value + step * (n - 1), d.get("mm" + name.replace("DDC1", "DDC%d" % n)))
+        if name == "DC_I2C_TRANSACTION0":
+            for k in range(4):
+                hold("DC_I2C_TRANSACTION%d" % k, value + k, d.get("mmDC_I2C_TRANSACTION%d" % k))
+print("hot plug lines and DDC: %d numbers of gpu_plug.mlx and gpu_ddc.mlx held against Linux's files, %d wrong" % (held, bad))
+sys.exit(1 if bad or rom_bad or wrong or display_bad else 0)
