@@ -1,0 +1,848 @@
+// The system calls mlxlibc makes, answered on brixOS by brixOS's own
+// (sys_calls.mlx is Linux's syscall instruction). The C library's
+// interface is POSIX's, so its calls keep Linux's x86_64 numbers and
+// shapes; here each is done with the native interface instead of the
+// kernel's Linux layer: files through std's host (node calls, handles as
+// descriptors), memory by memory_map, processes by process_branch,
+// process_replace and process_change, time by clock_read, signals by
+// events and the one upcall, sockets on streams and listeners.
+//
+// What brixOS has no counterpart for answers as Linux answers a call it
+// lacks (ENOSYS) or an operation it refuses (EPERM, EOPNOTSUPP); threads
+// are among them (a process runs one: clone with CLONE_THREAD is ENOSYS,
+// a futex wait never has to wait for another thread).
+const brix = @import("../../std/bootstrap/os/brix.mlx")
+const host = @import("../../std/bootstrap/os/host.mlx")
+const pages = @import("../../std/bootstrap/os/pages.mlx")
+const upcalls = @import("../../std/bootstrap/os/upcalls.mlx")
+const tty = @import("../../std/src/terminal/tty.mlx")
+
+pub fn syscall0(number: usize) -> isize { return dispatch(number, 0, 0, 0, 0, 0, 0) }
+pub fn syscall1(number: usize, a1: usize) -> isize { return dispatch(number, a1, 0, 0, 0, 0, 0) }
+pub fn syscall2(number: usize, a1: usize, a2: usize) -> isize { return dispatch(number, a1, a2, 0, 0, 0, 0) }
+pub fn syscall3(number: usize, a1: usize, a2: usize, a3: usize) -> isize { return dispatch(number, a1, a2, a3, 0, 0, 0) }
+pub fn syscall4(number: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize { return dispatch(number, a1, a2, a3, a4, 0, 0) }
+pub fn syscall5(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize { return dispatch(number, a1, a2, a3, a4, a5, 0) }
+pub fn syscall6(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> isize { return dispatch(number, a1, a2, a3, a4, a5, a6) }
+
+// Linux's errno values given back.
+const EPERM: isize = -1
+const ENOENT: isize = -2
+const EINTR: isize = -4
+const EBADF: isize = -9
+const ECHILD: isize = -10
+const EAGAIN: isize = -11
+const ENOMEM: isize = -12
+const EFAULT: isize = -14
+const EINVAL: isize = -22
+const ENOTTY: isize = -25
+const ENOSYS: isize = -38
+const EOPNOTSUPP: isize = -95
+const EAFNOSUPPORT: isize = -97
+const ETIMEDOUT: isize = -110
+
+const AT_FDCWD: usize = 18446744073709551516
+const AT_SYMLINK_NOFOLLOW: usize = 256
+
+fn words(address: usize) -> [*]usize { return unsafe { @ptrFromInt([*]usize, address) } }
+fn bytes(address: usize) -> [*]u8 { return unsafe { @ptrFromInt([*]u8, address) } }
+fn text(address: usize) -> [*]const u8 { return unsafe { @ptrFromInt([*]const u8, address) } }
+fn signed(value: usize) -> isize { return @bitCast(isize, value) }
+
+fn length(address: usize) -> usize {
+    const at = text(address)
+    var count: usize = 0
+    while at[count] != 0 { count += 1 }
+    return count
+}
+
+fn put32(address: usize, value: usize) -> void {
+    const into = bytes(address)
+    var k: usize = 0
+    while k < 4 {
+        into[k] = @intCast(u8, (value >> @intCast(u6, k * 8)) & 0xFF)
+        k += 1
+    }
+}
+
+fn put64(address: usize, value: usize) -> void { words(address)[0] = value }
+
+fn zero(address: usize, count: usize) -> void {
+    const into = bytes(address)
+    var k: usize = 0
+    while k < count {
+        into[k] = 0
+        k += 1
+    }
+}
+
+fn copyText(address: usize, value: []const u8) -> void {
+    const into = bytes(address)
+    var k: usize = 0
+    while k < value.length {
+        into[k] = value[k]
+        k += 1
+    }
+    into[k] = 0
+}
+
+// ---------------------------------------------------------------------------
+// The process itself
+
+fn self_() -> brix.ProcessRecord {
+    var record: brix.ProcessRecord = undefined
+    var none: [1]u8 = undefined
+    if brix.processSelf(&record, none[0..0]) < 0 { record.pid = 0 }
+    return record
+}
+
+// ---------------------------------------------------------------------------
+// Descriptors
+
+// A descriptor's handle (the slot is the descriptor).
+fn handleOf(descriptor: usize) -> u32 { return brix.ofDescriptor(signed(descriptor)) }
+
+// A handle's descriptor.
+fn descriptorOf(handle: u32) -> isize { return @intCast(isize, @intCast(usize, handle & 0xFF)) - 1 }
+
+// A copy of `descriptor` at the lowest free descriptor not below
+// `lowest` (the copies below given back).
+fn duplicateFrom(descriptor: usize, lowest: usize) -> isize {
+    var low: [64]isize = undefined
+    var count: usize = 0
+    var copy: isize = EBADF
+    while true {
+        const made = brix.duplicate(handleOf(descriptor), 0)
+        if made < 0 {
+            copy = host.asErrno(made)
+            break
+        }
+        copy = descriptorOf(@intCast(u32, made))
+        if copy >= signed(lowest) || count >= 64 { break }
+        low[count] = copy
+        count += 1
+    }
+    var k: usize = 0
+    while k < count {
+        _ = host.close(low[k])
+        k += 1
+    }
+    return copy
+}
+
+// dup2: `descriptor` copied to `target` (what was there closed first).
+fn duplicateTo(descriptor: usize, target: usize) -> isize {
+    if descriptor == target { return signed(target) }
+    if handleOf(descriptor) == 0 { return EBADF }
+    _ = host.close(signed(target))
+    const copy = duplicateFrom(descriptor, target)
+    if copy < 0 { return copy }
+    if copy != signed(target) {
+        _ = host.close(copy)
+        return EBADF
+    }
+    return copy
+}
+
+// iovec arrays (base, length pairs): each in turn.
+fn vector(descriptor: usize, iov: usize, count: usize, writing: bool, offset: isize) -> isize {
+    var done: usize = 0
+    var k: usize = 0
+    var at = offset
+    while k < count {
+        const base = words(iov + k * 16)[0]
+        const size = words(iov + k * 16)[1]
+        k += 1
+        if size == 0 { continue }
+        var got: isize = 0
+        if at >= 0 {
+            got = if writing { host.writeAt(signed(descriptor), base, size, @bitCast(usize, at)) } else { host.readAt(signed(descriptor), base, size, @bitCast(usize, at)) }
+        } else {
+            got = if writing { host.write(signed(descriptor), base, size) } else { host.read(signed(descriptor), base, size) }
+        }
+        if got < 0 { return if done > 0 { signed(done) } else { got } }
+        done += @bitCast(usize, got)
+        if at >= 0 { at += got }
+        if @bitCast(usize, got) < size { break }
+    }
+    return signed(done)
+}
+
+// poll: each item (fd i32, events i16, revents i16) waited on as its
+// handle's state.
+const POLLIN: usize = 1
+const POLLOUT: usize = 4
+const POLLERR: usize = 8
+const POLLHUP: usize = 16
+const POLLNVAL: usize = 32
+
+fn poll(items: usize, count: usize, timeout_ns: isize) -> isize {
+    var waits: [64]brix.WaitItem = undefined
+    const n = if count > 64 { 64 } else { count }
+    var k: usize = 0
+    while k < n {
+        const item = items + k * 8
+        const descriptor = @intCast(usize, @bitCast(u32, @intCast(u32, words(item)[0] & 0xFFFFFFFF)))
+        const wanted = (words(item)[0] >> 32) & 0xFFFF
+        var want: u32 = brix.State.PEER_GONE
+        if wanted & POLLIN != 0 { want |= brix.State.READABLE }
+        if wanted & POLLOUT != 0 { want |= brix.State.WRITABLE }
+        const negative = descriptor & 0x80000000 != 0
+        waits[k] = brix.WaitItem.{ .handle = if negative { 0 } else { handleOf(descriptor) }, .want = want, .seen = 0, .reserved = 0 }
+        k += 1
+    }
+    const deadline = if timeout_ns < 0 { brix.FOREVER } else if timeout_ns == 0 { 0 } else { brix.clock(brix.Clock.MONOTONIC) + @bitCast(usize, timeout_ns) }
+    var ready = brix.wait(waits[0..n], deadline)
+    if ready == -brix.Status.interrupted { return EINTR }
+    if ready < 0 && ready != -brix.Status.timed_out { ready = 0 }
+    var count_ready: isize = 0
+    k = 0
+    while k < n {
+        const item = items + k * 8
+        const seen = waits[k].seen
+        var revents: usize = 0
+        if waits[k].handle == 0 && (words(item)[0] & 0x80000000) == 0 { revents |= POLLNVAL }
+        if seen & brix.State.READABLE != 0 { revents |= POLLIN }
+        if seen & brix.State.WRITABLE != 0 { revents |= POLLOUT }
+        if seen & brix.State.PEER_GONE != 0 { revents |= POLLHUP }
+        const kept = words(item)[0] & 0x0000FFFFFFFFFFFF
+        words(item)[0] = kept | (revents << 48)
+        if revents != 0 { count_ready += 1 }
+        k += 1
+    }
+    return count_ready
+}
+
+// select: the descriptor sets as poll items, the sets written back.
+fn selectSets(count: usize, reads: usize, writes: usize, excepts: usize, timeout_ns: isize) -> isize {
+    var items: [64]usize = undefined
+    var which: [64]usize = undefined
+    var n: usize = 0
+    var descriptor: usize = 0
+    while descriptor < count && descriptor < 1024 && n < 64 {
+        const word = descriptor / 64
+        const bit = @intCast(usize, 1) << @intCast(u6, descriptor % 64)
+        var events: usize = 0
+        if reads != 0 && words(reads)[word] & bit != 0 { events |= POLLIN }
+        if writes != 0 && words(writes)[word] & bit != 0 { events |= POLLOUT }
+        if events != 0 {
+            items[n] = descriptor | (events << 32)
+            which[n] = descriptor
+            n += 1
+        }
+        descriptor += 1
+    }
+    const ready = poll(@intFromPtr(&items), n, timeout_ns)
+    if ready < 0 { return ready }
+    const set_words = (count + 63) / 64
+    var k: usize = 0
+    while k < set_words {
+        if reads != 0 { words(reads)[k] = 0 }
+        if writes != 0 { words(writes)[k] = 0 }
+        if excepts != 0 { words(excepts)[k] = 0 }
+        k += 1
+    }
+    var total: isize = 0
+    k = 0
+    while k < n {
+        const revents = items[k] >> 48
+        const word = which[k] / 64
+        const bit = @intCast(usize, 1) << @intCast(u6, which[k] % 64)
+        if reads != 0 && revents & (POLLIN | POLLHUP) != 0 {
+            words(reads)[word] |= bit
+            total += 1
+        }
+        if writes != 0 && revents & POLLOUT != 0 {
+            words(writes)[word] |= bit
+            total += 1
+        }
+        k += 1
+    }
+    return total
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+
+const MAP_FIXED: usize = 16
+const MAP_ANONYMOUS: usize = 32
+const MAP_FIXED_NOREPLACE: usize = 1048576
+
+// ioctl: a session's modes (TCGETS, TCSETS*: the kernel's 36-byte
+// termios) and size (TIOCGWINSZ), through std.terminal.tty's view of
+// session_mode and session_extent; ENOTTY otherwise.
+fn control(descriptor: isize, request: usize, argument: usize) -> isize {
+    const bytes = unsafe { @ptrFromInt([*]u8, argument) }
+    if request == 0x5401 {
+        var termios: tty.Termios = undefined
+        if !tty.getAttributes(descriptor, &termios) { return ENOTTY }
+        var k: usize = 0
+        while k < 36 {
+            bytes[k] = termios.bytes[k]
+            k += 1
+        }
+        return 0
+    }
+    if request >= 0x5402 && request <= 0x5404 {
+        var termios: tty.Termios = undefined
+        var k: usize = 0
+        while k < 60 {
+            termios.bytes[k] = if k < 36 { bytes[k] } else { 0 }
+            k += 1
+        }
+        return if tty.setAttributes(descriptor, &termios) { 0 } else { ENOTTY }
+    }
+    if request == 0x5413 {
+        var size = tty.Size.{ .rows = 0, .columns = 0 }
+        if !tty.windowSize(descriptor, &size) { return ENOTTY }
+        const words = unsafe { @ptrFromInt([*]u16, argument) }
+        words[0] = size.rows
+        words[1] = size.columns
+        words[2] = 0
+        words[3] = 0
+        return 0
+    }
+    return ENOTTY
+}
+
+fn mmap(address: usize, size: usize, protection: usize, flags: usize, descriptor: usize, offset: usize) -> isize {
+    if size == 0 { return EINVAL }
+    var at: isize = 0
+    if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+        const keep: usize = if flags & MAP_FIXED_NOREPLACE != 0 { 2 } else { 0 }
+        at = brix.call3(brix.MEMORY_MAP, address, size, 1 | keep)
+        if at == -brix.Status.exists { return -17 }
+    } else {
+        // A file's pages where the kernel puts them (node_map).
+        if flags & MAP_ANONYMOUS == 0 {
+            const mapped = brix.mapNode(handleOf(descriptor), offset, size)
+            if mapped >= 0 { return mapped }
+        }
+        at = brix.call3(brix.MEMORY_MAP, 0, size, 0)
+    }
+    if at < 0 { return ENOMEM }
+    // A file's bytes read into memory of its own (a fixed place, or one
+    // node_map would not give).
+    if flags & MAP_ANONYMOUS == 0 {
+        var done: usize = 0
+        while done < size {
+            const got = host.readAt(signed(descriptor), @bitCast(usize, at) + done, size - done, offset + done)
+            if got <= 0 { break }
+            done += @bitCast(usize, got)
+        }
+    }
+    return at
+}
+
+// ---------------------------------------------------------------------------
+// Processes
+
+// The children made here (process handles, the "pids" the program sees),
+// to wait for any of them.
+const CHILDREN: usize = 64
+var children: [CHILDREN]u32 = undefined // (per run)
+var childCount: usize = 0 // (per run)
+
+fn keepChild(handle: u32) -> void {
+    if childCount < CHILDREN {
+        children[childCount] = handle
+        childCount += 1
+    }
+}
+
+fn dropChild(index: usize) -> void {
+    childCount -= 1
+    children[index] = children[childCount]
+}
+
+// The status word wait4 writes: an exit's code, or the signal an event
+// stands for.
+fn statusOf(change: *const brix.Change) -> usize {
+    if change.*.what == brix.Change.EXITED { return (@intCast(usize, change.*.value) & 0xFF) << 8 }
+    if change.*.what == brix.Change.STOPPED { return 0x7F | (signalOf(change.*.value) << 8) }
+    if change.*.what == brix.Change.WENT_ON { return 0xFFFF }
+    return signalOf(change.*.value)
+}
+
+const WNOHANG: usize = 1
+
+fn wait4(pid: isize, status: usize, options: usize) -> isize {
+    while true {
+        var any = false
+        var k: usize = 0
+        while k < childCount {
+            const handle = children[k]
+            if pid > 0 && @intCast(isize, @intCast(usize, handle)) != pid {
+                k += 1
+                continue
+            }
+            any = true
+            var change = brix.Change.{ .what = 0, .value = 0, .detail = 0, .reserved = 0 }
+            if brix.change(handle, &change) == 0 {
+                if status != 0 { put32(status, statusOf(&change)) }
+                if change.what == brix.Change.EXITED || change.what == brix.Change.ENDED {
+                    _ = brix.close(handle)
+                    dropChild(k)
+                }
+                return @intCast(isize, @intCast(usize, handle))
+            }
+            k += 1
+        }
+        if !any { return ECHILD }
+        if options & WNOHANG != 0 { return 0 }
+        // Until one of them changes.
+        var waits: [64]brix.WaitItem = undefined
+        var n: usize = 0
+        k = 0
+        while k < childCount && n < 64 {
+            if pid <= 0 || @intCast(isize, @intCast(usize, children[k])) == pid {
+                waits[n] = brix.WaitItem.{ .handle = children[k], .want = brix.State.ENDED | brix.State.CHANGED, .seen = 0, .reserved = 0 }
+                n += 1
+            }
+            k += 1
+        }
+        const waited = brix.wait(waits[0..n], brix.FOREVER)
+        if waited == -brix.Status.interrupted { return EINTR }
+    }
+    return ECHILD
+}
+
+// execve: the program (a path) replaces this one, with `arguments` and
+// `environment`.
+fn execve(path: usize, arguments: usize, environment: usize) -> isize {
+    const opened = brix.open(0, text(path)[0..length(path)], brix.Open.READ, 0)
+    if opened < 0 { return host.asErrno(opened) }
+    const start = brix.Start.{ .arguments = arguments, .environment = environment, .roles = 0, .count = 0 }
+    const result = brix.replace(@intCast(u32, opened), &start)
+    _ = brix.close(@intCast(u32, opened))
+    return host.asErrno(result)
+}
+
+// A signal's number (as POSIX numbers them) for an event's kind, and back.
+fn signalOf(kind: u32) -> usize {
+    if kind == brix.Event.HANGUP { return 1 }
+    if kind == brix.Event.INTERRUPT { return 2 }
+    if kind == brix.Event.QUIT { return 3 }
+    if kind == brix.Event.KILL { return 9 }
+    if kind == brix.Event.FAULT { return 11 }
+    if kind == brix.Event.BROKEN { return 13 }
+    if kind == brix.Event.TERMINATE { return 15 }
+    if kind == brix.Event.CHILD { return 17 }
+    if kind == brix.Event.RESUME { return 18 }
+    if kind == brix.Event.HALT { return 19 }
+    if kind == brix.Event.SUSPEND { return 20 }
+    if kind == brix.Event.READ_BEHIND { return 21 }
+    if kind == brix.Event.NOTICE { return 28 }
+    return 10
+}
+
+fn kindOf(signal: usize) -> u32 {
+    if signal == 1 { return brix.Event.HANGUP }
+    if signal == 2 { return brix.Event.INTERRUPT }
+    if signal == 3 { return brix.Event.QUIT }
+    if signal == 9 { return brix.Event.KILL }
+    if signal == 13 { return brix.Event.BROKEN }
+    if signal == 15 { return brix.Event.TERMINATE }
+    if signal == 17 { return brix.Event.CHILD }
+    if signal == 18 { return brix.Event.RESUME }
+    if signal == 19 { return brix.Event.HALT }
+    if signal == 20 { return brix.Event.SUSPEND }
+    if signal == 21 || signal == 22 { return brix.Event.READ_BEHIND }
+    if signal == 28 { return brix.Event.NOTICE }
+    return brix.Event.USER
+}
+
+// kill: a child of ours (its handle), the process itself (0 or its pid),
+// or another by its pid (process_open).
+fn kill(pid: isize, signal: usize) -> isize {
+    var handle: u32 = 0
+    var opened = false
+    var k: usize = 0
+    while k < childCount {
+        if @intCast(isize, @intCast(usize, children[k])) == pid { handle = children[k] }
+        k += 1
+    }
+    if handle == 0 {
+        const target = if pid <= 0 { @intCast(isize, @intCast(usize, self_().pid)) } else { pid }
+        const got = brix.processOpen(@intCast(u32, target))
+        if got < 0 { return host.asErrno(got) }
+        handle = @intCast(u32, got)
+        opened = true
+    }
+    var result: isize = 0
+    if signal != 0 { result = brix.sendEvent(handle, kindOf(signal)) }
+    if opened { _ = brix.close(handle) }
+    return host.asErrno(result)
+}
+
+// ---------------------------------------------------------------------------
+// Signals: the handlers C sets (sigaction), run by the one upcall for the
+// events their signals are.
+
+const SIGNALS: usize = 65
+var handlers: [65]usize = undefined // (per run)
+var flagsOf: [65]usize = undefined // (per run)
+var blocked: usize = 0 // (per run)
+var handlersReady: bool = false // (per run)
+
+fn readyHandlers() -> void {
+    if handlersReady { return }
+    var k: usize = 0
+    while k < SIGNALS {
+        handlers[k] = 0
+        flagsOf[k] = 0
+        k += 1
+    }
+    handlersReady = true
+}
+
+const CHandler = fn(signal: i32) -> void
+const CAction = fn(signal: i32, info: usize, context: usize) -> void
+const SA_SIGINFO: usize = 4
+
+// An event whose signal has a handler: the handler, with a siginfo of
+// the signal and the sender.
+fn onEvent(record: upcalls.Record, context: usize) -> void {
+    const signal = signalOf(record.kind)
+    if signal >= SIGNALS { return }
+    const handler = handlers[signal]
+    if handler <= 1 { return }
+    var info: [16]usize = [16]usize{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    info[0] = signal
+    info[2] = @intCast(usize, record.sender)
+    if flagsOf[signal] & SA_SIGINFO != 0 {
+        const action = unsafe { @ptrFromInt(CAction, handler) }
+        action(@intCast(i32, signal), @intFromPtr(&info), context)
+    } else {
+        const plain = unsafe { @ptrFromInt(CHandler, handler) }
+        plain(@intCast(i32, signal))
+    }
+}
+
+// rt_sigaction: struct sigaction is handler, flags, restorer, mask.
+fn sigaction(signal: usize, action: usize, old: usize) -> isize {
+    if signal == 0 || signal >= SIGNALS || signal == 9 || signal == 19 { return EINVAL }
+    readyHandlers()
+    if old != 0 {
+        words(old)[0] = handlers[signal]
+        words(old)[1] = flagsOf[signal]
+        words(old)[2] = 0
+        words(old)[3] = 0
+    }
+    if action == 0 { return 0 }
+    handlers[signal] = words(action)[0]
+    flagsOf[signal] = words(action)[1]
+    const kind = kindOf(signal)
+    if handlers[signal] == 0 {
+        upcalls.release(kind)
+    } else if handlers[signal] == 1 {
+        // Ignored: claimed and dropped (the upcall finds no handler).
+        _ = upcalls.handle(kind, onEvent)
+    } else {
+        _ = upcalls.handle(kind, onEvent)
+    }
+    return 0
+}
+
+fn sigprocmask(how: usize, set: usize, old: usize) -> isize {
+    if old != 0 { put64(old, blocked) }
+    if set == 0 { return 0 }
+    const mask = words(set)[0]
+    if how == 0 { blocked |= mask } else if how == 1 { blocked &= ~mask } else { blocked = mask }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Sockets: AF_UNIX streams on brixOS's listeners and stream pairs; IP
+// sockets brixOS's own (not yet: EAFNOSUPPORT).
+
+const AF_UNIX: usize = 1
+
+fn socketPair(domain: usize, pair: usize) -> isize {
+    if domain != AF_UNIX { return EAFNOSUPPORT }
+    var ends: [2]u32 = [2]u32{ 0, 0 }
+    const made = brix.streamPair(&ends)
+    if made < 0 { return host.asErrno(made) }
+    put32(pair, @bitCast(usize, descriptorOf(ends[0])))
+    put32(pair + 4, @bitCast(usize, descriptorOf(ends[1])))
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// The calls
+
+fn uname(into: usize) -> isize {
+    zero(into, 65 * 6)
+    copyText(into, "brixOS")
+    copyText(into + 65, "brix")
+    copyText(into + 130, "1")
+    copyText(into + 195, "brixOS")
+    copyText(into + 260, "x86_64")
+    return 0
+}
+
+fn sysinfo(into: usize) -> isize {
+    var info: brix.SystemInfo = undefined
+    if brix.systemInfo(&info) < 0 { return EFAULT }
+    zero(into, 112)
+    put64(into, @intCast(usize, info.uptime) / 1000000000)
+    put64(into + 32, @intCast(usize, info.memory))
+    put64(into + 40, @intCast(usize, info.free))
+    put32(into + 104, 1)
+    return 0
+}
+
+fn clockGet(which: usize, into: usize) -> isize {
+    var seconds: isize = 0
+    var nanoseconds: isize = 0
+    if !host.clock(if which == 0 { host.REALTIME } else { host.MONOTONIC }, &seconds, &nanoseconds) { return EINVAL }
+    words(into)[0] = @bitCast(usize, seconds)
+    words(into)[1] = @bitCast(usize, nanoseconds)
+    return 0
+}
+
+fn nanosleep(request: usize) -> isize {
+    const duration = words(request)[0] * 1000000000 + words(request)[1]
+    return if host.sleep(duration) { 0 } else { EINTR }
+}
+
+const RLIM_INFINITY: usize = 18446744073709551615
+
+fn limit(which: usize, into: usize) -> isize {
+    if into == 0 { return 0 }
+    // The stack's 8 MiB, open files 64 (std's descriptors), the rest none.
+    var value = RLIM_INFINITY
+    if which == 3 { value = 8388608 }
+    if which == 7 { value = 64 }
+    words(into)[0] = value
+    words(into)[1] = value
+    return 0
+}
+
+fn dispatch(number: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> isize {
+    // Files and descriptors.
+    if number == 0 { return host.read(signed(a1), a2, a3) }
+    if number == 1 { return host.write(signed(a1), a2, a3) }
+    if number == 2 { return host.open(text(a1), a2, a3) }
+    if number == 257 { return host.openAt(signed(a1), text(a2), a3, a4) }
+    if number == 3 { return host.close(signed(a1)) }
+    if number == 4 { return host.statAt(host.AT_FDCWD, text(a1), a2, 0) }
+    if number == 6 { return host.statAt(host.AT_FDCWD, text(a1), a2, AT_SYMLINK_NOFOLLOW) }
+    if number == 5 { return host.fileStatus(signed(a1), a2) }
+    if number == 262 { return if a2 == 0 || text(a2)[0] == 0 { host.fileStatus(signed(a1), a3) } else { host.statAt(signed(a1), text(a2), a3, a4) } }
+    if number == 332 { return host.statx(signed(a1), text(a2), a3, a4, a5) }
+    if number == 8 { return host.seek(signed(a1), signed(a2), a3) }
+    if number == 17 { return host.readAt(signed(a1), a2, a3, a4) }
+    if number == 18 { return host.writeAt(signed(a1), a2, a3, a4) }
+    if number == 19 { return vector(a1, a2, a3, false, -1) }
+    if number == 20 { return vector(a1, a2, a3, true, -1) }
+    if number == 295 { return vector(a1, a2, a3, false, signed(a4)) }
+    if number == 296 { return vector(a1, a2, a3, true, signed(a4)) }
+    if number == 21 { return host.access(text(a1), a2) }
+    if number == 269 || number == 439 { return host.access(text(a2), a3) }
+    if number == 22 || number == 293 {
+        var ends: [2]isize = [2]isize{ -1, -1 }
+        if !host.pipe(&ends) { return -24 }
+        put32(a1, @bitCast(usize, ends[0]))
+        put32(a1 + 4, @bitCast(usize, ends[1]))
+        return 0
+    }
+    if number == 32 { return duplicateFrom(a1, 0) }
+    if number == 33 || number == 292 { return duplicateTo(a1, a2) }
+    if number == 72 {
+        // fcntl: F_DUPFD 0, F_GETFD 1, F_SETFD 2, F_GETFL 3, F_SETFL 4,
+        // F_DUPFD_CLOEXEC 1030 (every handle is close-on-exec here).
+        if a2 == 0 || a2 == 1030 { return duplicateFrom(a1, a3) }
+        if a2 == 1 { return 1 }
+        if a2 == 3 { return 2 }
+        return 0
+    }
+    if number == 16 { return control(signed(a1), a2, a3) }
+    if number == 7 { return poll(a1, a2, if signed(a3) < 0 { -1 } else { signed(a3) * 1000000 }) }
+    if number == 271 { return poll(a1, a2, if a3 == 0 { -1 } else { signed(words(a3)[0] * 1000000000 + words(a3)[1]) }) }
+    if number == 23 { return selectSets(a1, a2, a3, a4, if a5 == 0 { -1 } else { signed(words(a5)[0] * 1000000000 + words(a5)[1] * 1000) }) }
+    if number == 270 { return selectSets(a1, a2, a3, a4, if a5 == 0 { -1 } else { signed(words(a5)[0] * 1000000000 + words(a5)[1]) }) }
+    if number == 78 || number == 217 { return host.readDirectory(signed(a1), a2, a3) }
+    if number == 79 { return host.workingDirectory(a1, a2) }
+    if number == 80 { return host.changeDirectory(text(a1)) }
+    if number == 81 { return host.asErrno(brix.setDirectory(handleOf(a1))) }
+    if number == 82 { return host.renameAt(host.AT_FDCWD, text(a1), host.AT_FDCWD, text(a2), 0) }
+    if number == 264 { return host.renameAt(signed(a1), text(a2), signed(a3), text(a4), 0) }
+    if number == 316 { return host.renameAt(signed(a1), text(a2), signed(a3), text(a4), a5) }
+    if number == 83 { return host.makeDirectory(text(a1), a2) }
+    if number == 258 { return if signed(a1) == host.AT_FDCWD { host.makeDirectory(text(a2), a3) } else { host.asErrno(brix.make(handleOf(a1), text(a2)[0..length(a2)], brix.NodeKind.DIRECTORY, a3 & 0xFFF, text(a2)[0..0])) } }
+    if number == 84 { return host.removeDirectory(text(a1)) }
+    if number == 87 { return host.removeAt(host.AT_FDCWD, text(a1), 0) }
+    if number == 263 { return host.removeAt(signed(a1), text(a2), a3) }
+    if number == 86 { return host.linkAt(host.AT_FDCWD, text(a1), host.AT_FDCWD, text(a2), 0) }
+    if number == 265 { return host.linkAt(signed(a1), text(a2), signed(a3), text(a4), a5) }
+    if number == 158 { return if a1 == 0x1002 { host.asErrno(brix.setThreadPointer(a2)) } else { EINVAL } }
+    if number == 88 { return host.symbolicLink(text(a1), text(a2)) }
+    if number == 266 { return host.symbolicLink(text(a1), text(a3)) }
+    if number == 89 { return host.readLink(text(a1), a2, a3) }
+    if number == 267 { return host.readLink(text(a2), a3, a4) }
+    if number == 90 { return host.changeModeAt(host.AT_FDCWD, text(a1), a2) }
+    if number == 268 { return host.changeModeAt(signed(a1), text(a2), a3) }
+    if number == 91 { return host.asErrno(brix.nodeSet(handleOf(a1), brix.NodeSet.MODE, a2)) }
+    if number == 92 || number == 94 { return host.changeOwnerAt(host.AT_FDCWD, text(a1), a2, a3, if number == 94 { AT_SYMLINK_NOFOLLOW } else { 0 }) }
+    if number == 260 { return host.changeOwnerAt(signed(a1), text(a2), a3, a4, a5) }
+    if number == 93 { return host.asErrno(brix.own(handleOf(a1), a2 & 0xFFFFFFFF, a3 & 0xFFFFFFFF)) }
+    if number == 95 { return signed(host.setUmask(a1)) }
+    if number == 280 { return host.setTimesAt(signed(a1), a2, a3, a4) }
+    if number == 76 {
+        const opened = host.open(text(a1), 1, 0)
+        if opened < 0 { return opened }
+        const result = host.truncate(opened, a2)
+        _ = host.close(opened)
+        return result
+    }
+    if number == 77 { return host.truncate(signed(a1), a2) }
+    if number == 285 { return if a2 == 0 { host.truncate(signed(a1), a3 + a4) } else { EOPNOTSUPP } }
+    if number == 162 { return host.syncAll() }
+    if number == 74 || number == 75 || number == 306 { return host.syncFile(signed(a1), number == 75) }
+    if number == 137 { return host.fileSystemStatus(text(a1), a2) }
+    if number == 138 { return host.fileSystemStatus("/".pointer, a2) }
+    if number == 436 {
+        // close_range.
+        var descriptor = a1
+        while descriptor <= a2 && descriptor < 64 {
+            _ = host.close(signed(descriptor))
+            descriptor += 1
+        }
+        return 0
+    }
+    // copy_file_range at both positions: node_copy (pages shared).
+    if number == 326 && a2 == 0 && a4 == 0 { return host.copyRange(signed(a1), signed(a3), a5) }
+    if number == 40 {
+        // sendfile: through memory.
+        var buffer: [4096]u8 = undefined
+        var done: usize = 0
+        while done < a4 {
+            const want = if a4 - done < 4096 { a4 - done } else { 4096 }
+            const got = host.read(signed(a2), @intFromPtr(&buffer), want)
+            if got <= 0 { break }
+            const put = host.write(signed(a1), @intFromPtr(&buffer), @bitCast(usize, got))
+            if put <= 0 { break }
+            done += @bitCast(usize, put)
+        }
+        return signed(done)
+    }
+    // Memory.
+    if number == 9 { return mmap(a1, a2, a3, a4, a5, a6) }
+    if number == 11 { return host.asErrno(brix.unmap(a1, a2)) }
+    if number == 10 || number == 26 { return 0 }
+    if number == 28 {
+        if a3 == 4 { pages.release(a1, a2) }
+        return 0
+    }
+    if number == 27 { return if host.pageMapped(a1) { 0 } else { ENOMEM } }
+    if number == 25 { return ENOMEM }
+    if number == 12 { return if a1 == 0 { 0 } else { ENOMEM } }
+    // The process.
+    if number == 39 || number == 186 { return @intCast(isize, @intCast(usize, self_().pid)) }
+    if number == 110 { return @intCast(isize, @intCast(usize, self_().parent)) }
+    if number == 102 || number == 107 || number == 104 || number == 108 { return @intCast(isize, @intCast(usize, self_().user)) }
+    if number == 105 { return host.asErrno(brix.setIdentity(a1, a1)) }
+    if number == 106 { return host.asErrno(brix.setIdentity(@intCast(usize, self_().user), a1)) }
+    if number == 117 { return host.asErrno(brix.setIdentity(a1 & 0xFFFFFFFF, a1 & 0xFFFFFFFF)) }
+    if number == 119 { return 0 }
+    if number == 115 { return 0 }
+    if number == 112 || number == 109 || number == 111 || number == 121 || number == 124 {
+        // Sessions and groups: a group of its own on setsid.
+        if number == 112 { _ = brix.joinGroup(0, 0) }
+        return @intCast(isize, @intCast(usize, self_().pid))
+    }
+    if number == 60 || number == 231 {
+        brix.exit(a1)
+        return 0
+    }
+    if number == 57 || number == 58 || (number == 56 && a1 & 65536 == 0) {
+        const branched = brix.branch()
+        if branched < 0 { return host.asErrno(branched) }
+        if branched == 0 {
+            childCount = 0
+            return 0
+        }
+        keepChild(@intCast(u32, branched))
+        return branched
+    }
+    if number == 56 { return ENOSYS }
+    if number == 59 { return execve(a1, a2, a3) }
+    if number == 61 { return wait4(signed(a1), a2, a3) }
+    if number == 62 { return kill(signed(a1), a2) }
+    if number == 200 || number == 234 { return kill(0, if number == 200 { a2 } else { a3 }) }
+    if number == 13 { return sigaction(a1, a2, a3) }
+    if number == 14 { return sigprocmask(a1, a2, a3) }
+    if number == 131 || number == 15 || number == 127 { return 0 }
+    if number == 34 || number == 130 {
+        // pause, sigsuspend: until an event's handler ran.
+        _ = brix.call3(brix.WAIT, 0, 0, brix.FOREVER)
+        return EINTR
+    }
+    if number == 63 { return uname(a1) }
+    if number == 99 { return sysinfo(a1) }
+    if number == 97 || number == 302 { return limit(a1, if number == 302 { a4 } else { a2 }) }
+    if number == 160 { return 0 }
+    if number == 98 {
+        zero(a2, 144)
+        return 0
+    }
+    if number == 100 {
+        if a1 != 0 { zero(a1, 32) }
+        return signed(brix.clock(brix.Clock.MONOTONIC) / 10000000)
+    }
+    if number == 157 || number == 218 || number == 273 || number == 334 { return if number == 218 { @intCast(isize, @intCast(usize, self_().pid)) } else { 0 } }
+    if number == 24 { return 0 }
+    if number == 203 || number == 142 || number == 144 { return 0 }
+    if number == 204 {
+        if a2 >= 8 {
+            put64(a3, 1)
+            return 8
+        }
+        return EINVAL
+    }
+    if number == 143 || number == 145 || number == 146 || number == 147 { return 0 }
+    if number == 202 {
+        // A futex: no other thread waits or wakes (one thread a process).
+        const operation = a2 & 127
+        if operation == 0 { return if bytes(a1)[0] != @intCast(u8, a3 & 0xFF) || unsafe { @ptrFromInt(*u32, a1) }.* != @intCast(u32, a3 & 0xFFFFFFFF) { EAGAIN } else { ETIMEDOUT } }
+        return 0
+    }
+    // Time.
+    if number == 228 { return clockGet(a1, a2) }
+    if number == 229 {
+        if a2 != 0 {
+            words(a2)[0] = 0
+            words(a2)[1] = 1
+        }
+        return 0
+    }
+    if number == 96 {
+        var seconds: isize = 0
+        var nanoseconds: isize = 0
+        _ = host.clock(host.REALTIME, &seconds, &nanoseconds)
+        if a1 != 0 {
+            words(a1)[0] = @bitCast(usize, seconds)
+            words(a1)[1] = @bitCast(usize, nanoseconds) / 1000
+        }
+        return 0
+    }
+    if number == 201 {
+        var seconds: isize = 0
+        var nanoseconds: isize = 0
+        _ = host.clock(host.REALTIME, &seconds, &nanoseconds)
+        if a1 != 0 { words(a1)[0] = @bitCast(usize, seconds) }
+        return seconds
+    }
+    if number == 35 { return nanosleep(a1) }
+    if number == 230 { return nanosleep(a3) }
+    if number == 227 { return EPERM }
+    if number == 318 { return brix.randomFill(bytes(a1)[0..a2]) }
+    // Sockets.
+    if number == 53 { return socketPair(a1, a4) }
+    if number == 41 { return EAFNOSUPPORT }
+    if number == 44 { return host.write(signed(a1), a2, a3) }
+    if number == 45 { return host.read(signed(a1), a2, a3) }
+    if number == 48 { return 0 }
+    return ENOSYS
+}

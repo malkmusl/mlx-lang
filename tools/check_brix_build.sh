@@ -68,6 +68,12 @@ echo "ok   the kernel, wget, tar, brixfs, mlx4 for brixOS and a boot image build
 parts=(build.mlx VERSION mlx-out/version.mlx compiler/selfhost compiler/cc/asm.mlx compiler/cc/base.mlx std/src std/bootstrap
     projects/brix projects/shell projects/coreutils projects/wget projects/ping projects/tar projects/console projects/init projects/desktop/splash projects/desktop/shared projects/desktop/compositor projects/desktop/terminal projects/desktop/launcher projects/desktop/dock projects/desktop/topbar projects/desktop/ipc projects/desktop/login projects/desktop/greeter projects/desktop/lock projects/desktop/files projects/desktop/settings projects/filemanager-shared projects/desktop/apps tools/build-number)
 for list in projects/webkit/*.mlx; do parts+=("$list"); done
+# The task manager, the text editor and Observatory (with the code map and
+# the language server's checks it is built of), mlxlibc for brixOS (its
+# own files, not the C API shims' directories) and the single-byte
+# charsets its iconv reads.
+parts+=(projects/desktop/pulsar projects/desktop/comet tools/codemap tools/mlx-lsp std/registry/unicode/charsetgenerate.mlx std/registry/unicode/charsets)
+for file in projects/observatory/*.mlx compiler/libc/*.mlx; do parts+=("$file"); done
 "$work/tar-host" -czf "$work/www/mlx.tar.gz" "${parts[@]}"
 members=$("$work/tar-host" -tzf "$work/www/mlx.tar.gz" | wc -l)
 size=$(stat -c %s "$work/www/mlx.tar.gz")

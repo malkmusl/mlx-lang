@@ -2,6 +2,7 @@
 // a pointer and a length, from a directory's handle (0: the working
 // directory); open gives a handle with the rights asked for.
 const vfs = @import("../vfs.mlx")
+const clock = @import("../clock.mlx")
 const files = @import("../files.mlx")
 const memory = @import("../memory.mlx")
 const display = @import("../display.mlx")
@@ -11,6 +12,7 @@ const Process = @import("../process.mlx").Process
 const Bytes = @import("../bytes.mlx").Bytes
 const Status = @import("../status.mlx").Status
 const objects = @import("./objects.mlx")
+const volume = @import("../volume.mlx")
 const names = @import("../names.mlx")
 const channel = @import("../channel.mlx")
 
@@ -23,6 +25,8 @@ pub const Open = struct {
     pub const CREATE: usize = 0x4
     pub const EXCLUSIVE: usize = 0x8
     pub const TRUNCATE: usize = 0x10
+    // Every write lands at the file's end (several writers to one log).
+    pub const APPEND: usize = 0x20
 }
 
 // node_info's and node_list's kinds.
@@ -32,17 +36,22 @@ pub const Kind = struct {
     pub const LINK: usize = 3
     pub const FIFO: usize = 4
     pub const DEVICE: usize = 5
+    pub const LISTENER: usize = 6
+    // A device that stores blocks (a disk).
+    pub const STORAGE: usize = 7
 }
 
-// node_info's record: kind, mode, links, reserved (u32), size, modified
-// (nanoseconds since 1970), the node's number (u64).
-pub const INFO_SIZE: usize = 40
+// node_info's record: kind, mode, links, owners (u32), size, modified
+// (nanoseconds since 1970), the node's number, a device's number (u64).
+pub const INFO_SIZE: usize = 48
 
 pub fn kindOf(n: *const vfs.Node) -> usize {
     if n.*.kind == NodeKind.directory { return Kind.DIRECTORY }
     if n.*.kind == NodeKind.symlink { return Kind.LINK }
     if n.*.kind == NodeKind.fifo { return Kind.FIFO }
     if n.*.kind == NodeKind.file || n.*.kind == NodeKind.archive { return Kind.FILE }
+    if n.*.kind == NodeKind.listener { return Kind.LISTENER }
+    if n.*.kind == NodeKind.disk { return Kind.STORAGE }
     return Kind.DEVICE
 }
 
@@ -124,7 +133,8 @@ fn openPath(p: *Process, base: usize, path: [*]const u8, flags: usize, mode: usi
         const parent = tree.resolveParent(base, path, &last)
         if parent >= 0 { directory = @bitCast(usize, parent) }
     }
-    return p.*.files.openNodeIn(node, access, directory)
+    const appending = if writing && flags & Open.APPEND != 0 { files.Open.APPEND } else { @intCast(usize, 0) }
+    return p.*.files.openNodeIn(node, access | appending, directory)
 }
 
 // A device's memory (`total` bytes at `physical`) from `offset` on, `size`
@@ -156,18 +166,226 @@ pub fn info(p: *Process, handle: usize, address: usize) -> isize {
     const slot = p.*.files.get(fd).?
     if slot.*.kind != files.Kind.node { return Status.wrong_kind }
     if !p.prepare(address, INFO_SIZE) { return Status.bad_address }
+    fillInfo(slot.*.index, Bytes.pointer(address))
+    return 0
+}
+
+// node_info's record of the node `index` into `into`.
+fn fillInfo(index: usize, into: [*]u8) -> void {
     const tree = vfs.fileSystem()
-    tree.ready(slot.*.index)
-    const n = tree.node(slot.*.index)
-    const into = Bytes.pointer(address)
+    tree.ready(index)
+    const n = tree.node(index)
     Bytes.write32(into, 0, kindOf(n))
     Bytes.write32(into, 4, n.*.mode)
     Bytes.write32(into, 8, n.*.links)
-    Bytes.write32(into, 12, 0)
+    // (Its owner and group: 16 bits each.)
+    Bytes.write32(into, 12, (n.*.user & 0xFFFF) | ((n.*.group & 0xFFFF) << 16))
     Bytes.write64(into, 16, n.*.size)
     Bytes.write64(into, 24, n.*.modified * 1000000000)
-    Bytes.write64(into, 32, slot.*.index)
+    Bytes.write64(into, 32, index)
+    Bytes.write64(into, 40, files.Stat.deviceOf(n.*.kind))
+}
+
+// node_info_at: node_info's record of the node `path` names from
+// `directory`, without opening it (a listener is not connected to, a fifo
+// not waited for); `flags` 1: a link itself, not where it leads.
+pub fn infoAt(p: *Process, directory: usize, address: usize, length: usize, info: usize, flags: usize) -> isize {
+    const base = directoryOf(p, directory)
+    if base < 0 { return base }
+    if !p.prepare(info, INFO_SIZE) { return Status.bad_address }
+    const frame = copyPath(p, address, length)
+    if frame == 0 { return Status.bad_address }
+    const result = resolveIn(@bitCast(usize, base), frame, flags)
+    memory.allFrames().free(frame)
+    if result < 0 { return result }
+    fillInfo(@bitCast(usize, result), Bytes.pointer(info))
     return 0
+}
+
+// The node the path in `frame` names from `base` (`flags` 1: a link
+// itself, not where it leads), or a status.
+fn resolveIn(base: usize, frame: usize, flags: usize) -> isize {
+    const tree = vfs.fileSystem()
+    if flags & 1 == 0 { return tree.resolve(base, pathAt(frame)) }
+    var name: []const u8 = undefined
+    const parent = tree.resolveParent(base, pathAt(frame), &name)
+    if parent < 0 { return parent }
+    if name.length == 0 { return parent }
+    const found = tree.lookup(@bitCast(usize, parent), name.pointer, name.length)
+    return if found == vfs.Vfs.NONE { Status.not_found } else { @bitCast(isize, found) }
+}
+
+// node_set_at: node_set of the node `path` names from `directory`,
+// without opening it (a fifo is not waited for, a listener not
+// connected to); `flags` 1: a link itself, not where it leads.
+pub fn setAt(p: *Process, directory: usize, address: usize, length: usize, what: usize, value: usize, flags: usize) -> isize {
+    const base = directoryOf(p, directory)
+    if base < 0 { return base }
+    const frame = copyPath(p, address, length)
+    if frame == 0 { return Status.bad_address }
+    const found = resolveIn(@bitCast(usize, base), frame, flags)
+    memory.allFrames().free(frame)
+    if found < 0 { return found }
+    return setNode(@bitCast(usize, found), what, value)
+}
+
+// node_set: one thing of the node `handle` names (`what`): 1 its mode
+// (the permission bits), 2 its size (a file's: cut or grown with zeros),
+// 3 its modification time and 4 its access time (nanoseconds since 1970;
+// all ones: now). Its owner (or user 0) may set its mode and times, or
+// whoever may write to it its times; whoever may write to it its size.
+pub fn set(p: *Process, handle: usize, what: usize, value: usize) -> isize {
+    const fd = objects.descriptorOf(p, handle)
+    if fd < 0 { return Status.invalid_handle }
+    const slot = p.*.files.get(fd).?
+    if slot.*.kind != files.Kind.node { return Status.wrong_kind }
+    return setNode(slot.*.index, what, value)
+}
+
+fn setNode(index: usize, what: usize, value: usize) -> isize {
+    const tree = vfs.fileSystem()
+    tree.ready(index)
+    const n = tree.node(index)
+    if n.*.readOnly { return Status.read_only }
+    const owner = tree.*.actorUser == 0 || tree.*.actorUser == n.*.user
+    const now = clock.system().realtime() / clock.Clock.NANOSECONDS
+    if what == 1 {
+        if !owner { return Status.denied }
+        n.*.mode = value & 0xFFF
+    } else if what == 2 {
+        if n.isDirectory() { return Status.is_directory }
+        if !n.isRegular() { return Status.invalid }
+        if !tree.permits(index, vfs.Vfs.WRITE) { return Status.denied }
+        const cut = tree.truncate(index, value)
+        if cut < 0 { return Status.io_error }
+    } else if what == 3 || what == 4 {
+        if !owner && !tree.permits(index, vfs.Vfs.WRITE) { return Status.denied }
+        const seconds = if value == 0xFFFFFFFFFFFFFFFF { now } else { value / 1000000000 }
+        if what == 3 { n.*.modified = seconds } else { n.*.accessed = seconds }
+    } else {
+        return Status.invalid
+    }
+    n.*.changed = now
+    tree.touch(index, false)
+    return 0
+}
+
+// node_target: the target of the link `path` names from `directory` (the
+// link itself, not where it leads) into `address` (`capacity` bytes): its
+// length; invalid when it is no link.
+pub fn target(p: *Process, directory: usize, address: usize, length: usize, into: usize, capacity: usize) -> isize {
+    const base = directoryOf(p, directory)
+    if base < 0 { return base }
+    const frame = copyPath(p, address, length)
+    if frame == 0 { return Status.bad_address }
+    const tree = vfs.fileSystem()
+    var name: []const u8 = undefined
+    const parent = tree.resolveParent(@bitCast(usize, base), pathAt(frame), &name)
+    var result: isize = 0
+    if parent < 0 {
+        result = parent
+    } else {
+        const node = tree.lookup(@bitCast(usize, parent), name.pointer, name.length)
+        if node == vfs.Vfs.NONE {
+            result = Status.not_found
+        } else if !tree.node(node).isLink() {
+            result = Status.invalid
+        } else {
+            const size = tree.node(node).*.size
+            const count = if size > capacity { capacity } else { size }
+            if !p.prepare(into, count) {
+                result = Status.bad_address
+            } else {
+                result = @intCast(isize, tree.read(node, 0, Bytes.pointer(into), count))
+            }
+        }
+    }
+    memory.allFrames().free(frame)
+    return result
+}
+
+// handle_seek: where the next streaming read or write of the file
+// `handle` names is (`whence`: 0 from its start, 1 from where it is, 2
+// from its end): the new place.
+pub fn seek(p: *Process, handle: usize, offset: usize, whence: usize) -> isize {
+    const fd = objects.descriptorOf(p, handle)
+    if fd < 0 { return Status.invalid_handle }
+    return p.*.files.seek(fd, @bitCast(isize, offset), whence)
+}
+
+// node_sync: what changed goes to the disks (every volume's; `handle`
+// 0, or a node's handle: the same). io_error when a disk refused it.
+pub fn sync(p: *Process, handle: usize) -> isize {
+    if handle != 0 && objects.descriptorOf(p, handle) < 0 { return Status.invalid_handle }
+    return if volume.commitAll() { 0 } else { Status.io_error }
+}
+
+// node_copy: `length` bytes of the file `from` (at its position) into
+// the file `to` (at its), both positions on after them; whole pages are
+// shared between the two (copy on write), the rest copied. The bytes, or
+// a status (not regular files, `to` not written or appended to).
+pub fn copy(p: *Process, from: usize, to: usize, length: usize) -> isize {
+    const fdIn = objects.descriptorOf(p, from)
+    const fdOut = objects.descriptorOf(p, to)
+    if fdIn < 0 || fdOut < 0 { return Status.invalid_handle }
+    const source = p.*.files.get(fdIn).?
+    const target = p.*.files.get(fdOut).?
+    if source.*.kind != files.Kind.node || target.*.kind != files.Kind.node { return Status.wrong_kind }
+    if !files.Open.reads(source.*.flags) || !files.Open.writes(target.*.flags) || target.*.flags & files.Open.APPEND != 0 { return Status.denied }
+    const tree = vfs.fileSystem()
+    if !tree.node(source.*.index).isRegular() || !tree.node(target.*.index).isRegular() { return Status.wrong_kind }
+    const at = source.*.offset
+    const into = target.*.offset
+    if source.*.index == target.*.index && at < into + length && into < at + length { return Status.invalid }
+    const copied = tree.copyRange(source.*.index, at, target.*.index, into, length)
+    if copied > 0 {
+        source.*.offset = at + @bitCast(usize, copied)
+        target.*.offset = into + @bitCast(usize, copied)
+    }
+    return copied
+}
+
+// node_link: one more name for the node `from` names (from
+// `fromDirectory`; a link itself is the node), `to` from `toDirectory`
+// (a hard link: the same node, its links one more). Not a directory's.
+pub fn link(p: *Process, fromDirectory: usize, fromAddress: usize, fromLength: usize, toDirectory: usize, toAddress: usize, toLength: usize) -> isize {
+    const fromBase = directoryOf(p, fromDirectory)
+    if fromBase < 0 { return fromBase }
+    const toBase = directoryOf(p, toDirectory)
+    if toBase < 0 { return toBase }
+    const fromFrame = copyPath(p, fromAddress, fromLength)
+    if fromFrame == 0 { return Status.bad_address }
+    const toFrame = copyPath(p, toAddress, toLength)
+    if toFrame == 0 {
+        memory.allFrames().free(fromFrame)
+        return Status.bad_address
+    }
+    const tree = vfs.fileSystem()
+    var result: isize = 0
+    const found = tree.resolve(@bitCast(usize, fromBase), pathAt(fromFrame))
+    var name: []const u8 = undefined
+    if found < 0 {
+        result = found
+    } else if tree.node(@bitCast(usize, found)).isDirectory() {
+        result = Status.is_directory
+    } else {
+        const parent = tree.resolveParent(@bitCast(usize, toBase), pathAt(toFrame), &name)
+        if parent < 0 {
+            result = parent
+        } else if name.length == 0 || tree.lookup(@bitCast(usize, parent), name.pointer, name.length) != vfs.Vfs.NONE {
+            result = Status.exists
+        } else if tree.node(@bitCast(usize, parent)).*.readOnly {
+            result = Status.read_only
+        } else if !tree.permits(@bitCast(usize, parent), vfs.Vfs.WRITE) {
+            result = Status.denied
+        } else {
+            result = tree.link(@bitCast(usize, parent), name.pointer, name.length, @bitCast(usize, found))
+            if result > 0 { result = 0 }
+        }
+    }
+    memory.allFrames().free(fromFrame)
+    memory.allFrames().free(toFrame)
+    return result
 }
 
 // node_own: the node's owner and group (all ones: as it is); a process
@@ -221,11 +439,18 @@ pub fn make(p: *Process, directory: usize, address: usize, length: usize, kind: 
         } else {
             tree.own(made, p.*.user, p.*.group_id)
             tree.retain(made)
-            if kind == Kind.LINK {
+            result = tree.link(@bitCast(usize, parent), name.pointer, name.length, made)
+            // A link's target is written once it has its name (on a
+            // volume, the name puts the node there; what it holds then
+            // goes there too).
+            if result >= 0 && kind == Kind.LINK {
                 const written = tree.write(made, 0, Bytes.pointer(target), targetLength)
-                if written < 0 { result = written }
+                if written < 0 {
+                    _ = tree.unlink(@bitCast(usize, parent), name.pointer, name.length)
+                    result = written
+                }
             }
-            if result == 0 { result = tree.link(@bitCast(usize, parent), name.pointer, name.length, made) }
+            if result > 0 { result = 0 }
             tree.release(made)
         }
     }

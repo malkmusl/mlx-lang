@@ -112,6 +112,20 @@ export XDG_CONFIG_HOME="$work/config"
 # Which apps asked for which permission (MLXIPC keeps it there).
 export XDG_STATE_HOME="$work/state"
 mkdir -p "$XDG_CONFIG_HOME/mlx"
+# The look the scenarios that find windows by their frames' colours pin:
+# opaque frames, the focused one blue, the others grey (the default is a
+# translucent glass whose pixels depend on what is behind it).
+# A flat wallpaper (a 16x16 PNG of one dark grey, the screen's size when
+# scaled) and the old blue accent make the background even and the colours
+# known (the default background is made of the desktop's colours, an
+# aurora, background.mlx).
+python3 - "$work/flat.png" <<'PY'
+import struct, sys, zlib
+def chunk(kind, data): return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
+rows = b''.join(b'\x00' + bytes((24, 26, 32)) * 16 for _ in range(16))
+open(sys.argv[1], 'wb').write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 16, 16, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
+PY
+classic_look="border-color = #5aa0ff\ninactive-border-color = #505060\ntitle-opacity = 100\nwallpaper = $work/flat.png\naccent-color = #5aa0ff\n"
 # GTK's document portal may have mounted itself under the runtime directory.
 trap 'fusermount -u "$XDG_RUNTIME_DIR/doc" 2> /dev/null || true; rm -rf -- "$work"' EXIT
 
@@ -181,7 +195,10 @@ echo "ok   greeter mode starts only its trusted client and gives only it input"
 if [[ ${MLX_WAYLAND_GREETER_ONLY:-0} == 1 ]]; then exit 0; fi
 
 # Scenario 1: Mlx terminals (the terminal's title follows its shell once
-# bash names it, so the log lines are matched by their kind alone).
+# bash names it, so the log lines are matched by their kind alone). The
+# frames are made opaque blue here (the default is a translucent glass),
+# so the focused one's pixels are known.
+printf 'border-color = #5aa0ff\ntitle-opacity = 100\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/terminal.script" <<SCRIPT
 wait 2500
 pointer 200 200
@@ -220,6 +237,7 @@ shot $work/terminals.ppm
 close
 SCRIPT
 run_scenario terminal "$work/terminal.script" --terminal "$work/vector" --run "$work/vector"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 [[ "$(cat "$work/first.marker" 2> /dev/null)" == "mlx-typed" ]] || { echo "keyboard input did not reach the first terminal's shell" >&2; cat "$work/terminal-compositor.log" >&2; exit 1; }
 echo "ok   keys typed on the host reached the shell in the Mlx terminal"
 [[ $(grep -c "^map: Mlx Terminal" "$work/terminal-compositor.log") -eq 2 ]] || { echo "Alt+Enter did not open a second terminal" >&2; exit 1; }
@@ -245,7 +263,9 @@ PY
 echo "ok   Alt+drag moved the focused window by the pointer's travel"
 
 # Scenario 2: the compositor's own title bars (std.truetype titles, when
-# the default font is installed): dragging one moves its window.
+# the default font is installed): dragging one moves its window. The bar
+# is made opaque blue and without buttons here, so its pixels are known.
+printf 'border-color = #5aa0ff\ntitle-opacity = 100\ntitle-buttons = none\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/title.script" <<SCRIPT
 wait 1500
 pointer 120 12
@@ -258,6 +278,7 @@ shot $work/title.ppm
 close
 SCRIPT
 run_scenario title "$work/title.script" --terminal "$work/vector" --run "$work/vector"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 grep -q "^move: " "$work/title-compositor.log" || { echo "dragging the title bar did not move the window" >&2; cat "$work/title-compositor.log" >&2; exit 1; }
 # The window starts at (24, 24) and moves by (+100, +100): its frame's left
 # edge is at x = 122, its title bar spans y = 102..121 (rounded above
@@ -281,6 +302,47 @@ if sys.argv[2] == "1":
     assert light > 50, "no title text in the title bar (%d light pixels)" % light
 PY
 echo "ok   dragging the compositor's title bar moved the window"
+
+# Scenario 2b: the title bar's buttons (the defaults: minimize, maximize
+# and close on the right, chips 20 x 14 two pixels apart, four from the
+# bar's edge, y 6..19). The terminal's bar spans x 22..677: maximize is
+# the middle chip (632..651). Maximized, the bar spans the output (y
+# 0..19, the chips at 4..17): close is the last chip (1000..1019), lit
+# red under the pointer, minimize's white line runs across x 961..969 at
+# y 10.
+cat > "$work/buttons.script" <<SCRIPT
+wait 1500
+pointer 641 12
+press 272
+release 272
+wait 800
+pointer 1010 11
+wait 500
+shot $work/buttons.ppm
+press 272
+release 272
+wait 800
+close
+SCRIPT
+run_scenario buttons "$work/buttons.script" --terminal "$work/vector" --run "$work/vector"
+log="$work/buttons-compositor.log"
+grep -q "^title button: maximize" "$log" && grep -q "^maximize: " "$log" || { echo "the maximize button did not maximize the window" >&2; cat "$log" >&2; exit 1; }
+grep -q "^title button: close" "$log" || { echo "the close button did not close the window" >&2; cat "$log" >&2; exit 1; }
+python3 - "$work/buttons.ppm" <<'PY'
+import sys
+data = open(sys.argv[1], 'rb').read()
+_, size, _, pixels = data.split(b'\n', 3)
+width, height = map(int, size.split())
+def rgb(x, y):
+    offset = (y * width + x) * 3
+    return tuple(pixels[offset:offset + 3])
+# The close chip lit red under the pointer, minimize's symbol white.
+close = rgb(1002, 11)
+assert close[0] > 200 and close[1] < 120 and close[2] < 120, close
+line = rgb(965, 10)
+assert min(line) > 200, line
+PY
+echo "ok   the title bar's maximize and close buttons work"
 
 # Scenario 3: resizing. The Mlx terminal (652x396 at 24,24: 80x24 cells)
 # snaps to whole cells, so every size is exact: its bottom-right border
@@ -514,6 +576,7 @@ echo "ok   a pointer lock holds the cursor and relative motion reaches the clien
 # eighths over what is there) and the window snaps there when let go;
 # Super+Right puts it in the right half; dragging its title bar away
 # brings back its old size under the pointer; the top edge maximizes.
+printf "$classic_look" > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/snap.script" <<SCRIPT
 wait 5000
 pointer 200 40
@@ -546,6 +609,7 @@ wait 600
 close
 SCRIPT
 run_scenario snap "$work/snap.script" --no-fps --topbar "$work/bar/horizon" --terminal "$work/vector" --run "$work/vector"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 log="$work/snap-compositor.log"
 # (The work area: 1024x738 below the bar; its halves 512 wide.)
 grep -q "^snap: left " "$log" && grep -q "^snapped: 512x738 at 0,30" "$log" && grep -q "^window: 508x[0-9]* at 2,52" "$log" || { echo "dragging the window to the left edge did not snap it to the left half" >&2; cat "$log" >&2; exit 1; }
@@ -667,7 +731,7 @@ echo "ok   workspaces and scrollable tiling: the bar's buttons and the hotkeys s
 # way (left of 600, not yet gone). Back on workspace 1, Super+Right snaps it
 # to the right half: 300 ms in, its left edge glides between where it was
 # and x = 511, where it rests in the end.
-printf 'animations = slow\n' > "$XDG_CONFIG_HOME/mlx/compositor.conf"
+printf "${classic_look}animations = slow\n" > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/animations.script" <<SCRIPT
 wait 3000
 down 125
@@ -721,6 +785,7 @@ echo "ok   animations: workspaces slide, snapped windows glide into place"
 # at 16); they lift and it settles with the second column at x = 8, which
 # takes the focus. Super+Ctrl+wheel goes to workspace 2, Super+wheel up on
 # that (floating) one back to 1, the wheel over the top bar to 2 again.
+printf "$classic_look" > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/wheel.script" <<SCRIPT
 wait 5000
 pointer 500 400
@@ -776,6 +841,7 @@ wait 1000
 close
 SCRIPT
 run_scenario wheel "$work/wheel.script" --no-fps --topbar "$work/bar/horizon" --terminal "$work/vector" --run "$work/vector"
+rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 log="$work/wheel-compositor.log"
 grep -q "^settled on column 2: " "$log" || { echo "the strip did not settle on the second column when the fingers lifted" >&2; cat "$log" >&2; exit 1; }
 [[ "$(grep "^workspace: " "$log" | tr '\n' ' ')" == "workspace: 2 workspace: 1 workspace: 2 " ]] || { echo "Super+Ctrl+wheel, Super+wheel and the wheel over the bar did not switch workspaces 2, 1, 2" >&2; cat "$log" >&2; exit 1; }
@@ -802,6 +868,7 @@ echo "ok   the wheel walks columns and switches workspaces, fingers drag the str
 # their way up: nothing of them at y = 600) and lifting goes there; 100
 # pixels down and a rest spring back; sideways on that floating workspace
 # goes back to workspace 1.
+printf "$classic_look" > "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/gestures.script" <<SCRIPT
 wait 5000
 pointer 500 400
@@ -877,10 +944,10 @@ PY
 echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up and down or sideways, and spring back"
 
 # Scenario 11: control (its window at (24, 24); the categories in
-# its sidebar 28 pixels apart from y 44: General, Network, Display, Sound,
+# its sidebar 26 pixels apart from y 8: General, Network, Display, Sound,
 # Apps, Window management, Top bar, Appearance, Language; on the Window management page the
-# hotkey rows 34 pixels apart from y 436, on the General page the
-# terminal's at y 375, under the dock's three choices and its workspace
+# hotkey rows 34 pixels apart from y 414, on the General page the
+# terminal's at y 353, under the dock's three choices and its workspace
 # switch). Maximize gets Super+Shift+M; minimize gets
 # Super+Up (the maximize hotkey: it must reach the window); the terminal
 # hotkey is cleared; then Super+Up minimizes.
@@ -888,11 +955,11 @@ echo "ok   three-finger swipes drag the strip and settle, pull workspaces in up 
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/hotkeys.script" <<SCRIPT
 wait 2500
-pointer 124 222
+pointer 124 175
 press 272
 release 272
 wait 300
-pointer 524 475
+pointer 524 453
 press 272
 release 272
 wait 300
@@ -903,7 +970,7 @@ up 50
 up 42
 up 125
 wait 300
-pointer 524 509
+pointer 524 487
 press 272
 release 272
 wait 300
@@ -912,11 +979,11 @@ down 103
 up 103
 up 125
 wait 300
-pointer 124 82
+pointer 124 45
 press 272
 release 272
 wait 300
-pointer 524 375
+pointer 524 353
 press 272
 release 272
 wait 300
@@ -942,7 +1009,7 @@ rm -f "$conf"
 echo "ok   control records hotkeys (the compositor's too) and the compositor uses them at once"
 
 # Scenario 11b: control' Top bar page, opened by its argument (the
-# rows' middles 50 pixels apart from y 229: what plays, the tray, the sound,
+# rows' middles 50 pixels apart from y 207: what plays, the tray, the sound,
 # the battery, the control centre, the clock; a row's up arrow at x 670).
 # The sound moves up a place, a click on the battery's row hides it.
 cat > "$work/topbar-page.sh" <<SCRIPT
@@ -953,11 +1020,11 @@ chmod +x "$work/topbar-page.sh"
 rm -f "$XDG_CONFIG_HOME/mlx/topbar.conf"
 cat > "$work/topbar-page.script" <<SCRIPT
 wait 2500
-pointer 670 329
+pointer 670 307
 press 272
 release 272
 wait 600
-pointer 420 374
+pointer 420 352
 press 272
 release 272
 wait 800
@@ -1108,11 +1175,16 @@ sw, sh, sc, screen = load(work + '/capture-screen.png')
 ww, wh, wc, window = load(work + '/capture-window.png')
 assert sc == 3 and wc == 4, (sc, wc)
 assert ww < sw and wh < sh, (sw, sh, ww, wh)
-# Opaque content of the window, where the screen shows it.
-for x, y in ((ww - 60, wh - 60), (ww // 2, wh // 2)):
-    on_window = window[y][x * 4:x * 4 + 3]
-    on_screen = screen[24 + y][(24 + x) * 3:(24 + x) * 3 + 3]
-    assert window[y][x * 4 + 3] == 255 and on_window == on_screen, (x, y, on_window, on_screen)
+# The window's opaque pixels (its content is a translucent surface over
+# the blurred desktop; its text, switches and fields are opaque) are the
+# screen's where it shows them (its content at (24, 24)).
+opaque = same = 0
+for y in range(0, wh, 2):
+    for x in range(0, ww, 2):
+        if window[y][x * 4 + 3] != 255: continue
+        opaque += 1
+        if window[y][x * 4:x * 4 + 3] == screen[24 + y][(24 + x) * 3:(24 + x) * 3 + 3]: same += 1
+assert opaque > 500 and same * 100 >= opaque * 98, (opaque, same)
 PY
 damage=$(grep "^frame 2: damage" "$work/capture.log" | sed 's/.* damage //')
 [[ -n "$damage" && "$damage" != "0,0 "* ]] || { echo "the second frame did not wait for a change, or carried full damage ($damage)" >&2; cat "$work/capture.log" >&2; exit 1; }
@@ -1200,10 +1272,10 @@ fi
 
 # Scenario 14: control' Sound and Display pages. MLXIPC is the
 # session bus and starts MLX Audio (into a file) when control first
-# asks for it. On the Sound page (no sound card: Automatic at y 141, None
-# at y 179, the volume slider at y 220) None is chosen and the volume
+# asks for it. On the Sound page (no sound card: Automatic at y 119, None
+# at y 157, the volume slider at y 198) None is chosen and the volume
 # dragged from 100% to about half; on the Display page the night light
-# switch (y 371) is turned on.
+# switch (y 349) is turned on.
 "$compiler" --quiet projects/desktop/ipc/main.mlx -o "$work/synapse"
 "$compiler" --quiet projects/desktop/audio/main.mlx -o "$work/resonance"
 "$compiler" --quiet projects/desktop/audio/tool.mlx -o "$work/mlx-audio"
@@ -1220,27 +1292,27 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 cat > "$work/pages.script" <<SCRIPT
 wait 2500
-pointer 124 166
+pointer 124 123
 press 272
 release 272
 wait 1200
-pointer 300 179
+pointer 300 157
 press 272
 release 272
 wait 600
-pointer 718 220
+pointer 718 198
 press 272
-pointer 650 220
+pointer 650 198
 wait 50
-pointer 600 220
+pointer 600 198
 wait 100
 release 272
 wait 600
-pointer 124 138
+pointer 124 97
 press 272
 release 272
 wait 800
-pointer 753 371
+pointer 753 349
 press 272
 release 272
 wait 1500
@@ -1267,12 +1339,12 @@ grep -q "night light 4000 K" "$work/pages-compositor.log" || { echo "the composi
 rm -f "$XDG_CONFIG_HOME/mlx/compositor.conf"
 echo "ok   control' Sound page controls MLX Audio (output off, volume $((volume * 100 / 65536))%); the Display page reads the output and writes night light"
 
-# Scenario 14b: control' Network page (the category at y 110) on a
+# Scenario 14b: control' Network page (the category at y 71) on a
 # system bus of its own (synapse --address) with tools/network-test's
 # fakenetd in nexus's place: a cable and a Wi-Fi card that sees four
-# networks (Zuhause at y 354 needs a passphrase). Zuhause is chosen, a
+# networks (Zuhause at y 332 needs a passphrase). Zuhause is chosen, a
 # wrong passphrase is typed (refused: the field asks again, empty), then
-# the right one (joined), then Forget (at (374, 393)). The passphrase
+# the right one (joined), then Forget (at (374, 371)). The passphrase
 # reaches fakenetd only as its length.
 "$compiler" --quiet tools/network-test/fakenetd.mlx -o "$work/fakenetd"
 "$work/synapse" --address "$XDG_RUNTIME_DIR/system" > "$work/system-ipc.log" 2>&1 &
@@ -1314,11 +1386,11 @@ netd_pid=$!
 for _ in $(seq 1 50); do grep -q "^fakenetd: ready" "$work/fakenetd.log" && break; sleep 0.1; done
 cat > "$work/network.script" <<SCRIPT
 wait 2500
-pointer 124 110
+pointer 124 71
 press 272
 release 272
 wait 1500
-pointer 400 354
+pointer 400 332
 press 272
 release 272
 wait 800
@@ -1328,7 +1400,7 @@ wait 2000
 type correct horse battery
 enter
 wait 2500
-pointer 374 393
+pointer 374 371
 press 272
 release 272
 wait 1500
@@ -1348,8 +1420,8 @@ echo "ok   control' Network page joins a Wi-Fi network (a wrong passphrase is re
 # dialog opens on the compositor (at (24, 24); the question takes two
 # lines: "Remember this decision" at y 153, Allow at (422, 198)). Both are
 # clicked: the app records and ipc.conf keeps the answer. Then
-# control' Apps page (the category at y 194) lists the app's
-# microphone as allowed; Deny (at (662, 208)) is clicked: ipc.conf says
+# control' Apps page (the category at y 149) lists the app's
+# microphone as allowed; Deny (at (662, 186)) is clicked: ipc.conf says
 # so.
 if command -v bwrap > /dev/null && bwrap --bind / / true 2> /dev/null; then
     "$compiler" --quiet projects/desktop/permissions/main.mlx -o "$work/scope"
@@ -1392,11 +1464,11 @@ SCRIPT
     echo "ok   the permission dialog asks the user; Allow with Remember lets the app record and becomes a rule"
     cat > "$work/apps.script" <<SCRIPT
 wait 2500
-pointer 124 194
+pointer 124 149
 press 272
 release 272
 wait 1000
-pointer 662 208
+pointer 662 186
 press 272
 release 272
 wait 1500

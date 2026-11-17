@@ -34,6 +34,7 @@
 #
 #   tools/check_brix_draw.sh [compiler]
 set -euo pipefail
+. "$(dirname "$0")/brix_classic_look.sh"
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo_root"
@@ -104,8 +105,9 @@ cp projects/brix/settings/init/services/serial-shell.service "$work/services/"
 # frame said (MLX_FRAMES_SAY), and no frames-per-second counters in the
 # title bars (they are drawn anew each second while frames go by: frames of
 # the compositor's own, not of what is checked here).
+classic_look "$work"
 sed -e 's/^exec = kepler$/exec = kepler --verbose --no-fps/' -e '/^disabled = yes$/d' -e '$a log = console' -e '$a env = MLX_COMPOSITOR_LOG=-' -e '$a env = MLX_FRAMES_SAY=1' \
-    projects/brix/settings/init/services/desktop.service > "$work/services/desktop.service"
+    -e "\$a $classic_env" projects/brix/settings/init/services/desktop.service > "$work/services/desktop.service"
 grep -q '^exec = kepler --verbose --no-fps$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
 # A file to cat: forty lines, more than the terminal's window holds.
 for (( line = 1; line <= 40; line++ )); do
@@ -113,7 +115,7 @@ for (( line = 1; line <= 40; line++ )); do
 done > "$work/lines"
 entries=()
 for service in "$work"/services/*.service; do entries+=("settings/init/services/$(basename "$service")=$service"); done
-"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "share/apps/Vector.app/app.ini=projects/desktop/apps/Vector.app/app.ini" "share/apps/Vector.app/icon.png=projects/desktop/apps/Vector.app/icon.png" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "share/lines=$work/lines" "${entries[@]}" "$work/bin/"
+"$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" "share/apps/Vector.app/app.ini=projects/desktop/apps/Vector.app/app.ini" "share/apps/Vector.app/icon.png=projects/desktop/apps/Vector.app/icon.png" "${keymap[@]}" "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" "share/lines=$work/lines" "${entries[@]}" "${classic_entries[@]}" "$work/bin/"
 echo "ok   the kernel, impulse, ignition, kepler, vector, the launcher, the dock, the top bar and a boot image whose desktop says its frames build"
 
 # The QEMU monitor on a socket: keys, the mouse, screen dumps.

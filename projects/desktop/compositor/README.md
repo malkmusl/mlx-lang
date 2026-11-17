@@ -31,6 +31,34 @@ goes from the splash to the desktop with no text console in between.
 - Animated: windows glide where the compositor puts them, workspaces
   slide, new windows grow open, the snap preview grows out of the window
   (see Animations).
+- The desktop takes its colours from its background, as Material You
+  does (background.mlx, std.ui.scheme): the wallpaper (`wallpaper`, a PNG
+  or JPEG covering the screen) gives an accent, three "prism" colours (its
+  most colourful hues) and a tint; `accent-color = #rrggbb` makes them
+  from the user's own colour instead (`auto`: from the wallpaper).
+  Without a wallpaper the background is made of them (an aurora: the
+  prism's colours glowing over the tint). They go to
+  ~/.config/mlx/appearance.conf, which every app follows (std.ui.theme's
+  accent and surfaces, the top bar, the dock, notifications); control's
+  Appearance page chooses the wallpaper and the colour.
+- Title bars are tinted glass: translucent (`title-opacity`, 84% by
+  default) over what is behind them, blurred (`title-blur`), in the
+  desktop's colours unless `border-color` names one; the focused window's
+  bar carries the prism's gradient along its top (running across the
+  whole screen, so windows side by side light up as one). Its buttons are
+  chips with thin symbols (minimize, maximize or restore, close) that
+  light up under the pointer (the prism's colours, close in red) and act
+  when let go over. Which buttons and where is `title-buttons`
+  (`minimize,maximize,close` on the right by default; names before a `:`
+  go on the left, `none` drops them); control's Windows page arranges
+  them with arrows and previews the bar.
+- The keyboard layout is `keyboard-layout` and `keyboard-variant` in
+  compositor.conf (control's Language page offers US, Colemak,
+  Colemak-DH, Dvorak, German, Neo 2, UK, French and Swiss German):
+  freestanding, the keymap is made again at once and handed to every
+  client; unset, XKB_DEFAULT_LAYOUT decides as before. brixOS has a
+  keymap file for each of them in /system/settings/keyboard
+  (LAYOUT-VARIANT.xkb).
 - Windows resize by dragging their border (the cursor shows the
   direction; near a corner, the corner), with Alt+right-drag from the
   nearest corner, or from the client's own edges (`xdg_toplevel.resize`,

@@ -45,6 +45,7 @@
 #
 #   tools/check_brix_displays.sh [compiler]
 set -euo pipefail
+. "$(dirname "$0")/brix_classic_look.sh"
 cd "$(dirname "$0")/.."
 compiler=${1:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
 fonts=/usr/share/fonts/truetype/dejavu
@@ -338,14 +339,15 @@ stop
 echo "ok   the boot screen stays on both displays, the same picture, fitted ($seen)"
 
 # ---- 3. the desktop ----
+classic_look "$work"
 sed -e 's/^exec = kepler$/exec = kepler --verbose/' -e '/^disabled = yes$/d' -e '$a log = console' -e '$a env = MLX_COMPOSITOR_LOG=-' \
-    projects/brix/settings/init/services/desktop.service > "$work/services/desktop.service"
+    -e "\$a $classic_env" projects/brix/settings/init/services/desktop.service > "$work/services/desktop.service"
 grep -q '^exec = kepler --verbose$' "$work/services/desktop.service" || fail "desktop.service is not the shipped one"
 mkdir -p "$work/desktop/EFI/BOOT"
 "$work/brix-image" "$work/kernel" "$work/desktop/EFI/BOOT/BOOTX64.EFI" "flux=$work/flux" "impulse=$work/impulse" "impulsectl=$work/impulsectl" "ignition=$work/ignition" "kepler=$work/kepler" "vector=$work/vector" "launch=$work/launch" "orbit=$work/orbit" "horizon=$work/horizon" \
     "share/apps/Vector.app/app.ini=projects/desktop/apps/Vector.app/app.ini" "share/apps/Vector.app/icon.png=projects/desktop/apps/Vector.app/icon.png" \
     "fonts/DejaVuSansMono.ttf=$fonts/DejaVuSansMono.ttf" "fonts/DejaVuSans.ttf=$fonts/DejaVuSans.ttf" \
-    "settings/init/services/serial-shell.service=$work/services/serial-shell.service" "settings/init/services/desktop.service=$work/services/desktop.service" "$work/bin/"
+    "settings/init/services/serial-shell.service=$work/services/serial-shell.service" "settings/init/services/desktop.service=$work/services/desktop.service" "${classic_entries[@]}" "$work/bin/"
 start "$work/desktop" "${two[@]}"
 wait_for 'brix: 1 further display shows the same picture$'
 wait_for '^layer: orbit '

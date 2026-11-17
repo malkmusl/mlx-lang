@@ -62,6 +62,20 @@ leaves_brixos_by_process_exit() {
 
 # Whether $1 names the functions in a symbol table (.symtab), which the
 # crash reports of the desktop programs read.
+# A brixOS program's value arena from memory_map (NATIVE_BASE + 16), not
+# the Linux layer's mmap: its start stub holds mov eax, 0x4010.
+maps_brixos_arena_natively() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet --target=x86_64-brixos tests/support/brixos_linked_exit/main.mlx -o "$probe/probe" > /dev/null 2>&1 \
+        && od -An -tx1 -v "$probe/probe" | tr -d ' \n' | grep -q 'b810400000'; then
+        ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 writes_symbol_tables() {
     local probe
     probe=$(mktemp -d mlx-out/probe.XXXXXX)
@@ -1090,6 +1104,7 @@ probes=(
     "ends_functions_with_endless_loops|a function ending with a while true no break ends"
     "resolves_types_across_import_rings|records of modules that import one another naming one another"
     "leaves_brixos_by_process_exit|a linked brixOS program leaving by process_exit"
+    "maps_brixos_arena_natively|a brixOS program's value arena from memory_map"
     "reads_constant_tables_from_static_data|module-level const tables read from static data"
     "aligns_functions|functions at multiples of 16"
     "types_slices_of_constants|slices of constants and of by-value parameters as []const T"
