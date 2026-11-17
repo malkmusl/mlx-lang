@@ -629,8 +629,10 @@ registers), and only when the link the firmware trained has room for the
 new clock (lanes times rate times 8/10 over the bits a pixel; the rate
 is not in a register of its own and is worked out from the stream's M
 and N and the pixel clock). A link
-that is too slow would have to be trained again, which is the card's
-firmware tables' work and not there yet.
+that is too slow, or is not trained, is taken down and trained by the
+driver itself at the rate and lanes the timing needs ("A DisplayPort
+link trained by the driver", below), when the monitor answers on its AUX
+channel.
 On an HDMI or DVI output (TMDS) the pixel clock is a PLL's and is the
 link's clock too: the output is taken down, the PLL set, the timing set
 and the output brought up again, and the PLL, the transmitter, the
@@ -711,13 +713,16 @@ the path that follows from it.
     firmware    the firmware's picture is kept: no register of the
                 display is written and no table of the card's is run.
     rehearsal   the firmware's own mode set again by the same steps,
-                the card's own tables among them (today where the
-                picture leaves by HDMI or DVI signalling): the screen
+                the card's own tables among them (on HDMI and DVI the
+                clock, timing and transmitter by the tables; on
+                DisplayPort the firmware's own link taken down and
+                trained again at its own rate and lanes): the screen
                 goes dark for a moment and comes back as it was. Nothing
                 new is asked of the monitor.
-    ask         the monitor only asked, nothing set (the step before a
-                DisplayPort link is trained). Not built yet: the
-                firmware's picture is kept, and the log says so.
+    ask         the monitor only asked, nothing set: on a DisplayPort
+                output what the monitor says of itself over its AUX
+                channel is read and said. The firmware's picture is
+                kept. (On HDMI and DVI there is nothing to ask.)
 
 The choice is the first of these that names one:
 
@@ -776,8 +781,8 @@ kernel's display is the new picture from there on: the console is drawn
 again on it, and /devices/framebuffer gives the programs the monitor's
 own size. A plan that is not complete is not carried out, and one line
 says why ("gpu: the monitor's own mode is not set, the firmware's
-picture stays: the link is too slow: it must be trained again, not there
-yet").
+picture stays: the link is too slow: it has to be trained again, but the
+monitor does not answer on its AUX channel").
 
 A TMDS output's plan is carried out with more care still, since the
 card's own tables do part of it and nobody has seen them run here on a
@@ -884,6 +889,163 @@ the kernel sets the mode before it has a keyboard: F at the next start
 is the way back). The tables that Linux runs once at its
 start and this driver leaves to the firmware's own start (the
 transmitter's "init", the power gate) are not run.
+
+### A DisplayPort link trained by the driver
+
+On a DisplayPort output the monitor can be asked: it has a side channel,
+the AUX channel, and registers of its own behind it. The driver talks to
+it by the card's registers (gpu_aux.mlx), on the channel and the hot
+plug line the card's ROM names for the connector behind the output the
+firmware's picture leaves by (never by the output's number: a card
+wires them as it likes). It asks at every boot whose choice is not
+"firmware", before the plan is made:
+
+    gpu: hot plug line 2 reads high (sense 1, delayed 1; its block is on)
+    gpu: AUX 1: on, watching hot plug line 2, pins in AUX mode, free, receive window 1 (control 0x100001)
+    gpu: AUX 1: the data word read 0x0 before the first request, 0x0 before its reply
+    gpu: the monitor's capabilities: 12 14 c4 01 00 00 01 00 00 00 00 00 00 00 00 00
+    gpu: the monitor: DisplayPort 1.2, up to 5.40 Gbit/s on 4 lanes, patterns up to 3, enhanced framing, downspread
+    gpu: the monitor holds 1.62 Gbit/s on 2 lanes, all locked (status 77 00 01 01 00 00), power on
+
+and reads the monitor's EDID the same way (it is this output's monitor,
+whatever the loader passed on: with two adapters the loader's may be
+another's). What the monitor says decides with the card's words which
+case the link is, and the plan says it:
+
+- kept: the monitor holds the link the card's words give, every lane
+  locked, and it has room for the new clock. The clock, the timing and
+  the picture are set by registers alone, as before; afterwards the
+  monitor's lanes are read once more. Lanes that are not locked then:
+  the registers are put back, and if the lanes are still not locked the
+  firmware's own link is taken down and trained again.
+- trained again: the link is too slow. "gpu: plan (b, DisplayPort): the
+  link is too slow: it is taken down and trained at 2.70 Gbit/s on 4
+  lanes (the lowest rate and the fewest lanes that carry 266640 kHz; the
+  most both ends have is 5.40 Gbit/s on 4 lanes; ...)". The choice of
+  rate and lanes is Linux's: the lowest rate that does it, with as few
+  lanes as that rate needs, within what the card's ROM allows the
+  encoder and what the monitor says it can.
+- trained: the card says the link is not trained, or the monitor holds
+  no link or has lost its lanes.
+- refused, with the reason in one line: a monitor that does not answer
+  or is none to train (a hub, an embedded panel, three lanes), one that
+  holds another link than the card's words give (the way back would not
+  be known), a ROM that does not name the connector, its channel and
+  its line, a transmitter's table of another revision than 6, no rate
+  and lanes that carry the timing, a display clock that is too low
+  (raising it for a DisplayPort output is not built), several streams.
+  Without an answer a link that has room is still kept, on the card's
+  word, as before there was a way to ask.
+
+The display clock decides more than it seems to. The new rows need it
+at 1.2 times their pixel clock whatever the link does, so a link that
+is kept is refused for it like one that is trained: "gpu: plan (b,
+DisplayPort): nothing would be set: the display clock is 118032 kHz and
+would have to be 326350 kHz: raising it for a DisplayPort output is not
+built". Those are the figures of the RX 580 these trials are made on,
+as its firmware leaves it, for 3840x1080 at 270270 kHz: on that card a
+DisplayPort output keeps the firmware's picture until the clock is
+raised for it as the HDMI plan raises it (the card's SetDCEClock table,
+twice). A and R do not depend on it.
+
+A link is trained as Linux 6.6's display core trains one on these cards
+(gpu_link.mlx; the plan lists what is fixed of it beforehand, "gpu:
+would take the link down ...", "gpu: would train the link at ..."): the
+stream stopped, the monitor told its power state D3, the transmitter
+off by the card's own table (UNIPHYTransmitterControl, the one table a
+DisplayPort link runs), the controller blanked, the clock and the
+timing, the transmitter on at the link's rate and lanes, the monitor
+woken and told the link, then the training: clock recovery with pattern
+1 and equalisation with pattern 2, 3 or 4, in rounds: the lanes' drive
+set by the table, the monitor told, a wait, its status read and what it
+asks for taken. Its course cannot be known beforehand, so it is said as
+it runs, a line a round:
+
+    gpu: train 2.70x4, clock recovery, round 2: drive swing 1 pre 0; lanes 1 1 0 1, aligned 0, asked swing 1 1 2 1 pre 0 0 0 0
+    gpu: train 2.70x4: trained in 3 + 1 rounds with pattern 3 at swing 2 pre 0; holds after 5 ms (try 1 of 4, 38 ms)
+    gpu: train 2.70x4: failed at clock recovery on lane 2, which points to a lower rate (try 2 of 4; the last status 1 1 0 1, drive swing 3 pre 0)
+
+(a lane's digit: 1 its clock recovered, 2 equalised, 4 its symbols
+locked). A training that fails is tried again from the link taken down,
+four times in all. Then the stream is started with M for the new rate
+and the picture set; the monitor's lanes are read once more with the
+picture on the link. When anything fails the way back is the same
+sequence towards the firmware's state: its clock and timing, its own
+link trained at its own rate and lanes, its stream. The screen is dark
+from the stream's stop until the picture is shown; how long that can be
+at most is said before the first write, and it is a bound, not what is
+expected: a table is given two seconds and a try of a training five,
+whatever the card and the monitor do, which for four tries and their
+tables comes to "the screen is dark meanwhile, 104 s at most"; a
+training that goes as it should takes a fraction of a second.
+
+On the machine, with the monitor on a DisplayPort output, the order of
+trials is again keys and the one image:
+
+1. A (held while the machine starts): the monitor only asked. Nothing of
+   the card is written but the AUX channel's own words (and those are
+   put back). The lines above are the answer to the first question: does
+   the channel work by registers on this card. "gpu: AUX 1: no answer at
+   600h (status 0x...: timeout) after 32 tries" is the other answer;
+   send the log either way. The plan is said too, and not carried out.
+2. R: the firmware's own link taken down and trained again at its own
+   rate and lanes, the clock, the timing and the picture left. The
+   screen goes dark and comes back as it was: "gpu: controller 0 runs
+   the firmware's own mode again, 59.979 frames a second, on its own
+   link taken down and trained again at 1.62 Gbit/s on 2 lanes: the
+   picture is where it was". It shows that the table's three calls and
+   the training work on this card, and thereby the way back, before
+   anything new is asked of the monitor.
+3. Nothing (or N, where F is remembered): the monitor's own mode. The
+   driver asks first by itself, and goes on only when what it learned
+   allows it (and the display clock is enough: above).
+
+If it fails and the picture comes back, the screen says where ("gpu:
+step 39 of 83 failed (the link's own step: clock recovery): train the
+link at ...") and what came back. If the screen stays dark: as for an
+HDMI output, wait until the disk is quiet, restart with F held down, and
+send boot.previous.log whole. Its last "gpu:" line is one of the four
+endings above; for a link there is one thing more it can say, "gpu: the
+firmware's own link did not train again: the card sends its idle pattern
+and the stream all the same; the monitor may show nothing until a
+restart", and the state is then not called back. What cannot be the
+firmware's again is said as such: the lanes' drive is the new training's
+own, and a word of the back end that the training writes differently
+from the firmware is named ("gpu: DIG 1's framing word holds ... where
+the firmware had ... (the training's own value)").
+
+What is taken on trust until the card has said otherwise, each said in
+the log where it happens: the transmitter's "off" is told what Linux's
+display core tells it at a change of mode on a link it trained itself
+(DisplayPort, no clock, no lanes), which neither of Linux's two drivers
+sends to a link the firmware trained; the table's "init" is not run (the
+firmware's own start ran this ROM); the back end is expected to read on
+after the table's "on" and off after its "off". A check of these that
+fails costs the mode, not the picture, as long as the way back holds,
+which is what R is there to show first.
+
+Not done for a DisplayPort output: a setting above the first that
+carries the timing when that one does not train (the log names the next;
+the firmware's link is trained again instead), a display clock raised, a
+monitor behind a hub or one that carries several streams, an embedded
+panel, more than one controller, a link from nothing (an output the
+firmware did not start: its detection is the hot plug work's), the
+monitor's request for attention later (no interrupt is served: a link
+lost after the boot is not noticed), and the source's name that Linux
+writes to the monitor (300h). The AUX channel by the card's table
+(ProcessAuxChannelTransaction) is the second line if the registers get
+no answer on this card; it is not built.
+
+tests/480_gpu_dp_sequence_runtime.mlx holds all of that on the host,
+against a card that is a table and a monitor behind its AUX channel that
+is one too (tests/support/dp_monitor.mlx): each sequence write for
+write, table run for table run and AUX transaction for transaction, a
+failure at every one of them and the way back from each, a training that
+fails in each way there is.
+tests/481_gpu_dp_link_runtime.mlx holds the pieces: an AUX transaction's
+register words, the tries, the EDID through the channel, the monitor's
+capabilities, the arithmetic of rates and lanes, the table's blocks byte
+for byte, and every reason for no plan.
 
 tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
 numbers on the host, tests/459_edid_timing_runtime.mlx reads EDIDs

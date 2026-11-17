@@ -15,7 +15,7 @@
 #    byte, F;
 # 3. R: the firmware's own mode set again, for that boot; the start after
 #    it is what was remembered before (R changes nothing remembered);
-# 4. A: the monitor only asked (not built: the firmware's picture is
+# 4. A: the monitor only asked (nothing set: the firmware's picture is
 #    kept), for that boot;
 # 5. N: the monitor's own mode again, remembered at the next start; N
 #    once more writes nothing (the machine holds it already);
@@ -230,8 +230,8 @@ echo "ok   R: the firmware's own mode set again for that boot; the start after i
 # ---- 4. A: one boot ----
 boot a
 said "brixOS: display: the monitor only asked (A), for this start only" || fail "the loader does not say what A gave"
-said "this boot: the monitor only asked, which is not built yet: the firmware's picture is kept (A was pressed at this start and holds for this boot only)" || fail "after A the kernel does not say that the asking is not built"
-echo "ok   A: the monitor only asked, which is not built: the kernel says so and keeps the firmware's picture, for that boot"
+said "this boot: the monitor only asked, nothing set: the firmware's picture is kept (A was pressed at this start and holds for this boot only)" || fail "after A the kernel does not say that the monitor is only asked"
+echo "ok   A: the monitor only asked, nothing set: the kernel says so and keeps the firmware's picture, for that boot"
 
 # ---- 5. N, the start after it, and N again ----
 boot n

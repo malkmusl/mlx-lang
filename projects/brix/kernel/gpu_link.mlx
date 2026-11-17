@@ -1,0 +1,1395 @@
+// A DisplayPort link on a Polaris card (DCE 11.2): what the monitor is
+// asked over its AUX channel (gpu_aux.mlx) and what it answers, which rate
+// and how many lanes a timing needs, and the link taken down and brought
+// up again and trained by the driver itself. gpu_mode.mlx plans with this
+// (which case an output is, what its steps are); gpu_set.mlx carries the
+// two steps out that are the link's own: `down` and `bring`.
+//
+// Everything follows Linux 6.6's display core for this controller
+// (drivers/gpu/drm/amd/display/dc), function by function as named below:
+// link/protocols/link_dp_capability.c for what is read of the monitor and
+// the choice of rate and lanes, link_dp_training.c and link_dp_training_
+// 8b_10b.c for the training, link_dp_phy.c for the link's transmitter
+// and the monitor's power state, dce/dce_link_encoder.c for the back
+// end's registers. The monitor's own registers (its DPCD) are numbered as
+// include/drm/display/drm_dp.h numbers them. Every number is held
+// against those files by tools/check_gpu_registers.py.
+//
+// THE SEQUENCE is the display core's change of mode on a link it trained
+// itself (dce110_reset_hw_ctx_wrap for the old state, apply_single_
+// controller_ctx_to_hw for the new one):
+//   down:  the monitor told its power state D3 (600h = 2), the link's
+//          transmitter off (the card's table), the back end's pattern,
+//          "trained" and panel mode words cleared;
+//   bring: the lanes' count and the scrambler, the transmitter on at the
+//          link's rate (the table), the monitor told D0 (600h = 1), its
+//          panel mode word looked at, the link's settings written to it
+//          (102h, 108h, 107h, 101h, 100h), clock recovery with pattern 1
+//          and channel equalisation with pattern 2, 3 or 4 as rounds of
+//          { the lanes' drive set by the table, the monitor told, a wait,
+//          the monitor's status read and judged, what it asks for taken },
+//          the monitor's pattern off, the card to its idle pattern and
+//          "trained", and after 5 ms the lanes read once more. A training
+//          that fails is tried again from the link taken down, four times
+//          in all, 100, 150 and 200 ms apart.
+//
+// WHERE THIS LEAVES LINUX, each for care:
+// - Linux never does this from the firmware's state: it starts every
+//   output's transmitter anew (the table's "init"), blanks every
+//   controller and trains at the highest setting for trial. Here the
+//   firmware's picture is left until the choice is made, no trial is
+//   trained (the two ends' own limits are taken, as the older amdgpu
+//   does), and the table's "init" is not run (the firmware's own start
+//   ran this ROM). The transmitter's "off" is told what the display core
+//   tells it at every later change of mode (the mode DisplayPort, no
+//   clock, no lanes); what the ROM wants for a link the firmware trained
+//   is not in Linux's sources (its older driver names the new link's
+//   clock and lanes there). Both are said in the log when they happen.
+// - the monitor is not granted adjust requests after the training (bit
+//   0x20 of 101h, as the older amdgpu never grants it): so the read after
+//   5 ms holds for every monitor;
+// - every register written is read back; the back end must read "on"
+//   after the table's "on" and "off" after its "off" (which rests on what
+//   the table is taken to write: a table that did its work may fail
+//   this, which costs the mode and not the picture);
+// - a status read that fails ends the try (Linux goes on with what it
+//   had); a try has a time of its own (TRY_TIME) beside Linux's counts of
+//   rounds, so that it is bounded whatever the monitor and the tables do;
+// - the back end's panel mode word (DP_DPHY_INTERNAL_CTRL, whose number
+//   is in dce112_resource.c and not in the register header) is written
+//   only when it does not read 0;
+// - after the fourth failed try nothing more is trained. On the way back
+//   to the firmware's link the card is then put to its idle pattern all
+//   the same, so that a monitor that did lock without saying so gets a
+//   stream it can show (Linux leaves the pattern on unless the rate is
+//   the lowest).
+// Left out of what Linux does: the source's name written to the monitor
+// (300h, 303h), the monitor's 107h read after the stream starts, the
+// several-streams and repeater registers, forward error correction and
+// stream compression (this controller has neither).
+const scanout = @import("./gpu_display.mlx")
+const aux = @import("./gpu_aux.mlx")
+const blocks = @import("./gpu_blocks.mlx")
+
+// A back end's registers beyond the read-out's (in an encoder's block, as
+// gpu_display.mlx numbers them), and their fields.
+pub const DP_DPHY_INTERNAL_CTRL: usize = 0xA7
+pub const DP_LINK_FRAMING_CNTL: usize = 0xAB
+pub const DP_DPHY_CNTL: usize = 0xAF
+pub const DP_DPHY_TRAINING_PATTERN_SEL: usize = 0xB0
+pub const DP_DPHY_PRBS_CNTL: usize = 0xB5
+pub const DP_DPHY_SCRAM_CNTL: usize = 0xB6
+pub const DIG_BE_EN_CNTL__DIG_ENABLE: usize = 0x1
+pub const DIG_BE_CNTL__DIG_FE_SOURCE_SELECT: usize = 0x7F00
+pub const DIG_BE_CNTL__DIG_MODE: usize = 0x70000
+pub const DP_LINK_CNTL__DP_LINK_TRAINING_COMPLETE: usize = 0x10
+pub const DP_CONFIG__DP_UDI_LANES: usize = 0x3
+pub const DP_LINK_FRAMING_CNTL__DP_IDLE_BS_INTERVAL: usize = 0x3FFFF
+pub const DP_LINK_FRAMING_CNTL__DP_VBID_DISABLE: usize = 0x1000000
+pub const DP_LINK_FRAMING_CNTL__DP_VID_ENHANCED_FRAME_MODE: usize = 0x10000000
+pub const DP_DPHY_CNTL__DPHY_BYPASS: usize = 0x10000
+pub const DP_DPHY_TRAINING_PATTERN_SEL__DPHY_TRAINING_PATTERN_SEL: usize = 0x3
+pub const DP_DPHY_PRBS_CNTL__DPHY_PRBS_EN: usize = 0x1
+pub const DP_DPHY_SCRAM_CNTL__DPHY_SCRAMBLER_ADVANCE: usize = 0x10
+pub const DP_DPHY_SCRAM_CNTL__DPHY_SCRAMBLER_BS_COUNT: usize = 0x3FF00
+// What set_dp_phy_pattern_passthrough_mode writes into two of them.
+pub const IDLE_BS_INTERVAL: usize = 0x2000
+pub const SCRAMBLER_BS_COUNT: usize = 0x1FF
+
+// A hot plug line's words (line 1's numbers; eight apart, six lines) and
+// the bits read of them: the line now, the line after the card's filter,
+// a short pulse of the monitor's kept, and whether the line's block is
+// on at all.
+pub const DC_HPD_INT_STATUS: usize = 0x1898
+pub const DC_HPD_CONTROL: usize = 0x189A
+pub const HPD_STEP: usize = 8
+pub const HPD_LINES: usize = 6
+pub const DC_HPD_INT_STATUS__DC_HPD_SENSE: usize = 0x2
+pub const DC_HPD_INT_STATUS__DC_HPD_SENSE_DELAYED: usize = 0x10
+pub const DC_HPD_INT_STATUS__DC_HPD_RX_INT_STATUS: usize = 0x100
+pub const DC_HPD_CONTROL__DC_HPD_EN: usize = 0x10000000
+
+// The monitor's own registers (drm_dp.h).
+pub const DP_DPCD_REV: usize = 0x000
+pub const DP_MAX_LINK_RATE: usize = 0x001
+pub const DP_MAX_LANE_COUNT: usize = 0x002
+pub const DP_MAX_DOWNSPREAD: usize = 0x003
+pub const DP_DOWNSTREAMPORT_PRESENT: usize = 0x005
+pub const DP_MAIN_LINK_CHANNEL_CODING: usize = 0x006
+pub const DP_EDP_CONFIGURATION_CAP: usize = 0x00D
+pub const DP_TRAINING_AUX_RD_INTERVAL: usize = 0x00E
+pub const DP_LINK_BW_SET: usize = 0x100
+pub const DP_LANE_COUNT_SET: usize = 0x101
+pub const DP_TRAINING_PATTERN_SET: usize = 0x102
+pub const DP_TRAINING_LANE0_SET: usize = 0x103
+pub const DP_DOWNSPREAD_CTRL: usize = 0x107
+pub const DP_MAIN_LINK_CHANNEL_CODING_SET: usize = 0x108
+pub const DP_EDP_CONFIGURATION_SET: usize = 0x10A
+pub const DP_SINK_COUNT: usize = 0x200
+pub const DP_LANE0_1_STATUS: usize = 0x202
+pub const DP_LANE_ALIGN_STATUS_UPDATED: usize = 0x204
+pub const DP_SINK_STATUS: usize = 0x205
+pub const DP_ADJUST_REQUEST_LANE0_1: usize = 0x206
+pub const DP_SET_POWER: usize = 0x600
+pub const DP_DP13_DPCD_REV: usize = 0x2200
+// Their bits.
+pub const DP_MAX_LANE_COUNT_MASK: usize = 0x1F
+pub const DP_TPS3_SUPPORTED: usize = 0x40
+pub const DP_ENHANCED_FRAME_CAP: usize = 0x80
+pub const DP_MAX_DOWNSPREAD_0_5: usize = 0x01
+pub const DP_TPS4_SUPPORTED: usize = 0x80
+pub const DP_DWN_STRM_PORT_PRESENT: usize = 0x01
+pub const DP_ALTERNATE_SCRAMBLER_RESET_CAP: usize = 0x01
+pub const DP_TRAINING_AUX_RD_MASK: usize = 0x7F
+pub const DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT: usize = 0x80
+pub const DP_LANE_COUNT_ENHANCED_FRAME_EN: usize = 0x80
+pub const DP_LINK_SCRAMBLING_DISABLE: usize = 0x20
+pub const DP_TRAINING_PATTERN_1: usize = 1
+pub const DP_TRAINING_PATTERN_2: usize = 2
+pub const DP_TRAINING_PATTERN_3: usize = 3
+pub const DP_TRAINING_PATTERN_4: usize = 7
+pub const DP_TRAIN_MAX_SWING_REACHED: usize = 0x04
+pub const DP_TRAIN_PRE_EMPHASIS_SHIFT: usize = 3
+pub const DP_TRAIN_MAX_PRE_EMPHASIS_REACHED: usize = 0x20
+pub const DP_SPREAD_AMP_0_5: usize = 0x10
+pub const DP_SET_ANSI_8B10B: usize = 0x01
+pub const DP_ALTERNATE_SCRAMBLER_RESET_ENABLE: usize = 0x01
+pub const DP_LANE_CR_DONE: usize = 0x01
+pub const DP_LANE_CHANNEL_EQ_DONE: usize = 0x02
+pub const DP_LANE_SYMBOL_LOCKED: usize = 0x04
+pub const DP_INTERLANE_ALIGN_DONE: usize = 0x01
+pub const DP_RECEIVE_PORT_0_STATUS: usize = 0x01
+pub const DP_SET_POWER_D0: usize = 0x1
+pub const DP_SET_POWER_D3: usize = 0x2
+// (dc_dp_types.h has these two where drm_dp.h has no name: the monitor
+// can ask for other drive settings after a training, 02h; it is asking,
+// 204h.)
+pub const POST_LT_ADJ_REQ_SUPPORTED: usize = 0x20
+pub const POST_LT_ADJ_REQ_IN_PROGRESS: usize = 0x02
+
+// The rates a link runs at, as 100h numbers them (dc_dp_types.h's
+// LINK_RATE_LOW, HIGH, HIGH2 and HIGH3: 1.62, 2.7, 5.4 and 8.1 Gbit/s a
+// lane), and the lanes a link has.
+pub const LINK_RATE_LOW: usize = 0x06
+pub const LINK_RATE_HIGH: usize = 0x0A
+pub const LINK_RATE_HIGH2: usize = 0x14
+pub const LINK_RATE_HIGH3: usize = 0x1E
+pub const RATES = [_]usize{ LINK_RATE_LOW, LINK_RATE_HIGH, LINK_RATE_HIGH2, LINK_RATE_HIGH3 }
+pub const LANE_COUNTS = [_]usize{ 1, 2, 4 }
+
+// The training's counts (link_dp_training_8b_10b.h, link_dpms.c): rounds
+// of clock recovery at one swing and in all, the last round of the
+// equalisation counted from 0, tries of a whole training, and what is
+// added to the pause before each further try (milliseconds).
+pub const LINK_TRAINING_MAX_RETRY_COUNT: usize = 5
+pub const LINK_TRAINING_MAX_CR_RETRY: usize = 100
+pub const LINK_TRAINING_ATTEMPTS: usize = 4
+pub const LINK_TRAINING_RETRY_DELAY: usize = 50
+pub const VOLTAGE_SWING_MAX_LEVEL: usize = 3
+pub const PRE_EMPHASIS_MAX_LEVEL: usize = 3
+// Ours, in nanoseconds: what a try's rounds are given in all, whatever
+// the monitor and the tables do; what the back end's state is given to
+// follow its table (as gpu_mode.mlx's TAKEN); how long the monitor has
+// after it was told to wake before it is talked to (the older amdgpu's 1
+// to 2 ms); and Linux's 5 ms before the lanes are read once more.
+pub const TRY_TIME: usize = 5000000000
+pub const STATE_TIME: usize = 100000000
+pub const WOKEN: usize = 1000
+pub const HOLDS_AFTER: usize = 5000
+
+fn less(a: usize, b: usize) -> usize { return if a > b { a - b } else { 0 } }
+
+// A link's rate and lanes (a rate of 0: none).
+pub const Setting = struct {
+    code: usize
+    lanes: usize
+}
+
+// A lane's symbol clock in kHz for the rate `code` (LINK_RATE_REF_FREQ_
+// IN_KHZ times the rate's number).
+pub fn symbolClock(code: usize) -> usize { return code * blocks.LINK_RATE_REF_FREQ_IN_KHZ }
+
+// Whether a link of rate `code` and `lanes` lanes carries a pixel clock
+// of `clock` kHz at `bits` bits a pixel: ten bits a symbol of which eight
+// are data (dp_link_bandwidth_kbps) against the clock times the bits
+// (dc_bandwidth_in_kbps_from_timing).
+pub fn carries(code: usize, lanes: usize, clock: usize, bits: usize) -> bool {
+    return clock * bits <= symbolClock(code) * 8 * lanes
+}
+
+// The setting for a pixel clock within the two ends' limits: Linux's
+// order (decide_dp_link_settings: from one lane at the lowest rate, the
+// lanes 1, 2, 4 within a rate, then the next rate from one lane again),
+// the first that carries it; `skip` of them passed over (the next
+// candidates, for the log). A rate of 0: none carries it.
+pub fn choose(clock: usize, bits: usize, mostCode: usize, mostLanes: usize, skip: usize) -> Setting {
+    var passed: usize = 0
+    for code in RATES {
+        if code > mostCode { break }
+        for lanes in LANE_COUNTS {
+            if lanes > mostLanes { break }
+            if bits != 0 && carries(code, lanes, clock, bits) {
+                if passed == skip { return Setting.{ .code = code, .lanes = lanes } }
+                passed += 1
+            }
+        }
+    }
+    return Setting.{ .code = 0, .lanes = 0 }
+}
+
+// The highest rate the card offers on an output (dce110_link_encoder_
+// get_max_link_cap with the ROM's record: 2.7 Gbit/s; 5.4 with the
+// record's HBR2 bit; 8.1 with its HBR3 bit). Ours: without the record
+// 2.7 and no more (Linux keeps both and warns).
+pub fn cardRate(record: bool, hbr2: bool, hbr3: bool) -> usize {
+    if record && hbr3 { return LINK_RATE_HIGH3 }
+    if record && hbr2 { return LINK_RATE_HIGH2 }
+    return LINK_RATE_HIGH
+}
+
+// A rate's number taken down to the next rate there is (get_link_rate_
+// from_max_link_bw); 0 below the lowest.
+pub fn standardRate(code: usize) -> usize {
+    var found: usize = 0
+    for rate in RATES {
+        if code >= rate { found = rate }
+    }
+    return found
+}
+
+pub fn isRate(code: usize) -> bool { return code != 0 && standardRate(code) == code }
+
+// What a monitor says it can (its first sixteen registers, or the
+// sixteen from 2200h when they stand for them: retrieve_link_cap).
+pub const Caps = struct {
+    bytes: [16]u8
+    extended: bool
+    revision: usize
+    // The highest rate, as a rate there is (0: below the lowest), and as
+    // the monitor numbers it.
+    rate: usize
+    rateSaid: usize
+    lanes: usize
+    // Training patterns 3 and 4, enhanced framing, downspread; whether it
+    // could ask for other drive settings after a training.
+    tps3: bool
+    tps4: bool
+    enhanced: bool
+    downspread: bool
+    adjusts: bool
+    // An adapter or hub (its limits are not the link's); an embedded
+    // panel's scrambler start.
+    branch: bool
+    panel: bool
+    // The wait it asks for between "told" and "asked" in a training.
+    interval: usize
+}
+
+pub fn capsOf(bytes: *const [16]u8, extended: bool) -> Caps {
+    const lanes = @intCast(usize, bytes.*[DP_MAX_LANE_COUNT])
+    const spread = @intCast(usize, bytes.*[DP_MAX_DOWNSPREAD])
+    return Caps.{
+        .bytes = bytes.*,
+        .extended = extended,
+        .revision = @intCast(usize, bytes.*[DP_DPCD_REV]),
+        .rate = standardRate(@intCast(usize, bytes.*[DP_MAX_LINK_RATE])),
+        .rateSaid = @intCast(usize, bytes.*[DP_MAX_LINK_RATE]),
+        .lanes = lanes & DP_MAX_LANE_COUNT_MASK,
+        .tps3 = lanes & DP_TPS3_SUPPORTED != 0,
+        .tps4 = spread & DP_TPS4_SUPPORTED != 0,
+        .enhanced = lanes & DP_ENHANCED_FRAME_CAP != 0,
+        .downspread = spread & DP_MAX_DOWNSPREAD_0_5 != 0,
+        .adjusts = lanes & POST_LT_ADJ_REQ_SUPPORTED != 0,
+        .branch = @intCast(usize, bytes.*[DP_DOWNSTREAMPORT_PRESENT]) & DP_DWN_STRM_PORT_PRESENT != 0,
+        .panel = @intCast(usize, bytes.*[DP_EDP_CONFIGURATION_CAP]) & DP_ALTERNATE_SCRAMBLER_RESET_CAP != 0,
+        .interval = @intCast(usize, bytes.*[DP_TRAINING_AUX_RD_INTERVAL]) & DP_TRAINING_AUX_RD_MASK,
+    }
+}
+
+// Why a monitor that answered is none a link is trained to (ours).
+pub const Refusal = enum(u8) {
+    none,
+    // Its registers' revision is below 1.1 (enhanced framing is told to
+    // every monitor here).
+    old,
+    // Its highest rate is below the lowest there is.
+    no_rate,
+    // It has not 1, 2 or 4 lanes.
+    lanes,
+    // An adapter or a hub.
+    branch,
+    // An embedded panel.
+    panel
+}
+
+pub fn refusalOf(caps: *const Caps) -> Refusal {
+    if caps.*.revision < 0x11 { return Refusal.old }
+    if caps.*.rate == 0 { return Refusal.no_rate }
+    if caps.*.lanes != 1 && caps.*.lanes != 2 && caps.*.lanes != 4 { return Refusal.lanes }
+    if caps.*.branch { return Refusal.branch }
+    if caps.*.panel { return Refusal.panel }
+    return Refusal.none
+}
+
+pub fn refusalText(refusal: Refusal) -> []const u8 {
+    return match refusal {
+        .none => "nothing",
+        .old => "its registers are of a revision before 1.1",
+        .no_rate => "it names no rate a link runs at",
+        .lanes => "it names a count of lanes that is not 1, 2 or 4",
+        .branch => "it is an adapter or a hub, not a monitor: its limits are not the link's",
+        .panel => "it is an embedded panel"
+    }
+}
+
+// The status of lane `lane` in the six bytes read from 202h: half a byte
+// of the first two (dp_get_nibble_at_index).
+pub fn laneStatus(status: *const [6]u8, lane: usize) -> usize {
+    return (@intCast(usize, status.*[lane / 2]) >> @intCast(u6, (lane % 2) * 4)) & 0xF
+}
+
+// Clock recovered on every lane in use (dp_is_cr_done).
+pub fn clockDone(status: *const [6]u8, lanes: usize) -> bool {
+    var lane: usize = 0
+    while lane < lanes && lane < 4 {
+        if laneStatus(status, lane) & DP_LANE_CR_DONE == 0 { return false }
+        lane += 1
+    }
+    return true
+}
+
+// Every lane in use has its three bits (dp_check_link_loss_status looks
+// at these alone).
+pub fn lanesHold(status: *const [6]u8, lanes: usize) -> bool {
+    const all = DP_LANE_CR_DONE | DP_LANE_CHANNEL_EQ_DONE | DP_LANE_SYMBOL_LOCKED
+    var lane: usize = 0
+    while lane < lanes && lane < 4 {
+        if laneStatus(status, lane) & all != all { return false }
+        lane += 1
+    }
+    return true
+}
+
+pub fn aligned(status: *const [6]u8) -> bool { return @intCast(usize, status.*[2]) & DP_INTERLANE_ALIGN_DONE != 0 }
+
+// The three bits of every lane and the lanes aligned: what the
+// equalisation ends with, and what a link is judged by here before and
+// after a change.
+pub fn locked(status: *const [6]u8, lanes: usize) -> bool { return lanes != 0 && lanesHold(status, lanes) && aligned(status) }
+
+// The first lane in use whose clock is not recovered (4: none).
+pub fn clockLost(status: *const [6]u8, lanes: usize) -> usize {
+    var lane: usize = 0
+    while lane < lanes && lane < 4 {
+        if laneStatus(status, lane) & DP_LANE_CR_DONE == 0 { return lane }
+        lane += 1
+    }
+    return 4
+}
+
+// The lanes' drive: voltage swing and pre-emphasis, 0 to 3 each.
+pub const Drive = struct {
+    swing: usize
+    pre: usize
+}
+
+// What lane `lane` asks for (206h, 207h: half a byte a lane, the swing in
+// its two low bits, the pre-emphasis above them).
+pub fn askedBy(status: *const [6]u8, lane: usize) -> Drive {
+    const half = (@intCast(usize, status.*[4 + lane / 2]) >> @intCast(u6, (lane % 2) * 4)) & 0xF
+    return Drive.{ .swing = half & 3, .pre = (half >> 2) & 3 }
+}
+
+// The next drive (dp_decide_lane_settings with maximize_lane_settings):
+// every lane gets the highest swing and the highest pre-emphasis any
+// lane in use asks for, the pre-emphasis cut to what the swing leaves
+// room for (3 less the swing).
+pub fn nextDrive(status: *const [6]u8, lanes: usize) -> Drive {
+    var most = Drive.{ .swing = 0, .pre = 0 }
+    var lane: usize = 0
+    while lane < lanes && lane < 4 {
+        const one = askedBy(status, lane)
+        if one.swing > most.swing { most.swing = one.swing }
+        if one.pre > most.pre { most.pre = one.pre }
+        lane += 1
+    }
+    if most.pre > PRE_EMPHASIS_MAX_LEVEL - most.swing { most.pre = PRE_EMPHASIS_MAX_LEVEL - most.swing }
+    return most
+}
+
+// A lane's drive as the monitor is told it (103h and the three after it;
+// dp_hw_to_dpcd_lane_settings): with a bit each for the highest swing and
+// the highest pre-emphasis.
+pub fn monitorDrive(drive: Drive) -> u8 {
+    var byte = drive.swing | (drive.pre << @intCast(u6, DP_TRAIN_PRE_EMPHASIS_SHIFT))
+    if drive.swing == VOLTAGE_SWING_MAX_LEVEL { byte = byte | DP_TRAIN_MAX_SWING_REACHED }
+    if drive.pre == PRE_EMPHASIS_MAX_LEVEL { byte = byte | DP_TRAIN_MAX_PRE_EMPHASIS_REACHED }
+    return @intCast(u8, byte)
+}
+
+// The same as the transmitter's table is told it (dce110_link_encoder_
+// dp_set_lane_settings: swing and pre-emphasis alone; atombios.h's
+// DP_LANE_SET__ values).
+pub fn tableDrive(drive: Drive) -> usize { return drive.swing | (drive.pre << 3) }
+
+// The pattern the equalisation runs with (decide_eq_training_pattern: 4
+// when the monitor has it, else 3 when it has that, else 2; the card
+// sends all of them).
+pub fn patternFor(caps: *const Caps) -> usize {
+    if caps.*.tps4 { return 4 }
+    if caps.*.tps3 { return 3 }
+    return 2
+}
+
+// The byte the monitor is told a pattern by (102h): the pattern's number
+// (7 for pattern 4) and, but for pattern 4, "scrambling off"
+// (dp_initialize_scrambling_data_symbols).
+pub fn patternByte(pattern: usize) -> u8 {
+    if pattern == 4 { return @intCast(u8, DP_TRAINING_PATTERN_4) }
+    return @intCast(u8, pattern | DP_LINK_SCRAMBLING_DISABLE)
+}
+
+// The wait between "told" and "asked" in clock recovery, in microseconds
+// (get_cr_training_aux_rd_interval: 100, or four milliseconds times the
+// monitor's byte for a monitor of revision 1.2 and above; ours, from the
+// older amdgpu's helper: the same for one of revision 1.1 whose byte is
+// not 0, which is the longer wait).
+pub fn clockWait(revision: usize, interval: usize) -> usize {
+    if revision >= 0x11 && interval != 0 { return interval * 4000 }
+    return 100
+}
+
+// The same in the equalisation (get_eq_training_aux_rd_interval: by the
+// byte, which is taken as 0 below revision 1.2).
+pub fn equaliseWait(revision: usize, interval: usize) -> usize {
+    const byte = if revision >= 0x12 { interval } else { 0 }
+    if byte == 1 { return 4000 }
+    if byte == 2 { return 8000 }
+    if byte == 3 { return 12000 }
+    if byte == 4 { return 16000 }
+    if byte == 5 { return 32000 }
+    if byte == 6 { return 64000 }
+    return 400
+}
+
+// What the monitor holds of the link now.
+pub const Held = struct {
+    // The rate and the lanes it was told (100h, 101h), enhanced framing
+    // (101h), downspread (107h), its power state (600h), and the six
+    // bytes from 202h: the lanes' status, the alignment, its own status,
+    // what the lanes ask for.
+    code: usize
+    lanes: usize
+    enhanced: bool
+    downspread: bool
+    power: usize
+    status: [6]u8
+}
+
+// How the asking ended.
+pub const Asked = enum(u8) {
+    // The monitor was not asked.
+    not_asked,
+    // The hot plug line reads low with its block on: nothing was sent.
+    unplugged,
+    // The card's microcontroller holds the channel: nothing was sent.
+    taken,
+    // No answer.
+    silent,
+    // It answered: `caps`, `refusal`, `held`.
+    heard
+}
+
+// What a hot plug line's words say (all reads).
+pub const Plug = struct {
+    word: usize
+    sense: bool
+    delayed: bool
+    pulse: bool
+    blockOn: bool
+}
+
+// Hot plug line `line` (counted from 0) read.
+pub fn plugOf(card: *const scanout.Card, line: usize) -> Plug {
+    const word = card.reg(DC_HPD_INT_STATUS + HPD_STEP * (line % HPD_LINES))
+    return Plug.{
+        .word = word,
+        .sense = word & DC_HPD_INT_STATUS__DC_HPD_SENSE != 0,
+        .delayed = word & DC_HPD_INT_STATUS__DC_HPD_SENSE_DELAYED != 0,
+        .pulse = word & DC_HPD_INT_STATUS__DC_HPD_RX_INT_STATUS != 0,
+        .blockOn = card.reg(DC_HPD_CONTROL + HPD_STEP * (line % HPD_LINES)) & DC_HPD_CONTROL__DC_HPD_EN != 0,
+    }
+}
+
+// "hot plug line 2 reads high (sense 1, delayed 1; its block is on)".
+pub fn sayPlug(card: *const scanout.Card, line: usize, plug: *const Plug) -> void {
+    card.field("hot plug line ", line + 1)
+    card.say(if plug.*.sense { " reads high (sense 1" } else { " reads low (sense 0" })
+    card.say(if plug.*.delayed { ", delayed 1" } else { ", delayed 0" })
+    card.say(if plug.*.blockOn { "; its block is on)" } else { "; its block is off)" })
+}
+
+pub const Heard = struct {
+    state: Asked
+    // The channel (0 to 5) and the hot plug line (counted from 0) the
+    // ROM names for the output, and what the line reads.
+    channel: usize
+    line: usize
+    plug: Plug
+    caps: Caps
+    refusal: Refusal
+    held: Held
+}
+
+pub fn nothingHeard() -> Heard {
+    const none = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+    return Heard.{
+        .state = Asked.not_asked,
+        .channel = 0,
+        .line = 0,
+        .plug = Plug.{ .word = 0, .sense = false, .delayed = false, .pulse = false, .blockOn = false },
+        .caps = capsOf(&none, false),
+        .refusal = Refusal.none,
+        .held = Held.{ .code = 0, .lanes = 0, .enhanced = false, .downspread = false, .power = 0, .status = [_]u8{ 0, 0, 0, 0, 0, 0 } },
+    }
+}
+
+// "2.70" for the rate 0x0A: Gbit/s a lane.
+pub fn sayRate(card: *const scanout.Card, code: usize) -> void {
+    const hundredths = code * 27
+    card.field("", hundredths / 100)
+    card.say(if hundredths % 100 < 10 { ".0" } else { "." })
+    card.decimal(hundredths % 100)
+}
+
+// "2.70 Gbit/s on 4 lanes".
+pub fn saySetting(card: *const scanout.Card, setting: Setting) -> void {
+    sayRate(card, setting.code)
+    card.field(" Gbit/s on ", setting.lanes)
+    card.say(if setting.lanes == 1 { " lane" } else { " lanes" })
+}
+
+fn sayBytes(card: *const scanout.Card, bytes: []const u8) -> void {
+    var k: usize = 0
+    while k < bytes.length {
+        if k != 0 { card.say(" ") }
+        card.hexDigits(@intCast(usize, bytes[k]), 2)
+        k += 1
+    }
+}
+
+// What the monitor said it can, in two lines.
+pub fn sayCaps(card: *const scanout.Card, caps: *const Caps) -> void {
+    card.say(if caps.*.extended { "gpu: the monitor's capabilities (from 2200h): " } else { "gpu: the monitor's capabilities: " })
+    sayBytes(card, caps.*.bytes[0..16])
+    card.field("\ngpu: the monitor: DisplayPort ", caps.*.revision >> 4)
+    card.field(".", caps.*.revision & 0xF)
+    card.say(", up to ")
+    if caps.*.rate == 0 {
+        card.fieldHex("no rate there is (it says ", caps.*.rateSaid)
+        card.say(")")
+    } else {
+        sayRate(card, caps.*.rate)
+        card.say(" Gbit/s")
+    }
+    card.field(" on ", caps.*.lanes)
+    card.say(if caps.*.lanes == 1 { " lane" } else { " lanes" })
+    card.field(", patterns up to ", patternFor(caps))
+    card.say(if caps.*.enhanced { ", enhanced framing" } else { ", no enhanced framing (it is told so all the same, as Linux does)" })
+    card.say(if caps.*.downspread { ", downspread" } else { ", no downspread (it is told so all the same: the card's link clock is spread)" })
+    if caps.*.interval != 0 { card.field(", a training wait of ", caps.*.interval) }
+    if caps.*.branch { card.say(", an adapter or hub") }
+    if caps.*.panel { card.say(", an embedded panel") }
+    card.say("\n")
+}
+
+// What the monitor holds of the link, in one line.
+pub fn sayHeld(card: *const scanout.Card, held: *const Held) -> void {
+    card.say("gpu: the monitor holds ")
+    if isRate(held.*.code) {
+        saySetting(card, Setting.{ .code = held.*.code, .lanes = held.*.lanes })
+    } else {
+        card.fieldHex("a rate that is none (", held.*.code)
+        card.field(") on ", held.*.lanes)
+        card.say(" lanes")
+    }
+    card.say(if locked(&held.*.status, held.*.lanes) { ", all locked" } else { ", NOT all locked" })
+    card.say(" (status ")
+    sayBytes(card, held.*.status[0..6])
+    card.say(if held.*.power == DP_SET_POWER_D0 { "), power on" } else if held.*.power == DP_SET_POWER_D3 { "), power state D3" } else { "), power state not known" })
+    if @intCast(usize, held.*.status[2]) & POST_LT_ADJ_REQ_IN_PROGRESS != 0 { card.say(", asking for other drive settings") }
+    card.say("\n")
+}
+
+// The monitor on AUX channel `channel` asked what it can and what it
+// holds of the link (the channel watching hot plug line `line`, counted
+// from 0), and what came of it said. This writes the channel's own
+// words and nothing else of the card; nothing at all when the hot plug
+// line reads low with its block on, or the card's microcontroller holds
+// the channel. Linux's order (retrieve_link_cap): is the monitor awake
+// (600h read, ten tries a millisecond apart), its first sixteen
+// registers, and the sixteen at 2200h in their place when it has them.
+// Ours after it: what it holds (100h, 101h, 107h, 202h to 207h).
+pub fn ask(channel: *aux.Channel, heard: *Heard) -> void {
+    const card = channel.*.port.card
+    heard.* = nothingHeard()
+    heard.*.channel = channel.*.index
+    heard.*.line = channel.*.line
+    heard.*.plug = plugOf(card, channel.*.line)
+    card.say("gpu: ")
+    sayPlug(card, channel.*.line, &heard.*.plug)
+    if !heard.*.plug.sense && heard.*.plug.blockOn {
+        card.say(": no monitor is asked\n")
+        heard.*.state = Asked.unplugged
+        return
+    }
+    card.say(if heard.*.plug.sense { "\n" } else { ": going by whether the monitor answers\n" })
+    if !channel.begin() {
+        heard.*.state = Asked.taken
+        return
+    }
+    heard.*.state = Asked.silent
+    // Awake? (A read that says D3 is followed by one wait and nothing
+    // more: the channel answers in D3.)
+    var power: [1]u8 = undefined
+    var tries: usize = 0
+    var woke = false
+    channel.*.quiet = true
+    while tries < 10 && !woke {
+        tries += 1
+        woke = channel.read(DP_SET_POWER, power[0..])
+        if !woke {
+            const answer = channel.*.last.answer
+            if answer == aux.Answer.unplugged || answer == aux.Answer.taken || answer == aux.Answer.stuck { break }
+            channel.rest(1000)
+        }
+    }
+    channel.*.quiet = false
+    if !woke {
+        channel.sayFailed(DP_SET_POWER)
+        card.say("gpu: the monitor does not answer on its AUX channel: nothing is known of it\n")
+        return
+    }
+    if @intCast(usize, power[0]) == DP_SET_POWER_D3 { channel.rest(1000) }
+    var first: [16]u8 = undefined
+    if !channel.read(DP_DPCD_REV, first[0..]) { return }
+    var extended = false
+    if @intCast(usize, first[DP_TRAINING_AUX_RD_INTERVAL]) & DP_EXTENDED_RECEIVER_CAP_FIELD_PRESENT != 0 {
+        var second: [16]u8 = undefined
+        if channel.read(DP_DP13_DPCD_REV, second[0..]) {
+            first = second
+            extended = true
+        }
+    }
+    heard.*.caps = capsOf(&first, extended)
+    heard.*.refusal = refusalOf(&heard.*.caps)
+    var two: [2]u8 = undefined
+    var spread: [1]u8 = undefined
+    if !channel.read(DP_LINK_BW_SET, two[0..]) || !channel.read(DP_DOWNSPREAD_CTRL, spread[0..]) || !channel.read(DP_LANE0_1_STATUS, heard.*.held.status[0..]) { return }
+    heard.*.held.code = @intCast(usize, two[0])
+    heard.*.held.lanes = @intCast(usize, two[1]) & DP_MAX_LANE_COUNT_MASK
+    heard.*.held.enhanced = @intCast(usize, two[1]) & DP_LANE_COUNT_ENHANCED_FRAME_EN != 0
+    heard.*.held.downspread = @intCast(usize, spread[0]) & DP_SPREAD_AMP_0_5 != 0
+    heard.*.held.power = @intCast(usize, power[0])
+    heard.*.state = Asked.heard
+    sayCaps(card, &heard.*.caps)
+    sayHeld(card, &heard.*.held)
+    card.say("gpu: left out of what Linux tells a monitor: the source's name at 300h\n")
+}
+
+// The lanes' status read once more (202h to 207h) and said: whether all
+// `lanes` are locked. False too when the monitor does not answer.
+pub fn stillLocked(channel: *aux.Channel, lanes: usize, when: []const u8) -> bool {
+    const card = channel.*.port.card
+    var status: [6]u8 = undefined
+    if !channel.read(DP_LANE0_1_STATUS, status[0..]) {
+        card.say("gpu: the monitor's lanes were not read ")
+        card.say(when)
+        card.say("\n")
+        return false
+    }
+    const holds = locked(&status, lanes)
+    card.say(if holds { "gpu: the monitor's lanes are locked " } else { "gpu: the monitor's lanes are NOT all locked " })
+    card.say(when)
+    card.say(" (status ")
+    sayBytes(card, status[0..6])
+    card.say(if @intCast(usize, status[3]) & DP_RECEIVE_PORT_0_STATUS != 0 { "; it says its port is in sync)\n" } else { "; it does not say its port is in sync)\n" })
+    return holds
+}
+
+// ---- The link taken down and brought up.
+
+// How a table's run went: it wrote something; it ran to its end and
+// wrote nothing; it did not run to its end.
+pub const Ran = enum(u8) { well, nothing, ended }
+
+// What the link's steps are lent: the card, a register of the display
+// written, one of the card's tables run with a block (and what it is, for
+// the log), and the monitor's AUX channel.
+pub const Tools = struct {
+    card: *const scanout.Card
+    write: fn(usize, u32) -> void
+    run: fn(*const blocks.Block, []const u8) -> Ran
+    channel: *aux.Channel
+}
+
+// The output a link is on: its back end (the transmitter's number and
+// the encoder block's), the hot plug line as the table is told it (1 to
+// 6) and the connector's kind as the ROM numbers it; and of the monitor,
+// its registers' revision, the wait it asks for and the pattern its
+// equalisation runs with.
+pub const Output = struct {
+    backEnd: usize
+    line: usize
+    connector: usize
+    revision: usize
+    interval: usize
+    pattern: usize
+}
+
+// How a step of the link's went: as it should; not as it should (the
+// change ends there; on the way back it is said and the way goes on); or
+// so that either way ends there (a table that did not run to its end).
+pub const Went = enum(u8) { well, wrong, ended }
+
+// How a training ended.
+pub const End = enum(u8) {
+    trained,
+    // Clock recovery: a lane's clock did not come (`lane`).
+    clock,
+    // Equalisation: six rounds without it; clock recovery lost meanwhile
+    // on some lanes, or on all.
+    equalise,
+    clock_lost_some,
+    clock_lost_all,
+    // Trained, but a lane was not locked 5 ms later.
+    lost,
+    // The monitor did not answer (or its hot plug line is low).
+    silent,
+    // A table of the card's did not run to its end, or wrote nothing.
+    table,
+    // The back end does not read "on" after the transmitter's table.
+    state,
+    // A register did not hold what was written (`register`, `read`).
+    register,
+    // The try's time ran out.
+    time
+}
+
+// The course of a training (`bring`): how it ended, in which try, the
+// rounds of the last try, the last drive and status, and what was made
+// in all: table runs, register writes.
+pub const Course = struct {
+    end: End
+    tries: usize
+    clockRounds: usize
+    equaliseRounds: usize
+    drive: Drive
+    status: [6]u8
+    lane: usize
+    register: usize
+    read: usize
+    runs: usize
+    writes: usize
+    // The card was put to its idle pattern and told that the link is
+    // trained at the last try's end (after a training that came
+    // through; after one that failed, at the lowest rate or on the way
+    // back).
+    idle: bool
+}
+
+pub fn noCourse() -> Course {
+    return Course.{ .end = End.trained, .tries = 0, .clockRounds = 0, .equaliseRounds = 0, .drive = Drive.{ .swing = 0, .pre = 0 }, .status = [_]u8{ 0, 0, 0, 0, 0, 0 }, .lane = 4, .register = 0, .read = 0, .runs = 0, .writes = 0, .idle = false }
+}
+
+pub fn endText(end: End) -> []const u8 {
+    return match end {
+        .trained => "trained",
+        .clock => "clock recovery",
+        .equalise => "equalisation: six rounds without it",
+        .clock_lost_some => "equalisation: clock recovery lost on some lanes",
+        .clock_lost_all => "equalisation: clock recovery lost on all lanes",
+        .lost => "it trained, but a lane was not locked 5 ms later",
+        .silent => "the monitor did not answer",
+        .table => "a table's run",
+        .state => "the back end does not read on after its table",
+        .register => "a register did not hold what was written",
+        .time => "the try's time ran out"
+    }
+}
+
+// What a failure points to, in the words of Linux's rule for falling
+// back (decide_fallback_link_setting): said, not acted on.
+pub fn pointsTo(end: End) -> []const u8 {
+    if end == End.clock || end == End.clock_lost_all { return "which points to a lower rate" }
+    if end == End.equalise || end == End.clock_lost_some { return "which points to fewer lanes" }
+    if end == End.lost { return "the link does not hold" }
+    return ""
+}
+
+fn rest(card: *const scanout.Card, nanoseconds: usize) -> void {
+    const began = card.time()
+    var looks: usize = 0
+    while looks < 100000000 && less(card.time(), began) <= nanoseconds { looks += 1 }
+}
+
+// A register's whole word written and the bits `mask` read back.
+fn put(t: *const Tools, course: *Course, register: usize, value: usize, mask: usize) -> bool {
+    const write = t.*.write
+    write(register, @intCast(u32, value & 0xFFFFFFFF))
+    course.*.writes += 1
+    const read = t.*.card.reg(register)
+    if read & mask == value & mask { return true }
+    course.*.end = End.register
+    course.*.register = register
+    course.*.read = read
+    return false
+}
+
+// The bits `mask` of a register set to `bits`, the others as they are.
+fn update(t: *const Tools, course: *Course, register: usize, mask: usize, bits: usize) -> bool {
+    return put(t, course, register, (t.*.card.reg(register) & ~mask) | (bits & mask), mask)
+}
+
+// Until the back end reads on or off, STATE_TIME at most.
+fn awaitBackEnd(t: *const Tools, o: *const Output, on: bool) -> bool {
+    const card = t.*.card
+    const register = scanout.DIG[o.*.backEnd] + scanout.DIG_BE_EN_CNTL
+    const began = card.time()
+    var looks: usize = 0
+    while looks < 100000000 {
+        looks += 1
+        if (card.reg(register) & DIG_BE_EN_CNTL__DIG_ENABLE != 0) == on { return true }
+        if less(card.time(), began) > STATE_TIME { return false }
+    }
+    return false
+}
+
+fn sayTrain(card: *const scanout.Card, s: Setting) -> void {
+    card.say("gpu: train ")
+    sayRate(card, s.code)
+    card.field("x", s.lanes)
+}
+
+// The link taken down (dp_disable_link_phy with dce110_link_encoder_
+// disable_output and link_encoder_disable): the monitor told its power
+// state D3, the transmitter off by its table when the back end is on,
+// the back end's pattern, "trained" and panel mode words cleared after
+// it. With the back end off already neither the table nor the words, as
+// Linux leaves them then. `first`: this is the firmware's own link going
+// down at the plan's step: a monitor that does not take its power state
+// ends it there, before anything of the link is changed; later (between
+// two tries, on the way back) that is said and the link goes down all
+// the same.
+pub fn down(t: *const Tools, o: *const Output, first: bool, course: *Course) -> Went {
+    const card = t.*.card
+    const back = scanout.DIG[o.*.backEnd]
+    const d3 = [_]u8{@intCast(u8, DP_SET_POWER_D3)}
+    if !t.*.channel.write(DP_SET_POWER, d3[0..]) {
+        if first {
+            card.say("gpu: the monitor did not take its power state: the firmware's link is kept\n")
+            course.*.end = End.silent
+            return Went.wrong
+        }
+        card.say("gpu: the monitor did not take its power state; the link goes down all the same\n")
+    }
+    if card.reg(back + scanout.DIG_BE_EN_CNTL) & DIG_BE_EN_CNTL__DIG_ENABLE == 0 {
+        card.field("gpu: transmitter ", o.*.backEnd)
+        card.say(" is off already: its table is not run and the back end's words are left\n")
+        return Went.well
+    }
+    const off = blocks.linkOff(o.*.backEnd, o.*.line, o.*.connector)
+    if first {
+        card.field("gpu: transmitter ", o.*.backEnd)
+        card.say(" off by its table, told what Linux's display core tells it at a change of mode (DisplayPort, no clock, no lanes); what the ROM wants for a link the firmware trained is not known from Linux, and the table's \"init\" is not run before it (the firmware's own start ran this ROM)\n")
+    }
+    const run = t.*.run
+    const ran = run(&off, "the link's transmitter off")
+    course.*.runs += 1
+    if ran == Ran.ended {
+        course.*.end = End.table
+        return Went.ended
+    }
+    var went = Went.well
+    if ran == Ran.nothing {
+        course.*.end = End.table
+        went = Went.wrong
+    }
+    if !awaitBackEnd(t, o, false) {
+        card.field("gpu: DIG ", o.*.backEnd)
+        card.say(" still reads on after the transmitter's table turned it off\n")
+        course.*.end = End.state
+        went = Went.wrong
+    }
+    if !put(t, course, back + DP_DPHY_TRAINING_PATTERN_SEL, 0, DP_DPHY_TRAINING_PATTERN_SEL__DPHY_TRAINING_PATTERN_SEL) { went = Went.wrong }
+    if !update(t, course, back + scanout.DP_LINK_CNTL, DP_LINK_CNTL__DP_LINK_TRAINING_COMPLETE, 0) { went = Went.wrong }
+    if !panelMode(t, o, course) { went = Went.wrong }
+    return went
+}
+
+// The back end's panel mode word 0 (an external monitor's): written only
+// when it does not read so.
+fn panelMode(t: *const Tools, o: *const Output, course: *Course) -> bool {
+    const register = scanout.DIG[o.*.backEnd] + DP_DPHY_INTERNAL_CTRL
+    const now = t.*.card.reg(register)
+    if now == 0 { return true }
+    t.*.card.field("gpu: DIG ", o.*.backEnd)
+    t.*.card.fieldHex("'s panel mode word reads ", now)
+    t.*.card.say(": written 0, an external monitor's\n")
+    return put(t, course, register, 0, 0xFFFFFFFF)
+}
+
+// The card sends a training pattern (dce110_link_encoder_set_dp_phy_
+// pattern_training_pattern): the pattern's number less one as the whole
+// word, "trained" off, the PHY's bypass off, no test sequence.
+fn cardPattern(t: *const Tools, o: *const Output, course: *Course, pattern: usize) -> bool {
+    const back = scanout.DIG[o.*.backEnd]
+    return put(t, course, back + DP_DPHY_TRAINING_PATTERN_SEL, pattern - 1, DP_DPHY_TRAINING_PATTERN_SEL__DPHY_TRAINING_PATTERN_SEL) && update(t, course, back + scanout.DP_LINK_CNTL, DP_LINK_CNTL__DP_LINK_TRAINING_COMPLETE, 0) && update(t, course, back + DP_DPHY_CNTL, DP_DPHY_CNTL__DPHY_BYPASS, 0) && update(t, course, back + DP_DPHY_PRBS_CNTL, DP_DPHY_PRBS_CNTL__DPHY_PRBS_EN, 0)
+}
+
+// The card goes to its idle pattern and is told the link is trained
+// (set_dp_phy_pattern_passthrough_mode): the panel mode word, the
+// framing (the enhanced one, as the monitor was told), the scrambler's
+// count, "trained", the bypass off, no test sequence.
+fn cardIdle(t: *const Tools, o: *const Output, course: *Course) -> bool {
+    const back = scanout.DIG[o.*.backEnd]
+    const framing = DP_LINK_FRAMING_CNTL__DP_IDLE_BS_INTERVAL | DP_LINK_FRAMING_CNTL__DP_VBID_DISABLE | DP_LINK_FRAMING_CNTL__DP_VID_ENHANCED_FRAME_MODE
+    return panelMode(t, o, course) && update(t, course, back + DP_LINK_FRAMING_CNTL, framing, IDLE_BS_INTERVAL | DP_LINK_FRAMING_CNTL__DP_VID_ENHANCED_FRAME_MODE) && update(t, course, back + DP_DPHY_SCRAM_CNTL, DP_DPHY_SCRAM_CNTL__DPHY_SCRAMBLER_BS_COUNT, SCRAMBLER_BS_COUNT << 8) && update(t, course, back + scanout.DP_LINK_CNTL, DP_LINK_CNTL__DP_LINK_TRAINING_COMPLETE, DP_LINK_CNTL__DP_LINK_TRAINING_COMPLETE) && update(t, course, back + DP_DPHY_CNTL, DP_DPHY_CNTL__DPHY_BYPASS, 0) && update(t, course, back + DP_DPHY_PRBS_CNTL, DP_DPHY_PRBS_CNTL__DPHY_PRBS_EN, 0)
+}
+
+// One round of a training: the lanes' drive set on the card (the
+// transmitter's table, once a lane), the monitor told (the first round
+// of a pattern: the pattern and a drive byte a lane in one write at
+// 102h; later the drive bytes at 103h), the wait, and the six bytes of
+// status read into the course. False when the round was not made to its
+// end (`course.end` says why; `ended`: a table did not run to its end).
+fn round(t: *const Tools, o: *const Output, s: Setting, course: *Course, pattern: usize, first: bool, wait: usize, ended: *bool) -> bool {
+    const set = blocks.linkDrive(o.*.backEnd, s.code, s.lanes, tableDrive(course.*.drive), o.*.line, o.*.connector)
+    const run = t.*.run
+    var lane: usize = 0
+    while lane < s.lanes {
+        const ran = run(&set, "the lanes' drive")
+        course.*.runs += 1
+        if ran != Ran.well {
+            course.*.end = End.table
+            ended.* = ran == Ran.ended
+            return false
+        }
+        lane += 1
+    }
+    var told: [5]u8 = undefined
+    told[0] = patternByte(pattern)
+    lane = 0
+    while lane < 4 {
+        told[1 + lane] = monitorDrive(course.*.drive)
+        lane += 1
+    }
+    const taken = if first { t.*.channel.write(DP_TRAINING_PATTERN_SET, told[0..1 + s.lanes]) } else { t.*.channel.write(DP_TRAINING_LANE0_SET, told[1..1 + s.lanes]) }
+    if !taken {
+        course.*.end = End.silent
+        return false
+    }
+    t.*.channel.rest(wait)
+    if !t.*.channel.read(DP_LANE0_1_STATUS, course.*.status[0..]) {
+        course.*.end = End.silent
+        return false
+    }
+    return true
+}
+
+// "gpu: train 2.70x4, clock recovery, round 2: drive swing 1 pre 0; lanes
+// 7 7 1 1, aligned 0, asked swing 1 1 2 1 pre 0 0 0 0" (a lane's digit:
+// 1 its clock recovered, 2 equalised, 4 its symbols locked).
+fn sayRound(card: *const scanout.Card, s: Setting, what: []const u8, number: usize, drive: Drive, status: *const [6]u8) -> void {
+    sayTrain(card, s)
+    card.say(", ")
+    card.say(what)
+    card.field(", round ", number)
+    card.field(": drive swing ", drive.swing)
+    card.field(" pre ", drive.pre)
+    card.say("; lanes")
+    var lane: usize = 0
+    while lane < s.lanes {
+        card.field(" ", laneStatus(status, lane))
+        lane += 1
+    }
+    card.say(if aligned(status) { ", aligned 1, asked swing" } else { ", aligned 0, asked swing" })
+    lane = 0
+    while lane < s.lanes {
+        card.field(" ", askedBy(status, lane).swing)
+        lane += 1
+    }
+    card.say(" pre")
+    lane = 0
+    while lane < s.lanes {
+        card.field(" ", askedBy(status, lane).pre)
+        lane += 1
+    }
+    card.say("\n")
+}
+
+// One try of a training, from the lanes' count to the lanes read once
+// more: the file's head. `idle`: the card is put to its idle pattern
+// even when the training failed. `ended`: a table did not run to its
+// end.
+fn once(t: *const Tools, o: *const Output, s: Setting, course: *Course, idle: bool, ended: *bool) -> bool {
+    const card = t.*.card
+    const channel = t.*.channel
+    const back = scanout.DIG[o.*.backEnd]
+    const began = card.time()
+    course.*.clockRounds = 0
+    course.*.equaliseRounds = 0
+    course.*.drive = Drive.{ .swing = 0, .pre = 0 }
+    course.*.lane = 4
+    course.*.idle = false
+    // The lanes' count and the scrambler (configure_encoder), then the
+    // transmitter on (the table), and what it left in the back end.
+    if !put(t, course, back + scanout.DP_CONFIG, s.lanes - 1, DP_CONFIG__DP_UDI_LANES) { return false }
+    if !update(t, course, back + DP_DPHY_SCRAM_CNTL, DP_DPHY_SCRAM_CNTL__DPHY_SCRAMBLER_ADVANCE, DP_DPHY_SCRAM_CNTL__DPHY_SCRAMBLER_ADVANCE) { return false }
+    const on = blocks.linkOn(o.*.backEnd, s.code, s.lanes, o.*.line, o.*.connector)
+    const run = t.*.run
+    const ran = run(&on, "the link's transmitter on")
+    course.*.runs += 1
+    if ran != Ran.well {
+        course.*.end = End.table
+        ended.* = ran == Ran.ended
+        return false
+    }
+    const came = awaitBackEnd(t, o, true)
+    const word = card.reg(back + scanout.DIG_BE_CNTL)
+    card.field("gpu: transmitter ", o.*.backEnd)
+    card.say(" on at ")
+    saySetting(card, s)
+    card.field(": the table left DIG ", o.*.backEnd)
+    card.say(if came { " on" } else { " OFF" })
+    card.field(", mode ", (word & DIG_BE_CNTL__DIG_MODE) >> 16)
+    card.fieldHex(", front ends ", (word & DIG_BE_CNTL__DIG_FE_SOURCE_SELECT) >> 8)
+    card.field(", lanes ", (card.reg(back + scanout.DP_CONFIG) & DP_CONFIG__DP_UDI_LANES) + 1)
+    card.say("\n")
+    if !came {
+        course.*.end = End.state
+        return false
+    }
+    // The monitor woken, and its panel mode word (dp_set_panel_mode: an
+    // external monitor's has bit 0 clear; written only when it has not).
+    const d0 = [_]u8{@intCast(u8, DP_SET_POWER_D0)}
+    var one: [1]u8 = undefined
+    course.*.end = End.silent
+    if !channel.write(DP_SET_POWER, d0[0..]) { return false }
+    channel.rest(WOKEN)
+    if !channel.read(DP_EDP_CONFIGURATION_SET, one[0..]) { return false }
+    if @intCast(usize, one[0]) & DP_ALTERNATE_SCRAMBLER_RESET_ENABLE != 0 {
+        one[0] = @intCast(u8, @intCast(usize, one[0]) & ~DP_ALTERNATE_SCRAMBLER_RESET_ENABLE & 0xFF)
+        if !channel.write(DP_EDP_CONFIGURATION_SET, one[0..]) { return false }
+    }
+    // The two waits, worked out at each training's start: a monitor of
+    // revision 1.2 and above is asked its byte again, once for each
+    // (decide_8b_10b_training_settings).
+    var interval = o.*.interval
+    var clockInterval = interval
+    if o.*.revision >= 0x12 {
+        if !channel.read(DP_TRAINING_AUX_RD_INTERVAL, one[0..]) { return false }
+        clockInterval = @intCast(usize, one[0]) & DP_TRAINING_AUX_RD_MASK
+        if !channel.read(DP_TRAINING_AUX_RD_INTERVAL, one[0..]) { return false }
+        interval = @intCast(usize, one[0]) & DP_TRAINING_AUX_RD_MASK
+    }
+    const clockTime = clockWait(o.*.revision, clockInterval)
+    const equaliseTime = equaliseWait(o.*.revision, interval)
+    // The monitor told the link's settings (dpcd_exit_training_mode,
+    // dpcd_configure_channel_coding, dpcd_set_link_settings): no pattern,
+    // 8b/10b, downspread, the lanes with enhanced framing, the rate.
+    const none = [_]u8{0}
+    const coding = [_]u8{@intCast(u8, DP_SET_ANSI_8B10B)}
+    const spread = [_]u8{@intCast(u8, DP_SPREAD_AMP_0_5)}
+    const lanes = [_]u8{@intCast(u8, s.lanes | DP_LANE_COUNT_ENHANCED_FRAME_EN)}
+    const rate = [_]u8{@intCast(u8, s.code)}
+    if !channel.write(DP_TRAINING_PATTERN_SET, none[0..]) || !channel.write(DP_MAIN_LINK_CHANNEL_CODING_SET, coding[0..]) || !channel.write(DP_DOWNSPREAD_CTRL, spread[0..]) || !channel.write(DP_LANE_COUNT_SET, lanes[0..]) || !channel.write(DP_LINK_BW_SET, rate[0..]) { return false }
+
+    // Clock recovery (perform_8b_10b_clock_recovery_sequence).
+    var trained = false
+    var failed = false
+    if !cardPattern(t, o, course, 1) { failed = true }
+    var same: usize = 0
+    var recovered = false
+    while !failed && !recovered && same < LINK_TRAINING_MAX_RETRY_COUNT && course.*.clockRounds < LINK_TRAINING_MAX_CR_RETRY {
+        if less(card.time(), began) > TRY_TIME {
+            course.*.end = End.time
+            failed = true
+            break
+        }
+        if !round(t, o, s, course, 1, course.*.clockRounds == 0, clockTime, ended) {
+            failed = true
+            break
+        }
+        course.*.clockRounds += 1
+        sayRound(card, s, "clock recovery", course.*.clockRounds, course.*.drive, &course.*.status)
+        if clockDone(&course.*.status, s.lanes) {
+            recovered = true
+        } else if course.*.drive.swing == VOLTAGE_SWING_MAX_LEVEL {
+            break
+        } else {
+            if askedBy(&course.*.status, 0).swing == course.*.drive.swing { same += 1 } else { same = 0 }
+            course.*.drive = nextDrive(&course.*.status, s.lanes)
+        }
+    }
+    if !failed && !recovered {
+        course.*.end = End.clock
+        course.*.lane = clockLost(&course.*.status, s.lanes)
+        failed = true
+    }
+    // Equalisation (perform_8b_10b_channel_equalization_sequence).
+    if !failed && !cardPattern(t, o, course, o.*.pattern) { failed = true }
+    while !failed && !trained && course.*.equaliseRounds <= LINK_TRAINING_MAX_RETRY_COUNT {
+        if less(card.time(), began) > TRY_TIME {
+            course.*.end = End.time
+            failed = true
+            break
+        }
+        if !round(t, o, s, course, o.*.pattern, course.*.equaliseRounds == 0, equaliseTime, ended) {
+            failed = true
+            break
+        }
+        course.*.equaliseRounds += 1
+        sayRound(card, s, "equalisation", course.*.equaliseRounds, course.*.drive, &course.*.status)
+        if !clockDone(&course.*.status, s.lanes) {
+            course.*.end = if laneStatus(&course.*.status, 0) & DP_LANE_CR_DONE != 0 { End.clock_lost_some } else { End.clock_lost_all }
+            failed = true
+        } else if locked(&course.*.status, s.lanes) {
+            trained = true
+        } else {
+            course.*.drive = nextDrive(&course.*.status, s.lanes)
+        }
+    }
+    if !failed && !trained {
+        course.*.end = End.equalise
+        failed = true
+    }
+    // The monitor's pattern off, after success and after failure alike
+    // (dpcd_exit_training_mode); a monitor that does not take it after a
+    // training that came through has not been trained.
+    if !channel.write(DP_TRAINING_PATTERN_SET, none[0..]) && !failed {
+        course.*.end = End.silent
+        failed = true
+    }
+    // The card to its idle pattern: after a success; after a failure at
+    // the lowest rate alone, as Linux does (or when the caller asks).
+    if !failed || s.code == LINK_RATE_LOW || idle {
+        if !cardIdle(t, o, course) { failed = true }
+        course.*.idle = true
+    }
+    if failed { return false }
+    // Does it hold? (dp_transition_to_video_idle: 5 ms, then the six
+    // bytes from 200h, of which the lanes' are the third and fourth.)
+    channel.rest(HOLDS_AFTER)
+    var six: [6]u8 = undefined
+    if !channel.read(DP_SINK_COUNT, six[0..]) {
+        course.*.end = End.silent
+        return false
+    }
+    const lanesOnly = [_]u8{ six[2], six[3], 0, 0, 0, 0 }
+    if !lanesHold(&lanesOnly, s.lanes) {
+        course.*.end = End.lost
+        return false
+    }
+    course.*.end = End.trained
+    sayTrain(card, s)
+    card.field(": trained in ", course.*.clockRounds)
+    card.field(" + ", course.*.equaliseRounds)
+    card.field(" rounds with pattern ", o.*.pattern)
+    card.field(" at swing ", course.*.drive.swing)
+    card.field(" pre ", course.*.drive.pre)
+    card.field("; holds after 5 ms (try ", course.*.tries)
+    card.field(" of ", LINK_TRAINING_ATTEMPTS)
+    card.field(", ", less(card.time(), began) / 1000000)
+    card.say(" ms)\n")
+    return true
+}
+
+// The link brought up at `s` and trained (perform_link_training_with_
+// retries): up to four tries, the link taken down between two of them
+// and a pause before the next (100, 150, 200 ms). After the fourth
+// failure the transmitter is left on, as Linux leaves it; `back`: this
+// is the way back to the firmware's own link, on which the card is put
+// to its idle pattern even then. The course is said round by round.
+pub fn bring(t: *const Tools, o: *const Output, s: Setting, back: bool, course: *Course) -> Went {
+    const card = t.*.card
+    course.*.tries = 0
+    var delay = LINK_TRAINING_RETRY_DELAY
+    while course.*.tries < LINK_TRAINING_ATTEMPTS {
+        course.*.tries += 1
+        var ended = false
+        if once(t, o, s, course, back && course.*.tries == LINK_TRAINING_ATTEMPTS, &ended) { return Went.well }
+        sayTrain(card, s)
+        card.say(": failed at ")
+        card.say(endText(course.*.end))
+        if course.*.end == End.clock && course.*.lane < 4 { card.field(" on lane ", course.*.lane) }
+        if course.*.end == End.register {
+            card.say(" (")
+            card.hexDigits(course.*.register, 4)
+            card.say(" reads ")
+            card.hexDigits(course.*.read, 8)
+            card.say(")")
+        }
+        if pointsTo(course.*.end).length != 0 {
+            card.say(", ")
+            card.say(pointsTo(course.*.end))
+        }
+        card.field(" (try ", course.*.tries)
+        card.field(" of ", LINK_TRAINING_ATTEMPTS)
+        card.field("; the last status ", laneStatus(&course.*.status, 0))
+        card.field(" ", laneStatus(&course.*.status, 1))
+        card.field(" ", laneStatus(&course.*.status, 2))
+        card.field(" ", laneStatus(&course.*.status, 3))
+        card.field(", drive swing ", course.*.drive.swing)
+        card.field(" pre ", course.*.drive.pre)
+        card.say(")\n")
+        if ended { return Went.ended }
+        if course.*.tries == LINK_TRAINING_ATTEMPTS {
+            // The way back's last try ended before its rounds (the
+            // monitor did not answer, the back end did not read on): the
+            // card is put to its idle pattern and told "trained" all the
+            // same, so that the stream that follows is one a monitor can
+            // show, should it have locked without saying so.
+            if back && !course.*.idle {
+                const end = course.*.end
+                const register = course.*.register
+                const read = course.*.read
+                _ = cardIdle(t, o, course)
+                course.*.idle = true
+                course.*.end = end
+                course.*.register = register
+                course.*.read = read
+                sayTrain(card, s)
+                card.say(": the card put to its idle pattern and told that the link is trained, all the same\n")
+            }
+            break
+        }
+        // The link down and a pause, then again.
+        const kept = course.*.end
+        if down(t, o, false, course) == Went.ended { return Went.ended }
+        course.*.end = kept
+        delay += LINK_TRAINING_RETRY_DELAY
+        rest(card, delay * 1000000)
+    }
+    return Went.wrong
+}
+
+// How long `bring` can take at most, in nanoseconds, whatever the card
+// and the monitor do: four tries, each the try's own time, one round
+// beyond it (a round is begun within the time: a table's run a lane and
+// two accesses of the channel), what stands before and after the rounds
+// (the transmitter's table, the back end's state, sixteen accesses of
+// the channel, the waits), and between two tries the link taken down
+// (an access, a table, the state) and the pause. `table`: the most a
+// table's run takes.
+pub fn longest(lanes: usize, table: usize) -> usize {
+    const access = 2 * aux.ACCESS_MOST
+    const aRound = lanes * table + 2 * access + 64000000
+    const fixed = table + STATE_TIME + 16 * access + 10000000
+    const between = access + table + STATE_TIME
+    return LINK_TRAINING_ATTEMPTS * (TRY_TIME + aRound + fixed) + (LINK_TRAINING_ATTEMPTS - 1) * between + (2 + 3 + 4) * LINK_TRAINING_RETRY_DELAY * 1000000
+}
+
+// How long `down` can take at most.
+pub fn longestDown(table: usize) -> usize { return 2 * aux.ACCESS_MOST + table + STATE_TIME }
+
+// The back end's words a training writes over the firmware's (the lanes,
+// "trained", the panel mode, the framing, the PHY's control, the
+// pattern, the test sequence, the scrambler): read for the log before
+// anything is changed, and held against that afterwards.
+pub const WORDS: usize = 8
+pub const WORD_AT = [_]usize{ scanout.DP_CONFIG, scanout.DP_LINK_CNTL, DP_DPHY_INTERNAL_CTRL, DP_LINK_FRAMING_CNTL, DP_DPHY_CNTL, DP_DPHY_TRAINING_PATTERN_SEL, DP_DPHY_PRBS_CNTL, DP_DPHY_SCRAM_CNTL }
+const WORD_NAMES = [_][]const u8{ "lanes", "link control", "panel mode", "framing", "PHY control", "pattern", "test sequence", "scrambler" }
+
+pub fn words(card: *const scanout.Card, backEnd: usize, all: *[WORDS]usize) -> void {
+    var k: usize = 0
+    while k < WORDS {
+        all.*[k] = card.reg(scanout.DIG[backEnd] + WORD_AT[k])
+        k += 1
+    }
+}
+
+// "gpu: DIG 1 before: lanes 0x3, link control 0x10, ...".
+pub fn sayWords(card: *const scanout.Card, backEnd: usize, all: *const [WORDS]usize, when: []const u8) -> void {
+    card.field("gpu: DIG ", backEnd)
+    card.say(" ")
+    card.say(when)
+    card.say(":")
+    var k: usize = 0
+    while k < WORDS {
+        card.say(if k == 0 { " " } else { ", " })
+        card.say(WORD_NAMES[k])
+        card.fieldHex(" ", all.*[k])
+        k += 1
+    }
+    card.say("\n")
+}
+
+// How many of them differ now from `before`, each said.
+pub fn sayWordsChanged(card: *const scanout.Card, backEnd: usize, before: *const [WORDS]usize) -> usize {
+    var differ: usize = 0
+    var k: usize = 0
+    while k < WORDS {
+        const now = card.reg(scanout.DIG[backEnd] + WORD_AT[k])
+        if now != before.*[k] {
+            differ += 1
+            card.field("gpu: DIG ", backEnd)
+            card.say("'s ")
+            card.say(WORD_NAMES[k])
+            card.fieldHex(" word holds ", now)
+            card.fieldHex(" where the firmware had ", before.*[k])
+            card.say(" (the training's own value)\n")
+        }
+        k += 1
+    }
+    return differ
+}
+
+fn sayBlock(card: *const scanout.Card, block: *const blocks.Block) -> void {
+    var k: usize = 0
+    while k < block.*.bytes {
+        card.say(" ")
+        card.hexDigits(block.byte(k), 2)
+        k += 1
+    }
+}
+
+// What `down` would do, for the plan's list.
+pub fn listDown(card: *const scanout.Card, o: *const Output) -> void {
+    const off = blocks.linkOff(o.*.backEnd, o.*.line, o.*.connector)
+    card.say("gpu:   the monitor told its power state D3 (AUX write 600h = 02)\n")
+    card.field("gpu:   table UNIPHYTransmitterControl, transmitter ", o.*.backEnd)
+    card.say(" off (when the back end reads on):")
+    sayBlock(card, &off)
+    card.say("\ngpu:   then the back end's pattern word 0, \"trained\" 0, its panel mode word 0 when it is not\n")
+}
+
+// What `bring` would do at `s`, for the plan's list: what is fixed
+// beforehand of it.
+pub fn listBring(card: *const scanout.Card, o: *const Output, s: Setting) -> void {
+    const on = blocks.linkOn(o.*.backEnd, s.code, s.lanes, o.*.line, o.*.connector)
+    const set = blocks.linkDrive(o.*.backEnd, s.code, s.lanes, 0, o.*.line, o.*.connector)
+    card.field("gpu:   the lanes' count (", s.lanes)
+    card.say(") and the scrambler's start in the back end\n")
+    card.field("gpu:   table UNIPHYTransmitterControl, transmitter ", o.*.backEnd)
+    card.say(" on:")
+    sayBlock(card, &on)
+    card.say("\ngpu:   the monitor told its power state D0 (AUX write 600h = 01), 1 ms, its panel mode word read (10Ah)\n")
+    card.say("gpu:   the monitor told the link: 102h = 00, 108h = 01, 107h = 10, 101h = ")
+    card.hexDigits(s.lanes | DP_LANE_COUNT_ENHANCED_FRAME_EN, 2)
+    card.say(", 100h = ")
+    card.hexDigits(s.code, 2)
+    card.say("\ngpu:   clock recovery with pattern 1, then equalisation with pattern ")
+    card.decimal(o.*.pattern)
+    card.say(" (the monitor is told ")
+    card.hexDigits(@intCast(usize, patternByte(1)), 2)
+    card.say(", then ")
+    card.hexDigits(@intCast(usize, patternByte(o.*.pattern)), 2)
+    card.say("): rounds of the lanes' drive by the table (the first:")
+    sayBlock(card, &set)
+    card.field("), the monitor told, ", clockWait(o.*.revision, o.*.interval))
+    card.field(" us or ", equaliseWait(o.*.revision, o.*.interval))
+    card.say(" us, its status read; their course is said as they run\n")
+    card.field("gpu:   the monitor's pattern off, the card to its idle pattern and \"trained\", 5 ms, the lanes read once more; up to ", LINK_TRAINING_ATTEMPTS)
+    card.say(" tries, the link taken down between\n")
+}

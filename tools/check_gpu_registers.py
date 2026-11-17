@@ -41,6 +41,18 @@
 #   display/dc/gpio/hw_ddc.c                   the pad's time to settle
 #   drivers/gpu/drm/drm_edid.c                 (of the kernel's tree) the
 #   include/drm/drm_edid.h                     EDID's addresses and tries
+# and for a DisplayPort link (gpu_aux.mlx, gpu_link.mlx):
+#   include/drm/display/drm_dp.h               (of the kernel's tree) the
+#                                              monitor's registers
+#   include/drm/drm_edid.h, drivers/gpu/drm/drm_edid.c,
+#   drivers/gpu/drm/display/drm_dp_helper.c    (of the kernel's tree) the
+#                                              EDID's addresses, the tries
+#   display/dc/dc_ddc_types.h                  the AUX commands
+#   display/dc/dc_dp_types.h                   the rates, the drive's levels
+#   display/dc/dce/dce_aux.c, dce_aux.h        who holds a channel, its wait
+#   display/dc/link/protocols/link_dp_training.c, link_dp_training_8b_10b.h,
+#   display/dc/link/link_dpms.c                the training's counts
+#   display/include/link_service_types.h       a rate's 27 MHz
 #
 # Checked: each `const NAME: usize = 0x...` that is a register is the
 # header's mmNAME; a controller's register is at each controller's offset
@@ -68,6 +80,15 @@
 # same bits in each line's word and each message's), the pins' words,
 # the engine's numbers, the EDID's addresses and how often Linux tries,
 # and the ROM's table of DDC lines.
+# Of a DisplayPort link: the six AUX
+# channels' registers and fields, the pads' calibration words, the DDC
+# lines' pin words and the hot plug lines' words in all six, the back
+# end's link words in all seven blocks (the one that is not in the
+# header by dce112_resource.c's numbers); every address and bit of the
+# monitor's registers as drm_dp.h has it; the AUX commands, the tries
+# and waits, the rates, the training's counts and the two values
+# set_dp_phy_pattern_passthrough_mode writes, each as Linux's file has
+# it.
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -367,7 +388,7 @@ def constants(text):
 # size.
 bios_plain = re.sub(r"//[^\n]*", "", bios_h)
 SIZES = {"UCHAR": 1, "USHORT": 2, "ULONG": 4, "ATOM_FIRMWARE_CAPABILITY_ACCESS": 2, "PRODUCT_BRANDING": 1, "ATOM_I2C_ID_CONFIG": 1,
-         "ATOM_MODE_MISC_INFO_ACCESS": 2}
+         "ATOM_MODE_MISC_INFO_ACCESS": 2, "ATOM_I2C_ID_CONFIG_ACCESS": 1}
 
 def body_of(name):
     # The text between the braces of `typedef struct ... { ... } name;`
@@ -417,7 +438,9 @@ def members(text, at):
         if size is None:
             size = layout(kind)[1]
         if count is not None:
-            size *= 0 if count == "" else (int(count) if count.isdigit() else bios_defines[count])
+            # (A count that is an expression of the header: the fields
+            # before the array are placed all the same.)
+            size *= 0 if count == "" else (int(count) if count.isdigit() else bios_defines.get(count, 1))
         fields.append((field, at, kind))
         at += size
         text = text[f.end():]
@@ -451,7 +474,7 @@ def list_index(struct, field):
 
 # gpu_rom.mlx: numbers of its own (a ROM's most bytes, "none", how many
 # connectors are kept, amdgpu_atombios_allocate_fb_scratch's 20 KiB).
-OWN = {"ROOM", "NONE", "CONNECTORS", "DEFAULT_SCRATCH"}
+OWN = {"ROOM", "NONE", "CONNECTORS", "DEFAULT_SCRATCH", "DDC_LINES", "DDC_LINE_STEP"}
 rom_text = open(os.path.join(here, "gpu_rom.mlx")).read()
 # The hot plug pins' register and the six lines' bits in it.
 for n, shift in enumerate(table(rom_text, "HPD_PIN_SHIFTS")):
@@ -462,6 +485,11 @@ for name, value, inside in constants(rom_text):
         continue
     if name == "DC_GPIO_HPD_A":
         hold(name, value, d.get("mm" + name))
+    elif name == "DC_GPIO_DDC1_A":
+        # The six DDC lines' clock pins' words, a step apart.
+        step = dict((n, v) for n, v, i in constants(rom_text))["DDC_LINE_STEP"]
+        for k in range(6):
+            hold("DC_GPIO_DDC%d_A" % (k + 1), value + step * k, d.get("mmDC_GPIO_DDC%d_A" % (k + 1)))
     elif inside == "Command":
         hold("Command." + name, value, list_index("ATOM_MASTER_LIST_OF_COMMAND_TABLES", name))
     elif inside == "Data":
@@ -491,6 +519,9 @@ blocks_text = open(os.path.join(here, "gpu_blocks.mlx")).read()
 blocks_held = held
 for name, value, inside in constants(blocks_text):
     if name in ("WORDS", "LANES"):
+        continue
+    if name == "LINK_RATE_REF_FREQ_IN_KHZ":
+        hold(name, value, one(r"LINK_RATE_REF_FREQ_IN_KHZ\s*=\s*(\d+)", source("link_service_types.h")))
         continue
     if "__" in name:
         struct, field = name.split("__")
@@ -706,4 +737,125 @@ for name, value, inside in constants(ddc_text):
             for k in range(4):
                 hold("DC_I2C_TRANSACTION%d" % k, value + k, d.get("mmDC_I2C_TRANSACTION%d" % k))
 print("hot plug lines and DDC: %d numbers of gpu_plug.mlx and gpu_ddc.mlx held against Linux's files, %d wrong" % (held, bad))
+
+# ---- A DisplayPort link: gpu_aux.mlx and gpu_link.mlx.
+link_needed = ("drm_dp.h", "drm_edid.h", "drm_edid.c", "drm_dp_helper.c", "dc_ddc_types.h", "dc_dp_types.h", "dce_aux.c", "dce_aux.h",
+               "link_dp_training.c", "link_dp_training_8b_10b.h", "link_dpms.c", "link_service_types.h")
+link_missing = [name for name in link_needed if not os.path.exists(os.path.join(hdr, name))]
+if link_missing:
+    sys.exit("a DisplayPort link is not held: not in %s: %s" % (hdr, " ".join(link_missing)))
+link_before = held
+link_bad_before = bad
+
+def values_of(name):
+    # Every `#define NAME value` of a file and every member of its
+    # enumerations (one without a value of its own is one more than the
+    # member before it), the value a number, a shift `(a << b)`, a sum
+    # `(a + b)` or another name of the file.
+    out = {}
+    text = re.sub(r"/\*.*?\*/", "", source(name), flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    later = []
+
+    def number(value):
+        value = value.strip().strip("()").strip()
+        f = re.match(r"^(0x[0-9a-fA-F]+|\d+)\s*(<<|\+)\s*(\d+)$", value)
+        if f:
+            return (int(f.group(1), 0) << int(f.group(3))) if f.group(2) == "<<" else int(f.group(1), 0) + int(f.group(3))
+        if re.match(r"^(0x[0-9a-fA-F]+|\d+)[uUlL]*$", value):
+            return int(re.match(r"^(0x[0-9a-fA-F]+|\d+)", value).group(1), 0)
+        return out.get(value)
+
+    for m in re.finditer(r"^\s*#\s*define\s+(\w+)\s+(.+?)\s*$", text, re.M):
+        got = number(m.group(2))
+        if got is not None:
+            out.setdefault(m.group(1), got)
+    for m in re.finditer(r"\benum\s*\w*\s*\{([^}]*)\}", text):
+        last = -1
+        for member in m.group(1).split(","):
+            f = re.match(r"^\s*(\w+)\s*(?:=\s*(.+?))?\s*$", member, re.S)
+            if not f:
+                continue
+            got = last + 1 if f.group(2) is None else number(f.group(2))
+            if got is None:
+                last = -1
+                continue
+            out.setdefault(f.group(1), got)
+            last = got
+    return out
+
+dp = values_of("drm_dp.h")
+link_values = {}
+for name in ("drm_edid.h", "drm_edid.c", "drm_dp_helper.c", "dc_ddc_types.h", "dc_dp_types.h", "dce_aux.c", "dce_aux.h",
+             "link_dp_training.c", "link_dp_training_8b_10b.h", "link_dpms.c"):
+    for key, value in values_of(name).items():
+        link_values.setdefault(key, value)
+# (What set_dp_phy_pattern_passthrough_mode writes: that function's text.)
+passthrough = source("dce_link_encoder.c")
+passthrough = passthrough[passthrough.index("static void set_dp_phy_pattern_passthrough_mode("):]
+passthrough = passthrough[:passthrough.index("\n}\n")]
+link_values["IDLE_BS_INTERVAL"] = one(r"DP_IDLE_BS_INTERVAL,\s*(0x[0-9a-fA-F]+)", passthrough)
+link_values["SCRAMBLER_BS_COUNT"] = one(r"DPHY_SCRAMBLER_BS_COUNT,\s*(0x[0-9a-fA-F]+)", passthrough)
+for n in range(7):
+    elsewhere["mmDP%d_DP_DPHY_INTERNAL_CTRL" % n] = one(r"#define\s+mmDP%d_DP_DPHY_INTERNAL_CTRL\s+(0x[0-9a-fA-F]+)" % n, source("dce112_resource.c"))
+# Numbers that are this driver's own: counts of the card's parts, its own
+# bounds and waits (the files' heads say what each is), the polling's
+# 10 us (dce_aux.c's REG_WAIT), "none", and two bits that drm_dp.h has no
+# name for (dc_dp_types.h has them as bit fields: bit 5 of 02h and bit 1
+# of 204h; gpu_link.mlx says so where they stand).
+LINK_OWN = {"CHANNELS", "DDC_STEP", "HPD_STEP", "HPD_LINES", "POLL", "TRIES", "I2C_TRIES", "I2C_DEFERS", "EDID_TRIES", "ACCESS_MOST",
+            "NONE", "TRY_TIME", "STATE_TIME", "WOKEN", "HOLDS_AFTER", "WORDS", "POST_LT_ADJ_REQ_SUPPORTED", "POST_LT_ADJ_REQ_IN_PROGRESS",
+            "I2C_SPEED_KHZ"}
+aux_text = open(os.path.join(here, "gpu_aux.mlx")).read()
+link_text = open(os.path.join(here, "gpu_link.mlx")).read()
+aux_offsets = table(aux_text, "AUX_OFFSETS")
+hold("the AUX channels", len(aux_offsets), 6)
+aux_names = dict((name, value) for name, value, inside in constants(aux_text))
+for name, value, inside in constants(aux_text):
+    if name in LINK_OWN:
+        continue
+    if "__" in name:
+        hold(name, value, sh.get(name + "_MASK"))
+        if name.startswith("DC_GPIO_DDC1_MASK__"):
+            for k in range(2, 7):
+                other = name.replace("DDC1", "DDC%d" % k).replace("PAD1", "PAD%d" % k)
+                hold(other, value, sh.get(other + "_MASK"))
+    elif name.startswith("AUX_") and ("mmDP_AUX0_" + name) in d:
+        for n in range(6):
+            hold("DP_AUX%d_%s" % (n, name), value + aux_offsets[n], d.get("mmDP_AUX%d_%s" % (n, name)))
+    elif name in ("AUXP_IMPCAL", "AUXN_IMPCAL"):
+        hold(name, value, d.get("mm" + name))
+    elif name in ("DC_GPIO_DDC1_MASK", "DC_GPIO_DDC1_A"):
+        for k in range(6):
+            hold(name.replace("DDC1", "DDC%d" % (k + 1)), value + aux_names["DDC_STEP"] * k, d.get("mm" + name.replace("DDC1", "DDC%d" % (k + 1))))
+    elif name.startswith("DP_"):
+        hold(name, value, dp.get(name))
+    else:
+        hold(name, value, link_values.get(name))
+# (The fields of the first channel's words are every channel's.)
+for name, value, inside in constants(aux_text):
+    if "__" in name and name.startswith("AUX_") and not name.startswith(("AUXP", "AUXN")):
+        for n in range(6):
+            hold("DP_AUX%d_%s" % (n, name), value, sh.get(name + "_MASK"))
+link_names = dict((name, value) for name, value, inside in constants(link_text))
+for name, value, inside in constants(link_text):
+    if name in LINK_OWN:
+        continue
+    if "__" in name:
+        hold(name, value, sh.get(name + "_MASK"))
+    elif name in ("DC_HPD_INT_STATUS", "DC_HPD_CONTROL"):
+        for n in range(6):
+            hold("HPD%d_%s" % (n, name), value + link_names["HPD_STEP"] * n, d.get("mmHPD%d_%s" % (n, name)))
+    elif name.startswith("DP_DPHY") or name == "DP_LINK_FRAMING_CNTL":
+        # In a back end's block (the one word that is not in the header:
+        # dce112_resource.c's numbers).
+        for n in range(7):
+            hold("DP%d_%s" % (n, name), digs[n] + value, d.get("mmDP%d_%s" % (n, name), elsewhere.get("mmDP%d_%s" % (n, name))))
+    elif name.startswith("DP_"):
+        hold(name, value, dp.get(name))
+    else:
+        hold(name, value, link_values.get(name))
+rates = re.search(r"pub const RATES = \[_\]usize\{([^}]*)\}", link_text).group(1).replace(" ", "").split(",")
+hold("the rates there are", int(rates == ["LINK_RATE_LOW", "LINK_RATE_HIGH", "LINK_RATE_HIGH2", "LINK_RATE_HIGH3"]), 1)
+print("DisplayPort link: %d numbers of gpu_aux.mlx and gpu_link.mlx held against Linux's files, %d wrong" % (held - link_before, bad - link_bad_before))
 sys.exit(1 if bad or rom_bad or wrong or display_bad else 0)
