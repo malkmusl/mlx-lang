@@ -74,7 +74,9 @@ passed through as a Multiboot memory map, so the kernel maps all of RAM,
 the ranges above the hole and above 4 GiB included; the display's
 framebuffer from the Graphics Output Protocol into the boot info,
 ExitBootServices, out of long mode, the image to 1 MiB, the blob's
-entry). The kernel's console
+entry). Its first act is to read the key that chooses what the GPU's
+driver does with the display at this boot ("One image, and the choice
+at boot" below). The kernel's console
 stays the serial line; the screen is mlx-console's (below).
 
     brixOS: kernel at 0x200000, 292 KiB
@@ -556,9 +558,9 @@ writes two images for such a machine beside the build's: BOOTX64-diag.EFI
 (no graphical session: the kernel's log stays on the screen to be read or
 photographed) and BOOTX64-console.EFI (mlx-console on the screen: a
 shell with the USB keyboard; `cat /devices/klog` shows the log). Both
-run on one processor and carry the GPU's firmware.
-(tools/brix-native-efi.sh makes the images that ask the GPU's driver for
-the monitor's own mode: below.)
+run on one processor and carry the GPU's firmware. (What the GPU's
+driver does with the display is chosen in them as in the build's image,
+at boot: below.)
 
 The GPU (gpu.mlx: an AMD Radeon, Polaris) is found and its register path
 tried; its driver is built in stages, and what the next ones stand on is
@@ -567,11 +569,13 @@ the card reads and writes (`gpu.dma`), its firmware from the boot
 archive by name (`Archive.find`), a vector for its interrupt
 (layout.Vector.GPU, `Pci.enableMsi`, `smp.localApic`). The firmware's
 picture is the console and the desktop's screen: the file's head says
-what must not be done to the card while it is, and where to read that
-the usual boot writes no register of the display.
+what must not be done to the card while it is, and where to read that a
+boot which keeps the firmware's picture writes no register of the
+display.
 
-Its display controller (DCE 11.2) is read at every boot, and set only
-when the image asks for it (gpu_display.mlx reads, gpu_mode.mlx plans,
+Its display controller (DCE 11.2) is read at every boot and set to the
+monitor's own mode, unless the boot's choice keeps the firmware's
+picture (gpu_display.mlx reads, gpu_mode.mlx plans,
 gpu_set.mlx writes; the register numbers and fields are those of Linux's
 dce_11_2_d.h, dce_11_2_sh_mask.h, vid.h and gmc_8_1_d.h, looked up there
 and held against them by tools/check_gpu_registers.py; only a Polaris
@@ -678,19 +682,80 @@ directly instead). (The read-out's own "next stage" and "would set"
 lines are the stage's before; the plan says more.)
 
 None of this writes to the card, and none of it runs a table of the
-card's. A plan is carried out only by an image whose archive has a file
-settings/gpu with the word `native`; the word `rehearsal` there asks for
-less (below).
+card's: reading and planning are the same at every boot. What is done
+with the plan is the boot's choice.
 
-    tools/brix-native-efi.sh
+### One image, and the choice at boot
 
-makes both from the build's image: mlx-out/bin/brix/esp/EFI/BOOT/
-BOOTX64-native.EFI and BOOTX64-rehearsal.EFI are BOOTX64.EFI with that
-one file more (`brix-image --add`), and BOOTX64-diag-native.EFI and
-BOOTX64-diag-rehearsal.EFI the diagnostic image likewise when
-tools/brix-diag-efi.sh has made one. With the file, and a plan that is
-complete, the kernel carries the plan out before any program runs
-(gpu_set.mlx): the new picture's memory is cleared, each write is read
+There is one image, BOOTX64.EFI, and what the GPU's driver does with the
+display is chosen in it, at boot (display_choice.mlx). The choice says
+how far the driver goes and nothing else: which output the monitor is on
+and what kind of signal it takes is never chosen, by no key, no setting
+and no word in the image; the driver reads that at every boot and takes
+the path that follows from it.
+
+    native      the monitor's own mode: a plan that is complete is
+                carried out; where it is not, one line says why and the
+                firmware's picture stays. What the image does by itself.
+    firmware    the firmware's picture is kept: no register of the
+                display is written and no table of the card's is run.
+    rehearsal   the firmware's own mode set again by the same steps,
+                the card's own tables among them (today where the
+                picture leaves by HDMI or DVI signalling): the screen
+                goes dark for a moment and comes back as it was. Nothing
+                new is asked of the monitor.
+    ask         the monitor only asked, nothing set (the step before a
+                DisplayPort link is trained). Not built yet: the
+                firmware's picture is kept, and the log says so.
+
+The choice is the first of these that names one:
+
+1. A key held or tapped while the machine starts: F firmware, N native,
+   R rehearsal, A ask, either case. The loader reads the firmware's
+   keyboard as its first act (image/efi.mlx's choice part: every key the
+   firmware has kept, then for three tenths of a second more when none
+   of ours was among them) and says on the firmware's console what it
+   took ("brixOS: display: the firmware's picture is kept (F),
+   remembered"). A firmware may throw away what was typed while it
+   started (OVMF keeps only the keys of its last moments before the
+   image): hold the key down, or tap it, from switching on until
+   brixOS's first lines are there, rather than pressing it once.
+2. What a key at an earlier start left in the machine: F and N are
+   remembered, R and A hold for their one boot and change nothing that
+   is remembered. The memory is the firmware's own, a UEFI variable
+   (BrixDisplay under 4e1050e5-03af-4698-8f99-584a105df8f3, non-volatile,
+   one byte: the letter F or N; written only when it changes). It goes
+   with the machine, not with the disk or the image, and the firmware's
+   shell shows it (`dmpstore BrixDisplay -guid
+   4e1050e5-03af-4698-8f99-584a105df8f3`).
+3. The image's file settings/gpu, whose first word is one of the four
+   names: for someone who builds an image with a fixed choice. The
+   build's own image has no such file.
+4. native.
+
+The kernel says the choice at every boot, with the key that changes it:
+
+    gpu: this boot: the monitor's own mode (the default; F while the machine starts keeps the firmware's picture)
+    gpu: this boot: the firmware's picture is kept (F was pressed at an earlier start and is remembered; N sets the monitor's own mode again)
+    gpu: this boot: the firmware's own mode set again by the card's tables (R was pressed at this start and holds for this boot only)
+
+and after it, a line each, what was not as it should be for the loader:
+a firmware that gave it no keyboard or no variable store ("gpu: the
+firmware gave the loader no keyboard to read: a key while the machine
+starts is not seen on this machine"), one that did not take the key to
+remember ("gpu: the firmware's variable store did not take F to remember
+(status 8: write protected)": the key then holds for that boot only),
+something remembered that is no choice (passed over; F or N writes it
+anew). How long the loader looked is in the log alone ("gpu: the loader
+looked for a key for 302 ms and saw none of F, N, R and A": what a boot
+without a key takes longer by; with a key it does not wait), and on a
+machine without such a card so is the choice ("gpu: no card of ours to
+set a mode on; this boot: ..."). Started by a Multiboot loader there is
+no loader of ours and no key: the image's word, else native.
+
+With the choice native and a plan that is complete, the kernel carries
+the plan out before any program runs (gpu_set.mlx): the new picture's
+memory is cleared, each write is read
 back, each state waited for has its time, and afterwards the
 controller's frame counter must run at the planned rate and the memory
 interface must not say that it ran dry. When anything of that fails the
@@ -698,7 +763,10 @@ firmware's state is put back, every register from the value read before,
 and the log says what failed and what came back. When it holds, the
 kernel's display is the new picture from there on: the console is drawn
 again on it, and /devices/framebuffer gives the programs the monitor's
-own size.
+own size. A plan that is not complete is not carried out, and one line
+says why ("gpu: the monitor's own mode is not set, the firmware's
+picture stays: the link is too slow: it must be trained again, not there
+yet").
 
 A TMDS output's plan is carried out with more care still, since the
 card's own tables do part of it and nobody has seen them run here on a
@@ -724,40 +792,56 @@ for seven tables comes to "the screen is dark meanwhile, 18 s at most
 (and 18 s more at most if the firmware's state has to be put back)".
 After that the kernel goes on starting in any case.
 
-On the machine, in three steps, each only after the one before held.
+On the machine there is nothing to prepare and nothing to copy but the
+one image: it is started, and the screen says what happens.
 
-1. The build's own image (or the diagnostic one, where the log stays on
-   the screen). Nothing is written. The "gpu:" lines say whether there
-   is a plan: on the screen the monitor's timing, the controller's
-   lines, the video BIOS's line and "gpu: plan (b, TMDS): ... 7 table
-   runs and 86 writes would do it", or "nothing would be set: ..." with
-   the reason. If there is none, or before going on in any case, send
-   the log and the card's ROM (logserve's /all and /gpu.rom, or boot.log
-   and gpu.rom from a brixfs volume): with the ROM every table the plan
-   runs can be run on the host first, against Linux's own interpreter
-   (tools/check_atom_reference.sh), where a table this interpreter
-   cannot run costs nothing.
-2. BOOTX64-rehearsal.EFI: the firmware's own mode set again by the same
-   steps (the plan line then begins "gpu: plan (the firmware's own mode
-   set again): ..."). The screen goes dark for a moment and comes back
-   as it was. Nothing new is asked of the monitor; it shows that the
-   card's tables run here, that the output goes off and comes back and
-   that the checks hold on this card. The line that says so: "gpu:
-   controller 0 runs the firmware's own mode again, set by the card's
-   tables, ... the picture is where it was". (It does not show that the
-   PLL takes another clock: the one asked for is the one that runs.)
-3. BOOTX64-native.EFI: the monitor's own mode. The desktop at the
-   monitor's own size is the success; the log says "gpu: controller 0
-   shows a picture of 3840x1080 as it is, ... the monitor's own mode is
-   set (7 table runs, 86 writes, each read back)".
+- By itself, without a key. The "gpu:" lines say the monitor's timing,
+  the controller's lines, the video BIOS's line, the choice ("gpu: this
+  boot: the monitor's own mode (the default; ...)") and the plan: "gpu:
+  plan (b, TMDS): ... 7 table runs and 86 writes would do it", or
+  "nothing would be set: ..." with the reason. A complete plan is
+  carried out at once ("gpu: setting the monitor's own mode: carrying
+  out the plan's 7 table runs and 86 writes; the screen is dark
+  meanwhile, 18 s at most (...)"): the screen goes dark, and the desktop
+  at the monitor's own size is the success; the log says "gpu:
+  controller 0 shows a picture of 3840x1080 as it is, ... the monitor's
+  own mode is set (7 table runs, 86 writes, each read back)". Where the
+  plan is not complete the firmware's picture stays, and the line that
+  says why is what to send (with the log and the card's ROM: logserve's
+  /all and /gpu.rom, or boot.log and gpu.rom from a brixfs volume; with
+  the ROM every table the plan runs can be run on the host first,
+  against Linux's own interpreter, tools/check_atom_reference.sh).
+- R, for who wants the smaller step first: held while the machine
+  starts, it has the firmware's own mode set again by the same steps
+  (the plan line then begins "gpu: plan (the firmware's own mode set
+  again): ..."). The screen goes dark for a moment and comes back as it
+  was. Nothing new is asked of the monitor; it shows that the card's
+  tables run here, that the output goes off and comes back and that the
+  checks hold on this card. The line that says so: "gpu: controller 0
+  runs the firmware's own mode again, set by the card's tables, ... the
+  picture is where it was". (It does not show that the PLL takes another
+  clock: the one asked for is the one that runs.) R holds for that one
+  boot.
+- F keeps the firmware's picture, at that start and at every one after
+  it; N at a start sets the monitor's own mode again.
+
+So the order of trials is keys, not images: R first if one wants to,
+then nothing (or N, where F is remembered).
 
 If it fails and the picture comes back, the screen says why ("gpu: step
 24 of 108 failed (...): run SetPixelClock with ...") and what came back
 ("gpu: the firmware's state is back (...)"). If the screen stays dark:
 wait until the disk is quiet (the system goes on starting behind the
-dark screen, and klogsave writes that boot's log), then restart into the
-normal image, which never writes to the display: klogsave has kept the
-dark boot's log as boot.previous.log on the brixfs volumes (`cat
+dark screen, and klogsave writes that boot's log), then restart and hold
+F down while the machine starts. That boot writes nothing to the display
+and shows the firmware's picture, as every boot after it does until N is
+pressed at a start. (Should F not be taken, the picture dark again: the
+firmware did not give the loader the key. Its setup has the switches for
+that, a USB keyboard served while it starts and its fast boot off; the
+log of such a boot says what the loader saw, "gpu: the loader looked for
+a key for ... ms and saw none of F, N, R and A", or that it had no
+keyboard at all.) klogsave has kept the dark boot's log as
+boot.previous.log on the brixfs volumes (`cat
 /volumes/NAME/boot.previous.log`, or logserve's /boot.previous.log; the
 boot after that one overwrites it, klogsave run again by hand does not).
 That file is what to send back, whole: its "gpu:" lines say each table's
@@ -783,9 +867,10 @@ scrambles there and the monitor has to be told over its DDC lines; there
 is no I2C here), two DVI links, more than eight bits a colour and YCbCr,
 audio, a monitor plugged in later or another one (the plan is for the
 monitor the firmware showed its picture on), and a way to take the new
-mode back when the monitor shows nothing though every register is right
-(someone would have to confirm the picture; the kernel sets the mode
-before there is a keyboard). The tables that Linux runs once at its
+mode back within the same boot when the monitor shows nothing though
+every register is right (someone would have to confirm the picture, and
+the kernel sets the mode before it has a keyboard: F at the next start
+is the way back). The tables that Linux runs once at its
 start and this driver leaves to the firmware's own start (the
 transmitter's "init", the power gate) are not run.
 
@@ -802,14 +887,30 @@ write nothing, do not end or cannot be run, the rehearsal; and
 tests/475_gpu_tmds_blocks_runtime.mlx holds what each table is told byte
 for byte against the bytes worked out from Linux's atombios.h and
 command_table.c, the timing and signalling chosen, and every reason for
-no plan.
+no plan. tests/482_display_choice_runtime.mlx holds the choice: every
+combination of key, remembered variable, image word and what the
+firmware let the loader do, and the log's lines; and it runs the
+loader's own part on the host, the text brix-image puts at the
+application's entry, against a firmware that is a table
+(tests/support/choice_firmware.mlx): every key list with every variable
+and every answer to a write, a key that comes late, a keyboard that
+fails, and a firmware that lacks its keyboard, its waiting, its variable
+store or its console. Tests 460 and 474 hold
+that a boot which keeps the firmware's picture writes nothing and runs
+no table. tools/check_brix_choice.sh tries the loader's part under OVMF
+in QEMU, the keys sent through QEMU's monitor: no key, F and the start
+after it, R, A, N, something remembered that is no choice, an image with
+settings/gpu, and a Multiboot start. (OVMF given by -bios keeps its
+variables in memory, and what a loader writes is gone with QEMU; the
+check gives the firmware as two flash drives, its code and a variable
+store that is written.)
 
 On this controller Linux does not write the pixel clock's PLL and the
 transmitter itself: it runs small programs out of the card's own video
 BIOS ROM (AtomBIOS command tables: SetPixelClock, the transmitter's and
 the encoder's control and others). So does the kernel, for a TMDS
-output's plan and only when the image asks (gpu_blocks.mlx has what
-each table is told).
+output's plan and never at a boot that keeps the firmware's picture
+(gpu_blocks.mlx has what each table is told).
 
 The ROM is read at every boot (gpu_rom.mlx), by the first of three ways
 that gives one that holds: the copy the card's UEFI driver leaves in the
@@ -857,8 +958,9 @@ read outside the ROM, a run has a count and a time, calls a depth; a
 run that fails says the table, the offset and the opcode). The card is
 reached through hands the kernel fills: hands that only read stop a run
 at its first write and say what it would have written, and the hands
-that write do so only in an image that asks for the monitor's own mode.
-(With the setting off no table is run at all, not with hands that only
+that write do so only at a boot whose choice lets the driver write (the
+monitor's own mode, or the rehearsal). (At a boot that keeps the
+firmware's picture no table is run at all, not with hands that only
 read either: gpu_set.mlx's head says why.)
 Since the card cannot be tried in a VM, the interpreter is proven on the
 host: tests/472_atom_interpreter_runtime.mlx runs tables assembled by
