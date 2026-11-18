@@ -930,27 +930,39 @@ case the link is, and the plan says it:
   lanes as that rate needs, within what the card's ROM allows the
   encoder and what the monitor says it can.
 - trained: the card says the link is not trained, or the monitor holds
-  no link or has lost its lanes.
+  no link or has lost its lanes. A link that has room is trained too
+  when the display clock has to be raised (below).
 - refused, with the reason in one line: a monitor that does not answer
   or is none to train (a hub, an embedded panel, three lanes), one that
   holds another link than the card's words give (the way back would not
   be known), a ROM that does not name the connector, its channel and
   its line, a transmitter's table of another revision than 6, no rate
-  and lanes that carry the timing, a display clock that is too low
-  (raising it for a DisplayPort output is not built), several streams.
+  and lanes that carry the timing, a display clock that would have to
+  be raised above the ROM's own figure, or raised for a link that is
+  kept and cannot be trained, several streams.
   Without an answer a link that has room is still kept, on the card's
   word, as before there was a way to ask.
 
 The display clock decides more than it seems to. The new rows need it
-at 1.2 times their pixel clock whatever the link does, so a link that
-is kept is refused for it like one that is trained: "gpu: plan (b,
-DisplayPort): nothing would be set: the display clock is 118032 kHz and
-would have to be 326350 kHz: raising it for a DisplayPort output is not
-built". Those are the figures of the RX 580 these trials are made on,
-as its firmware leaves it, for 3840x1080 at 270270 kHz: on that card a
-DisplayPort output keeps the firmware's picture until the clock is
-raised for it as the HDMI plan raises it (the card's SetDCEClock table,
-twice). A and R do not depend on it.
+at 1.2 times their pixel clock whatever the link does. The RX 580 these
+trials are made on has 118032 kHz as its firmware leaves it, and
+3840x1080 at 270270 kHz needs 326350 kHz, so the plan raises it as the
+HDMI plan does, with the card's SetDCEClock table run twice (the clock,
+then the DisplayPort reference clock), before anything of the output is
+touched:
+
+    gpu: the display clock is 118032 kHz (the ROM's own figure 626100 kHz): 270270 kHz needs 326350, which it is not: it is raised to that
+
+The second run also sets the reference clock that the stream's pixel
+clock is divided from, and that clock's modulo (a ROM may leave them,
+and write nothing). Both are read right after it and must be as before
+("gpu: 0142 & ffffffff is 23c34600 ...");
+if they are not, nothing else is done and the clock is put back. On the
+user's card the table writes what is there already. A link that would
+be kept is trained again instead, since a kept link is set by registers
+alone; without the monitor's answer it stays refused. The way back runs
+the two tables again for the clock as it was, last. A and R do not
+depend on it.
 
 A link is trained as Linux 6.6's display core trains one on these cards
 (gpu_link.mlx; the plan lists what is fixed of it beforehand, "gpu:
@@ -1002,7 +1014,7 @@ trials is again keys and the one image:
    anything new is asked of the monitor.
 3. Nothing (or N, where F is remembered): the monitor's own mode. The
    driver asks first by itself, and goes on only when what it learned
-   allows it (and the display clock is enough: above).
+   allows it (the display clock raised if it has to be: above).
 
 If it fails and the picture comes back, the screen says where ("gpu:
 step 39 of 83 failed (the link's own step: clock recovery): train the
@@ -1030,13 +1042,13 @@ which is what R is there to show first.
 
 Not done for a DisplayPort output: a setting above the first that
 carries the timing when that one does not train (the log names the next;
-the firmware's link is trained again instead), a display clock raised, a
-monitor behind a hub or one that carries several streams, an embedded
-panel, more than one controller, a link from nothing (an output the
-firmware did not start: its detection is the hot plug work's), the
-monitor's request for attention later (no interrupt is served: a link
-lost after the boot is not noticed), and the source's name that Linux
-writes to the monitor (300h). The AUX channel by the card's table
+the firmware's link is trained again instead), a monitor behind a hub
+or one that carries several streams, an embedded panel, more than one
+controller, a link from nothing (an output the firmware did not start:
+its detection is the hot plug work's), the monitor's request for
+attention later (no interrupt is served: a link lost after the boot is
+not noticed), and the source's name that Linux writes to the monitor
+(300h). The AUX channel by the card's table
 (ProcessAuxChannelTransaction) is the second line if the registers get
 no answer on this card; it is not built.
 
@@ -1050,6 +1062,8 @@ tests/481_gpu_dp_link_runtime.mlx holds the pieces: an AUX transaction's
 register words, the tries, the EDID through the channel, the monitor's
 capabilities, the arithmetic of rates and lanes, the table's blocks byte
 for byte, and every reason for no plan.
+tests/499_gpu_dp_clock_runtime.mlx holds the display clock raised, at
+the user's card's figures, event for event, and its way back.
 
 tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
 numbers on the host, tests/459_edid_timing_runtime.mlx reads EDIDs
