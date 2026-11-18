@@ -60,6 +60,12 @@
 #   display/dc/dc_dp_types.h                   the short pulse's bytes
 #   include/drm/display/drm_dp.h               (of the kernel's tree) the
 #                                              sink count's bits
+#   display/dc/link/protocols/link_dp_irq_handler.c  where they are read
+# and for a passive adapter behind a DisplayPort connector (gpu_adapter.mlx):
+#   drivers/gpu/drm/display/drm_dp_dual_mode_helper.c,
+#   include/drm/display/drm_dp_dual_mode_helper.h  (of the kernel's tree)
+#   display/dc/link/link_detection.c           how often the display core
+#                                              reads an adapter's ID
 #
 # Checked: each `const NAME: usize = 0x...` that is a register is the
 # header's mmNAME; a controller's register is at each controller's offset
@@ -872,7 +878,7 @@ for n in range(7):
 # of 204h; gpu_link.mlx says so where they stand).
 LINK_OWN = {"CHANNELS", "DDC_STEP", "HPD_STEP", "HPD_LINES", "POLL", "TRIES", "I2C_TRIES", "I2C_DEFERS", "EDID_TRIES", "ACCESS_MOST",
             "NONE", "TRY_TIME", "STATE_TIME", "WOKEN", "HOLDS_AFTER", "WORDS", "POST_LT_ADJ_REQ_SUPPORTED", "POST_LT_ADJ_REQ_IN_PROGRESS",
-            "I2C_SPEED_KHZ"}
+            "I2C_SPEED_KHZ", "FALLBACKS", "PLANS_AGAIN"}
 aux_text = open(os.path.join(here, "gpu_aux.mlx")).read()
 link_text = open(os.path.join(here, "gpu_link.mlx")).read()
 aux_offsets = table(aux_text, "AUX_OFFSETS")
@@ -942,7 +948,46 @@ sink = re.search(r"#\s*define\s+DP_GET_SINK_COUNT\(x\)\s*\(\(\(\(x\) & (0x[0-9a-
 hold("DP_SINK_COUNT_HIGH", watch["DP_SINK_COUNT_HIGH"], int(sink.group(1), 16) if sink else None)
 hold("DP_SINK_COUNT_MASK", watch["DP_SINK_COUNT_MASK"], int(sink.group(2), 16) if sink else None)
 hold("the short pulse's bytes", int(re.search(r"var six: \[(\d+)\]u8", watch_text).group(1)), one(r"union hpd_irq_data \{.*?uint8_t raw\[(\d+)\];", re.sub(r"\n", " ", source("dc_dp_types.h"))))
+# (From DisplayPort 1.4 on: the event status indicators, as
+# link_dp_irq_handler.c's dp_read_hpd_rx_irq_data reads and takes them.)
+if not os.path.exists(os.path.join(hdr, "link_dp_irq_handler.c")):
+    sys.exit("the short pulse's bytes are not held: not in %s: link_dp_irq_handler.c" % hdr)
+irq = re.sub(r"\s+", " ", source("link_dp_irq_handler.c"))
+ESI = ("DP_SINK_COUNT_ESI", "DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0", "DP_LANE0_1_STATUS_ESI", "DP_LANE2_3_STATUS_ESI", "DP_LANE_ALIGN_STATUS_UPDATED_ESI", "DP_SINK_STATUS_ESI")
+for name in ("DP_DPCD_REV_14",) + ESI:
+    hold(name, watch[name], dp.get(name))
+    if name != "DP_DPCD_REV_14":
+        hold("%s taken" % name, int(("esi[%s - DP_SINK_COUNT_ESI]" % name) in watch_text), int(("tmp[%s - DP_SINK_COUNT_ESI]" % name) in irq))
+hold("the event status indicators read", int(re.search(r"var esi: \[(\d+)\]u8", watch_text).group(1)), dp["DP_SINK_STATUS_ESI"] - dp["DP_SINK_COUNT_ESI"] + 1 if "uint8_t tmp[DP_SINK_STATUS_ESI - DP_SINK_COUNT_ESI + 1]" in irq else None)
+hold("read there from revision 1.4", int("if revision < DP_DPCD_REV_14 {" in watch_text), int("dpcd_rev.raw < DPCD_REV_14" in irq))
 print("DisplayPort hot plug: %d numbers of gpu_dpwatch.mlx held against Linux's files, %d wrong" % (held - watch_before, bad - watch_bad_before))
+
+# ---- A passive adapter behind a DisplayPort connector (gpu_adapter.mlx):
+# its address and registers, the HDMI ID's text and the clocks
+# (drivers/gpu/drm/display/drm_dp_dual_mode_helper.c and include/drm/
+# display/drm_dp_dual_mode_helper.h of the kernel's tree).
+adapter_before, adapter_bad_before = held, bad
+adapter_missing = [name for name in ("drm_dp_dual_mode_helper.h", "drm_dp_dual_mode_helper.c", "link_detection.c") if not os.path.exists(os.path.join(hdr, name))]
+if adapter_missing:
+    sys.exit("a passive adapter is not held: not in %s: %s" % (hdr, " ".join(adapter_missing)))
+adapter_text = open(os.path.join(here, "gpu_adapter.mlx")).read()
+dual = values_of("drm_dp_dual_mode_helper.h")
+for key, value in values_of("drm_dp_dual_mode_helper.c").items():
+    dual.setdefault(key, value)
+dual_c = re.sub(r"\s+", " ", source("drm_dp_dual_mode_helper.c"))
+dual["TYPE1_MAX_TMDS_CLOCK"] = one(r"if \(type < DRM_DP_DUAL_MODE_TYPE2_DVI\) return (\d+);", dual_c)
+# (How often the HDMI ID is read: once, and again while the display
+# core's retry_count lasts, link_detection.c's query_dp_dual_mode_adaptor.)
+retries = one(r"int retry_count = (\d+);", re.sub(r"\s+", " ", source("link_detection.c")))
+dual["ID_READS"] = None if retries is None else retries + 1
+for name, value, inside in constants(adapter_text):
+    if name != "NONE":
+        hold(name, value, dual.get(name))
+hdmi_id = re.search(r'pub const HDMI_ID = "([^"]*)"', adapter_text)
+want_id = re.search(r'dp_dual_mode_hdmi_id\[DP_DUAL_MODE_HDMI_ID_LEN\] = "([^"]*)"', dual_c)
+hold("the HDMI ID's text", int(hdmi_id is not None and want_id is not None and hdmi_id.group(1) == want_id.group(1)), 1)
+hold("a type 2 adapter's clock in 2.5 MHz", int("a.clockByte * 5000 / 2" in adapter_text), int("return max_tmds_clock * 5000 / 2;" in dual_c))
+print("a passive adapter: %d numbers of gpu_adapter.mlx held against Linux's files, %d wrong" % (held - adapter_before, bad - adapter_bad_before))
 
 # ---- The card's engines: gpu_engines.mlx (the stages toward a card that
 # takes commands: S0, M1, M2, I1). Beside the files above, of Linux 6.6's

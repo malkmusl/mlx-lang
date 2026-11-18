@@ -23,9 +23,11 @@
 // "init" before any of this, at its start; here that table runs as the
 // first step of a move to the connector (gpu_mode.mlx), and the user's ROM
 // writes nothing for it, on the host: the channel's words are the AUX
-// block's alone. (A passive adapter behind the connector, which answers on
-// the DDC pins and not on the AUX channel, is not looked for: Linux's
-// dp_is_sink_present switches the pins for that. Said as "no answer".)
+// block's alone. A passive adapter behind the connector answers on the DDC
+// pins and not on the AUX channel: when nothing answers there, it is
+// looked for over the DDC line by the card's I2C engine (gpu_adapter.mlx:
+// drm_dp_dual_mode_detect; `lookForAdapter`), and the connector is then
+// one that sends TMDS (its EDID read over DDC, as an HDMI connector's).
 //
 // THE TWO PULSES, as Linux's display core reads a DisplayPort connector's
 // hot plug line (amdgpu_dm.c: handle_hpd_irq for a long pulse,
@@ -79,6 +81,7 @@ const plug = @import("./gpu_plug.mlx")
 const mode = @import("./gpu_mode.mlx")
 const modeset = @import("./gpu_set.mlx")
 const changing = @import("./gpu_change.mlx")
+const adapter = @import("./gpu_adapter.mlx")
 
 pub const NONE: usize = plug.NONE
 // Ours, in nanoseconds: how often the lanes of the DisplayPort output that
@@ -93,6 +96,16 @@ pub const DC_HPD_INT_STATUS__DC_HPD_RX_INT_STATUS: usize = 0x100
 // bit 7 as bit 6).
 pub const DP_SINK_COUNT_MASK: usize = 0x3F
 pub const DP_SINK_COUNT_HIGH: usize = 0x80
+// The revision from which a short pulse's bytes are read at the event
+// status indicators (drm_dp.h's DP_DPCD_REV_14), and those of them that
+// stand for 200h to 205h.
+pub const DP_DPCD_REV_14: usize = 0x14
+pub const DP_SINK_COUNT_ESI: usize = 0x2002
+pub const DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0: usize = 0x2003
+pub const DP_LANE0_1_STATUS_ESI: usize = 0x200C
+pub const DP_LANE2_3_STATUS_ESI: usize = 0x200D
+pub const DP_LANE_ALIGN_STATUS_UPDATED_ESI: usize = 0x200E
+pub const DP_SINK_STATUS_ESI: usize = 0x200F
 
 // Why the lanes of the output that shows the picture are looked at.
 pub const Look = enum(u8) { none, pulse, back, interval }
@@ -125,7 +138,28 @@ pub const Sinks = struct {
     // did not answer or was not on. A pulse of its line or the monitor
     // back on it make it looked after again.
     left: usize
+    // For a connector whose AUX channel does not answer, a passive
+    // adapter looked for over its DDC line (gpu_adapter.mlx, `useDdc`):
+    // the card's I2C engine (none: no adapter is looked for), a pause in
+    // microseconds, the card's DDC lines and crystal, the plug item's
+    // reading (the connector whose EDID it reads, NONE: none; the engine
+    // is one for the whole card), and a reader for an adapter's EDID at
+    // boot (while brixOS runs the plug item reads it at its ticks).
+    ddcHands: ?*const ddc.Hands
+    pause: fn(usize) -> void
+    lines: usize
+    crystal: usize
+    reading: ?*const usize
+    reader: ddc.Reader
+    booting: bool
+    // The ROM's record of the connectors the plans read for the output
+    // that shows the picture (gpu_mode.mlx's tmdsPlan for the firmware's
+    // output and for a mode changed on it), kept with what an adapter
+    // said, as the connectors' own records are (none: only those).
+    board: ?*videorom.Board
 }
+
+fn noPause(microseconds: usize) -> void {}
 
 // Nothing asked yet. `port`'s write may reach the AUX blocks alone.
 pub fn begin(s: *Sinks, port: aux.Port, ack: fn(usize, u32) -> void, asks: bool) -> void {
@@ -146,6 +180,116 @@ pub fn begin(s: *Sinks, port: aux.Port, ack: fn(usize, u32) -> void, asks: bool)
     s.*.lost = 0
     s.*.trained = 0
     s.*.left = NONE
+    s.*.ddcHands = null
+    s.*.pause = noPause
+    s.*.lines = 0
+    s.*.crystal = 0
+    s.*.reading = null
+    s.*.booting = false
+    s.*.board = null
+    s.*.reader.idle()
+}
+
+// The card's I2C engine lent for adapters (the fields' head): `reading`
+// is the plug item's (gpu_plug.mlx's Watch.reading); `board` the ROM's
+// record the plans read.
+pub fn useDdc(s: *Sinks, hands: *const ddc.Hands, pause: fn(usize) -> void, lines: usize, crystal: usize, reading: *const usize, board: ?*videorom.Board) -> void {
+    s.*.ddcHands = hands
+    s.*.pause = pause
+    s.*.lines = lines
+    s.*.crystal = crystal
+    s.*.reading = reading
+    s.*.board = board
+}
+
+// What an adapter behind connector `k` passes (a clock of 0: none), in
+// the connector's record and in the ROM's record the plans read for the
+// output that shows the picture (a mode changed on it, the firmware's
+// own output), which gpu_plug.mlx's survey copied the first from.
+fn record(s: *Sinks, ports: *plug.Ports, k: usize, clock: usize, hdmi: bool) -> void {
+    ports.*.ports[k].rom.adapterClock = clock
+    ports.*.ports[k].rom.adapterHdmi = hdmi
+    if s.*.board == null || k >= s.*.board.?.*.count { return }
+    s.*.board.?.*.connectors[k].adapterClock = clock
+    s.*.board.?.*.connectors[k].adapterHdmi = hdmi
+}
+
+// Whether connector `k` is a DisplayPort one that sends TMDS now, through
+// an adapter: the firmware's output, or the picture's after a move (its
+// monitor is the plug item's to ask over DDC, gpu_plug.mlx's `asks`).
+fn sendsTmds(p: *const plug.Port) -> bool { return p.*.rom.kind == videorom.CONNECTOR_OBJECT_ID_DISPLAYPORT && p.*.firmware && p.*.sends == plug.Sends.tmds }
+
+// A DisplayPort connector that sends TMDS asked for the adapter behind it
+// over its DDC line (its registers alone: the EDID is the plug item's),
+// so that the plans for it know the adapter's clock (Linux's display core
+// asks every passive adapter when it finds the monitor, query_dp_dual_
+// mode_adaptor). One line says what was found.
+fn askSending(s: *Sinks, ports: *plug.Ports, k: usize) -> void {
+    const port = &ports.*.ports[k]
+    const card = s.*.port.card
+    const lent = adapter.Lent.{ .card = card, .hands = s.*.ddcHands.?, .pause = s.*.pause, .wire = &port.*.wire, .lines = s.*.lines, .crystal = s.*.crystal }
+    var found = adapter.detect(&lent)
+    // (Nothing at the adapter's address: a type 1 adapter to DVI, which
+    // need not answer there; the output sends TMDS by it now.)
+    adapter.takenAsDvi(&found)
+    card.say("gpu: ")
+    plug.sayName(card, port)
+    card.say(": the output sends TMDS")
+    card.say(if found.idRead { "; on its DDC line " } else { ", and nothing answers at an adapter's address on its DDC line: " })
+    adapter.say(card, &found)
+    if adapter.passive(&found) { record(s, ports, k, found.clock, adapter.passesHdmi(&found)) } else { record(s, ports, k, 0, false) }
+}
+
+// Whether the card's I2C engine is free for an adapter's look: lent, and
+// no EDID being read.
+fn ddcFree(s: *const Sinks) -> bool { return s.*.ddcHands != null && (s.*.reading == null || s.*.reading.?.* == NONE) }
+
+// A connector whose AUX channel does not answer, looked at for a passive
+// adapter (gpu_adapter.mlx): its registers over the DDC line; at boot its
+// monitor's EDID over the same line at once (a type 1 adapter to DVI need
+// not answer at its address: an EDID that answers makes the connector
+// one); while brixOS runs the EDID is the plug item's to read at its
+// ticks (`askAt`), and the switch waits for it. One line says what was
+// found. Of the connector's record: the adapter's clock and whether it
+// passes HDMI (in `rom`), and at boot the EDID.
+fn lookForAdapter(s: *Sinks, ports: *plug.Ports, k: usize) -> void {
+    const port = &ports.*.ports[k]
+    const card = s.*.port.card
+    const lent = adapter.Lent.{ .card = card, .hands = s.*.ddcHands.?, .pause = s.*.pause, .wire = &port.*.wire, .lines = s.*.lines, .crystal = s.*.crystal }
+    var found = adapter.detect(&lent)
+    var edidRead = false
+    if s.*.booting && (found.dual == adapter.Dual.unknown || adapter.passive(&found)) {
+        ddc.read(card, s.*.ddcHands.?, s.*.pause, &port.*.wire, s.*.lines, s.*.crystal, &s.*.reader)
+        edidRead = s.*.reader.heard.outcome == ddc.Outcome.read
+        if edidRead { adapter.takenAsDvi(&found) }
+    }
+    card.say("gpu: ")
+    plug.sayName(card, port)
+    card.say(": nothing answers on its AUX channel")
+    if found.dual == adapter.Dual.unknown {
+        if s.*.booting {
+            card.say(", nothing at an adapter's address on its DDC line, and no EDID there: no monitor that can be asked (one that is off, or none)\n")
+            return
+        }
+        // (While brixOS runs the EDID is read at the plug item's ticks:
+        // this is a type 1 adapter to DVI only if it answers, and the
+        // line says no more than that.)
+        adapter.takenAsDvi(&found)
+        card.say(", nothing at an adapter's address on its DDC line (a type 1 adapter to DVI need not answer there): if an EDID answers there, ")
+    } else {
+        card.say(if !found.idRead { ", nothing at an adapter's address on its DDC line, and an EDID answers there: " } else { "; on its DDC line " })
+    }
+    adapter.say(card, &found)
+    if !adapter.passive(&found) { return }
+    record(s, ports, k, found.clock, adapter.passesHdmi(&found))
+    if s.*.booting {
+        port.*.asked = 1
+        plug.keep(card, port, &s.*.reader)
+        plug.sayHeard(card, port)
+        return
+    }
+    port.*.askAt = card.time()
+    port.*.asked = 0
 }
 
 // Whether a connector's monitor is one to ask over an AUX channel: a
@@ -276,6 +420,15 @@ pub fn askOne(s: *Sinks, ports: *plug.Ports, k: usize) -> void {
     port.*.heard.clear()
     port.*.monitor = edid.read(port.*.heard.data())
     port.*.offer = edid.nothing()
+    record(s, ports, k, 0, false)
+    // (Nothing answers on the AUX channel: a passive adapter is looked for
+    // over the DDC line, when the I2C engine is lent and free.)
+    if port.*.dp.state == dplink.Asked.silent && ddcFree(s) {
+        port.*.heard.outcome = ddc.Outcome.no_answer
+        port.*.heardAt = card.time()
+        lookForAdapter(s, ports, k)
+        return
+    }
     if port.*.dp.state == dplink.Asked.heard {
         var bytes: [2 * aux.EDID_LENGTH]u8 = undefined
         if channel.edid(0, bytes[0..aux.EDID_LENGTH]) {
@@ -307,12 +460,16 @@ pub fn adopt(s: *Sinks, ports: *plug.Ports, k: usize, heard: *const dplink.Heard
 // high, but one already asked (`adopt`).
 pub fn atBoot(s: *Sinks, ports: *plug.Ports) -> void {
     if !s.*.asks { return }
+    s.*.booting = true
     var k: usize = 0
     while k < ports.*.count {
         const port = &ports.*.ports[k]
         if usable(port) && port.*.level == plug.Level.high && port.*.dp.state == dplink.Asked.not_asked { askOne(s, ports, k) }
+        // (The firmware's output by an adapter: what the adapter passes.)
+        if sendsTmds(port) && port.*.level == plug.Level.high && ddcFree(s) { askSending(s, ports, k) }
         k += 1
     }
+    s.*.booting = false
 }
 
 // The timer's tick, after gpu_plug.mlx's (in its interrupt): what changed
@@ -336,7 +493,14 @@ pub fn note(s: *Sinks, card: *const scanout.Card, watch: *plug.Watch, showing: u
             } else {
                 s.*.due[change.*.port] = false
             }
+        } else if sendsTmds(port) {
+            // (The output that sends TMDS by an adapter: the adapter is
+            // asked again when its line comes back.)
+            s.*.due[change.*.port] = change.*.now == plug.Level.high
         }
+        // (A DisplayPort connector's line gone: so is the adapter it may
+        // have had, in the ROM's record the plans read too.)
+        if change.*.now != plug.Level.high && port.*.rom.kind == videorom.CONNECTOR_OBJECT_ID_DISPLAYPORT { record(s, ports, change.*.port, 0, false) }
         k += 1
     }
     // (At a look of the lines: the short pulse's latch as it was read.)
@@ -394,7 +558,18 @@ fn silent(text: []const u8) -> void {}
 pub fn carry(s: *Sinks, lend: *const Lend, ports: *plug.Ports, showing: usize) -> bool {
     var k: usize = 0
     while k < ports.*.count {
-        if s.*.due[k] && ports.*.ports[k].level == plug.Level.high && usable(&ports.*.ports[k]) { askOne(s, ports, k) }
+        // (While the plug item reads an EDID the I2C engine is its own:
+        // a connector whose monitor may be an adapter's is asked at the
+        // next carry.)
+        if s.*.due[k] && s.*.ddcHands != null && !ddcFree(s) {
+            k += 1
+            continue
+        }
+        if s.*.due[k] && ports.*.ports[k].level == plug.Level.high && usable(&ports.*.ports[k]) {
+            askOne(s, ports, k)
+        } else if s.*.due[k] && ports.*.ports[k].level == plug.Level.high && sendsTmds(&ports.*.ports[k]) && s.*.ddcHands != null {
+            askSending(s, ports, k)
+        }
         s.*.due[k] = false
         k += 1
     }
@@ -433,7 +608,7 @@ fn lanes(s: *Sinks, lend: *const Lend, ports: *plug.Ports, showing: usize, why: 
     const count = (card.reg(back + scanout.DP_CONFIG) & dplink.DP_CONFIG__DP_UDI_LANES) + 1
     channel.*.quiet = true
     var six: [6]u8 = undefined
-    const read = channel.read(dplink.DP_SINK_COUNT, six[0..])
+    const read = irqData(channel, port.*.dp.caps.revision, &six)
     var power: [1]u8 = undefined
     const awake = read && channel.read(dplink.DP_SET_POWER, power[0..])
     channel.*.quiet = false
@@ -447,7 +622,7 @@ fn lanes(s: *Sinks, lend: *const Lend, ports: *plug.Ports, showing: usize, why: 
     plug.sayName(card, port)
     card.say(if why == Look.pulse { ": a short pulse of its hot plug line (the monitor asks to be looked at): " } else if why == Look.back { ": the monitor is back on its line: " } else { ": its lanes looked at: " })
     if !read {
-        card.say("its monitor does not answer at 200h: the link is not judged\n")
+        card.say(if port.*.dp.caps.revision < DP_DPCD_REV_14 { "its monitor does not answer at 200h: the link is not judged\n" } else { "its monitor does not answer at 2002h: the link is not judged\n" })
         s.*.left = showing
         return false
     }
@@ -471,16 +646,38 @@ fn lanes(s: *Sinks, lend: *const Lend, ports: *plug.Ports, showing: usize, why: 
     }
     s.*.lost += 1
     card.say(if awake { ": the link is lost (the monitor is on): it is trained again" } else { ": the link is lost (the monitor's power state was not read): it is trained again" })
-    card.say(" at the rate and lanes it ran\n")
-    return trainAgain(s, lend, ports, showing)
+    card.say(if why == Look.back { " at the rate and lanes the monitor's registers give now\n" } else { " at the rate and lanes it ran\n" })
+    return trainAgain(s, lend, ports, showing, why)
+}
+
+// The six bytes a short pulse is judged by, as Linux reads them (link_dp_
+// irq_handler.c's dp_read_hpd_rx_irq_data): from 200h for a monitor whose
+// registers are of a revision below 1.4; for 1.4 and above the fourteen
+// from 2002h (the event status indicators, DP_SINK_COUNT_ESI to
+// DP_SINK_STATUS_ESI) in one read, and of them 2002h, 2003h and 200Ch to
+// 200Fh, which stand for 200h to 205h. False when the monitor does not
+// answer.
+fn irqData(channel: *aux.Channel, revision: usize, six: *[6]u8) -> bool {
+    if revision < DP_DPCD_REV_14 { return channel.read(dplink.DP_SINK_COUNT, six.*[0..]) }
+    var esi: [14]u8 = undefined
+    if !channel.read(DP_SINK_COUNT_ESI, esi[0..]) { return false }
+    six.*[0] = esi[DP_SINK_COUNT_ESI - DP_SINK_COUNT_ESI]
+    six.*[1] = esi[DP_DEVICE_SERVICE_IRQ_VECTOR_ESI0 - DP_SINK_COUNT_ESI]
+    six.*[2] = esi[DP_LANE0_1_STATUS_ESI - DP_SINK_COUNT_ESI]
+    six.*[3] = esi[DP_LANE2_3_STATUS_ESI - DP_SINK_COUNT_ESI]
+    six.*[4] = esi[DP_LANE_ALIGN_STATUS_UPDATED_ESI - DP_SINK_COUNT_ESI]
+    six.*[5] = esi[DP_SINK_STATUS_ESI - DP_SINK_COUNT_ESI]
+    return true
 }
 
 // The link of the output that shows the picture trained again at its rate
-// and lanes (gpu_mode.mlx's `Wish.again`): the monitor asked again for
-// what it can, the card read out again unless the read-out is the card's
-// as it is now, the plan made, said and carried out with every other
-// processor held still.
-fn trainAgain(s: *Sinks, lend: *const Lend, ports: *plug.Ports, showing: usize) -> bool {
+// and lanes (gpu_mode.mlx's `Wish.again`), or after a long pulse (`why`
+// back: the monitor found anew, as Linux's detection finds it) at the
+// rate and lanes its registers give now (`Wish.anew`): the monitor asked
+// again for what it can, the card read out again unless the read-out is
+// the card's as it is now, the plan made, said and carried out with every
+// other processor held still.
+fn trainAgain(s: *Sinks, lend: *const Lend, ports: *plug.Ports, showing: usize, why: Look) -> bool {
     const card = s.*.port.card
     const port = &ports.*.ports[showing]
     const channel = channelOf(s, ports, showing)
@@ -497,8 +694,8 @@ fn trainAgain(s: *Sinks, lend: *const Lend, ports: *plug.Ports, showing: usize) 
     }
     const monitor = edid.read(port.*.heard.data())
     const offer = edid.nothing()
-    mode.makeWith(card, &seen.*.readout, &seen.*.memory, &monitor, &offer, lend.*.rom, mode.Wish.again, &port.*.dp, lend.*.plan)
-    card.say("gpu: in the lines that follow, \"the firmware's own link\" is the link that ran\n")
+    mode.makeWith(card, &seen.*.readout, &seen.*.memory, &monitor, &offer, lend.*.rom, if why == Look.back { mode.Wish.anew } else { mode.Wish.again }, &port.*.dp, lend.*.plan)
+    card.say(if why == Look.back { "gpu: in the lines that follow, \"the firmware's own link\" is the link that ran; the link is set from what the monitor says now\n" } else { "gpu: in the lines that follow, \"the firmware's own link\" is the link that ran\n" })
     mode.say(card, lend.*.plan)
     const done = changing.heldWith(lend.*.change, seen, lend.*.plan, lend.*.result, "the link trained again", channel, null)
     plug.serveAll(card, ports)
