@@ -1,0 +1,275 @@
+// QEMU's display adapter, for a mode set while the system runs: the
+// "Bochs display interface" of QEMU's standard VGA, its secondary-vga
+// and its bochs-display (PCI 1234:1111). The adapter has no timing and no
+// link: a mode is a size, set by a handful of 16-bit registers (the
+// DISPI registers), and the picture is always at the start of the memory
+// its BAR0 names, 32 bits a pixel, a row after the other. So this is the
+// driver that lets every part of a mode change be tried on a virtual
+// machine (tools/check_brix_modes.sh).
+//
+// The registers are those of QEMU's docs/specs/standard-vga and
+// hw/display/bochs-vbe.h, set in the order Linux 6.6's driver sets them
+// (drivers/gpu/drm/tiny/bochs.c, bochs_hw_setmode): the interface off,
+// the depth, the size, the bank, the virtual size (the picture's own),
+// the offsets (none), the interface on with the linear framebuffer.
+// They are reached in the memory the adapter's BAR2 names (from its
+// byte 0x500 on, register n at twice n: all three devices have that), or,
+// on an adapter without that memory, through the index and data ports
+// 0x1CE and 0x1CF (the standard VGA alone answers there). The same memory
+// begins with the monitor's EDID (`edid`).
+//
+// What the adapter does with a size it cannot make it does without a
+// word (QEMU's vbe_fixup_regs: a width is brought down to a multiple of
+// eight, a height to what its memory holds), so a mode is judged before
+// (`judge`) and every register is read back after: when one does not
+// hold what was written, the registers of the mode before are written
+// again and read back in the same way.
+//
+// The other processors stand still while the registers are written
+// (smp.mlx's `holdOthers`), as for every display's change: a moment
+// here, and the same hold a real card's change needs for longer.
+//
+// When the interface is turned on the adapter clears the picture itself
+// (QEMU does unless the "no clear" bit is set, which it is not here).
+// Linux's driver also writes the VGA attribute index to show the
+// picture; here the picture is shown already when this runs (the
+// firmware's, or the one display.mlx set at boot), and that port is left
+// alone (a bochs-display has no VGA ports at all).
+const cpu = @import("./cpu.mlx")
+const memory = @import("./memory.mlx")
+const Pci = @import("./pci.mlx").Pci
+const dm = @import("./display_modes.mlx")
+const smp = @import("./smp.mlx")
+const clock = @import("./clock.mlx")
+
+const Port = cpu.Port
+
+pub const VENDOR: usize = 0x1234
+pub const DEVICE: usize = 0x1111
+
+// The DISPI registers, by number.
+const ID: usize = 0
+const XRES: usize = 1
+const YRES: usize = 2
+const BPP: usize = 3
+const ENABLE: usize = 4
+const BANK: usize = 5
+const VIRT_WIDTH: usize = 6
+const VIRT_HEIGHT: usize = 7
+const X_OFFSET: usize = 8
+const Y_OFFSET: usize = 9
+const VIDEO_MEMORY_64K: usize = 10
+// ENABLE's bits: the interface on, the linear framebuffer.
+const ENABLED: usize = 0x01
+const LFB_ENABLED: usize = 0x40
+// The interface's versions answer 0xB0C0 to 0xB0C5; from 0xB0C4 on the
+// adapter says how much memory it has.
+const ID_FIRST: usize = 0xB0C0
+const ID_MEMORY: usize = 0xB0C4
+// The index and data ports, and where the registers lie in BAR2's
+// memory.
+const INDEX_PORT: usize = 0x1CE
+const DATA_PORT: usize = 0x1CF
+const MMIO_DISPI: usize = 0x500
+const MMIO_BYTES: usize = 4096
+// The EDID's room at the start of BAR2's memory: eight blocks.
+const EDID_ROOM: usize = 1024
+// The sizes the interface takes (QEMU's VBE_DISPI_MAX_XRES and _YRES),
+// and the smallest one a console and a desktop can be seen on.
+const MAX_WIDTH: usize = 16000
+const MAX_HEIGHT: usize = 12000
+const MIN_WIDTH: usize = 320
+const MIN_HEIGHT: usize = 200
+
+// An adapter: where it is on the PCI bus, its registers in the kernel's
+// view (0: by the ports), its picture's memory and how many bytes of it
+// there are, and the registers of the mode before the last one set.
+const Adapter = struct {
+    function: usize
+    registers: usize
+    picture: usize
+    bytes: usize
+    had: [10]usize
+    hadOne: bool
+
+    fn read(self: *const Self, index: usize) -> usize {
+        if self.*.registers != 0 {
+            const at = unsafe { @ptrFromInt(*u16, self.*.registers + MMIO_DISPI + index * 2) }
+            return @intCast(usize, at.*)
+        }
+        Port.out16(INDEX_PORT, index)
+        return Port.in16(DATA_PORT)
+    }
+
+    fn write(self: *const Self, index: usize, value: usize) -> void {
+        if self.*.registers != 0 {
+            const at = unsafe { @ptrFromInt(*u16, self.*.registers + MMIO_DISPI + index * 2) }
+            at.* = @intCast(u16, value & 0xFFFF)
+            return
+        }
+        Port.out16(INDEX_PORT, index)
+        Port.out16(DATA_PORT, value)
+    }
+
+    // The size `width` by `height` set, and whether every register holds
+    // it afterwards.
+    fn put(self: *const Self, width: usize, height: usize) -> bool {
+        self.write(ENABLE, 0)
+        self.write(BPP, 32)
+        self.write(XRES, width)
+        self.write(YRES, height)
+        self.write(BANK, 0)
+        self.write(VIRT_WIDTH, width)
+        self.write(VIRT_HEIGHT, height)
+        self.write(X_OFFSET, 0)
+        self.write(Y_OFFSET, 0)
+        self.write(ENABLE, ENABLED | LFB_ENABLED)
+        return self.read(XRES) == width && self.read(YRES) == height && self.read(BPP) == 32 && self.read(VIRT_WIDTH) == width && self.read(X_OFFSET) == 0 && self.read(Y_OFFSET) == 0 && self.read(ENABLE) & (ENABLED | LFB_ENABLED) == ENABLED | LFB_ENABLED
+    }
+}
+
+// As many adapters as the kernel has displays.
+pub const MAX: usize = 9
+pub const NONE: usize = MAX
+var adapters: [MAX]Adapter = undefined // (per run)
+var count: usize = 0 // (per run)
+
+// The adapter at the PCI function `function` whose picture's memory is at
+// `picture` taken: its number for the functions below, NONE when it is no
+// such adapter or does not answer as one.
+pub fn attach(function: usize, picture: usize) -> usize {
+    if function == Pci.NONE || count == MAX { return NONE }
+    const identity = Pci.read(function, Pci.VENDOR_DEVICE)
+    if identity & 0xFFFF != VENDOR || (identity >> 16) & 0xFFFF != DEVICE { return NONE }
+    const a = &adapters[count]
+    a.*.function = function
+    a.*.registers = 0
+    a.*.picture = picture
+    a.*.hadOne = false
+    const physical = Pci.memBase(function, 2)
+    if physical != 0 && Pci.read(function, Pci.BAR0 + 8) & 1 == 0 { a.*.registers = memory.Device.map(physical, MMIO_BYTES, memory.Device.UNCACHED) }
+    // (Without BAR2's memory the ports: only the adapter that is the
+    // machine's VGA answers there, and only one can.)
+    if a.*.registers == 0 && Pci.classCode(function) >> 8 != 0x0300 { return NONE }
+    const version = a.read(ID)
+    if version < ID_FIRST || version > ID_FIRST + 0xF { return NONE }
+    a.*.bytes = if version >= ID_MEMORY { a.read(VIDEO_MEMORY_64K) * 65536 } else { 0 }
+    const window = Pci.memSize(function, 0)
+    if a.*.bytes == 0 || (window != 0 && a.*.bytes > window) { a.*.bytes = window }
+    if a.*.bytes == 0 { return NONE }
+    count += 1
+    return count - 1
+}
+
+// How long the other processors stood still for the last change of an
+// adapter's registers (nanoseconds), and how many of them did not say
+// that they did (none, on a machine that is well).
+var stoodFor: usize = 0 // (per run)
+var deafOnes: usize = 0 // (per run)
+
+pub fn stood() -> usize { return stoodFor }
+
+pub fn deaf() -> usize { return deafOnes }
+
+fn hold() -> usize {
+    const began = clock.system().monotonic()
+    deafOnes = smp.holdOthers()
+    return began
+}
+
+fn release(began: usize) -> void {
+    smp.releaseOthers()
+    stoodFor = clock.system().monotonic() - began
+}
+
+// How much memory adapter `which` has for its picture, in bytes.
+pub fn memoryOf(which: usize) -> usize { return adapters[which].bytes }
+
+// The monitor's EDID as adapter `which` has it at the start of its
+// register memory: the base block and as many extension blocks as it
+// names and the room holds; nothing when the adapter has no such memory
+// or the bytes do not begin as an EDID.
+pub fn edid(which: usize) -> []const u8 {
+    const a = &adapters[which]
+    const bytes = unsafe { @ptrFromInt([*]const u8, a.*.registers) }
+    if a.*.registers == 0 { return bytes[0..0] }
+    var k: usize = 0
+    while k < 8 {
+        const wanted: u8 = if k == 0 || k == 7 { 0 } else { 0xFF }
+        if bytes[k] != wanted { return bytes[0..0] }
+        k += 1
+    }
+    var blocks = 1 + @intCast(usize, bytes[126])
+    if blocks * 128 > EDID_ROOM { blocks = EDID_ROOM / 128 }
+    return bytes[0..blocks * 128]
+}
+
+// Whether adapter `which` makes the mode: a size it takes (a width in
+// steps of eight, neither side beyond the interface's most or below
+// what can be seen), within its memory.
+pub fn judge(which: usize, mode: *dm.Mode) -> void {
+    const a = &adapters[which]
+    if mode.*.width & 7 != 0 || mode.*.width < MIN_WIDTH || mode.*.height < MIN_HEIGHT || mode.*.width > MAX_WIDTH || mode.*.height > MAX_HEIGHT {
+        mode.*.why = dm.Why.SIZE
+    } else if mode.*.width * mode.*.height * 4 > a.*.bytes {
+        mode.*.why = dm.Why.MEMORY
+    }
+}
+
+// The mode's size set on adapter `which`; the registers as they were are
+// kept for `back`.
+pub fn set(which: usize, mode: *const dm.Mode, picture: *dm.Picture) -> dm.Set {
+    const a = &adapters[which]
+    var probe = mode.*
+    probe.why = dm.Why.NONE
+    judge(which, &probe)
+    if probe.why != dm.Why.NONE { return dm.Set.refused }
+    var had: [10]usize = undefined
+    var k: usize = 0
+    while k < 10 {
+        had[k] = a.read(k)
+        k += 1
+    }
+    const began = hold()
+    if !a.put(mode.*.width, mode.*.height) {
+        // The size before again (it was the picture's a moment ago).
+        const again = a.put(had[XRES], had[YRES])
+        release(began)
+        return if again { dm.Set.back } else { dm.Set.lost }
+    }
+    release(began)
+    a.*.had = had
+    a.*.hadOne = true
+    picture.*.address = a.*.picture
+    picture.*.width = mode.*.width
+    picture.*.height = mode.*.height
+    picture.*.pitch = mode.*.width * 4
+    return dm.Set.done
+}
+
+// The size that was there before the last `set` put back.
+pub fn back(which: usize, before: *const dm.Mode, picture: *dm.Picture) -> dm.Set {
+    const a = &adapters[which]
+    if !a.*.hadOne { return dm.Set.refused }
+    const width = a.*.had[XRES]
+    const height = a.*.had[YRES]
+    const now = [2]usize{ a.read(XRES), a.read(YRES) }
+    const began = hold()
+    if !a.put(width, height) {
+        const again = a.put(now[0], now[1])
+        release(began)
+        return if again { dm.Set.back } else { dm.Set.lost }
+    }
+    release(began)
+    a.*.hadOne = false
+    picture.*.address = a.*.picture
+    picture.*.width = width
+    picture.*.height = height
+    picture.*.pitch = width * 4
+    return dm.Set.done
+}
+
+// The seam's record for adapter `which`.
+pub fn driver(which: usize) -> dm.Driver {
+    return dm.Driver.{ .kind = dm.Kind.QEMU, .which = which, .timed = false, .anySize = true, .judge = judge, .set = set, .back = back }
+}

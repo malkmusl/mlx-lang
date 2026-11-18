@@ -749,6 +749,10 @@ The choice is the first of these that names one:
    build's own image has no such file.
 4. native.
 
+(A mode confirmed while the system ran is remembered and set at the
+next boots in place of the monitor's own; N pressed at a start forgets
+it, F leaves it unset: "A display's mode while the system runs", below.)
+
 The kernel says the choice at every boot, with the key that changes it:
 
     gpu: this boot: the monitor's own mode (the default; F while the machine starts keeps the firmware's picture)
@@ -1420,6 +1424,129 @@ step writes a register of the display's, and the picture is watched
 around each one. Try 1 first, then 2. tests/493 and 494 hold the steps
 on a card that is a table; tools/check_gpu_registers.py holds their
 numbers against Linux's.
+
+### A display's mode while the system runs
+
+The mode the boot leaves is not the last word: a display's mode can be
+changed while brixOS runs, tried, and kept or not.
+
+For every display the kernel lists the modes its monitor offers
+(kernel/display_modes.mlx, from the monitor's EDID: every timing it
+writes out, and the ones it only names, a bit of the established
+timings, a standard timing's code, a video code of a CTA-861 extension,
+through the standards' tables, kernel/mode_tables.mlx, which are Linux
+6.6's and held against Linux's file by tools/check_display_modes.py).
+Each mode says whether the display's driver can set it, and when not,
+why: more than the output carries, an interlaced picture, a mode the
+monitor names without a timing the tables have, not this driver. The
+kernel says the sum at boot ("brixOS: display 0: 24 modes, of which its
+driver (QEMU's adapter) can set 20, and any other size its 16 MiB hold;
+it runs 1024x768 at 60.00 Hz") and each mode in its log. The EDID is
+what the firmware passed on through the loader, or what the display's
+driver has read itself; a driver that reads more of the monitor after
+the boot (more blocks, or another monitor plugged in) hands the bytes
+over (gpu.mlx's `modeEdid`) and has the modes listed anew (modes.mlx's
+`relist`).
+
+A program asks through the display's node (spec/04-stdlib/os/brix.xml,
+Displays: the calls display_modes and display_mode; std.displaymodes).
+The mode asked for is set and is pending. Unless it is confirmed within
+fifteen seconds, the kernel itself puts the mode before back and says so:
+a mode the monitor does not show cannot be answered for, so no answer
+means no. Confirmed, it stays, and it is what the next boots set, in
+place of the monitor's own. Root may ask, and the program that draws on
+the display when the display's node is its user's: a session's
+compositor, once whoever starts the session has given the display's
+node to the session's person (node_own). The login does not do that
+yet, so today it is root, and the desktop where it is started as root.
+Nobody else.
+
+From a shell, as root, that is the image's tool `display`:
+
+    display                 every display and its modes
+    display 1920x1080       sets it and asks: "Can you read this? Press
+                            Enter within 15 seconds to keep it"; Enter
+                            keeps it, anything else or nothing brings
+                            the mode before back
+    display ask 1920x1080   sets it and leaves it pending (for a script)
+    display confirm         the pending mode stays
+    display back            the pending mode is taken back
+    display state           what runs, what is pending
+
+What sets a mode is the display's driver, behind one seam
+(display_modes.mlx's `Driver`):
+
+- QEMU's adapter (kernel/bochs.mlx: the standard VGA, secondary-vga and
+  bochs-display, PCI 1234:1111): a mode is a size, set by the adapter's
+  registers; every mode its EDID names and any other size its memory
+  holds (a width in steps of eight). This is what tools/check_brix_modes.sh
+  runs every part on.
+- A Radeon's HDMI or DVI output (kernel/gpu_change.mlx, from gpu.mlx):
+  the mode set that runs at boot, made for the timing asked for from
+  what the card runs at that moment, and carried out with the same
+  checks and the same way back (the mode before, where the boot's way
+  back is the firmware's). Every other processor stands still while the
+  card is written (smp.mlx's `holdOthers`: an interrupt brings each to a
+  halt where it is, and it goes on when the change is over; bounded at
+  60 seconds whatever happens). By the times the boot's own mode set
+  took on the card this was built on that is about half a second: the
+  tenth of a second the monitor is given to see the signal gone, the two
+  times the frames are counted, a twentieth of a second of states waited
+  for, and the tables' own runs. It has not been measured as a whole
+  yet: the log says the figure after each change ("gpu: every other
+  processor stood still for the change, ... ms"). What gpu_set.mlx says
+  on the way speaks of
+  "the monitor's own mode" and "the firmware's state", as at boot: here
+  they are the mode asked for and the mode that runs, and a line before
+  them says so. A request is carried out whatever the boot's choice was
+  (after F too: the firmware's picture was kept at boot, and the mode
+  asked for by hand later has the fifteen seconds' net).
+  Not there: another rate of the size that runs (the plan takes a size
+  that runs as done), and a mode whose clock the output does not carry
+  (the list says the output's most).
+- Every other display: the modes are listed, and a request is refused
+  with the reason: a Radeon's DisplayPort output ("the display's driver
+  changes the mode of an HDMI or DVI output only"), a display that is as
+  the firmware left it ("no driver of this system sets its mode").
+
+After a change the display's node says the new picture (its size, its
+pitch; node_map gives its memory, which on the Radeon is another part of
+the card's memory), the kernel's console is on it where it was on the
+old one, and every handle of the node has the state "changed" until its
+holder has read the node again. A program that still has the old picture
+mapped keeps memory of the adapter there, which the display shows no
+more: it never faults; it reads the node and maps it anew.
+
+What is remembered is a file, /system/settings/display-modes, written by
+the kernel when a mode is confirmed (a line a display: its adapter, its
+monitor by the name in its EDID, the mode: "mode 1002:67df
+4c2d123478563412 1920x1080@60000") and read at boot, after the GPU's
+probe. It is remembered for that monitor on that adapter: another
+monitor gets its own mode. A system that runs from its image alone has
+no disk to keep it on, and says so when a mode is confirmed. On the
+Radeon the boot sets the monitor's own mode first, as ever, and then the
+remembered one by the same change a request makes.
+
+The boot's choice goes before what is remembered:
+
+- F (the firmware's picture is kept): nothing is set, a remembered mode
+  neither; it stays remembered.
+- N pressed at this start means the monitor's own mode, and brings it
+  back when a remembered mode turned out badly: the remembered mode is
+  not set and is forgotten ("brixOS: display 0: N was pressed at this
+  start: the mode remembered for this monitor, 1920x1080 at 60.00 Hz, is
+  forgotten, and its own mode is what the boots set again").
+- Without a key the remembered mode is set ("brixOS: display 0: the
+  mode remembered for this monitor is set: 1920x1080 at 60.00 Hz (N
+  while the machine starts sets the monitor's own mode again and forgets
+  this one)").
+
+tests/489_display_modes_runtime.mlx holds the lists, every request and
+the remembered file on the host; tests/490_gpu_mode_change_runtime.mlx
+the Radeon's change against a card that is a table (the same writes and
+table runs as a boot's mode set for that timing, the picture's two
+places in turn, a failure at every table); tools/check_brix_modes.sh the
+whole of it on QEMU's adapter, with the screen dumped after each step.
 
 ## The network
 
