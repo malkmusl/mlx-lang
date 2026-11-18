@@ -1541,6 +1541,250 @@ packet takes) and halfopen.mlx (the table's rules) on the host.
 Not yet: IPv6, a second link, the configuration changed while the
 system runs.
 
+## The kernel log handed over (logpush)
+
+A boot whose screen stays dark cannot be photographed. So the machine
+hands its kernel log over by itself: logpush
+(projects/brix/tools/logpush) uploads it over HTTPS into a private
+GitHub repository of the machine's owner, from where whoever looks into
+the boot (and has been let into that repository) reads it. Nothing is
+ever uploaded into this project's own, public repository: logpush knows
+no repository but the one its settings name, asks GitHub about that one
+before every upload and uploads nothing unless the answer says it is
+private, and the token its owner makes for it can write nowhere else.
+
+### Once: the repository, the token, the file
+
+1. On GitHub, make a **private** repository for the logs (any name, say
+   `brix-logs`), with "Add a README file" ticked so that it has a
+   branch.
+2. Make a token that may write that one repository and nothing else:
+   Settings, Developer settings, Personal access tokens, Fine-grained
+   tokens, Generate new token; Repository access: "Only select
+   repositories" and the one repository; Permissions, Repository
+   permissions, Contents: "Read and write" (GitHub adds Metadata:
+   Read-only itself). Its text begins with `github_pat_`.
+3. In this checkout's top directory, write the file `logpush.local`
+   with an editor: two lines, the repository and the token.
+
+       OWNER/brix-logs
+       github_pat_...
+
+   .gitignore names the file, the copies an editor leaves beside it
+   (`logpush.local~`, `.logpush.local.swp`, `logpush.local.bak`, a
+   `.txt` added to its name) and every name that begins with
+   `logpush.local` (`logpush.local2`, `logpush.local-old`): git does
+   not show them and no commit takes them. Keep it that way (`chmod 600
+   logpush.local`; never `git add -f`; no copy of it under a name that
+   does not begin so).
+4. Build as always, `./mlx build brix`, and copy
+   mlx-out/bin/brix/esp/EFI/BOOT/BOOTX64.EFI to the machine. The build
+   takes the file into the image as /system/settings/logpush when it is
+   there; without the file the image is the one everyone builds, and
+   uploads nothing. (An image that is built already takes it without a
+   build: `mlx-out/bin/brix-image --add BOOTX64.EFI BOOTX64.EFI
+   settings/logpush=logpush.local`.)
+
+That image carries the token: it is for the one machine, not to be
+published or passed on. A token that got out is revoked on the same
+GitHub page, and a new one written into the file.
+
+Further lines may follow the two, each a word and what it sets:
+`machine NAME` (this machine's name in the paths, else `brix`),
+`branch NAME` (else the repository's own), `again SECONDS` (when the
+second upload of a boot comes, else 120; 0: none), `api https://HOST`
+(a GitHub of one's own instead of api.github.com). Lines that begin
+with `#` are notes.
+
+### What then happens by itself
+
+logpush.service starts `logpush boot` at every boot, in the background:
+nothing waits for it, the shell and the desktop come as fast as
+without it. It waits until the network has an address (90 seconds at
+most; DHCP answers a few seconds into the boot), then uploads, each as
+a new file:
+
+    MACHINE/2026-11-17T20-41-07Z/klog-0000031.482s.txt
+        the kernel log (/devices/klog) as it was 31.482 seconds after
+        the boot of that date and time (UTC, by the machine's clock)
+    MACHINE/2026-11-17T20-41-07Z/previous-boot-klog.txt
+        the log of the boot before, as klogsave kept it on a brixfs
+        volume (boot.previous.log): after a boot that went dark, this
+        is that boot's log. Once a boot.
+    MACHINE/gpu-rom-1a2b3c4d5e6f7a8b.rom
+        the graphics card's ROM as the kernel read it (/devices/gpurom),
+        named by its bytes (the start of their SHA-256): the same ROM is
+        the same name at every boot, and a name the repository has is
+        not uploaded again
+
+The directories sort by time; the newest is the last boot. Two minutes
+after its first upload the service uploads the log once more, when it
+has grown (what is tried on the machine happens during the boot and
+after it). What stands in the way for a moment (no name server yet, no
+answer, GitHub's side) is tried again, five times in all, 5, 10, 20 and
+40 seconds apart; what will not pass by waiting (a token GitHub does
+not take, a certificate that is not trusted) is said once and not tried
+again. A try after the first uploads only what did not go before: the
+kernel log, once uploaded, stays one file while the log of the boot
+before or the ROM is tried again, and the second upload, two minutes
+later, takes with it what of them the first could not get through.
+
+What it did is a line each in /temporary/logs/logpush.log (`cat` it):
+
+    logpush: uploaded the kernel log (48213 bytes) as brix/2026-11-17T20-41-07Z/klog-0000031.482s.txt
+
+Then the service stays, asleep, for the next part. (In an image without
+settings it says that in one line and ends. `impulsectl status` shows
+the one that stays as "starting": a oneshot that has not ended.)
+
+### By hand
+
+    logpush
+
+uploads the kernel log as it is at that moment, as often as wanted
+(each a file of its own name in the boot's directory), and says the
+same lines on the terminal. In root's shell (the serial console's)
+logpush reads the settings and uploads itself. In the desktop's
+terminal the person logged in is `brix`, who may not read the settings;
+there logpush asks the service to upload (over a listener node,
+/temporary/logpush: brixOS's own way from one program to another) and
+says the lines the service sends back. The service takes nothing from
+the asker, uploads what it always uploads to where its settings say,
+and answers one upload in three seconds at most.
+
+### A system installed on the machine's disk
+
+All of the above is the system as the boot image carries it. On a
+machine where `install` once copied the system onto a volume, /system
+is the disk's from then on and the boot image's own is at /volumes/boot:
+a new BOOTX64.EFI brings a new kernel, and the programs, services and
+settings stay the disk's. There logpush uploads only when the installed
+system has it: a system installed from an image with logpush and its
+settings (`install` copies /system/settings/logpush with the rest and
+keeps its mode, 0600, so the token is then on that volume as well; the
+volume's blocks are root's alone to read like every disk's). After an
+image with a new token, or the first one with logpush: install again
+(`install` says how: the volume's system directory removed first). And
+on an installed system `logpush` by hand works in root's shell alone:
+/temporary is on the disk there, a directory of a volume holds no
+listener node, and the service ends after its uploads instead of
+staying for askers (its log has the uploads, `impulsectl status` says
+"done").
+
+### What a line means
+
+    no settings (/system/settings/logpush)
+        the image was built without logpush.local: step 3 and 4
+    line N of the settings is not a repository's name / not a token /
+    none logpush knows
+        logpush.local's line N is wrong (the line itself is never
+        shown: it may be the token)
+    this machine has no network device / the network link is down /
+    this machine has no address yet
+        the machine's side: no driver for its card, no cable, no answer
+        from a DHCP server yet (`sysinfo`, the Network page)
+    the name api.github.com cannot be looked up ... / was not found
+        no name server came with the address, none answered, or the
+        network's own name server does not know GitHub
+    api.github.com refused the connection / did not answer
+        something between the machine and GitHub does not let port 443
+        through. logpush speaks to GitHub itself: it knows no proxy
+    the certificate of api.github.com is not trusted: ...
+        what answered is not GitHub as the image knows it: a root that
+        is not in /system/settings/certificates (a proxy that opens
+        TLS, or GitHub with a new authority: then the file needs that
+        root), another host's certificate (a network's login page), or
+        one that is expired or not valid yet by the machine's clock
+        (the date is said: set the clock). Nothing was sent
+    this machine's clock is not set (it says 2000-01-01)
+        the clock reads before 2026: a certificate cannot be judged
+        without the date, so nothing is sent. Set date and time in the
+        firmware's setup, as UTC
+    this machine's processor has no source of random numbers
+        the kernel's random numbers come from the clock alone there,
+        and a TLS key made of them could be worked out: the token is
+        not sent (a processor since about 2012 has one; the kernel's
+        log says "random numbers keyed from ...")
+    401: GitHub does not take the token
+        mistyped, expired or revoked: a new token into logpush.local,
+        a new image
+    403: the token may not do this
+        the token lacks "Contents: Read and write" for this repository
+        (or GitHub's limit of requests is reached: later)
+    404: no repository OWNER/NAME, or the token may not see it
+        the name in logpush.local, or the token is for another
+        repository
+    OWNER/NAME is a public repository
+        logpush uploads into private repositories only: make it
+        private on GitHub (Settings, Danger Zone)
+    409 / 500 and above / the connection ended before the answer was
+    whole
+        GitHub's side or the way there, for the moment: the service
+        tries again by itself
+    410: GitHub no longer takes the API version this logpush speaks
+        logpush asks for GitHub's API version 2022-11-28, which GitHub
+        serves until 2028-03-10 (its documentation in November 2026):
+        after that a newer logpush, with the version GitHub serves
+        then, and a new image
+    422: GitHub does not take the file
+        the branch of a `branch` line is not there (a name that is
+        taken is tried under the next one before this is said)
+    the settings ... are the system's alone to read, and the service
+    that uploads for everyone else is not running
+        logpush by hand as a user who is not root, and the service was
+        stopped or has ended: its log says why
+
+### The token on the machine
+
+The settings are in the boot image (and, where the system was installed
+on the machine's disk from that image, in the copy `install` made on
+the volume) and nowhere else. The kernel gives
+/system/settings/logpush to the system's user alone (mode 0600, as
+/system/settings/shadow), and the disks' blocks as well
+(/devices/disk*: the boot image is on one of them): a program of the
+person logged in (brix) can read neither, and gets nothing of the
+settings from the service it asks. What such a program can do is ask
+for uploads (one in three seconds at most, of what the service always
+uploads) and take the service's listener away: /temporary is every
+user's to write, and the kernel does not yet keep one user's node there
+from another, so a user's program can remove /temporary/logpush or put
+up a listener of its own that answers `logpush` by hand with lines of
+its own. No upload and nothing of the settings comes of that; after it
+`logpush` by hand works in root's shell, or again for everyone once the
+service is started anew (`impulsectl restart logpush`).
+
+logpush reads the token from that file itself and sends it in the
+request's header, over TLS, to the host of the settings; it is in no
+argument, no environment, no line logpush says (every line is searched
+for it before it goes out) and no upload. The service's log is
+everyone's to read (as every service's in /temporary/logs); should
+logpush ever crash there, std.crash's report in it shows the
+processor's registers, and a register may hold eight bytes of what the
+program had in hand at that moment, the token too while a request is
+made: a log with a crash report in it is not to be passed on whole.
+The chain of certificates must lead to a root in
+/system/settings/certificates (the image carries six: the roots of the
+two authorities that sign and signed for GitHub, Sectigo's and
+DigiCert's; projects/brix/settings/certificates says which, with their
+fingerprints) and the certificate must be api.github.com's; nothing in
+the program switches that off, and a redirect is never followed. The
+key of the TLS connection is made of the kernel's random numbers
+(kernel/random.mlx: ChaCha20 under a key from the processor's own
+source, RDSEED or RDRAND; system_info says whether the processor had
+one, and without one logpush sends no token). The network is brixOS's
+own socket calls (std.net on brixOS), not the Linux layer.
+
+tests/487_logpush_runtime.mlx tries the program on the host against
+servers of its own (the requests byte for byte, the settings in every
+form, every answer, TLS that verifies and TLS that does not, the token
+in no line), tests/488_kernel_random_runtime.mlx the kernel's
+generator; tools/check_brix_logpush.sh boots it all in QEMU against a
+server on the host that plays the API, without TLS and behind std's
+own TLS server (`test-endpoint http://HOST:PORT` in the settings is for
+the former: an address without TLS, which takes only a token that
+begins with `test-`, so that no real token can go out in the clear
+whatever a settings file says).
+
 ## brixfs: the disk's format
 
 brixfs (projects/brix/brixfs.mlx, the format; kernel/volume.mlx, the
