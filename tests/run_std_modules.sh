@@ -114,6 +114,14 @@
 #   tests/505_gpu_engines_compute_ring_runtime.mlx  stage 5 (the graphics
 #                                       block, the RLC, the KIQ and compute
 #                                       ring 0, the ring as an interface)
+#   tests/512_zero_data_runtime.mlx     a program's globals that start zero
+#                                       in its .bss, in memory only, as a
+#                                       linked program and (tests/support/
+#                                       zero_data_static.mlx) a static one;
+#                                       tests/support/zero_data_headers.mlx
+#                                       the headers of the same for brixOS,
+#                                       of a versioned plugin and of a
+#                                       freestanding program (no .bss)
 #   tests/502_gpu_card_interface_runtime.mlx  the kernel interface of the
 #   tests/503_vulkan_driver_entry_runtime.mlx  Vulkan driver on the host's
 #                                       card, and the driver's stage (a)
@@ -260,6 +268,54 @@ run 424_h265_cpu_decode_runtime "a 64x64 H.265 Main 10 stream (weighted B frames
 run 425_vp9_header_runtime "a 48x32 VP9 stream's uncompressed headers (profile, depth, subsampling, size, frame types, references and their slots, refresh flags, the compressed header's place), a superframe's index split, a broken frame marker refused"
 run 417_aac_decode_runtime "AAC-LC decoded from an MP4 and an ADTS stream, each within 15 dB of the WAV it was encoded from; damaged blocks refused; reset"
 run 416_mp4_demux_runtime "MP4 files read: a plain file's sample tables (chunks, composition offsets, sync samples, an edit list, seeking), fragments (trex defaults, tfdt, trun flags, one without tfdt), avcC parameter sets and Annex B, AudioSpecificConfig, a fragment cut short, damage"
+run 512_zero_data_runtime "a linked program's globals that start zero (undefined, zeros, structs and arrays of them, null, false, 0.0, vectors aligned to 16, a 4 MiB array) in its .bss, in memory only: the file smaller than they are, p_memsz past p_filesz over them, a .bss of no bits, every byte zero at the start, the globals with a value beside them in .data and kept"
+
+# The same program static (object/elf64.mlx's image).
+status=0
+if "$compiler" --quiet tests/support/zero_data_static.mlx -o "$work/zero_data_static"; then
+    "$work/zero_data_static" || status=$?
+    if [[ $status -eq 13 ]]; then
+        echo "ok   zero_data_static: a static program's globals that start zero in its .bss, in memory only"
+    else
+        echo "FAIL zero_data_static: check $status failed"
+        failures=$((failures + 1))
+    fi
+else
+    echo "FAIL zero_data_static did not compile"
+    failures=$((failures + 1))
+fi
+
+# The headers of what test 512 cannot run here (tests/support/
+# zero_data_headers.mlx, exits 13): the same programs for brixOS, a
+# versioned plugin whose export var starts zero (its data symbols in
+# .data and .bss, the version sections named after .bss), and a
+# freestanding program, which keeps every global in its file.
+headers() {
+    local label=$1 least=$2 words=$3
+    shift 3
+    local status=0
+    if ! "$compiler" --quiet "$@" -o "$work/zero_data_$label"; then
+        echo "FAIL zero_data_headers_$label did not compile"
+        failures=$((failures + 1))
+        return
+    fi
+    "$work/zero_data_headers" "$work/zero_data_$label" "$least" || status=$?
+    if [[ $status -eq 13 ]]; then
+        echo "ok   zero_data_headers_$label: $words"
+    else
+        echo "FAIL zero_data_headers_$label: check $status failed"
+        failures=$((failures + 1))
+    fi
+}
+if "$compiler" --quiet tests/support/zero_data_headers.mlx -o "$work/zero_data_headers"; then
+    headers brixos_static 4194304 "a static brixOS program's globals that start zero in its .bss" --target=x86_64-brixos tests/support/zero_data_static.mlx
+    headers brixos_linked 4194304 "a linked brixOS program's globals that start zero in its .bss" --target=x86_64-brixos tests/512_zero_data_runtime.mlx
+    headers plugin 8 "a versioned plugin's export var that starts zero a data symbol in its .bss, its sections named" --plugin --soname=libzero.so.1 --symbol-version=ZERO_1 tests/support/plugin_library.mlx
+    headers freestanding none "a freestanding program keeps every global in its file: no .bss" --target=x86_64-freestanding tests/support/zero_data_freestanding.mlx
+else
+    echo "FAIL zero_data_headers did not compile"
+    failures=$((failures + 1))
+fi
 
 # A packed struct wider than a word is refused with the message that says
 # so (tests/support/packed_too_wide).
