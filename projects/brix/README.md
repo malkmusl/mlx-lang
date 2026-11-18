@@ -1185,11 +1185,10 @@ kind ("... the DisplayPort connector 1 (DIG 0, hot plug line 1), which
 sends TMDS (an adapter is behind it): the TMDS path"). The other cases,
 each said as plainly: something on a connector the firmware did not
 start ("gpu: something is plugged into connector 3 (HDMI), which the
-firmware did not start: this driver does not bring it up yet": bringing
-an output up from nothing, and following a monitor that is moved, is
-the next stage), nothing where the firmware's picture goes out, nothing
-anywhere, several connectors with something, a firmware that started no
-output of this card, a ROM without connector records.
+firmware did not start": what follows is the next subsection's),
+nothing where the firmware's picture goes out, nothing anywhere,
+several connectors with something, a firmware that started no output of
+this card, a ROM without connector records.
 
 A hot plug line is read as Linux reads it on this card (the line's
 block of registers, its two sense bits), and it is judged only when
@@ -1268,8 +1267,8 @@ What is plugged into an HDMI or DVI connector is asked for its EDID then
 the timer's interrupt), once more a second later when nothing answers
 at first; a reading that was under way while its monitor was pulled and
 another plugged in is dropped, and the one that is there is asked. The
-driver knows of every change and says it; nothing is done about one
-yet. Not there yet either: what is behind a DisplayPort
+driver knows of every change and says it; what it does about one is
+the next subsection's. Not there yet: what is behind a DisplayPort
 connector the firmware did not start (a monitor or an adapter: Linux
 switches a pin of the DDC line to tell), an adapter's own word about
 itself, and the EDID with the two pins driven by hand where the card's
@@ -1291,6 +1290,107 @@ whether the card's hot plug blocks and its I2C engine are as Linux's
 code expects: every line that begins "gpu: connector", "gpu: hot plug
 line", "gpu: the monitor is", and what is said when the cable is pulled
 and put back.
+
+### The monitor followed: another output at boot, a cable moved while brixOS runs
+
+The picture goes where the monitor is (gpu_switch.mlx), by itself, at
+the default boot; nothing names an output. The card has one picture of
+the kernel's (the console's and the desktop's), shown by the one
+controller the firmware started: that controller stays, and only its
+way out changes.
+
+At boot, when the monitor is on another HDMI or DVI connector than the
+one the firmware started and nothing is plugged in there, the plan is
+made for the monitor's connector, with a new picture of the monitor's
+own size, as for the firmware's output:
+
+    gpu: the monitor is on connector 3 (HDMI), the firmware's picture goes out by connector 2 (HDMI), where nothing is plugged in: the picture is brought to the monitor
+    gpu: plan (move, TMDS): connector 2 (HDMI, DIG 4, PLL 4) to connector 3 (HDMI, DIG 5, front end 5, PLL 5), controller 0 stays: HDMI signalling at 270270 kHz (now DVI at 107960 kHz), a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 9 table runs and 88 writes would do it
+
+When the monitor is where the firmware's picture goes out, nothing of
+this happens: "gpu: the picture stays on connector 2 (HDMI), where the
+monitor is", and the mode set is the one of before, write for write.
+
+While brixOS runs, when the monitor's cable is moved from one HDMI or
+DVI output to another, the picture follows once the old output's line
+has been low for a second and the monitor has answered on the new one:
+
+    gpu: the monitor was unplugged from connector 2 (HDMI): the picture still goes out there, to nothing
+    gpu: connector 2 (HDMI): the monitor has left and no other connector has one: the output is kept as it is (nothing is taken down)
+    gpu: something was plugged into connector 3 (HDMI)
+    gpu: connector 3 (HDMI): the monitor says 3840x1080 at 60 Hz, HDMI, up to 300 MHz (...)
+    gpu: the monitor is on connector 3 (HDMI) now, and nothing is plugged into connector 2 (HDMI): the picture is brought there (...)
+    gpu: bringing the picture to the other output: carrying out the plan's 9 table runs and 67 writes; the screen is dark meanwhile, 23 s at most (and 22 s more at most if the state of before has to be put back)
+    gpu: the picture goes out by connector 3 (HDMI) now; its memory, size and pitch are as they were: no program is told
+
+The steps are the study's (gpu-autoswitch.verified.md 4.2, 4.5, 4.6):
+the new output's transmitter made ready once a boot ("init", and the
+output that shows the picture checked to be still on and its frames
+still counted), the new back end told its hot plug line, the old
+output down, the controller stopped, the old output's PLL powered
+down, the new output's PLL set, the timing, the new front end and back
+end up, the picture shown where it was. (The user's ROM does nothing
+for "init": that table ends at once and writes nothing, which is no
+failure there; the checks after it judge it.) Every write is read back
+and every table's answer looked at; when anything fails the way back
+brings the picture to the output it was on ("gpu: back on connector 2
+(HDMI), where no monitor is; the monitor on connector 3 (HDMI) is not
+shown") and it is tried again in 5 and 30 seconds, three times in all,
+or when a line or an EDID changes. When the way back itself does not
+end in the state of before, nothing is tried again at that boot ("gpu:
+the monitor is not followed any more at this boot: ..."), and a restart
+starts from the firmware's picture. The change is made from the timer's
+tick on the first processor, in one go: no other processor enters the
+kernel meanwhile, programs go on drawing into the picture, which is not
+moved.
+
+A monitor switched off and on, or to another input and back, on the
+same output: its EDID is read again; the same monitor, an output that
+still sends: nothing is written ("gpu: connector 2 (HDMI): the monitor
+is back after 3000 ms with its line low; the output sent all along:
+nothing is written"). Nothing more is needed for HDMI and DVI below 340
+MHz: the output never stopped. An output found not sending any more
+(the driver never takes it down; something else would have) is said,
+and setting its mode again is tried; a plan starts from the output that
+runs, so with its back end off that is refused and said, and a restart
+sets it. A monitor whose line never moves is not seen and needs
+nothing.
+
+What the driver does not do, and says when it meets it:
+
+- a second monitor while the first shows the picture: "gpu: a second
+  monitor on connector 3 (HDMI), 1920x1080: it is not driven (one
+  picture, on connector 2 (HDMI))";
+- a monitor of another size than the picture while brixOS runs: the
+  picture keeps its size (the programs drawing on it would have to be
+  told), it stays where it goes out, and "a restart gives the monitor
+  its own mode";
+- a monitor on a DisplayPort connector: "a monitor on a DisplayPort
+  connector is not followed yet" (the picture is brought to HDMI and
+  DVI only; DisplayPort as either end of a move is to come);
+- a DVI monitor that needs two links (above 165 MHz): no timing fits,
+  said by the plan;
+- a card whose firmware started none of its outputs: no controller of it
+  runs, and none is started from nothing.
+
+At a boot that keeps the firmware's picture (F) nobody is asked and
+nothing is written; the log says what the default boot would do ("...
+this boot writes nothing, so the picture stays (a boot of the monitor's
+own mode would bring it there, if its EDID holds)"), at boot and while
+brixOS runs. The trial choices ask and do not follow.
+
+The proof is on the host, against the user's whole card as a table:
+tests/485_gpu_switch_runtime.mlx (the boot's cases; the cable moved
+from HDMI to HDMI and back and to DVI and back, every table run in
+order with its block; off and on, another input; a second monitor;
+pulled and plugged in again; a failure at every write and every table
+run of a move, with the state of before back after each) and
+tests/486_gpu_switch_plan_runtime.mlx (the plan byte for byte against
+the study, which controller, front end and PLL at the edges, every
+refusal, the same-size rule). From the machine, what tells whether it
+works: the lines above, and everything between "the picture is brought
+there" and "the picture goes out by" (the log, fetched over the network
+when the screen stays dark).
 
 ## The network
 

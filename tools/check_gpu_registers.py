@@ -88,7 +88,11 @@
 # monitor's registers as drm_dp.h has it; the AUX commands, the tries
 # and waits, the rates, the training's counts and the two values
 # set_dp_phy_pattern_passthrough_mode writes, each as Linux's file has
-# it.
+# it. Of the picture brought to another output (gpu_mode.mlx's "THE
+# PICTURE BROUGHT TO ANOTHER OUTPUT", the transmitter's "init" and the
+# PLL's power-down in gpu_blocks.mlx): the words of each PHY's PLL and
+# each PHY's symbol clock that are read around the power-down and the new
+# clock, at all six.
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -115,7 +119,8 @@ vid = open(os.path.join(hdr, "vid.h")).read()
 # placing of a surface, Linux's values.
 NOT_REGISTERS = {"CONTROLLERS", "BACK_ENDS", "FRONT_ENDS", "MODE_DISPLAYPORT", "MODE_LVDS", "MODE_DVI", "MODE_HDMI",
     "MODE_DISPLAYPORT_MST", "FIRST_FRAME", "COUNTED", "FRAMES", "PLACED", "ROW", "MAX_WATERMARK", "VID_N", "TAKEN",
-    "STREAM_GONE", "ENCODER_PRIMED", "STEPS", "SIGNAL_GONE", "BLOCKS", "NO_BLOCK", "TIMING_WORDS"}
+    "STREAM_GONE", "ENCODER_PRIMED", "STEPS", "SIGNAL_GONE", "BLOCKS", "NO_BLOCK", "TIMING_WORDS",
+    "NO_CONNECTOR", "STILL"}
 
 # What a TMDS output's mode set has from other files than the display's
 # two headers: registers by their mm names, fields by their _MASK names,
@@ -243,6 +248,17 @@ for n, number in enumerate(table(mode_text, "DC_HPD_INT_STATUS")):
     hold("HPD%d_DC_HPD_INT_STATUS" % n, number, d.get("mmHPD%d_DC_HPD_INT_STATUS" % n))
 hold("the PHYs' PLLs' words", len(table(mode_text, "PHYPLL_PIXCLK_RESYNC_CNTL")), 6)
 hold("the hot plug lines' words", len(table(mode_text, "DC_HPD_INT_STATUS")), 6)
+# A move's PLL words (DC_COMBOPHYPLLREGS0_ to 5_) and symbol clock words
+# (SYMCLKA_ to F_), by the back end's number.
+for word in ("PLL_WRAP_CNTRL", "FREQ_CTRL0", "FREQ_CTRL3"):
+    numbers = table(mode_text, "DC_COMBOPHYPLLREGS_" + word)
+    hold("the PLLs' %s words" % word, len(numbers), 6)
+    for n, number in enumerate(numbers):
+        hold("DC_COMBOPHYPLLREGS%d_%s" % (n, word), number, d.get("mmDC_COMBOPHYPLLREGS%d_%s" % (n, word)))
+symbols = table(mode_text, "SYMCLK_CLOCK_ENABLE")
+hold("the symbol clocks' words", len(symbols), 6)
+for n, number in enumerate(symbols):
+    hold("SYMCLK%s_CLOCK_ENABLE" % "ABCDEF"[n], number, d.get("mmSYMCLK%s_CLOCK_ENABLE" % "ABCDEF"[n]))
 
 # Every number of the raw dump's runs is a register, in each controller's
 # block.
