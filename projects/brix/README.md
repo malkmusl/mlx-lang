@@ -1392,6 +1392,35 @@ works: the lines above, and everything between "the picture is brought
 there" and "the picture goes out by" (the log, fetched over the network
 when the screen stays dark).
 
+### The card's engines: how far a boot goes (the digits)
+
+The first steps toward a Radeon that takes commands (kernel/
+gpu_engines.mlx, after the study of the kernel's part of that, its
+section 8, worked out from Linux 6.6's amdgpu). A digit held while the machine starts says how far they go
+at this boot; it is read by the same loader as F, N, R and A, holds for
+that boot only and is never remembered (projects/brix/engine_choice.mlx;
+the word Info.STAGE):
+
+- no digit, or 0: stage 0. The card's SMC, memory controller, GART,
+  interrupt ring, engines, ROM numbers, temperature and firmware files
+  are read and said ("gpu: step S0: card as found: ..."). Nothing is
+  written but three index words, each put back.
+- 1: stage 1. The card's memory seen by the processor is divided: the
+  display keeps all but the top 64 MiB, the driver takes those ("gpu:
+  step M1"); then the GART is turned on ("gpu: step M2").
+- 2 (or more: this kernel has stages up to 2): stage 2, the interrupt
+  ring as well ("gpu: step I1").
+
+F keeps every stage at 0. One line says which stage a boot goes to and
+why ("gpu: this boot: the card's engines up to stage 2, the interrupt
+ring (2 was pressed at this start and holds for this boot only)"). Each
+step has one line that says whether it worked; a step that fails puts
+its registers back as the firmware had them and no later step runs. No
+step writes a register of the display's, and the picture is watched
+around each one. Try 1 first, then 2. tests/493 and 494 hold the steps
+on a card that is a table; tools/check_gpu_registers.py holds their
+numbers against Linux's.
+
 ## The network
 
 A virtio network device (QEMU's `-netdev user,id=n0 -device

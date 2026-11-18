@@ -93,6 +93,15 @@
 # PLL's power-down in gpu_blocks.mlx): the words of each PHY's PLL and
 # each PHY's symbol clock that are read around the power-down and the new
 # clock, at all six.
+# Of the card's engines (gpu_engines.mlx: the stages toward a card that
+# takes commands): every register, SMC address and field against the
+# memory controller's, the system's, the bus interface's, the graphics
+# block's and the SMC's headers, Linux's numbers where its files have
+# them (the GART's place and size, an entry's bits, the interrupt ring,
+# the waits, the golden tables in their order, the firmware files' names
+# and header versions), the display's runs of tests/support/
+# engine_card.mlx made again from dce_11_2_d.h, and that no register a
+# step writes is the display's (the files are named at that section).
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -874,4 +883,219 @@ for name, value, inside in constants(link_text):
 rates = re.search(r"pub const RATES = \[_\]usize\{([^}]*)\}", link_text).group(1).replace(" ", "").split(",")
 hold("the rates there are", int(rates == ["LINK_RATE_LOW", "LINK_RATE_HIGH", "LINK_RATE_HIGH2", "LINK_RATE_HIGH3"]), 1)
 print("DisplayPort link: %d numbers of gpu_aux.mlx and gpu_link.mlx held against Linux's files, %d wrong" % (held - link_before, bad - link_bad_before))
+
+# ---- The card's engines: gpu_engines.mlx (the stages toward a card that
+# takes commands: S0, M1, M2, I1). Beside the files above, of Linux 6.6's
+# drivers/gpu/drm/amd:
+#   include/asic_reg/gmc/gmc_8_1_sh_mask.h, oss/oss_3_0_d.h,
+#   oss/oss_3_0_sh_mask.h, bif/bif_5_0_sh_mask.h, gca/gfx_8_0_d.h,
+#   gca/gfx_8_0_sh_mask.h, smu/smu_7_1_3_d.h, smu/smu_7_1_3_sh_mask.h
+#                                       the registers, the SMC's, fields
+#   amdgpu/cikd.h                       the memory's kind in MC_SEQ_MISC0
+#   amdgpu/gmc_v8_0.c amdgpu/amdgpu_gmc.c amdgpu/amdgpu_gmc.h
+#                                       the memory start, the GART's place
+#                                       and enable, its golden words
+#   amdgpu/amdgpu_vm.h amdgpu/amdgpu_gart.h amdgpu/amdgpu.h
+#                                       an entry's bits, a page, the waits
+#   amdgpu/tonga_ih.c amdgpu/amdgpu_ih.h the interrupt ring
+#   amdgpu/gfx_v8_0.c amdgpu/sdma_v3_0.c the golden tables read at S0,
+#                                       the address configuration
+#   amdgpu/amdgpu_ucode.h               a firmware file's header
+#   amdgpu/amdgpu_cgs.c                 which SMC file a card takes
+#   pm/powerplay/smumgr/smu7_smumgr.c, polaris10_smumgr.c
+#                                       the SMC running, its RAM, the fuse
+# and the display's runs of tests/support/engine_card.mlx made again from
+# dce_11_2_d.h; and that no register the steps write is the display's.
+engines_needed = ("gmc_8_1_sh_mask.h", "oss_3_0_d.h", "oss_3_0_sh_mask.h", "bif_5_0_sh_mask.h", "gfx_8_0_d.h", "gfx_8_0_sh_mask.h",
+                  "smu_7_1_3_d.h", "smu_7_1_3_sh_mask.h", "cikd.h", "gmc_v8_0.c", "amdgpu_gmc.c", "amdgpu_gmc.h", "amdgpu_vm.h",
+                  "amdgpu_gart.h", "amdgpu.h", "tonga_ih.c", "amdgpu_ih.h", "gfx_v8_0.c", "sdma_v3_0.c", "amdgpu_ucode.h",
+                  "amdgpu_cgs.c", "smu7_smumgr.c", "polaris10_smumgr.c")
+engines_missing = [name for name in engines_needed if not os.path.exists(os.path.join(hdr, name))]
+if engines_missing:
+    sys.exit("the card's engines are not held: not in %s: %s" % (hdr, " ".join(engines_missing)))
+engines_before = held
+engines_bad_before = bad
+engines_text = open(os.path.join(here, "gpu_engines.mlx")).read()
+regs = {}
+for name in ("gmc_8_1_d.h", "oss_3_0_d.h", "bif_5_0_d.h", "gfx_8_0_d.h", "smu_7_1_3_d.h"):
+    for key, value in defines(os.path.join(hdr, name)).items():
+        regs.setdefault(key, value)
+masks = {}
+for name in ("gmc_8_1_sh_mask.h", "oss_3_0_sh_mask.h", "bif_5_0_sh_mask.h", "gfx_8_0_sh_mask.h", "smu_7_1_3_sh_mask.h", "dce_11_2_sh_mask.h"):
+    for key, value in defines(os.path.join(hdr, name)).items():
+        masks.setdefault(key, value)
+DISPLAYS = {"VGA_RENDER_CONTROL", "VGA_HDP_CONTROL", "DMIF_STATUS", "DMIF_ADDR_CALC"}
+cikd = defines(os.path.join(hdr, "cikd.h"))
+gmc_c = text_of("gmc_v8_0.c")
+gmc_common = text_of("amdgpu_gmc.c")
+ih_c = text_of("tonga_ih.c")
+gfx_c = text_of("gfx_v8_0.c")
+sdma_c = text_of("sdma_v3_0.c")
+smu7_c = text_of("smu7_smumgr.c")
+p10_c = text_of("polaris10_smumgr.c")
+ucode_h = re.sub(r"/\*.*?\*/", "", text_of("amdgpu_ucode.h"), flags=re.S)
+
+def bits(expression):
+    # "(1ULL << 4)" and plain numbers.
+    m = re.match(r"\(?\s*1ULL\s*<<\s*(\d+)\s*\)?$", expression.strip())
+    if m:
+        return 1 << int(m.group(1))
+    return int(expression.strip().rstrip("ULl"), 0)
+
+def define_in(name, define):
+    m = re.search(r"#define\s+%s\s+([^/\n]+)" % define, text_of(name))
+    return None if m is None else bits(m.group(1))
+
+def ucode_offset(struct, field):
+    # A field's offset in amdgpu_ucode.h's structures (uint32_t and
+    # uint16_t fields, a struct common_firmware_header first).
+    m = re.search(r"struct\s+%s\s*\{(.*?)\};" % struct, ucode_h, re.S)
+    at = 0
+    for kind, name in re.findall(r"(struct\s+\w+|uint32_t|uint16_t)\s+(\w+)\s*;", m.group(1)):
+        if name == field:
+            return at
+        at += {"uint32_t": 4, "uint16_t": 2}.get(kind, 32)
+    return at if field == "size" else None
+
+# Linux's numbers that are no register, each where Linux has it.
+blocks = re.search(r"amdgpu_vm_adjust_size\(adev,\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\)", gmc_c)
+levels = 2  # what amdgpu_vm_adjust_size's tmp holds when it asks for the block size (the study's 2.5)
+level_bits = (levels.bit_length() - 1) + 18
+LINUX = {
+    "MC_MASK": int(re.search(r"mc_mask = (0x[0-9a-fA-F]+)ULL", gmc_c).group(1), 0),
+    "AMDGPU_GMC_HOLE_START": define_in("amdgpu_gmc.h", "AMDGPU_GMC_HOLE_START"),
+    "GART_BYTES": int(re.search(r"case CHIP_POLARIS10:[^\n]*\n(?:[^\n]*\n)*?\s*adev->gmc.gart_size = (\d+)ULL << 20", gmc_c).group(1)) << 20,
+    "FOUR_GB": int(re.search(r"four_gb = (0x[0-9a-fA-F]+)ULL", gmc_common).group(1), 0),
+    "AMDGPU_GPU_PAGE_SIZE": define_in("amdgpu_gart.h", "AMDGPU_GPU_PAGE_SIZE"),
+    "ENTRY_BYTES": int(re.search(r"table_size = adev->gart.num_gpu_pages \* (\d+)", gmc_c).group(1)),
+    "PTE_ADDRESS": int(re.search(r"value = addr & (0x[0-9A-Fa-f]+)ULL", gmc_common).group(1), 0),
+    "AMDGPU_MAX_USEC_TIMEOUT": define_in("amdgpu.h", "AMDGPU_MAX_USEC_TIMEOUT"),
+    "MAX_PFN": int(blocks.group(2 - 1)) << 18,
+    "FRAGMENT_SIZE": int(blocks.group(2)),
+    "BLOCK_SIZE": level_bits - 9 if levels <= 8 else (level_bits + 3) // 2,
+    "SYSTEM_ACCESS_MODE": int(re.search(r"SYSTEM_ACCESS_MODE, (\d+)\)", gmc_c).group(1)),
+    "EFFECTIVE_L2_QUEUE_SIZE": int(re.search(r"EFFECTIVE_L2_QUEUE_SIZE, (\d+)\)", gmc_c).group(1)),
+    "CONTEXT1_IDENTITY_ACCESS_MODE": int(re.search(r"CONTEXT1_IDENTITY_ACCESS_MODE, (\d+)\)", gmc_c).group(1)),
+    "AGP_EMPTY": int(re.search(r"WREG32\(mmMC_VM_AGP_TOP, (0x[0-9A-Fa-f]+)\)", gmc_c).group(1), 0),
+    "IH_RING_BYTES": eval(re.search(r"amdgpu_ih_ring_init\(adev, &adev->irq.ih, ([\d *]+), true\)", ih_c).group(1)),
+    "IH_ENTRY_BYTES": int(re.search(r"ih->rptr \+= (\d+);", ih_c).group(1)),
+    "AMDGPU_IH_MAX_NUM_IVS": define_in("amdgpu_ih.h", "AMDGPU_IH_MAX_NUM_IVS"),
+    "SMC_RAM_RUNNING": int(re.search(r"(0x[0-9a-fA-F]+) <= cgs_read_ind_register\(hwmgr->device, CGS_IND_REG__SMC, ixSMC_PC_C\)", smu7_c).group(1), 0),
+    "AVFS_FUSE_WORD": int(re.search(r"ixSMU_EFUSE_0 \+ \((\d+)\*4\)", p10_c).group(1)),
+    "TONGA_GB_ADDR_CONFIG_GOLDEN": int(re.search(r"#define TONGA_GB_ADDR_CONFIG_GOLDEN (0x[0-9a-fA-F]+)", gfx_c).group(1), 0),
+    "SMU7_SMC_SIZE": int(re.search(r"#define SMU7_SMC_SIZE (0x[0-9a-fA-F]+)", smu7_c).group(1), 0),
+    "HDP_SURFACE_FIRST": int(re.search(r"WREG32\(\((0x[0-9a-fA-F]+) \+ j\), 0x00000000\);", gmc_c).group(1), 0),
+    "HDP_SURFACE_STEP": int(re.search(r"i < \d+; i\+\+, j \+= (0x[0-9a-fA-F]+)\)", gmc_c).group(1), 0),
+    "HDP_SURFACE_WORDS": len(re.findall(r"WREG32\(\(0x[0-9a-fA-F]+ \+ j\), 0x00000000\);", gmc_c)),
+    "HDP_SURFACES": int(re.search(r"for \(i = 0, j = 0; i < (\d+); i\+\+, j \+= 0x6\)", gmc_c).group(1)),
+    "GFX_Info": list_index("ATOM_MASTER_LIST_OF_DATA_TABLES", "GFX_Info"),
+    "ATOM_GFX_INFO_V2_1__GfxIpMinVer": offset_of("ATOM_GFX_INFO_V2_1", "GfxIpMinVer"),
+    "ATOM_GFX_INFO_V2_1__size": layout("ATOM_GFX_INFO_V2_1")[1],
+    "ATOM_FIRMWARE_INFO_V2_2__ulDefaultEngineClock": offset_of("ATOM_FIRMWARE_INFO_V2_2", "ulDefaultEngineClock"),
+    "ATOM_FIRMWARE_INFO_V2_2__ulDefaultMemoryClock": offset_of("ATOM_FIRMWARE_INFO_V2_2", "ulDefaultMemoryClock"),
+    "HEADER__size_bytes": ucode_offset("common_firmware_header", "size_bytes"),
+    "HEADER__header_version_major": ucode_offset("common_firmware_header", "header_version_major"),
+    "HEADER__header_version_minor": ucode_offset("common_firmware_header", "header_version_minor"),
+    "HEADER__ucode_version": ucode_offset("common_firmware_header", "ucode_version"),
+    "HEADER__ucode_size_bytes": ucode_offset("common_firmware_header", "ucode_size_bytes"),
+    "HEADER__ucode_array_offset_bytes": ucode_offset("common_firmware_header", "ucode_array_offset_bytes"),
+    "HEADER__size": ucode_offset("common_firmware_header", "size"),
+    "GFX_HEADER__jt_offset": ucode_offset("gfx_firmware_header_v1_0", "jt_offset"),
+    "GFX_HEADER__jt_size": ucode_offset("gfx_firmware_header_v1_0", "jt_size"),
+    "ATOM_S7_ASIC_INIT_COMPLETE_MASK": scratch_bits.get("ATOM_S7_ASIC_INIT_COMPLETE_MASK"),
+    "MC_SEQ_MISC0__MT__MASK": cikd.get("MC_SEQ_MISC0__MT__MASK"),
+    "MC_SEQ_MISC0__MT__GDDR5": cikd.get("MC_SEQ_MISC0__MT__GDDR5"),
+}
+for flag in ("VALID", "SYSTEM", "SNOOPED", "EXECUTABLE", "READABLE", "WRITEABLE"):
+    LINUX["AMDGPU_PTE_" + flag] = define_in("amdgpu_vm.h", "AMDGPU_PTE_" + flag)
+# The version the register list of polaris10_mc.bin leaves (its own
+# ucode_version, read from the repository's file).
+firmware_dir = os.path.join(here, "..", "firmware", "amdgpu")
+with open(os.path.join(firmware_dir, "polaris10_mc.bin"), "rb") as f:
+    mc = f.read()
+LINUX["MC_LIST_VERSION"] = int.from_bytes(mc[16:20], "little")
+# This driver's own numbers (the file's head says what each is), and
+# DMA_PAGES, which is gpu.mlx's.
+ENGINES_OWN = {"DRIVER_PART", "PROVED", "SCRATCH_TRIAL", "TABLE_AT", "DEFAULT_PAGE_AT", "BEYOND_AT", "SILENT_FOR", "LOOK_EVERY", "STORM",
+               "RATE_SLACK", "KEPT", "NONE", "MEC_FILE", "ON_RING", "ON_COPY", "ON_QUEUES", "ON_PROCESSORS", "ON_RLC",
+               "ON_DOORBELLS", "ON_GART", "ON_SMC"}
+gpu_text = open(os.path.join(here, "gpu.mlx")).read()
+hold("DMA_PAGES is gpu.mlx's", int(re.search(r"const DMA_PAGES: usize = (\d+)", engines_text).group(1)),
+     int(re.search(r"const DMA_PAGES: usize = (\d+)", gpu_text).group(1)))
+hold("DEFAULT_PAGE_AT is behind the GART's table", int(LINUX["GART_BYTES"] // LINUX["AMDGPU_GPU_PAGE_SIZE"] * LINUX["ENTRY_BYTES"]),
+     LINUX["GART_BYTES"] // LINUX["AMDGPU_GPU_PAGE_SIZE"] * LINUX["ENTRY_BYTES"])
+engine_names = {}
+for name, value, inside in constants(engines_text):
+    engine_names[name] = value
+    if name in ENGINES_OWN or name == "DMA_PAGES":
+        continue
+    if name in LINUX:
+        hold(name, value, LINUX[name])
+    elif name.startswith("ix"):
+        hold(name, value, regs.get(name))
+    elif "__" in name:
+        hold(name, value, masks.get(name + "_MASK"))
+    elif name in DISPLAYS:
+        hold(name, value, d.get("mm" + name))
+    else:
+        hold(name, value, regs.get("mm" + name))
+# The golden tables, register for register in Linux's order.
+def golden(text, table):
+    body = re.search(r"static const u32 %s\[\] =\s*\{(.*?)\};" % table, text, re.S).group(1)
+    rows = [row.strip() for row in body.replace("\n", " ").split(",") if row.strip()]
+    return rows
+def resolve(name):
+    if name.startswith("mm"):
+        return regs.get(name, d.get(name))
+    return int(name, 0)
+memory_rows = golden(gmc_c, "golden_settings_polaris10_a11")
+code_memory = [int(x, 0) if x.startswith("0x") or x.isdigit() else engine_names.get(x) for x in
+               re.search(r"pub const GOLDEN_MEMORY = \[_\]usize\{([^}]*)\}", engines_text).group(1).replace(" ", "").split(",")]
+hold("the memory controller's golden words, as many", len(code_memory), len(memory_rows))
+for k, row in enumerate(memory_rows[:len(code_memory)]):
+    hold("golden memory word %d" % k, code_memory[k], resolve(row))
+for table, source, mine in (("golden_settings_polaris10_a11", gfx_c, "GOLDEN_GRAPHICS"), ("polaris10_golden_common_all", gfx_c, "GOLDEN_COMMON"),
+                            ("golden_settings_polaris10_a11", sdma_c, "GOLDEN_COPY")):
+    rows = golden(source, table)
+    wanted = [resolve(rows[k]) for k in range(0, len(rows), 3)]
+    code = table_of = [int(x, 0) for x in re.search(r"pub const %s = \[_\]usize\{([^}]*)\}" % mine, engines_text).group(1).replace(" ", "").split(",")]
+    hold("%s's registers, as many" % mine, len(code), len(wanted))
+    for k in range(min(len(code), len(wanted))):
+        hold("%s %d" % (mine, k), code[k], wanted[k])
+# The firmware files' names as Linux asks for them, and the header
+# versions the repository's files have.
+names = re.findall(r'"(polaris10_\w+\.bin)"', re.search(r"pub const FILES = \[_\]\[\]const u8\{([^}]*)\}", engines_text).group(1))
+linux_names = set(re.findall(r'"amdgpu/(polaris10_\w+\.bin)"', gfx_c + sdma_c + text_of("amdgpu_cgs.c")))
+majors = [int(x) for x in re.search(r"pub const FILE_MAJOR = \[_\]usize\{([^}]*)\}", engines_text).group(1).replace(" ", "").split(",")]
+minors = [int(x) for x in re.search(r"pub const FILE_MINOR = \[_\]usize\{([^}]*)\}", engines_text).group(1).replace(" ", "").split(",")]
+for k, name in enumerate(names):
+    hold("Linux asks for " + name, int(name in linux_names), 1)
+    with open(os.path.join(firmware_dir, name), "rb") as f:
+        head = f.read(12)
+    hold(name + "'s header version", (majors[k] << 16) | minors[k], (int.from_bytes(head[8:10], "little") << 16) | int.from_bytes(head[10:12], "little"))
+for name in re.findall(r'pub const SMC_\w+ = "(polaris10_\w+\.bin)"', engines_text):
+    hold("Linux asks for " + name, int(name in linux_names), 1)
+# The display's runs of the test's card, made again from the header (its
+# numbers but for the audio controller's: below 0xc0, and the aliases).
+display_numbers = sorted(set(v for k, v in d.items() if k.startswith("mm") and v >= 0xC0 and not k.endswith("_ALIAS")))
+runs = []
+first = last = display_numbers[0]
+for v in display_numbers[1:]:
+    if v - last > 16:
+        runs += [first, last]
+        first = v
+    last = v
+runs += [first, last]
+card_text = open(os.path.join(here, "..", "..", "..", "tests", "support", "engine_card.mlx")).read()
+card_runs = [int(x, 0) for x in re.search(r"pub const DISPLAY_RUNS = \[_\]usize\{([^}]*)\}", card_text).group(1).replace(" ", "").split(",")]
+hold("the display's runs of engine_card.mlx are dce_11_2_d.h's", int(card_runs == runs), 1)
+# No register a step writes is the display's.
+written_names = set(re.findall(r"\b(?:put|alter|set|whereDiffers|change)\(e, (\w+)", engines_text)) | set(re.findall(r"\bwr\(e, (\w+)", engines_text))
+for name in sorted(written_names):
+    if name not in engine_names:
+        continue
+    number = engine_names[name]
+    in_display = any(runs[k] <= number <= runs[k + 1] for k in range(0, len(runs), 2))
+    hold("%s (%#x) written by a step is no register of the display's" % (name, number), int(in_display), 0)
+print("the card's engines: %d numbers of gpu_engines.mlx (and engine_card.mlx's display runs) held against Linux's files, %d wrong" % (held - engines_before, bad - engines_bad_before))
 sys.exit(1 if bad or rom_bad or wrong or display_bad else 0)

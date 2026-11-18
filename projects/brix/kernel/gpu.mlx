@@ -80,7 +80,10 @@
 // data window (`report`), and to read the ROM, when the firmware's ACPI
 // table does not have it, the PCI configuration's ROM word or the
 // management controller's index and the ROM's (`romSetConfig`,
-// `romSetRegister`), each put back as it was.
+// `romSetRegister`), each put back as it was; and for the card's engines'
+// first look (gpu_engines.mlx's S0, at every boot: the end of this file)
+// the SMC's index, the memory controller's IO debug index and the queue
+// selector, each put back as it was.
 //
 // FOR WHAT SETS A MODE WITH THE ROM'S TABLES: `tables()` is the
 // interpreter with the ROM open (null: there is no ROM that holds, or
@@ -179,6 +182,9 @@ const ddc = @import("./gpu_ddc.mlx")
 const dplink = @import("./gpu_link.mlx")
 const aux = @import("./gpu_aux.mlx")
 const rule = @import("./gpu_switch.mlx")
+const engines = @import("./gpu_engines.mlx")
+const stages = @import("../engine_choice.mlx")
+const smp = @import("./smp.mlx")
 const Page = memory.Page
 
 const VENDOR_AMD: usize = 0x1002
@@ -573,7 +579,7 @@ fn setDisplay() -> void {
 // the one a mode set made after it).
 fn knowPicture() -> void {
     known = scanout.Memory.{
-        .aperture = if gpu.vramViewSize != 0 { gpu.vramViewSize } else { gpu.vramSize },
+        .aperture = displayAperture(),
         .pictureOffset = 0,
         .pictureBytes = 0,
         .pictureWidth = 0,
@@ -1306,6 +1312,7 @@ fn take(address: usize) -> bool {
         plug.serveAll(&card, &watch.ports)
         beginFollowing()
         watching = watch.ports.found
+        bringEngines(address)
     } else {
         console.out.write("gpu: the display controller is not read (its registers are known for Polaris cards only)\n")
     }
@@ -1317,6 +1324,7 @@ fn take(address: usize) -> bool {
 // is AMD, else one of another display class.)
 pub fn probe() -> bool {
     gpu.present = false
+    gpu.registers = 0
     watching = false
     asking = false
     following.how = rule.How.off
@@ -1326,6 +1334,7 @@ pub fn probe() -> bool {
     // (No card whose display this driver sets: the choice is said all
     // the same, in the log alone, with what the loader found.)
     if !chosenSaid { sayChoice(false) }
+    if !engineSaid { enginesWithoutCard() }
     return found
 }
 
@@ -1343,4 +1352,157 @@ fn find() -> bool {
         pass += 1
     }
     return false
+}
+
+// ---- The card's engines: the first stages toward a card that takes
+// commands (gpu_engines.mlx), as far as this boot's digit says
+// (../engine_choice.mlx: a digit held while the machine starts, in the
+// boot information's word Info.STAGE; none: stage 0, which reads and
+// says and writes nothing but index words). They run once the display is
+// final for this boot (`take`, after `leaveChannel` and the connectors'
+// watch), for a Polaris 10 the firmware started, with the hot plug tick
+// kept off the card. A boot that goes beyond stage 0 gives the display's
+// plan the aperture less its top 64 MiB (`displayAperture`), the
+// driver's part.
+
+var engineState: engines.Engines = undefined // (per run)
+var engineSaid = false // (per run)
+var engineBegun = false // (per run)
+var engineDevice: usize = 0 // (per run)
+var engineWatching = false // (per run)
+
+// How far this boot goes: the loader's digit, whether it had a keyboard,
+// and the display's choice (F holds every stage back at 0).
+fn engineDecision() -> stages.Decision { return stages.decide(cpu.BootInfo.get(layout.Info.STAGE), cpu.BootInfo.get(layout.Info.CHOICE), chosen.choice) }
+
+// The part of the aperture the display's plan may use at this boot: all
+// of the kernel's view at stage 0 (nothing changes for it), the view less
+// the driver's top 64 MiB from stage 1 on, on a card whose stages run.
+fn displayAperture() -> usize {
+    const view = if gpu.vramViewSize != 0 { gpu.vramViewSize } else { gpu.vramSize }
+    if !engines.polaris10(gpu.device) || gpu.vramViewSize == 0 { return view }
+    const limit = engines.displayLimit(view, engineDecision().stage)
+    return if limit == 0 { view } else { limit }
+}
+
+// The card as the steps reach it: its registers (gpu.rreg and wreg: all
+// the steps' registers lie in the register aperture), the aperture's
+// words in the kernel's view, the memory set aside for the card (`dma`;
+// the kernel sees the system's memory at layout.Memory.virtual), the PCI
+// command word, the interrupt as a message to the first processor, the
+// firmware files of the boot archive.
+fn engineRead(number: usize) -> u32 { return gpu.rreg(number) }
+
+fn engineWrite(number: usize, value: u32) -> void { gpu.wreg(number, value) }
+
+fn enginePause(microseconds: usize) -> void { clock.pause(microseconds) }
+
+fn engineVramRead(offset: usize) -> usize {
+    if gpu.vramView == 0 || offset + 8 > gpu.vramViewSize { return engines.NONE }
+    return unsafe { @ptrFromInt(*usize, gpu.vramView + offset) }.*
+}
+
+fn engineVramWrite(offset: usize, value: usize) -> void {
+    if gpu.vramView == 0 || offset + 8 > gpu.vramViewSize { return }
+    const at = unsafe { @ptrFromInt(*usize, gpu.vramView + offset) }
+    at.* = value
+}
+
+fn engineMemoryRead(physical: usize) -> u32 { return unsafe { @ptrFromInt(*u32, layout.Memory.virtual(physical)) }.* }
+
+fn engineCommand() -> usize { return Pci.read(engineDevice, Pci.COMMAND) & 0xFFFF }
+
+fn engineRoute() -> bool {
+    const apic = smp.localApic()
+    if !apic.0 || engineDevice == 0 { return false }
+    return Pci.enableMessages(engineDevice, layout.Vector.GPU, apic.1) != 0
+}
+
+fn engineInterrupts() -> usize { return gpu.interrupts }
+
+fn engineWaiting() -> bool { return smp.waiting(layout.Vector.GPU) }
+
+var engineFileName: [64]u8 = undefined // (per run)
+
+fn engineFile(name: []const u8) -> []const u8 {
+    const prefix = "firmware/amdgpu/"
+    if prefix.length + name.length > engineFileName.length { return name[0..0] }
+    var k: usize = 0
+    while k < prefix.length {
+        engineFileName[k] = prefix[k]
+        k += 1
+    }
+    var j: usize = 0
+    while j < name.length {
+        engineFileName[k + j] = name[j]
+        j += 1
+    }
+    const file = archive.Archive.boot().find(engineFileName[0..k + j])
+    if file.size == 0 { return name[0..0] }
+    return file.data[0..file.size]
+}
+
+// The hot plug tick kept off the card for the steps (the reviewers' rule
+// for anything that writes the card): an EDID's reading that is under way
+// is let end first (the tick goes on meanwhile, `watching` set), then
+// `watching` is cleared. At boot the kernel runs with interrupts off: no
+// tick comes until the first program runs, and none is under way (the
+// wait is for the steps asked for later, from the running system, where
+// the tick is the timer's interrupt and runs to its end before the step
+// goes on). False: a reading did not end in 2 s.
+fn engineQuiet() -> bool {
+    engineWatching = watching
+    if !watching { return true }
+    const deadline = clock.Deadline.after(2000)
+    while true {
+        watching = false
+        if watch.reading == plug.NONE { return true }
+        watching = true
+        if deadline.passed() { return false }
+        clock.pause(10000)
+    }
+    return false
+}
+
+// The card's engines brought as far as this boot says: its line first,
+// then the stages (gpu_engines.mlx's `run`: S0, then M1 and M2, then I1,
+// each only after the one before it passed).
+fn bringEngines(address: usize) -> void {
+    engineSaid = true
+    engineDevice = address
+    const d = engineDecision()
+    stages.say(displayWrite, &d, true)
+    const hands = engines.Hands.{ .read = engineRead, .write = engineWrite, .now = displayNow, .pause = enginePause, .say = displayWrite, .aside = displayAside, .vramRead = engineVramRead, .vramWrite = engineVramWrite, .dma = dma, .memoryRead = engineMemoryRead, .command = engineCommand, .route = engineRoute, .interrupts = engineInterrupts, .waiting = engineWaiting, .file = engineFile }
+    var where = engines.Card.{ .device = gpu.device, .revision = gpu.revision, .view = gpu.vramViewSize, .pictureOffset = gpu.consoleOffset, .pictureBytes = gpu.consoleBytes, .dmaBase = gpu.dmaBase, .dmaPages = if gpu.dmaBase != 0 { DMA_PAGES } else { 0 }, .rom = null }
+    if tablesOpen { where.rom = &machine }
+    engines.begin(&engineState, &hands, &where, d.stage)
+    if !engineQuiet() {
+        console.out.write("gpu: the card's engines are not read at this boot: an EDID's reading did not end in 2 s\n")
+        return
+    }
+    engines.run(&engineState)
+    engineBegun = true
+    watching = engineWatching
+}
+
+// No card of ours for the stages: said in one line; an AMD card that was
+// looked at but is not one whose stages run (not started, not a Polaris
+// 10) is said so by S0 itself.
+fn enginesWithoutCard() -> void {
+    if gpu.registers != 0 && !gpu.present {
+        bringEngines(0)
+        return
+    }
+    engineSaid = true
+    const d = engineDecision()
+    stages.say(displayWrite, &d, false)
+}
+
+// The way down (power.mlx, before the machine restarts or powers off):
+// what reads the system's memory stopped (the interrupt ring), the GART
+// left on. Nothing when no stage brought anything up.
+pub fn stopEngines() -> void {
+    if !engineBegun { return }
+    watching = false
+    engines.stop(&engineState)
 }
