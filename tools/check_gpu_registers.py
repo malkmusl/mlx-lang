@@ -53,6 +53,13 @@
 #   display/dc/link/protocols/link_dp_training.c, link_dp_training_8b_10b.h,
 #   display/dc/link/link_dpms.c                the training's counts
 #   display/include/link_service_types.h       a rate's 27 MHz
+# and for the picture brought to and from a DisplayPort output and that
+# output's hot plug line (gpu_mode.mlx's "A MOVE WITH A DISPLAYPORT END",
+# gpu_dpwatch.mlx):
+#   display/dc/inc/hw/stream_encoder.h         the stream's pixel depth
+#   display/dc/dc_dp_types.h                   the short pulse's bytes
+#   include/drm/display/drm_dp.h               (of the kernel's tree) the
+#                                              sink count's bits
 #
 # Checked: each `const NAME: usize = 0x...` that is a register is the
 # header's mmNAME; a controller's register is at each controller's offset
@@ -92,7 +99,11 @@
 # PICTURE BROUGHT TO ANOTHER OUTPUT", the transmitter's "init" and the
 # PLL's power-down in gpu_blocks.mlx): the words of each PHY's PLL and
 # each PHY's symbol clock that are read around the power-down and the new
-# clock, at all six.
+# clock, at all six. Of a move with a DisplayPort end and that output's
+# hot plug line (gpu_dpwatch.mlx): the stream's pixel depth, each line's
+# interrupt word at all six and its two bits, the sink count's bits as
+# drm_dp.h takes them, the bytes read at a short pulse as dc_dp_types.h
+# has them (the 2 s between looks at the lanes are ours, not Linux's).
 # Of the card's engines (gpu_engines.mlx: the stages toward a card that
 # takes commands): every register, SMC address and field against the
 # memory controller's, the system's, the bus interface's, the graphics
@@ -143,7 +154,10 @@ vid = open(os.path.join(hdr, "vid.h")).read()
 NOT_REGISTERS = {"CONTROLLERS", "BACK_ENDS", "FRONT_ENDS", "MODE_DISPLAYPORT", "MODE_LVDS", "MODE_DVI", "MODE_HDMI",
     "MODE_DISPLAYPORT_MST", "FIRST_FRAME", "COUNTED", "FRAMES", "PLACED", "ROW", "MAX_WATERMARK", "VID_N", "TAKEN",
     "STREAM_GONE", "ENCODER_PRIMED", "STEPS", "SIGNAL_GONE", "BLOCKS", "NO_BLOCK", "TIMING_WORDS",
-    "NO_CONNECTOR", "STILL"}
+    "NO_CONNECTOR", "STILL",
+    # (A move's pixel on a DisplayPort link: three colours of eight bits,
+    # the depth the stream is told.)
+    "MOVE_BITS"}
 
 # What a TMDS output's mode set has from other files than the display's
 # two headers: registers by their mm names, fields by their _MASK names,
@@ -172,6 +186,7 @@ for m in re.finditer(r"^\s*(DENTIST_\w+)\s*=\s*(0x[0-9a-fA-F]+|\d+)", source("cl
     LINUX_VALUES[m.group(1)] = int(m.group(2), 0)
 LINUX_VALUES["HDMI_SCRAMBLED"] = one(r"#define\s+HDMI_CLOCK_CHANNEL_RATE_MORE_340M\s+(\d+)", source("dce_stream_encoder.c"))
 LINUX_VALUES["HDMI_FAST"] = one(r"HDMI_6GB_EN[^;]*?adjusted_pix_clk_khz >= (\d+)", source("dce_link_encoder.c"))
+LINUX_VALUES["DP_COMPONENT_PIXEL_DEPTH_8BPC"] = one(r"DP_COMPONENT_PIXEL_DEPTH_8BPC\s*=\s*(0x[0-9a-fA-F]+|\d+)", source("stream_encoder.h"))
 LINUX_VALUES["GENERATOR_DEFAULT"] = one(r"dentist_vco_freq_khz == 0\)\s*clk_mgr_dce->base\.dentist_vco_freq_khz = (\d+);", source("dce_clk_mgr.c"))
 
 bad = 0
@@ -897,6 +912,24 @@ for name, value, inside in constants(link_text):
 rates = re.search(r"pub const RATES = \[_\]usize\{([^}]*)\}", link_text).group(1).replace(" ", "").split(",")
 hold("the rates there are", int(rates == ["LINK_RATE_LOW", "LINK_RATE_HIGH", "LINK_RATE_HIGH2", "LINK_RATE_HIGH3"]), 1)
 print("DisplayPort link: %d numbers of gpu_aux.mlx and gpu_link.mlx held against Linux's files, %d wrong" % (held - link_before, bad - link_bad_before))
+
+# ---- The hot plug line of a DisplayPort output (gpu_dpwatch.mlx): the
+# short pulse's latch and its acknowledgement in each line's words, the
+# sink count's bits (DP_GET_SINK_COUNT), the six bytes read from 200h.
+watch_before, watch_bad_before = held, bad
+watch_text = open(os.path.join(here, "gpu_dpwatch.mlx")).read()
+watch = dict((m.group(1), int(m.group(2), 0)) for m in re.finditer(r"^(?:pub )?const (\w+): usize = (0x[0-9A-Fa-f]+|\d+)\s*$", watch_text, re.M))
+for name in ("DC_HPD_INT_CONTROL",):
+    hold(name, watch[name], d.get("mm" + name))
+    for n in range(6):
+        hold("HPD%d_%s" % (n, name), watch[name] + hpd_step * n, d.get("mmHPD%d_%s" % (n, name)))
+for name in ("DC_HPD_INT_CONTROL__DC_HPD_RX_INT_ACK", "DC_HPD_INT_STATUS__DC_HPD_RX_INT_STATUS"):
+    hold(name, watch[name], sh.get(name + "_MASK"))
+sink = re.search(r"#\s*define\s+DP_GET_SINK_COUNT\(x\)\s*\(\(\(\(x\) & (0x[0-9a-fA-F]+)\) >> 1\) \| \(\(x\) & (0x[0-9a-fA-F]+)\)\)", source("drm_dp.h"))
+hold("DP_SINK_COUNT_HIGH", watch["DP_SINK_COUNT_HIGH"], int(sink.group(1), 16) if sink else None)
+hold("DP_SINK_COUNT_MASK", watch["DP_SINK_COUNT_MASK"], int(sink.group(2), 16) if sink else None)
+hold("the short pulse's bytes", int(re.search(r"var six: \[(\d+)\]u8", watch_text).group(1)), one(r"union hpd_irq_data \{.*?uint8_t raw\[(\d+)\];", re.sub(r"\n", " ", source("dc_dp_types.h"))))
+print("DisplayPort hot plug: %d numbers of gpu_dpwatch.mlx held against Linux's files, %d wrong" % (held - watch_before, bad - watch_bad_before))
 
 # ---- The card's engines: gpu_engines.mlx (the stages toward a card that
 # takes commands: S0, M1, M2, I1). Beside the files above, of Linux 6.6's

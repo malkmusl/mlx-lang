@@ -1366,6 +1366,50 @@ change ran inside the timer's interrupt, about 1.5 seconds with the
 card read out first, while every other processor that came to the
 kernel waited for it.)
 
+A DisplayPort output is either end of a move too (kernel/gpu_dpwatch.mlx
+and gpu_mode.mlx's "A MOVE WITH A DISPLAYPORT END"). A monitor plugged
+into a DisplayPort connector is asked over the connector's AUX channel,
+brought up as Linux brings it up when the firmware did not: what it can
+(its DPCD) and its EDID through the channel's I2C bridge.
+
+    gpu: connector 0 (DisplayPort): the monitor says 3840x1080 at 60 Hz over its AUX channel 1 (DisplayPort 1.2, up to 5.40 Gbit/s on 4 lanes; EDID of 2 blocks)
+    gpu: the monitor is on connector 0 (DisplayPort) now, and nothing is plugged into connector 2 (HDMI): the picture is brought there (...)
+    gpu: controller 0 shows a picture of 3840x1080 as it is, 59.998 frames a second: the picture goes out by the new output, on a link trained at 2.70 Gbit/s on 4 lanes (...)
+
+To DisplayPort: the display clock raised as the DisplayPort plan raises
+it, the old output down, the controller's clock the DTO's, the timing,
+the link trained (gpu_link.mlx), the stream on. From DisplayPort to HDMI
+or DVI: the stream, the link and the transmitter off as Linux takes them
+down, the new output's PLL the clock. From one DisplayPort output to the
+other: the old link down, the new one trained, the controller running on
+the DTO throughout. The way back after a failure brings the old output
+up again, a DisplayPort one trained at its own rate and lanes (with
+nothing on its line that training cannot end, and the log says so).
+
+The hot plug line of the DisplayPort output that shows the picture is
+read as Linux reads it: a long pulse is a plug or an unplug, as for
+HDMI; a short pulse (the monitor asks to be looked at) and, every 2 s,
+a look of our own read the sink count and the lanes over AUX, one line
+each when there is something to say, and a lost link is trained again at
+the rate and lanes it ran:
+
+    gpu: connector 0 (DisplayPort): a short pulse of its hot plug line (the monitor asks to be looked at): sink count 1, lanes 7 7 7 7, aligned: the link holds
+    gpu: connector 0 (DisplayPort): its lanes looked at: sink count 1, lanes 0 0 0 0, not aligned: the link is lost (the monitor is on): it is trained again at the rate and lanes it ran
+
+A link that does not train again (a monitor set to another input keeps
+its line high and its lanes unlocked) is tried once and then left until
+the monitor pulses its line or comes back on it, so that the desktop
+does not stand still every 2 s:
+
+    gpu: connector 0 (DisplayPort): its link did not train again: the looks every 2 s leave it now; it is trained again when the monitor pulses its hot plug line or comes back on it
+
+When the monitor's own timing needs more than the link both ends have,
+another timing of its size from its EDID is taken, as on HDMI.
+
+The display's mode is changed on a DisplayPort output as on HDMI (the
+display tool, the Display page): the link that runs is kept when it has
+room for the mode, else trained for it.
+
 A monitor switched off and on, or to another input and back, on the
 same output: its EDID is read again; the same monitor, an output that
 still sends: nothing is written ("gpu: connector 2 (HDMI): the monitor
@@ -1387,9 +1431,12 @@ What the driver does not do, and says when it meets it:
   picture keeps its size (the programs drawing on it would have to be
   told), it stays where it goes out, and "a restart gives the monitor
   its own mode";
-- a monitor on a DisplayPort connector: "a monitor on a DisplayPort
-  connector is not followed yet" (the picture is brought to HDMI and
-  DVI only; DisplayPort as either end of a move is to come);
+- a monitor on a DisplayPort connector that does not answer on its AUX
+  channel (one that is off, an adapter to HDMI or DVI): "it is not
+  driven"; several streams on one DisplayPort link are not there;
+- another monitor of the picture's size plugged into the DisplayPort
+  output that shows the picture keeps the timing that runs ("a timing of
+  its own on this DisplayPort output is set at the next start");
 - a DVI monitor that needs two links (above 165 MHz): no timing fits,
   said by the plan;
 - a card whose firmware started none of its outputs: no controller of it
@@ -1409,7 +1456,11 @@ pulled and plugged in again; a failure at every write and every table
 run of a move, with the state of before back after each) and
 tests/486_gpu_switch_plan_runtime.mlx (the plan byte for byte against
 the study, which controller, front end and PLL at the edges, every
-refusal, the same-size rule). From the machine, what tells whether it
+refusal, the same-size rule) and tests/510_gpu_dp_switch_runtime.mlx
+(DisplayPort at either end, at boot and while brixOS runs, the tables in
+the display core's order, every table run of each move refused in turn,
+the short and long pulses, a mode change on DisplayPort). From the
+machine, what tells whether it
 works: the lines above, and everything between "the picture is brought
 there" and "the picture goes out by" (the log, fetched over the network
 when the screen stays dark).
