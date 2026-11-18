@@ -629,8 +629,10 @@ registers), and only when the link the firmware trained has room for the
 new clock (lanes times rate times 8/10 over the bits a pixel; the rate
 is not in a register of its own and is worked out from the stream's M
 and N and the pixel clock). A link
-that is too slow would have to be trained again, which is the card's
-firmware tables' work and not there yet.
+that is too slow, or is not trained, is taken down and trained by the
+driver itself at the rate and lanes the timing needs ("A DisplayPort
+link trained by the driver", below), when the monitor answers on its AUX
+channel.
 On an HDMI or DVI output (TMDS) the pixel clock is a PLL's and is the
 link's clock too: the output is taken down, the PLL set, the timing set
 and the output brought up again, and the PLL, the transmitter, the
@@ -711,13 +713,16 @@ the path that follows from it.
     firmware    the firmware's picture is kept: no register of the
                 display is written and no table of the card's is run.
     rehearsal   the firmware's own mode set again by the same steps,
-                the card's own tables among them (today where the
-                picture leaves by HDMI or DVI signalling): the screen
+                the card's own tables among them (on HDMI and DVI the
+                clock, timing and transmitter by the tables; on
+                DisplayPort the firmware's own link taken down and
+                trained again at its own rate and lanes): the screen
                 goes dark for a moment and comes back as it was. Nothing
                 new is asked of the monitor.
-    ask         the monitor only asked, nothing set (the step before a
-                DisplayPort link is trained). Not built yet: the
-                firmware's picture is kept, and the log says so.
+    ask         the monitor only asked, nothing set: on a DisplayPort
+                output what the monitor says of itself over its AUX
+                channel is read and said. The firmware's picture is
+                kept. (On HDMI and DVI there is nothing to ask.)
 
 The choice is the first of these that names one:
 
@@ -743,6 +748,10 @@ The choice is the first of these that names one:
    names: for someone who builds an image with a fixed choice. The
    build's own image has no such file.
 4. native.
+
+(A mode confirmed while the system ran is remembered and set at the
+next boots in place of the monitor's own; N pressed at a start forgets
+it, F leaves it unset: "A display's mode while the system runs", below.)
 
 The kernel says the choice at every boot, with the key that changes it:
 
@@ -776,8 +785,8 @@ kernel's display is the new picture from there on: the console is drawn
 again on it, and /devices/framebuffer gives the programs the monitor's
 own size. A plan that is not complete is not carried out, and one line
 says why ("gpu: the monitor's own mode is not set, the firmware's
-picture stays: the link is too slow: it must be trained again, not there
-yet").
+picture stays: the link is too slow: it has to be trained again, but the
+monitor does not answer on its AUX channel").
 
 A TMDS output's plan is carried out with more care still, since the
 card's own tables do part of it and nobody has seen them run here on a
@@ -884,6 +893,177 @@ the kernel sets the mode before it has a keyboard: F at the next start
 is the way back). The tables that Linux runs once at its
 start and this driver leaves to the firmware's own start (the
 transmitter's "init", the power gate) are not run.
+
+### A DisplayPort link trained by the driver
+
+On a DisplayPort output the monitor can be asked: it has a side channel,
+the AUX channel, and registers of its own behind it. The driver talks to
+it by the card's registers (gpu_aux.mlx), on the channel and the hot
+plug line the card's ROM names for the connector behind the output the
+firmware's picture leaves by (never by the output's number: a card
+wires them as it likes). It asks at every boot whose choice is not
+"firmware", before the plan is made:
+
+    gpu: hot plug line 2 reads high (sense 1, delayed 1; its block is on)
+    gpu: AUX 1: on, watching hot plug line 2, pins in AUX mode, free, receive window 1 (control 0x100001)
+    gpu: AUX 1: the data word read 0x0 before the first request, 0x0 before its reply
+    gpu: the monitor's capabilities: 12 14 c4 01 00 00 01 00 00 00 00 00 00 00 00 00
+    gpu: the monitor: DisplayPort 1.2, up to 5.40 Gbit/s on 4 lanes, patterns up to 3, enhanced framing, downspread
+    gpu: the monitor holds 1.62 Gbit/s on 2 lanes, all locked (status 77 00 01 01 00 00), power on
+
+and reads the monitor's EDID the same way (it is this output's monitor,
+whatever the loader passed on: with two adapters the loader's may be
+another's). What the monitor says decides with the card's words which
+case the link is, and the plan says it:
+
+- kept: the monitor holds the link the card's words give, every lane
+  locked, and it has room for the new clock. The clock, the timing and
+  the picture are set by registers alone, as before; afterwards the
+  monitor's lanes are read once more. Lanes that are not locked then:
+  the registers are put back, and if the lanes are still not locked the
+  firmware's own link is taken down and trained again.
+- trained again: the link is too slow. "gpu: plan (b, DisplayPort): the
+  link is too slow: it is taken down and trained at 2.70 Gbit/s on 4
+  lanes (the lowest rate and the fewest lanes that carry 266640 kHz; the
+  most both ends have is 5.40 Gbit/s on 4 lanes; ...)". The choice of
+  rate and lanes is Linux's: the lowest rate that does it, with as few
+  lanes as that rate needs, within what the card's ROM allows the
+  encoder and what the monitor says it can.
+- trained: the card says the link is not trained, or the monitor holds
+  no link or has lost its lanes. A link that has room is trained too
+  when the display clock has to be raised (below).
+- refused, with the reason in one line: a monitor that does not answer
+  or is none to train (a hub, an embedded panel, three lanes), one that
+  holds another link than the card's words give (the way back would not
+  be known), a ROM that does not name the connector, its channel and
+  its line, a transmitter's table of another revision than 6, no rate
+  and lanes that carry the timing, a display clock that would have to
+  be raised above the ROM's own figure, or raised for a link that is
+  kept and cannot be trained, several streams.
+  Without an answer a link that has room is still kept, on the card's
+  word, as before there was a way to ask.
+
+The display clock decides more than it seems to. The new rows need it
+at 1.2 times their pixel clock whatever the link does. The RX 580 these
+trials are made on has 118032 kHz as its firmware leaves it, and
+3840x1080 at 270270 kHz needs 326350 kHz, so the plan raises it as the
+HDMI plan does, with the card's SetDCEClock table run twice (the clock,
+then the DisplayPort reference clock), before anything of the output is
+touched:
+
+    gpu: the display clock is 118032 kHz (the ROM's own figure 626100 kHz): 270270 kHz needs 326350, which it is not: it is raised to that
+
+The second run also sets the reference clock that the stream's pixel
+clock is divided from, and that clock's modulo (a ROM may leave them,
+and write nothing). Both are read right after it and must be as before
+("gpu: 0142 & ffffffff is 23c34600 ...");
+if they are not, nothing else is done and the clock is put back. On the
+user's card the table writes what is there already. A link that would
+be kept is trained again instead, since a kept link is set by registers
+alone; without the monitor's answer it stays refused. The way back runs
+the two tables again for the clock as it was, last. A and R do not
+depend on it.
+
+A link is trained as Linux 6.6's display core trains one on these cards
+(gpu_link.mlx; the plan lists what is fixed of it beforehand, "gpu:
+would take the link down ...", "gpu: would train the link at ..."): the
+stream stopped, the monitor told its power state D3, the transmitter
+off by the card's own table (UNIPHYTransmitterControl, the one table a
+DisplayPort link runs), the controller blanked, the clock and the
+timing, the transmitter on at the link's rate and lanes, the monitor
+woken and told the link, then the training: clock recovery with pattern
+1 and equalisation with pattern 2, 3 or 4, in rounds: the lanes' drive
+set by the table, the monitor told, a wait, its status read and what it
+asks for taken. Its course cannot be known beforehand, so it is said as
+it runs, a line a round:
+
+    gpu: train 2.70x4, clock recovery, round 2: drive swing 1 pre 0; lanes 1 1 0 1, aligned 0, asked swing 1 1 2 1 pre 0 0 0 0
+    gpu: train 2.70x4: trained in 3 + 1 rounds with pattern 3 at swing 2 pre 0; holds after 5 ms (try 1 of 4, 38 ms)
+    gpu: train 2.70x4: failed at clock recovery on lane 2, which points to a lower rate (try 2 of 4; the last status 1 1 0 1, drive swing 3 pre 0)
+
+(a lane's digit: 1 its clock recovered, 2 equalised, 4 its symbols
+locked). A training that fails is tried again from the link taken down,
+four times in all. Then the stream is started with M for the new rate
+and the picture set; the monitor's lanes are read once more with the
+picture on the link. When anything fails the way back is the same
+sequence towards the firmware's state: its clock and timing, its own
+link trained at its own rate and lanes, its stream. The screen is dark
+from the stream's stop until the picture is shown; how long that can be
+at most is said before the first write, and it is a bound, not what is
+expected: a table is given two seconds and a try of a training five,
+whatever the card and the monitor do, which for four tries and their
+tables comes to "the screen is dark meanwhile, 104 s at most"; a
+training that goes as it should takes a fraction of a second.
+
+On the machine, with the monitor on a DisplayPort output, the order of
+trials is again keys and the one image:
+
+1. A (held while the machine starts): the monitor only asked. Nothing of
+   the card is written but the AUX channel's own words (and those are
+   put back). The lines above are the answer to the first question: does
+   the channel work by registers on this card. "gpu: AUX 1: no answer at
+   600h (status 0x...: timeout) after 32 tries" is the other answer;
+   send the log either way. The plan is said too, and not carried out.
+2. R: the firmware's own link taken down and trained again at its own
+   rate and lanes, the clock, the timing and the picture left. The
+   screen goes dark and comes back as it was: "gpu: controller 0 runs
+   the firmware's own mode again, 59.979 frames a second, on its own
+   link taken down and trained again at 1.62 Gbit/s on 2 lanes: the
+   picture is where it was". It shows that the table's three calls and
+   the training work on this card, and thereby the way back, before
+   anything new is asked of the monitor.
+3. Nothing (or N, where F is remembered): the monitor's own mode. The
+   driver asks first by itself, and goes on only when what it learned
+   allows it (the display clock raised if it has to be: above).
+
+If it fails and the picture comes back, the screen says where ("gpu:
+step 39 of 83 failed (the link's own step: clock recovery): train the
+link at ...") and what came back. If the screen stays dark: as for an
+HDMI output, wait until the disk is quiet, restart with F held down, and
+send boot.previous.log whole. Its last "gpu:" line is one of the four
+endings above; for a link there is one thing more it can say, "gpu: the
+firmware's own link did not train again: the card sends its idle pattern
+and the stream all the same; the monitor may show nothing until a
+restart", and the state is then not called back. What cannot be the
+firmware's again is said as such: the lanes' drive is the new training's
+own, and a word of the back end that the training writes differently
+from the firmware is named ("gpu: DIG 1's framing word holds ... where
+the firmware had ... (the training's own value)").
+
+What is taken on trust until the card has said otherwise, each said in
+the log where it happens: the transmitter's "off" is told what Linux's
+display core tells it at a change of mode on a link it trained itself
+(DisplayPort, no clock, no lanes), which neither of Linux's two drivers
+sends to a link the firmware trained; the table's "init" is not run (the
+firmware's own start ran this ROM); the back end is expected to read on
+after the table's "on" and off after its "off". A check of these that
+fails costs the mode, not the picture, as long as the way back holds,
+which is what R is there to show first.
+
+Not done for a DisplayPort output: a setting above the first that
+carries the timing when that one does not train (the log names the next;
+the firmware's link is trained again instead), a monitor behind a hub
+or one that carries several streams, an embedded panel, more than one
+controller, a link from nothing (an output the firmware did not start:
+its detection is the hot plug work's), the monitor's request for
+attention later (no interrupt is served: a link lost after the boot is
+not noticed), and the source's name that Linux writes to the monitor
+(300h). The AUX channel by the card's table
+(ProcessAuxChannelTransaction) is the second line if the registers get
+no answer on this card; it is not built.
+
+tests/480_gpu_dp_sequence_runtime.mlx holds all of that on the host,
+against a card that is a table and a monitor behind its AUX channel that
+is one too (tests/support/dp_monitor.mlx): each sequence write for
+write, table run for table run and AUX transaction for transaction, a
+failure at every one of them and the way back from each, a training that
+fails in each way there is.
+tests/481_gpu_dp_link_runtime.mlx holds the pieces: an AUX transaction's
+register words, the tries, the EDID through the channel, the monitor's
+capabilities, the arithmetic of rates and lanes, the table's blocks byte
+for byte, and every reason for no plan.
+tests/499_gpu_dp_clock_runtime.mlx holds the display clock raised, at
+the user's card's figures, event for event, and its way back.
 
 tests/452_gpu_display_readout_runtime.mlx reads the same from tables of
 numbers on the host, tests/459_edid_timing_runtime.mlx reads EDIDs
@@ -1000,6 +1180,619 @@ used: each row of each character drawn built all 1520 bytes of it in the
 kernel's arena, which was full after 173 characters. That, not a driver,
 was the freeze after "probing storage". The table is a `var` now, and
 mlx4 reads a `const` table from static data as well.)
+
+### Where the monitor is: the connectors, hot plug, the monitor asked
+
+Nobody chooses the output. No key, no setting and no word in the image
+names HDMI or DisplayPort: the Radeon's driver looks (gpu_plug.mlx). The
+card's ROM names the connectors; each connector's hot plug line says
+whether something is plugged in; the encoder blocks say by which
+connector the firmware's picture goes out and what is sent there. All of
+that is read, nothing is written for it, so it is said at every boot,
+one that keeps the firmware's picture too (the numbers here are a
+test's, not a card's):
+
+    gpu: connector 0 (HDMI, DIG 4, hot plug line 2): a monitor is plugged in; the firmware's picture goes out here
+    gpu: connector 1 (DisplayPort, DIG 0, hot plug line 1): nothing is plugged in
+    gpu: connector 3 (HDMI, DIG 1, hot plug line 4): something is plugged in; the firmware did not start this output
+    gpu: the monitor is on the HDMI connector 0 (DIG 4, hot plug line 2): the TMDS path
+
+The last line is the detection: where the monitor is and which path
+follows. The path goes by what the output sends, not by the connector's
+kind ("... the DisplayPort connector 1 (DIG 0, hot plug line 1), which
+sends TMDS (an adapter is behind it): the TMDS path"). The other cases,
+each said as plainly: something on a connector the firmware did not
+start ("gpu: something is plugged into connector 3 (HDMI), which the
+firmware did not start": what follows is the next subsection's),
+nothing where the firmware's picture goes out, nothing anywhere,
+several connectors with something, a firmware that started no output of
+this card, a ROM without connector records.
+
+A hot plug line is read as Linux reads it on this card (the line's
+block of registers, its two sense bits), and it is judged only when
+what Linux counts on stands: the block is on and the pin is the
+block's. Where it does not, the line says so ("... whether something is
+plugged in is not known: the line's block is off, and Linux's display
+core counts on the firmware having left it on") and nothing is
+concluded: the plan goes on as the firmware left things. Each line's
+own words are in the log alone ("gpu: hot plug line 2: status 0x12,
+control 0x10001000, filter 0xa00032 ..."). One thing follows from a
+line for certain: as Linux sets no mode on an output whose line is low,
+this driver does not either ("gpu: the monitor's own mode is not set:
+nothing is plugged into connector 0 (HDMI), where the picture goes out
+...").
+
+The monitor is then asked for its EDID by the driver itself, over the
+connector's DDC line with the card's I2C engine (gpu_ddc.mlx: the
+engine as Linux's display core drives it): on every connector that
+sends TMDS, and on an HDMI or DVI connector the firmware did not start
+when something is plugged in. That writes words of the I2C engine and
+of the line's two pins, each put back as it was found, and nothing of
+a controller, a clock or a transmitter; at a boot that keeps the
+firmware's picture (F) nobody is asked ("gpu: no monitor is asked for
+its EDID at this boot ..."). What a monitor said:
+
+    gpu: connector 0 (HDMI): the monitor says 3840x1080 at 60 Hz, HDMI, up to 300 MHz (EDID of 2 blocks over DDC line 2, the card's DDC2)
+    gpu: connector 0 (HDMI): it is the EDID the loader passed on
+
+("DDC line 2" is the ROM's number for the line, the same that the "gpu:
+connector N: ..." line of the video BIOS says; "the card's DDC2" is
+which of the card's six lines that is, the one whose pins and words are
+used. The two numbers are not the same thing: on the machine this is
+built on the ROM's line 0 is the card's DDC1.) The EDID read from the
+connector the picture goes out by is held against the one the EFI
+loader got from the firmware, and a line says which of the two the plan
+is made from. The same (the line above). The same, but the firmware
+gave the loader less of it:
+
+    gpu: connector 2 (HDMI): the loader passed on the first 1 block of it alone: the plan goes by all 2, read from the connector now
+
+(the machine this is built on does that, and what says that a monitor
+is an HDMI one is in the second block: without it the plan took the
+monitor for a DVI one and found no timing that fits). Another one
+("... differs from the one the loader passed on (from byte 12 on): the
+one read now counts, it is the monitor that is there"). Or the driver's
+reading failed ("gpu: connector 0 (HDMI): nothing answers on DDC line 2,
+the card's DDC2: no EDID (a monitor that is off, or none)", "... its
+EDID could not be read over DDC line 2, the card's DDC2: the I2C engine
+stayed busy (the engine's status 0x1)"), and the loader's counts. Where the plan goes by other bytes than
+before, the monitor's own timing is said anew. A monitor's own mode no
+longer needs the firmware to have read the EDID.
+
+While brixOS runs the lines are looked at ten times a second, from the
+timer's tick: two registers a line and one for all, nothing written,
+and nothing at all on a machine without the card. A change is said
+once, when two looks in a row agree and it has lasted as long as
+Linux's filter waits (a plug on an HDMI or DVI connector half a second,
+an unplug a tenth; on a DisplayPort connector the two looks), so a
+bounce or a short pulse says nothing:
+
+    gpu: the monitor was unplugged from connector 0 (HDMI): the picture still goes out there, to nothing
+    gpu: something was plugged into connector 3 (HDMI)
+    gpu: connector 3 (HDMI): the monitor says 3840x1080 at 60 Hz, HDMI, up to 300 MHz (EDID of 2 blocks over DDC line 3, the card's DDC6)
+
+A line that stops saying anything is said once too, and nothing is
+concluded from it until it can be read again: its block gone off, or
+its two sense bits differing for longer than a filter of the block's
+own could hold them apart (0.6 s, or more where the block's filter word
+holds more) ("gpu: connector 0 (HDMI): its hot plug line cannot be
+read any more: its two sense bits differ"; later "... can be read now:
+nothing is plugged in"). The record never keeps a level the line no
+longer says.
+
+What is plugged into an HDMI or DVI connector is asked for its EDID then
+(a piece of the reading each tick, some 60 ms in all; never a wait in
+the timer's interrupt), once more a second later when nothing answers
+at first; a reading that was under way while its monitor was pulled and
+another plugged in is dropped, and the one that is there is asked. The
+driver knows of every change and says it; what it does about one is
+the next subsection's. Not there yet: what is behind a DisplayPort
+connector the firmware did not start (a monitor or an adapter: Linux
+switches a pin of the DDC line to tell), an adapter's own word about
+itself, and the EDID with the two pins driven by hand where the card's
+I2C engine may not be used (the log says when that is so).
+
+None of it can be tried without the card, so it is proven on the host
+against a card that is a table: tests/483_gpu_plug_detect_runtime.mlx
+(every connector and line state at boot, every case of the detection,
+changes over time against a clock of the test's: pulses of every length
+around Linux's times, lines toggled at random with no change lost or
+said twice, an hour of looks; not one write) and
+tests/484_gpu_ddc_edid_runtime.mlx (the I2C engine's transfers write for
+write and wait for wait as worked out from Linux's dce_i2c_hw.c, EDIDs
+of one to eight blocks, everything that can go wrong on the line, on
+every line and whatever the engine's words held beforehand, every word
+put back). tools/check_gpu_registers.py holds the numbers of both
+files against Linux's. From the machine the lines above are what tells
+whether the card's hot plug blocks and its I2C engine are as Linux's
+code expects: every line that begins "gpu: connector", "gpu: hot plug
+line", "gpu: the monitor is", and what is said when the cable is pulled
+and put back.
+
+### The monitor followed: another output at boot, a cable moved while brixOS runs
+
+The picture goes where the monitor is (gpu_switch.mlx), by itself, at
+the default boot; nothing names an output. The card has one picture of
+the kernel's (the console's and the desktop's), shown by the one
+controller the firmware started: that controller stays, and only its
+way out changes.
+
+At boot, when the monitor is on another HDMI or DVI connector than the
+one the firmware started and nothing is plugged in there, the plan is
+made for the monitor's connector, with a new picture of the monitor's
+own size, as for the firmware's output:
+
+    gpu: the monitor is on connector 3 (HDMI), the firmware's picture goes out by connector 2 (HDMI), where nothing is plugged in: the picture is brought to the monitor
+    gpu: plan (move, TMDS): connector 2 (HDMI, DIG 4, PLL 4) to connector 3 (HDMI, DIG 5, front end 5, PLL 5), controller 0 stays: HDMI signalling at 270270 kHz (now DVI at 107960 kHz), a picture of 3840x1080 at 0x500000 of the aperture, the scaler off: 9 table runs and 88 writes would do it
+
+When the monitor is where the firmware's picture goes out, nothing of
+this happens: "gpu: the picture stays on connector 2 (HDMI), where the
+monitor is", and the mode set is the one of before, write for write.
+
+While brixOS runs, when the monitor's cable is moved from one HDMI or
+DVI output to another, the picture follows once the old output's line
+has been low for a second and the monitor has answered on the new one:
+
+    gpu: the monitor was unplugged from connector 2 (HDMI): the picture still goes out there, to nothing
+    gpu: connector 2 (HDMI): the monitor has left and no other connector has one: the output is kept as it is (nothing is taken down)
+    gpu: something was plugged into connector 3 (HDMI)
+    gpu: connector 3 (HDMI): the monitor says 3840x1080 at 60 Hz, HDMI, up to 300 MHz (...)
+    gpu: the monitor is on connector 3 (HDMI) now, and nothing is plugged into connector 2 (HDMI): the picture is brought there (...)
+    gpu: bringing the picture to the other output: carrying out the plan's 9 table runs and 67 writes; the screen is dark meanwhile, 23 s at most (and 22 s more at most if the state of before has to be put back)
+    gpu: the picture goes out by connector 3 (HDMI) now; its memory, size and pitch are as they were: no program is told
+
+The steps are the study's (gpu-autoswitch.verified.md 4.2, 4.5, 4.6):
+the new output's transmitter made ready once a boot ("init", and the
+output that shows the picture checked to be still on and its frames
+still counted), the new back end told its hot plug line, the old
+output down, the controller stopped, the old output's PLL powered
+down, the new output's PLL set, the timing, the new front end and back
+end up, the picture shown where it was. (The user's ROM does nothing
+for "init": that table ends at once and writes nothing, which is no
+failure there; the checks after it judge it.) Every write is read back
+and every table's answer looked at; when anything fails the way back
+brings the picture to the output it was on ("gpu: back on connector 2
+(HDMI), where no monitor is; the monitor on connector 3 (HDMI) is not
+shown") and it is tried again in 5 and 30 seconds, three times in all,
+or when a line or an EDID changes. When the way back itself does not
+end in the state of before, nothing is tried again at that boot ("gpu:
+the monitor is not followed any more at this boot: ..."), and a restart
+starts from the firmware's picture. The timer's tick decides; the
+change is made right after that interrupt, on the trap's way back, by
+the same machinery as a mode a program asks for: every other processor
+stands still while the card is written, and only then. The picture's
+memory is not moved, and programs draw on as before. (Before, the whole
+change ran inside the timer's interrupt, about 1.5 seconds with the
+card read out first, while every other processor that came to the
+kernel waited for it.)
+
+A DisplayPort output is either end of a move too (kernel/gpu_dpwatch.mlx
+and gpu_mode.mlx's "A MOVE WITH A DISPLAYPORT END"). A monitor plugged
+into a DisplayPort connector is asked over the connector's AUX channel,
+brought up as Linux brings it up when the firmware did not: what it can
+(its DPCD) and its EDID through the channel's I2C bridge.
+
+    gpu: connector 0 (DisplayPort): the monitor says 3840x1080 at 60 Hz over its AUX channel 1 (DisplayPort 1.2, up to 5.40 Gbit/s on 4 lanes; EDID of 2 blocks)
+    gpu: the monitor is on connector 0 (DisplayPort) now, and nothing is plugged into connector 2 (HDMI): the picture is brought there (...)
+    gpu: controller 0 shows a picture of 3840x1080 as it is, 59.998 frames a second: the picture goes out by the new output, on a link trained at 2.70 Gbit/s on 4 lanes (...)
+
+To DisplayPort: the display clock raised as the DisplayPort plan raises
+it, the old output down, the controller's clock the DTO's, the timing,
+the link trained (gpu_link.mlx), the stream on. From DisplayPort to HDMI
+or DVI: the stream, the link and the transmitter off as Linux takes them
+down, the new output's PLL the clock. From one DisplayPort output to the
+other: the old link down, the new one trained, the controller running on
+the DTO throughout. The way back after a failure brings the old output
+up again, a DisplayPort one trained at its own rate and lanes (with
+nothing on its line that training cannot end, and the log says so).
+
+The hot plug line of the DisplayPort output that shows the picture is
+read as Linux reads it: a long pulse is a plug or an unplug, as for
+HDMI; a short pulse (the monitor asks to be looked at) and, every 2 s,
+a look of our own read the sink count and the lanes over AUX, one line
+each when there is something to say, and a lost link is trained again at
+the rate and lanes it ran:
+
+    gpu: connector 0 (DisplayPort): a short pulse of its hot plug line (the monitor asks to be looked at): sink count 1, lanes 7 7 7 7, aligned: the link holds
+    gpu: connector 0 (DisplayPort): its lanes looked at: sink count 1, lanes 0 0 0 0, not aligned: the link is lost (the monitor is on): it is trained again at the rate and lanes it ran
+
+A link that does not train again (a monitor set to another input keeps
+its line high and its lanes unlocked) is tried once and then left until
+the monitor pulses its line or comes back on it, so that the desktop
+does not stand still every 2 s:
+
+    gpu: connector 0 (DisplayPort): its link did not train again: the looks every 2 s leave it now; it is trained again when the monitor pulses its hot plug line or comes back on it
+
+When the monitor's own timing needs more than the link both ends have,
+another timing of its size from its EDID is taken, as on HDMI.
+
+The display's mode is changed on a DisplayPort output as on HDMI (the
+display tool, the Display page): the link that runs is kept when it has
+room for the mode, else trained for it.
+
+A monitor switched off and on, or to another input and back, on the
+same output: its EDID is read again; the same monitor, an output that
+still sends: nothing is written ("gpu: connector 2 (HDMI): the monitor
+is back after 3000 ms with its line low; the output sent all along:
+nothing is written"). Nothing more is needed for HDMI and DVI below 340
+MHz: the output never stopped. An output found not sending any more
+(the driver never takes it down; something else would have) is said,
+and setting its mode again is tried; a plan starts from the output that
+runs, so with its back end off that is refused and said, and a restart
+sets it. A monitor whose line never moves is not seen and needs
+nothing.
+
+What the driver does not do, and says when it meets it:
+
+- a second monitor while the first shows the picture: "gpu: a second
+  monitor on connector 3 (HDMI), 1920x1080: it is not driven (one
+  picture, on connector 2 (HDMI))";
+- a monitor of another size than the picture while brixOS runs: the
+  picture keeps its size (the programs drawing on it would have to be
+  told), it stays where it goes out, and "a restart gives the monitor
+  its own mode";
+- a monitor on a DisplayPort connector that does not answer on its AUX
+  channel (one that is off, an adapter to HDMI or DVI): "it is not
+  driven"; several streams on one DisplayPort link are not there;
+- another monitor of the picture's size plugged into the DisplayPort
+  output that shows the picture keeps the timing that runs ("a timing of
+  its own on this DisplayPort output is set at the next start");
+- a DVI monitor that needs two links (above 165 MHz): no timing fits,
+  said by the plan;
+- a card whose firmware started none of its outputs: no controller of it
+  runs, and none is started from nothing.
+
+At a boot that keeps the firmware's picture (F) nobody is asked and
+nothing is written; the log says what the default boot would do ("...
+this boot writes nothing, so the picture stays (a boot of the monitor's
+own mode would bring it there, if its EDID holds)"), at boot and while
+brixOS runs. The trial choices ask and do not follow.
+
+The proof is on the host, against the user's whole card as a table:
+tests/485_gpu_switch_runtime.mlx (the boot's cases; the cable moved
+from HDMI to HDMI and back and to DVI and back, every table run in
+order with its block; off and on, another input; a second monitor;
+pulled and plugged in again; a failure at every write and every table
+run of a move, with the state of before back after each) and
+tests/486_gpu_switch_plan_runtime.mlx (the plan byte for byte against
+the study, which controller, front end and PLL at the edges, every
+refusal, the same-size rule) and tests/510_gpu_dp_switch_runtime.mlx
+(DisplayPort at either end, at boot and while brixOS runs, the tables in
+the display core's order, every table run of each move refused in turn,
+the short and long pulses, a mode change on DisplayPort). From the
+machine, what tells whether it
+works: the lines above, and everything between "the picture is brought
+there" and "the picture goes out by" (the log, fetched over the network
+when the screen stays dark).
+
+### The card's engines: how far a boot goes (the digits)
+
+The first steps toward a Radeon that takes commands (kernel/
+gpu_engines.mlx, gpu_smc_sdma.mlx, gpu_compute.mlx, gpu_graphics.mlx and
+gpu_first_space.mlx, after the study of the kernel's part of that, its
+section 8, worked out from Linux 6.6's amdgpu). A digit held while the machine starts says how far they go
+at this boot; it is read by the same loader as F, N, R and A, holds for
+that boot only and is never remembered (projects/brix/engine_choice.mlx;
+the word Info.STAGE):
+
+- no digit, or 0: stage 0. The card's SMC, memory controller, GART,
+  interrupt ring, engines, ROM numbers, temperature and firmware files
+  are read and said ("gpu: step S0: card as found: ..."). Nothing is
+  written but three index words, each put back.
+- 1: stage 1. The card's memory seen by the processor is divided: the
+  display keeps all but the top 64 MiB, the driver takes those ("gpu:
+  step M1"); then the GART is turned on ("gpu: step M2").
+- 2: stage 2, the interrupt ring as well ("gpu: step I1").
+- 3: stage 3. The card's SMC is given its firmware and started ("gpu:
+  step F1"), then it loads the engines' firmware ("gpu: step F2"). The
+  engines are halted again afterwards: nothing runs on them yet.
+- 4: stage 4, the two copy engines run: one by itself first ("gpu: step
+  D1"), then both, with a fill and a copy of the card's memory checked
+  by the processor ("gpu: step D2").
+- 5: stage 5, the graphics
+  block's settings ("gpu: step G1"), its RLC ("gpu: step G2"), the compute
+  processor with its KIQ and compute ring 0 ("gpu: step G3"), and a small
+  program of the card's run on that ring, its end and its interrupt
+  checked ("gpu: step G4"). When copy engine 0 does not read its ring at
+  such a boot, G1 and G2 come first and D1 is tried once more; the log
+  says which order worked.
+- 6: stage 6, the graphics ring ("gpu: step G5"): started with its clear
+  state, tested, and a small program run on it. Before that, two words
+  the picture's way goes through (HDP_ADDR_CONFIG and the display's
+  DMIF_ADDR_CALC) are given the card's address layout, each only when it
+  does not hold it already, with the picture watched around those two
+  writes alone; the line says what each held and how many were written.
+  These are the only display-side words any step writes.
+- 7: stage 7, a program's address space ("gpu: step V1"): the kernel makes
+  one, maps a page of the system's memory and a page of the card's memory
+  in it, and runs small programs in it on compute ring 0: one writes a
+  word to each page, one writes where nothing is mapped (the card must
+  report that as a fault, and the line says the page and the decoded
+  fault), and a third shows the ring went on. The address space is given
+  back afterwards; if a program in it did not end, it is emptied and kept
+  until the machine stops instead. This is what the Vulkan driver's
+  programs run in (kernel/gpu_space.mlx).
+At a boot of stage 7 whose V1 passed, the kernel serves programs the
+native calls 80 to 85 on the card (kernel/gpu_work.mlx; spec/04-stdlib/
+os/brix.xml, GpuDevices), and says so in one line ("gpu: programs' work
+on compute ring 0: 7936 MiB of the card's memory and ... MiB of the
+system's for programs, address spaces 1 to 7, streams checked and
+copied"); the card's record (/devices/gpu0) lists compute ring 0 then,
+and at no other boot. A program opens /devices/gpu0 (its owner is the
+person logged in at the seat, and root) and gets memory of the card
+(beyond the part the processor reaches, cleared by the card) or of the
+system (frames the processor maps), maps it into its own address space
+of the card, and submits streams: the kernel copies every stream into
+its own pages, checks each packet on that copy (only those a compute
+stream of our driver has; what was checked is what runs), and runs the
+copy on compute ring 0 in the program's address space; a fence says
+when it is done. A process may have 4 contexts, 64 fences and 256
+mappings; the seven address spaces bound the contexts in all. A fault
+in a program's address space, a privileged register or instruction (told
+to the program whose stream it came in), or a ring that
+hangs loses that program's context ("gpu: context 0 (process 41) lost:
+..."), and the others go on. A ring that does not move for 10 seconds
+is left down until the next boot, said in one line ("gpu: compute ring 0
+has not moved for 10 s ...: it stays down until the next boot; ..."):
+Linux's way back for it writes words whose reach on the display its
+sources do not say.
+
+So with 7 held, vkinfo says "a device = made (its self-test passed) and
+given back" (the self-test, a doubler and a division, runs on the card);
+without it, "not yet: no engine of the card takes commands (the system
+does not start the card's engines for programs at this boot)". The
+desktop composes on the card when its device opens and its first frame
+is the processor's pixel for pixel, else on the processor; its log says
+which in one line ("renderer: the Vulkan device ... composes the
+desktop: ..." or "renderer: ... composing on the processor"). tests/517
+and 518 hold the calls and the driver on them on a card that is a
+table.
+The rings are stopped again when the machine restarts or powers off.
+
+On the machine: hold 6 while it starts and look for the line "gpu: step
+G5: the graphics ring: started, its clear state taken (916 words) ...";
+then hold 7 and look for "gpu: step V1: address space 1 (directory at
+...) ... an unmapped write faulted as it should (page 0x12345, a write,
+...); the ring went on". If a step fails, its line says why, and the
+log shows the card's state; the steps before it stay up.
+
+F keeps every stage at 0. One line says which stage a boot goes to and
+why ("gpu: this boot: the card's engines up to stage 2, the interrupt
+ring (2 was pressed at this start and holds for this boot only)"). Each
+step has one line that says whether it worked; a step that fails puts
+its registers back as the firmware had them and no later step runs (a
+failed F1 leaves the SMC held in reset and the kernel watching the
+card's temperature, a failed F2, D1, D2 or G step leaves the engines
+halted). No
+step writes a register of the display's but G5 its one word
+(DMIF_ADDR_CALC, only where it differs), and the picture is watched
+around each one. From stage 3 on each step says the card's temperature
+before and after, and none begins at 85 C or more; nothing sets a clock,
+a voltage or the fan; while a ring runs the kernel reads the temperature
+once a second, takes no new work at 85 C and stops every ring at 95 C.
+Try 1 first, then 2, 3, 4, 5, 6 and 7. tests/493, 494, 500, 501, 504,
+505, 506 and 507 hold the steps on a card that is a table;
+tools/check_gpu_registers.py holds their numbers against Linux's, and
+tools/check_gpu_clear_state.py the graphics ring's first words.
+
+### A display's mode while the system runs
+
+The mode the boot leaves is not the last word: a display's mode can be
+changed while brixOS runs, tried, and kept or not.
+
+For every display the kernel lists the modes its monitor offers
+(kernel/display_modes.mlx, from the monitor's EDID: every timing it
+writes out, and the ones it only names, a bit of the established
+timings, a standard timing's code, a video code of a CTA-861 extension,
+through the standards' tables, kernel/mode_tables.mlx, which are Linux
+6.6's and held against Linux's file by tools/check_display_modes.py).
+Each mode says whether the display's driver can set it, and when not,
+why: more than the output carries, an interlaced picture, a mode the
+monitor names without a timing the tables have, not this driver. The
+kernel says the sum at boot ("brixOS: display 0: 24 modes, of which its
+driver (QEMU's adapter) can set 20, and any other size its 16 MiB hold;
+it runs 1024x768 at 60.00 Hz") and each mode in its log. The EDID is
+what the firmware passed on through the loader, or what the display's
+driver has read itself; a driver that reads more of the monitor after
+the boot (more blocks, or another monitor plugged in) hands the bytes
+over (gpu.mlx's `modeEdid`) and has the modes listed anew (modes.mlx's
+`relist`).
+
+A program asks through the display's node (spec/04-stdlib/os/brix.xml,
+Displays: the calls display_modes and display_mode; std.displaymodes).
+The mode asked for is set and is pending. Unless it is confirmed within
+fifteen seconds, the kernel itself puts the mode before back and says so:
+a mode the monitor does not show cannot be answered for, so no answer
+means no. Confirmed, it stays, and it is what the next boots set, in
+place of the monitor's own. Root may ask, and the program that draws on
+the display when the display's node is its user's: a session's
+compositor, once whoever starts the session has given the display's
+node to the session's person (node_own). The login does that: sentinel
+gives every display's node to the person whose session (or to the
+greeter's account, whose greeter) it starts, before that program takes
+its identity (projects/desktop/login/native.mlx, `giveDisplays`), so the
+person before keeps nothing of it. Nobody else.
+
+From a shell, as root, that is the image's tool `display`:
+
+    display                 every display and its modes
+    display 1920x1080       sets it and asks: "Can you read this? Press
+                            Enter within 15 seconds to keep it"; Enter
+                            keeps it, anything else or nothing brings
+                            the mode before back
+    display ask 1920x1080   sets it and leaves it pending (for a script)
+    display confirm         the pending mode stays
+    display back            the pending mode is taken back
+    display state           what runs, what is pending
+
+From the desktop, which is how it is meant to be done:
+
+1. Open Settings (the top bar's control centre, or `control display`)
+   and its Display page. It names who sets the display's modes ("Radeon,
+   HDMI or DVI" on the machine this was built for), the resolution and
+   rate that run, and lists every mode the display can run, the largest
+   first: the one that runs chosen, the monitor's own marked "(the
+   monitor's own)". Under "Not available" are the modes the monitor
+   names that cannot be set, each with the kernel's reason.
+2. Click a mode. The settings program asks the desktop's compositor
+   (kepler: MLXIPC's native format on a channel of its own,
+   projects/desktop/compositor/mode_change.mlx), the compositor asks the
+   kernel, and the screen takes the mode at once. The desktop is laid
+   out for it: the top bar across the new width, the dock in the middle
+   of the new bottom, maximized and tiled windows in the new work area,
+   fullscreen ones on the whole screen, every other window where it was
+   in proportion to the screen and inside it.
+3. On the new picture, in the middle, the desktop asks "Keep this
+   display mode?" and counts the seconds down ("It goes back in 12
+   s."). Enter or Keep keeps it: the kernel remembers it for this
+   monitor. A system that runs from a disk sets it at every boot from
+   then on; one that runs from its image alone (a stick, as the machine
+   this was built for runs it) keeps it until it restarts, and the
+   kernel's log says so. Escape or Go back brings the mode before back
+   at once.
+4. When the monitor does not show the mode chosen (it stays dark, or
+   says it cannot show it), do nothing: after fifteen seconds the kernel
+   itself brings the mode before back, and the desktop follows. The
+   question is drawn by the compositor and the time is counted by the
+   kernel, so this holds whatever program the settings were in.
+5. Kept a mode that later turns out bad (another monitor, a cable that
+   carries less)? Hold N while the machine starts: the kernel forgets the
+   remembered mode and sets the monitor's own again.
+
+Whatever changes the display's mode (the desktop, `display` from a
+shell, the kernel taking a mode back), the programs that draw on the
+screen follow it: the desktop's compositor and mlx-console map the new
+picture, take its size and draw all of it again (the console's program
+is told its new size in cells; the `display` tool's own question is
+then on the new picture). The boot animation (ignition) does not: it
+runs only the few seconds before the desktop or the console takes the
+screen, and a mode is changed then only by hand from the serial shell;
+it then goes on drawing into the memory of the old picture until it
+quits, and the picture it hands on (a file of the old size) is not one
+the next program fades in from. Under the desktop the desktop's
+question is the one to answer: it has the keys while it is up, so in a
+terminal there use `display ask` (or the Display page) rather than the
+tool's own question. tools/check_brix_modes_desktop.sh does
+all of the above on QEMU's adapter (the desktop as root and a person's
+session, a mode kept and the next boot in it, mlx-console), with
+screenshots. (A system installed on a disk keeps the kernel's file, but
+cannot run the desktop yet: the kernel makes no listener node, the
+Wayland socket, in a directory of a brixfs volume. The check makes the
+next boot's image with the file the kernel wrote instead.)
+
+What sets a mode is the display's driver, behind one seam
+(display_modes.mlx's `Driver`):
+
+- QEMU's adapter (kernel/bochs.mlx: the standard VGA, secondary-vga and
+  bochs-display, PCI 1234:1111): a mode is a size, set by the adapter's
+  registers; every mode its EDID names and any other size its memory
+  holds (a width in steps of eight). This is what tools/check_brix_modes.sh
+  runs every part on.
+- A Radeon's HDMI or DVI output (kernel/gpu_change.mlx, from gpu.mlx):
+  the mode set that runs at boot, made for the timing asked for from
+  what the card runs at that moment, and carried out with the same
+  checks and the same way back (the mode before, where the boot's way
+  back is the firmware's). Every other processor stands still while the
+  card is written (smp.mlx's `holdOthers`: an interrupt brings each to a
+  halt where it is, and it goes on when the change is over; bounded at
+  60 seconds whatever happens). By the times the boot's own mode set
+  took on the card this was built on that is about half a second: the
+  tenth of a second the monitor is given to see the signal gone, the two
+  times the frames are counted, a twentieth of a second of states waited
+  for, and the tables' own runs. It has not been measured as a whole
+  yet: the log says the figure after each change ("gpu: every other
+  processor stood still for the change, ... ms"). What gpu_set.mlx says
+  on the way speaks of
+  "the monitor's own mode" and "the firmware's state", as at boot: here
+  they are the mode asked for and the mode that runs, and a line before
+  them says so. A request is carried out whatever the boot's choice was
+  (after F too: the firmware's picture was kept at boot, and the mode
+  asked for by hand later has the fifteen seconds' net).
+  Not there: another rate of the size that runs (the plan takes a size
+  that runs as done), and a mode whose clock the output does not carry
+  (the list says the output's most).
+- Every other display: the modes are listed, and a request is refused
+  with the reason: a Radeon's DisplayPort output ("the display's driver
+  changes the mode of an HDMI or DVI output only"), a display that is as
+  the firmware left it ("no driver of this system sets its mode").
+
+After a change the display's node says the new picture (its size, its
+pitch; node_map gives its memory, which on the Radeon is another part of
+the card's memory), the kernel's console is on it where it was on the
+old one, and every handle of the node has the state "changed" until its
+holder has read the node again. A program that still has the old picture
+mapped keeps that mapping: the kernel does not take it away (a fault
+would end the program, and the one that draws is the desktop). On the
+Radeon a new picture is never put where the picture just before it lay
+(two places in the card's memory, used in turn), so what a program one
+change late draws there is not seen; one that is two changes late (it
+did not look again across a change and its taking back) may draw onto
+the picture shown. QEMU's adapter shows its picture from the start of
+its memory whatever its size, so there a late program's drawing lands
+on the new picture, sheared, until it reads the node and maps it anew.
+
+What is remembered is a file, /system/settings/display-modes, written by
+the kernel when a mode is confirmed (a line a display: its adapter, its
+monitor by the name in its EDID, the mode: "mode 1002:67df
+4c2d123478563412 1920x1080@60000") and read at boot, after the GPU's
+probe. It is remembered for that monitor on that adapter: another
+monitor gets its own mode. A system that runs from its image alone has
+no disk to keep it on, and says so when a mode is confirmed. On the
+Radeon the boot sets the monitor's own mode first, as ever, and then the
+remembered one by the same change a request makes.
+
+When 2 KiB do not hold every monitor's line, the lines confirmed longest
+ago are left out. A remembered mode that a boot tries and that fails
+(the display was written and the mode did not come) is forgotten, and
+the log says so: tried at every boot it would darken every start. One
+that cannot be set at a boot, with nothing written, stays remembered.
+A confirmation that comes after the fifteen seconds finds the mode
+before back, even when the timer's tick has not come yet to take it
+back.
+
+The boot's choice goes before what is remembered:
+
+- F (the firmware's picture is kept): nothing is set, a remembered mode
+  neither; it stays remembered.
+- N pressed at this start means the monitor's own mode, and brings it
+  back when a remembered mode turned out badly: the remembered mode is
+  not set and is forgotten ("brixOS: display 0: N was pressed at this
+  start: the mode remembered for this monitor, 1920x1080 at 60.00 Hz, is
+  forgotten, and its own mode is what the boots set again").
+- Without a key the remembered mode is set ("brixOS: display 0: the
+  mode remembered for this monitor is set: 1920x1080 at 60.00 Hz (N
+  while the machine starts sets the monitor's own mode again and forgets
+  this one)").
+
+On the Radeon the mode a program asks for, the hot plug lines with the
+EDIDs read over DDC, and the monitor followed to another output are one
+driver (kernel/gpu_together.mlx), with one user of the card's display
+at a time:
+
+- While a mode is set, nothing looks at the lines and no EDID is read;
+  a reading that is under way is let end first ("gpu: connector 3
+  (HDMI): the reading of its EDID that is under way is let end before
+  the card is written"), never cut in the middle. While the picture is
+  brought to another output a program's request is answered "busy".
+- After a mode change, the monitor moved to another output gets the
+  picture with the mode that runs. After a move, the display's modes
+  are those of the monitor it is on now, read from its EDID, and the
+  next change is made for that output.
+- A monitor moved while a mode waits to be confirmed: the mode before
+  is put back first ("gpu: the picture is to be brought to connector 3
+  (HDMI) while a mode asked for waits to be confirmed: the mode before
+  is put back first"), then the picture is brought over. A second
+  monitor, or the monitor switched off and on, leaves the question as
+  it is.
+
+tests/489_display_modes_runtime.mlx holds the lists, every request and
+the remembered file on the host; tests/498_gpu_together_runtime.mlx the
+mode change, the hot plug lines and the move together, each in the
+middle of the others; tests/490_gpu_mode_change_runtime.mlx
+the Radeon's change against a card that is a table (the same writes and
+table runs as a boot's mode set for that timing, the picture's two
+places in turn, a failure at every table); tools/check_brix_modes.sh the
+whole of it on QEMU's adapter, with the screen dumped after each step.
 
 ## The network
 
@@ -1249,6 +2042,250 @@ run reach.mlx (the netmask's rule, everyone's addresses, the way a
 packet takes) and halfopen.mlx (the table's rules) on the host.
 Not yet: IPv6, a second link, the configuration changed while the
 system runs.
+
+## The kernel log handed over (logpush)
+
+A boot whose screen stays dark cannot be photographed. So the machine
+hands its kernel log over by itself: logpush
+(projects/brix/tools/logpush) uploads it over HTTPS into a private
+GitHub repository of the machine's owner, from where whoever looks into
+the boot (and has been let into that repository) reads it. Nothing is
+ever uploaded into this project's own, public repository: logpush knows
+no repository but the one its settings name, asks GitHub about that one
+before every upload and uploads nothing unless the answer says it is
+private, and the token its owner makes for it can write nowhere else.
+
+### Once: the repository, the token, the file
+
+1. On GitHub, make a **private** repository for the logs (any name, say
+   `brix-logs`), with "Add a README file" ticked so that it has a
+   branch.
+2. Make a token that may write that one repository and nothing else:
+   Settings, Developer settings, Personal access tokens, Fine-grained
+   tokens, Generate new token; Repository access: "Only select
+   repositories" and the one repository; Permissions, Repository
+   permissions, Contents: "Read and write" (GitHub adds Metadata:
+   Read-only itself). Its text begins with `github_pat_`.
+3. In this checkout's top directory, write the file `logpush.local`
+   with an editor: two lines, the repository and the token.
+
+       OWNER/brix-logs
+       github_pat_...
+
+   .gitignore names the file, the copies an editor leaves beside it
+   (`logpush.local~`, `.logpush.local.swp`, `logpush.local.bak`, a
+   `.txt` added to its name) and every name that begins with
+   `logpush.local` (`logpush.local2`, `logpush.local-old`): git does
+   not show them and no commit takes them. Keep it that way (`chmod 600
+   logpush.local`; never `git add -f`; no copy of it under a name that
+   does not begin so).
+4. Build as always, `./mlx build brix`, and copy
+   mlx-out/bin/brix/esp/EFI/BOOT/BOOTX64.EFI to the machine. The build
+   takes the file into the image as /system/settings/logpush when it is
+   there; without the file the image is the one everyone builds, and
+   uploads nothing. (An image that is built already takes it without a
+   build: `mlx-out/bin/brix-image --add BOOTX64.EFI BOOTX64.EFI
+   settings/logpush=logpush.local`.)
+
+That image carries the token: it is for the one machine, not to be
+published or passed on. A token that got out is revoked on the same
+GitHub page, and a new one written into the file.
+
+Further lines may follow the two, each a word and what it sets:
+`machine NAME` (this machine's name in the paths, else `brix`),
+`branch NAME` (else the repository's own), `again SECONDS` (when the
+second upload of a boot comes, else 120; 0: none), `api https://HOST`
+(a GitHub of one's own instead of api.github.com). Lines that begin
+with `#` are notes.
+
+### What then happens by itself
+
+logpush.service starts `logpush boot` at every boot, in the background:
+nothing waits for it, the shell and the desktop come as fast as
+without it. It waits until the network has an address (90 seconds at
+most; DHCP answers a few seconds into the boot), then uploads, each as
+a new file:
+
+    MACHINE/2026-11-17T20-41-07Z/klog-0000031.482s.txt
+        the kernel log (/devices/klog) as it was 31.482 seconds after
+        the boot of that date and time (UTC, by the machine's clock)
+    MACHINE/2026-11-17T20-41-07Z/previous-boot-klog.txt
+        the log of the boot before, as klogsave kept it on a brixfs
+        volume (boot.previous.log): after a boot that went dark, this
+        is that boot's log. Once a boot.
+    MACHINE/gpu-rom-1a2b3c4d5e6f7a8b.rom
+        the graphics card's ROM as the kernel read it (/devices/gpurom),
+        named by its bytes (the start of their SHA-256): the same ROM is
+        the same name at every boot, and a name the repository has is
+        not uploaded again
+
+The directories sort by time; the newest is the last boot. Two minutes
+after its first upload the service uploads the log once more, when it
+has grown (what is tried on the machine happens during the boot and
+after it). What stands in the way for a moment (no name server yet, no
+answer, GitHub's side) is tried again, five times in all, 5, 10, 20 and
+40 seconds apart; what will not pass by waiting (a token GitHub does
+not take, a certificate that is not trusted) is said once and not tried
+again. A try after the first uploads only what did not go before: the
+kernel log, once uploaded, stays one file while the log of the boot
+before or the ROM is tried again, and the second upload, two minutes
+later, takes with it what of them the first could not get through.
+
+What it did is a line each in /temporary/logs/logpush.log (`cat` it):
+
+    logpush: uploaded the kernel log (48213 bytes) as brix/2026-11-17T20-41-07Z/klog-0000031.482s.txt
+
+Then the service stays, asleep, for the next part. (In an image without
+settings it says that in one line and ends. `impulsectl status` shows
+the one that stays as "starting": a oneshot that has not ended.)
+
+### By hand
+
+    logpush
+
+uploads the kernel log as it is at that moment, as often as wanted
+(each a file of its own name in the boot's directory), and says the
+same lines on the terminal. In root's shell (the serial console's)
+logpush reads the settings and uploads itself. In the desktop's
+terminal the person logged in is `brix`, who may not read the settings;
+there logpush asks the service to upload (over a listener node,
+/temporary/logpush: brixOS's own way from one program to another) and
+says the lines the service sends back. The service takes nothing from
+the asker, uploads what it always uploads to where its settings say,
+and answers one upload in three seconds at most.
+
+### A system installed on the machine's disk
+
+All of the above is the system as the boot image carries it. On a
+machine where `install` once copied the system onto a volume, /system
+is the disk's from then on and the boot image's own is at /volumes/boot:
+a new BOOTX64.EFI brings a new kernel, and the programs, services and
+settings stay the disk's. There logpush uploads only when the installed
+system has it: a system installed from an image with logpush and its
+settings (`install` copies /system/settings/logpush with the rest and
+keeps its mode, 0600, so the token is then on that volume as well; the
+volume's blocks are root's alone to read like every disk's). After an
+image with a new token, or the first one with logpush: install again
+(`install` says how: the volume's system directory removed first). And
+on an installed system `logpush` by hand works in root's shell alone:
+/temporary is on the disk there, a directory of a volume holds no
+listener node, and the service ends after its uploads instead of
+staying for askers (its log has the uploads, `impulsectl status` says
+"done").
+
+### What a line means
+
+    no settings (/system/settings/logpush)
+        the image was built without logpush.local: step 3 and 4
+    line N of the settings is not a repository's name / not a token /
+    none logpush knows
+        logpush.local's line N is wrong (the line itself is never
+        shown: it may be the token)
+    this machine has no network device / the network link is down /
+    this machine has no address yet
+        the machine's side: no driver for its card, no cable, no answer
+        from a DHCP server yet (`sysinfo`, the Network page)
+    the name api.github.com cannot be looked up ... / was not found
+        no name server came with the address, none answered, or the
+        network's own name server does not know GitHub
+    api.github.com refused the connection / did not answer
+        something between the machine and GitHub does not let port 443
+        through. logpush speaks to GitHub itself: it knows no proxy
+    the certificate of api.github.com is not trusted: ...
+        what answered is not GitHub as the image knows it: a root that
+        is not in /system/settings/certificates (a proxy that opens
+        TLS, or GitHub with a new authority: then the file needs that
+        root), another host's certificate (a network's login page), or
+        one that is expired or not valid yet by the machine's clock
+        (the date is said: set the clock). Nothing was sent
+    this machine's clock is not set (it says 2000-01-01)
+        the clock reads before 2026: a certificate cannot be judged
+        without the date, so nothing is sent. Set date and time in the
+        firmware's setup, as UTC
+    this machine's processor has no source of random numbers
+        the kernel's random numbers come from the clock alone there,
+        and a TLS key made of them could be worked out: the token is
+        not sent (a processor since about 2012 has one; the kernel's
+        log says "random numbers keyed from ...")
+    401: GitHub does not take the token
+        mistyped, expired or revoked: a new token into logpush.local,
+        a new image
+    403: the token may not do this
+        the token lacks "Contents: Read and write" for this repository
+        (or GitHub's limit of requests is reached: later)
+    404: no repository OWNER/NAME, or the token may not see it
+        the name in logpush.local, or the token is for another
+        repository
+    OWNER/NAME is a public repository
+        logpush uploads into private repositories only: make it
+        private on GitHub (Settings, Danger Zone)
+    409 / 500 and above / the connection ended before the answer was
+    whole
+        GitHub's side or the way there, for the moment: the service
+        tries again by itself
+    410: GitHub no longer takes the API version this logpush speaks
+        logpush asks for GitHub's API version 2022-11-28, which GitHub
+        serves until 2028-03-10 (its documentation in November 2026):
+        after that a newer logpush, with the version GitHub serves
+        then, and a new image
+    422: GitHub does not take the file
+        the branch of a `branch` line is not there (a name that is
+        taken is tried under the next one before this is said)
+    the settings ... are the system's alone to read, and the service
+    that uploads for everyone else is not running
+        logpush by hand as a user who is not root, and the service was
+        stopped or has ended: its log says why
+
+### The token on the machine
+
+The settings are in the boot image (and, where the system was installed
+on the machine's disk from that image, in the copy `install` made on
+the volume) and nowhere else. The kernel gives
+/system/settings/logpush to the system's user alone (mode 0600, as
+/system/settings/shadow), and the disks' blocks as well
+(/devices/disk*: the boot image is on one of them): a program of the
+person logged in (brix) can read neither, and gets nothing of the
+settings from the service it asks. What such a program can do is ask
+for uploads (one in three seconds at most, of what the service always
+uploads) and take the service's listener away: /temporary is every
+user's to write, and the kernel does not yet keep one user's node there
+from another, so a user's program can remove /temporary/logpush or put
+up a listener of its own that answers `logpush` by hand with lines of
+its own. No upload and nothing of the settings comes of that; after it
+`logpush` by hand works in root's shell, or again for everyone once the
+service is started anew (`impulsectl restart logpush`).
+
+logpush reads the token from that file itself and sends it in the
+request's header, over TLS, to the host of the settings; it is in no
+argument, no environment, no line logpush says (every line is searched
+for it before it goes out) and no upload. The service's log is
+everyone's to read (as every service's in /temporary/logs); should
+logpush ever crash there, std.crash's report in it shows the
+processor's registers, and a register may hold eight bytes of what the
+program had in hand at that moment, the token too while a request is
+made: a log with a crash report in it is not to be passed on whole.
+The chain of certificates must lead to a root in
+/system/settings/certificates (the image carries six: the roots of the
+two authorities that sign and signed for GitHub, Sectigo's and
+DigiCert's; projects/brix/settings/certificates says which, with their
+fingerprints) and the certificate must be api.github.com's; nothing in
+the program switches that off, and a redirect is never followed. The
+key of the TLS connection is made of the kernel's random numbers
+(kernel/random.mlx: ChaCha20 under a key from the processor's own
+source, RDSEED or RDRAND; system_info says whether the processor had
+one, and without one logpush sends no token). The network is brixOS's
+own socket calls (std.net on brixOS), not the Linux layer.
+
+tests/487_logpush_runtime.mlx tries the program on the host against
+servers of its own (the requests byte for byte, the settings in every
+form, every answer, TLS that verifies and TLS that does not, the token
+in no line), tests/488_kernel_random_runtime.mlx the kernel's
+generator; tools/check_brix_logpush.sh boots it all in QEMU against a
+server on the host that plays the API, without TLS and behind std's
+own TLS server (`test-endpoint http://HOST:PORT` in the settings is for
+the former: an address without TLS, which takes only a token that
+begins with `test-`, so that no real token can go out in the clear
+whatever a settings file says).
 
 ## brixfs: the disk's format
 

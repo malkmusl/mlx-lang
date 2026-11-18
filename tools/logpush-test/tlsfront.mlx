@@ -1,0 +1,156 @@
+// For tools/check_brix_logpush.sh: TLS in front of the check's server,
+// on the host. It makes a root and a server's certificate for ADDRESS
+// (std.asn1 and Ed25519, tools/http-test-server/certs.mlx; fresh keys at
+// each start), writes the root as PEM to ROOT (what the check puts into
+// an image as the certificates brixOS trusts), and answers TLS 1.3
+// (std.tls.server) on PORT of the loopback: each request that comes
+// through it is passed on, as it is, to the server without TLS on
+// BACKEND, and that one's answer back through TLS.
+//
+//     tlsfront PORT BACKEND ROOT ADDRESS    ADDRESS as a.b.c.d: where the
+//                                           machine in QEMU finds the host
+//                                           (10.0.2.2)
+//
+// It says "tlsfront: ready" when it listens, and runs until it is ended.
+const std = @import("std")
+const net = @import("std.net")
+const random = @import("std.random")
+const tls = @import("std.tls.server")
+const certs = @import("../http-test-server/certs.mlx")
+const process = std.linux.process
+
+const ROOM: usize = 1048576
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+
+var held: [ROOM]u8 = undefined // (per run)
+
+// Where an HTTP message's head ends in `bytes` (after its empty line);
+// 0 when it has not ended yet.
+fn headEnd(bytes: []const u8) -> usize {
+    const found = std.text.find(bytes, "\r\n\r\n")
+    return if found < bytes.length { found + 4 } else { 0 }
+}
+
+// The body's length a head gives ("Content-Length: N", in any case); 0
+// when it gives none.
+fn bodyLength(head: []const u8) -> usize {
+    const name = "content-length:"
+    var at: usize = 0
+    while at + name.length < head.length {
+        var matches = at == 0 || head[at - 1] == 10
+        var k: usize = 0
+        while matches && k < name.length {
+            const byte = if head[at + k] >= 65 && head[at + k] <= 90 { head[at + k] + 32 } else { head[at + k] }
+            if byte != name[k] { matches = false }
+            k += 1
+        }
+        if matches {
+            var value: usize = 0
+            var d = at + name.length
+            while d < head.length && head[d] == 32 { d += 1 }
+            while d < head.length && head[d] >= 48 && head[d] <= 57 {
+                value = value * 10 + @intCast(usize, head[d] - 48)
+                d += 1
+            }
+            return value
+        }
+        at += 1
+    }
+    return 0
+}
+
+// One HTTP message into `held`, from the TLS connection (`server`) or
+// from the socket `fd`: its length, 0 when the connection ended first.
+fn message(secure: bool, server: *tls.Server, fd: isize) -> usize {
+    var length: usize = 0
+    var whole: usize = 0
+    while whole == 0 || length < whole {
+        if length == ROOM { return 0 }
+        const room: [*]u8 = unsafe { @ptrFromInt([*]u8, @intFromPtr(&held) + length) }
+        const got = if secure { tls.receive(server, room, ROOM - length) } else { net.receive(fd, room, ROOM - length) }
+        if got <= 0 { return 0 }
+        length += @intCast(usize, got)
+        if whole == 0 {
+            const head = headEnd(held[0..length])
+            if head != 0 { whole = head + bodyLength(held[0..head]) }
+        }
+    }
+    return length
+}
+
+// A connection that came: the handshake, then request for request to the
+// backend and its answer back.
+fn serve(fd: isize, backendPort: u16, chain: [*]const tls.Certificate, seed: [*]const u8) -> void {
+    var server: tls.Server = undefined
+    if !tls.accept(&server, fd, chain, 1, seed) { return }
+    const address = net.ipv4(127, 0, 0, 1, backendPort)
+    const backend = net.connect(&address, 5000)
+    if backend < 0 {
+        tls.close(&server)
+        return
+    }
+    while true {
+        var length = message(true, &server, fd)
+        if length == 0 || !net.send(backend, held[0..length]) { break }
+        length = message(false, &server, backend)
+        if length == 0 || !tls.send(&server, held[0..length]) { break }
+    }
+    net.close(backend)
+    tls.close(&server)
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    if std.process.count(arguments) != 5 {
+        say("usage: tlsfront PORT BACKEND ROOT ADDRESS\n")
+        return 2
+    }
+    const port = std.parse.unsigned(std.process.argument(arguments, 1))
+    const backend = std.parse.unsigned(std.process.argument(arguments, 2))
+    var name: net.Address = undefined
+    if !port.valid || !backend.valid || port.value > 65535 || backend.value > 65535 || !net.parseAddress(std.string.asSlice(std.process.argument(arguments, 4)), 0, &name) || name.family != net.Family.ipv4 {
+        say("tlsfront: PORT and BACKEND are ports, ADDRESS an IPv4 address\n")
+        return 2
+    }
+    var rootSeed: [32]u8 = undefined
+    var serverSeed: [32]u8 = undefined
+    if !random.fill(&rootSeed, 32) || !random.fill(&serverSeed, 32) { return 1 }
+    var rootDer: [certs.ROOM]u8 = undefined
+    var serverDer: [certs.ROOM]u8 = undefined
+    const rootLength = certs.make("logpush check root", &rootSeed, "logpush check root", &rootSeed, 1, true, &rootDer)
+    const serverLength = certs.makeFor("logpush check server", &serverSeed, "logpush check root", &rootSeed, 2, false, "host.logpush.test", name.bytes[0..4], &serverDer)
+    if rootLength == 0 || serverLength == 0 { return 1 }
+    var pem: [2 * certs.ROOM + 128]u8 = undefined
+    const pemLength = certs.pem(rootDer[0..rootLength], &pem)
+    if !std.fs.writeFile(arguments[3], &pem, pemLength, 420) {
+        say("tlsfront: cannot write the root\n")
+        return 1
+    }
+    var chain: [1]tls.Certificate = undefined
+    chain[0] = tls.Certificate.{ .der = &serverDer, .length = serverLength }
+    const loopback = net.ipv4(127, 0, 0, 1, @intCast(u16, port.value))
+    const listener = net.listen(&loopback, 8)
+    if listener < 0 {
+        say("tlsfront: cannot listen\n")
+        return 1
+    }
+    say("tlsfront: ready\n")
+    while true {
+        var peer: net.Address = undefined
+        const fd = net.accept(listener, &peer)
+        if fd < 0 { return 1 }
+        // Each connection in a process of its own (a handshake that
+        // does not end keeps nobody else waiting); those that ended are
+        // taken off.
+        const child = process.fork()
+        if child == 0 {
+            net.close(listener)
+            serve(fd, @intCast(u16, backend.value), &chain, &serverSeed)
+            std.linux.exitGroup(0)
+        }
+        net.close(fd)
+        var status: usize = 0
+        while process.waitProcess(-1, &status, 1) > 0 {}
+    }
+    return 0
+}

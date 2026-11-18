@@ -1042,6 +1042,23 @@ shifts_powers_of_two() {
     return $ok
 }
 
+# Whether programs $1 builds keep their globals that start zero out of the
+# file, in a .bss in memory only (tests/support/zero_data_static.mlx, test
+# 512's program static, exits 13); earlier compilers wrote every global's
+# bytes into the file, and the Vulkan driver's working arrays made the
+# brixOS image too large for its place below the kernel's arena.
+keeps_zero_data_out_of_files() {
+    local probe status=0
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    if "$1" --quiet tests/support/zero_data_static.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+    else
+        status=1
+    fi
+    rm -rf -- "$probe"
+    [[ $status -eq 13 ]]
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -1114,6 +1131,7 @@ probes=(
     "ends_statements_after_postfix|a statement ended by a line's last .* or .?"
     "addresses_constants|the address of a module-level constant"
     "shifts_powers_of_two|divisions and products by a constant power of two as shifts and masks"
+    "keeps_zero_data_out_of_files|globals that start zero in a .bss, out of the program's file"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

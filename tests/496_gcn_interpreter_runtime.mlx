@@ -1,0 +1,1108 @@
+// The interpreter of the RX 580's shader code (projects/brix/vulkan/
+// wave.mlx, built for the host) on programs assembled here an instruction
+// at a time (encode.mlx), each run as one wave and its registers read
+// afterwards:
+// - each instruction's effect, worked out by hand from the NIR operation
+//   ACO selects it for (Mesa's nir_opcodes.py) and the flags as ACO uses
+//   them: the scalar adds' carry and borrow in scc, the logic operations'
+//   scc (not zero), shifts whose count is cut to five bits, s_cselect,
+//   s_movk's sign, the 64-bit moves and logic, the saveexec forms (exec
+//   and the old exec), a difference of equal values (no borrow), v_cmpx
+//   with lanes off, the twelve scalar comparisons at the signed and
+//   unsigned edges and s_cmp_lg_u64; the vector adds and subtractions with
+//   their carries into vcc and into any scalar pair, the carry in, the low
+//   and high products signed and unsigned, the shifts by their first
+//   source, and, or, xor, not, min and max, v_cndmask by vcc and by a
+//   pair, every comparison condition of i32 and u32 and v_cmpx writing
+//   exec, v_readfirstlane, the conversions, the reciprocal, a float
+//   product, v_mul_u32_u24, v_mad_u32_u24 and v_bfe_u32; lanes that are
+//   off left alone, and a comparison's and a carry's bits for them ones;
+// - scalar loads of one, two and four words, buffer loads and stores with
+//   the offset in a register, the scalar offset and the immediate one;
+// - the branches on scc, vcc and exec, and s_branch backwards;
+// - the work group's start: user data, group ids, local ids of an 8 x 8
+//   group and of a group of 100 (a second, partial wave), exec;
+// and what it must refuse, each with its reason and where:
+// - a load's register read or written before an s_waitcnt let it come,
+//   vmcnt counting in order, lgkmcnt(n) saying nothing of a scalar load
+//   while more than n are out, and the program ending with memory still
+//   counted;
+// - each of the ten wait-state rules of the study's table for GFX8 (the
+//   ninth for stores of three and four registers, and not with an SGPR
+//   as the scalar offset), one instruction short (refused, the rule's number) and with enough s_nop
+//   (passed: the run then stops only at what is not modelled, or ends);
+// - two scalar values on a vector instruction's constant bus (two SGPRs,
+//   an SGPR and a literal, an SGPR beside v_cndmask's vcc), but one SGPR
+//   twice;
+// - a buffer access past the descriptor's range, an address no region
+//   holds, a store into a region that may not be written; a register no
+//   instruction wrote in that lane, one beyond the program's count, the
+//   scratch descriptor's s0; a conversion out of range, a reciprocal of
+//   0; an instruction that is not modelled; words that are no
+//   instruction; a branch off the program; a run that does not end.
+// With an argument, each failing check is printed.
+// Exits 13.
+const std = @import("std")
+const isa = @import("../projects/brix/vulkan/isa.mlx")
+const encode = @import("../projects/brix/vulkan/encode.mlx")
+const wave = @import("../projects/brix/vulkan/wave.mlx")
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+
+fn sayNumber(value: u64) -> void {
+    var digits: [20]u8 = undefined
+    var at: usize = 20
+    var rest = value
+    while true {
+        at -= 1
+        digits[at] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    say(digits[at..20])
+}
+
+var failed: u16 = 0
+var show = false
+
+fn check(number: u16, holds: bool) -> void {
+    if holds { return }
+    if failed == 0 { failed = number }
+    if show {
+        say("check ")
+        sayNumber(@intCast(u64, number))
+        say(" fails\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Assembling
+
+var code: [4096]u32 = undefined
+var count: usize = 0
+var bad = false
+
+fn emit(i: encode.Inst) -> void {
+    var words: [3]u32 = undefined
+    const n = encode.encode(&i, words[0..])
+    if n == 0 {
+        bad = true
+        return
+    }
+    var k: usize = 0
+    while k < n {
+        code[count] = words[k]
+        count += 1
+        k += 1
+    }
+}
+
+fn begin() -> void {
+    count = 0
+    bad = false
+}
+
+fn v(n: u16) -> u16 { return encode.VGPR + n }
+fn k(value: u32) -> u16 { return encode.constant(value) }
+
+fn sop2(op: isa.Op, d: u16, a: u16, b: u16) -> void {
+    var i = encode.blank(op)
+    i.dst = d
+    i.src0 = a
+    i.src1 = b
+    emit(i)
+}
+
+fn sop2l(op: isa.Op, d: u16, a: u16, b: u16, literal: u32) -> void {
+    var i = encode.blank(op)
+    i.dst = d
+    i.src0 = a
+    i.src1 = b
+    i.literal = literal
+    emit(i)
+}
+
+fn sop1(op: isa.Op, d: u16, a: u16) -> void {
+    var i = encode.blank(op)
+    i.dst = d
+    i.src0 = a
+    emit(i)
+}
+
+fn movl(d: u16, value: u32) -> void {
+    var i = encode.blank(isa.S_MOV_B32)
+    i.dst = d
+    i.src0 = encode.constant(value)
+    i.literal = value
+    emit(i)
+}
+
+fn sopc(op: isa.Op, a: u16, b: u16) -> void {
+    var i = encode.blank(op)
+    i.src0 = a
+    i.src1 = b
+    emit(i)
+}
+
+fn sopp(op: isa.Op, imm: u32) -> void {
+    var i = encode.blank(op)
+    i.imm = imm
+    emit(i)
+}
+
+fn vop2(op: isa.Op, d: u16, a: u16, b: u16) -> void {
+    var i = encode.blank(op)
+    i.dst = d
+    i.src0 = a
+    i.src1 = b
+    emit(i)
+}
+
+fn vop2l(op: isa.Op, d: u16, a: u16, b: u16, literal: u32) -> void {
+    var i = encode.blank(op)
+    i.dst = d
+    i.src0 = a
+    i.src1 = b
+    i.literal = literal
+    emit(i)
+}
+
+fn vop1(op: isa.Op, d: u16, a: u16) -> void {
+    var i = encode.blank(op)
+    i.dst = d
+    i.src0 = a
+    emit(i)
+}
+
+fn vop1l(op: isa.Op, d: u16, value: u32) -> void {
+    var i = encode.blank(op)
+    i.dst = d
+    i.src0 = encode.LITERAL
+    i.literal = value
+    emit(i)
+}
+
+// The VOP3 form: VOP1/2/C ones made so, and the VOP3 ones.
+fn vop3(op: isa.Op, d: u16, d2: u16, a: u16, b: u16, c: u16) -> void {
+    var i = encode.blank(op)
+    if op.format != isa.Format.vop3 { i.form = encode.Form.vop3 }
+    i.dst = d
+    i.dst2 = d2
+    i.src0 = a
+    i.src1 = b
+    i.src2 = c
+    emit(i)
+}
+
+fn smem(op: isa.Op, d: u16, base: u16, offset: u32) -> void {
+    var i = encode.blank(op)
+    i.dst = d
+    i.src0 = base
+    i.flags = encode.IMM
+    i.imm = offset
+    emit(i)
+}
+
+fn mubuf(op: isa.Op, data: u16, address: u16, resource: u16, soffset: u16, offset: u32, offen: bool) -> void {
+    var i = encode.blank(op)
+    i.dst = data
+    i.src0 = address
+    i.src1 = resource
+    i.src2 = soffset
+    i.imm = offset
+    if offen { i.flags = encode.OFFEN }
+    emit(i)
+}
+
+fn wait(vm: u32, lgkm: u32) -> void { sopp(isa.S_WAITCNT, encode.waitWord(vm, encode.WAIT_EXP_MASK, lgkm)) }
+fn nop(states: u32) -> void { sopp(isa.S_NOP, states - 1) }
+fn end() -> void {
+    wait(0, 0)
+    sopp(isa.S_ENDPGM, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Running one wave
+
+var memory: wave.Memory = undefined
+var result: wave.Result = undefined
+var launch: wave.Launch = undefined
+var data: [256]u32 = undefined
+var table: [64]u32 = undefined
+var locked: [16]u32 = undefined
+
+const DATA: u64 = 0x40000
+const TABLE: u64 = 0x50000
+const LOCKED: u64 = 0x60000
+
+fn setUp() -> void {
+    launch.vgprs = 32
+    launch.sgprs = 64
+    launch.userCount = 6
+    launch.user[2] = @intCast(u32, TABLE)
+    launch.user[3] = 0
+    launch.user[4] = 0x1234
+    launch.user[5] = 0
+    launch.groupIdX = true
+    launch.groupIdY = true
+    launch.groupIdZ = true
+    launch.localIdComponents = 2
+    launch.groupSizeX = 8
+    launch.groupSizeY = 8
+    launch.groupSizeZ = 1
+    launch.rcpError = 0
+    launch.maxSteps = 100000
+    wave.emptyMemory(&memory)
+    _ = wave.addRegion(&memory, DATA, data[0..], true)
+    _ = wave.addRegion(&memory, TABLE, table[0..], false)
+    _ = wave.addRegion(&memory, LOCKED, locked[0..], false)
+    var j: usize = 0
+    while j < 256 {
+        data[j] = 0x1000 + @intCast(u32, j)
+        j += 1
+    }
+    j = 0
+    while j < 64 {
+        table[j] = 0x2000 + @intCast(u32, j)
+        j += 1
+    }
+    // a buffer descriptor at table[0..4]: DATA, 64 words
+    table[0] = @intCast(u32, DATA)
+    table[1] = 0
+    table[2] = 256
+    table[3] = 0
+    // one at table[4..8] for the region that may not be written
+    table[4] = @intCast(u32, LOCKED)
+    table[5] = 0
+    table[6] = 64
+    table[7] = 0
+}
+
+// Runs the assembled program as work group (3, 5, 7).
+fn go() -> wave.Stop {
+    if bad { return wave.Stop.entry }
+    if !wave.load(code[0..count], &result) { return result.stop }
+    if !wave.start(&launch, 3, 5, 7, 0) { return wave.Stop.entry }
+    result.steps = 0
+    wave.run(&launch, &memory, &result)
+    if show && result.stop != wave.Stop.done {
+        say("  stopped ")
+        sayNumber(@intCast(u64, @intFromEnum(result.stop)))
+        say(" at word ")
+        sayNumber(@intCast(u64, result.pc))
+        say(", detail ")
+        sayNumber(result.detail)
+        say("\n")
+    }
+    return result.stop
+}
+
+fn s(r: usize) -> u32 { return wave.wave.s[r] }
+fn lane(r: usize, l: usize) -> u32 { return wave.wave.v[r * wave.LANES + l] }
+fn pair(r: usize) -> u64 { return @intCast(u64, wave.wave.s[r]) | @intCast(u64, wave.wave.s[r + 1]) << 32 }
+fn sccIs(value: bool) -> bool { return wave.wave.sccWritten && wave.wave.scc == value }
+
+// The standard opening: the descriptor into s[12:15], exec as it came.
+fn descriptor() -> void {
+    smem(isa.S_LOAD_DWORDX4, 12, 2, 0)
+    wait(15, 0)
+}
+
+// ---------------------------------------------------------------------------
+
+fn testScalar() -> void {
+    setUp()
+    begin()
+    movl(20, 0xFFFFFFFF)
+    sop2(isa.S_ADD_U32, 21, 20, k(2))
+    sop2(isa.S_CSELECT_B32, 22, k(1), k(0))
+    sop2(isa.S_SUB_U32, 23, k(1), k(2))
+    sop2(isa.S_CSELECT_B32, 24, k(1), k(0))
+    sop2(isa.S_SUB_U32, 25, k(5), k(2))
+    sop2(isa.S_CSELECT_B32, 26, k(1), k(0))
+    sop2l(isa.S_MUL_I32, 27, encode.LITERAL, k(3), 0x80000001)
+    sop2(isa.S_LSHL_B32, 28, k(3), k(33))
+    sop2l(isa.S_LSHR_B32, 29, encode.LITERAL, k(36), 0x80000000)
+    sop2l(isa.S_ASHR_I32, 30, encode.LITERAL, k(4), 0x80000000)
+    sop2(isa.S_AND_B32, 31, k(12), k(3))
+    sop2(isa.S_CSELECT_B32, 32, k(1), k(0))
+    sop2(isa.S_OR_B32, 33, k(12), k(3))
+    sop2(isa.S_XOR_B32, 34, k(12), k(10))
+    sop2(isa.S_ANDN2_B32, 35, k(12), k(4))
+    var i = encode.blank(isa.S_MOVK_I32)
+    i.dst = 36
+    i.imm = 0x8001
+    emit(i)
+    i = encode.blank(isa.S_MOVK_I32)
+    i.dst = 37
+    i.imm = 0x7FFF
+    emit(i)
+    sop1(isa.S_MOV_B64, 38, k(0xFFFFFFFF))
+    sop1(isa.S_NOT_B32, 40, k(0))
+    sop2(isa.S_AND_B64, 42, 38, k(5))
+    sop2(isa.S_OR_B64, 44, k(0), k(0))
+    sop2(isa.S_CSELECT_B32, 46, k(1), k(0))
+    sop2(isa.S_XNOR_B64, 48, k(0), k(0))
+    // a sum of exactly 0xFFFFFFFF carries nothing
+    movl(50, 0xFFFFFFFE)
+    sop2(isa.S_ADD_U32, 51, 50, k(1))
+    sop2(isa.S_CSELECT_B32, 52, k(1), k(0))
+    // a difference of equal values borrows nothing
+    sop2(isa.S_SUB_U32, 53, k(7), k(7))
+    sop2(isa.S_CSELECT_B32, 54, k(1), k(0))
+    end()
+    check(1, go() == wave.Stop.done)
+    check(2, s(21) == 1 && s(22) == 1)
+    check(3, s(23) == 0xFFFFFFFF && s(24) == 1 && s(25) == 3 && s(26) == 0)
+    check(4, s(27) == 0x80000003)
+    check(5, s(28) == 6 && s(29) == 0x08000000 && s(30) == 0xF8000000)
+    check(6, s(31) == 0 && s(32) == 0 && s(33) == 15 && s(34) == 6 && s(35) == 8)
+    check(7, s(36) == 0xFFFF8001 && s(37) == 0x7FFF)
+    check(12, s(51) == 0xFFFFFFFF && s(52) == 0)
+    // (13 is the number of a run that passes: this check is 133)
+    check(133, s(53) == 0 && s(54) == 0)
+    check(8, pair(38) == 0xFFFFFFFFFFFFFFFF && s(40) == 0xFFFFFFFF && pair(42) == 5 && pair(44) == 0 && s(46) == 0 && pair(48) == 0xFFFFFFFFFFFFFFFF)
+
+    // the twelve comparisons at the edges, each into a register by
+    // s_cselect
+    setUp()
+    begin()
+    const ops = [10]isa.Op{ isa.S_CMP_EQ_U32, isa.S_CMP_LG_U32, isa.S_CMP_GT_I32, isa.S_CMP_GE_I32, isa.S_CMP_LT_I32, isa.S_CMP_LE_I32, isa.S_CMP_GT_U32, isa.S_CMP_GE_U32, isa.S_CMP_LT_U32, isa.S_CMP_LE_U32 }
+    movl(20, 0x80000000)
+    movl(21, 0x7FFFFFFF)
+    var at: u16 = 0
+    while at < 10 {
+        sopc(ops[at], 20, 21)
+        sop2(isa.S_CSELECT_B32, 22 + at, k(1), k(0))
+        sopc(ops[at], 21, 21)
+        sop2(isa.S_CSELECT_B32, 32 + at, k(1), k(0))
+        at += 1
+    }
+    sopc(isa.S_CMP_LG_U64, 20, k(0))
+    sop2(isa.S_CSELECT_B32, 42, k(1), k(0))
+    sopc(isa.S_CMP_EQ_U64, 20, 20)
+    sop2(isa.S_CSELECT_B32, 43, k(1), k(0))
+    end()
+    check(9, go() == wave.Stop.done)
+    // 0x80000000 against 0x7FFFFFFF: signed less, unsigned greater
+    const want = [10]u32{ 0, 1, 0, 0, 1, 1, 1, 1, 0, 0 }
+    const same = [10]u32{ 1, 0, 0, 1, 0, 1, 0, 1, 0, 1 }
+    var ok = true
+    at = 0
+    while at < 10 {
+        if s(22 + @intCast(usize, at)) != want[at] || s(32 + @intCast(usize, at)) != same[at] { ok = false }
+        at += 1
+    }
+    check(10, ok)
+    check(11, s(42) == 1 && s(43) == 1)
+}
+
+fn testExec() -> void {
+    // the saveexec forms: exec of the 8 x 8 group is all 64 lanes
+    setUp()
+    begin()
+    movl(20, 0x0000FFFF)
+    movl(21, 0xF0000000)
+    sop1(isa.S_AND_SAVEEXEC_B64, 22, 20)
+    sop2(isa.S_CSELECT_B32, 24, k(1), k(0))
+    sop1(isa.S_MOV_B64, 26, encode.EXEC)
+    sop1(isa.S_OR_SAVEEXEC_B64, 28, k(0))
+    sop1(isa.S_MOV_B64, 30, encode.EXEC)
+    sop1(isa.S_ANDN2_SAVEEXEC_B64, 32, 20)
+    sop1(isa.S_MOV_B64, 34, encode.EXEC)
+    end()
+    check(20, go() == wave.Stop.done)
+    check(21, pair(22) == 0xFFFFFFFFFFFFFFFF && s(24) == 1 && pair(26) == 0xF00000000000FFFF)
+    check(22, pair(28) == 0xF00000000000FFFF && pair(30) == 0xF00000000000FFFF)
+    check(23, pair(32) == 0xF00000000000FFFF && pair(34) == 0)
+    // v_cmpx with lanes off: exec keeps only lanes that were on and whose
+    // comparison holds (the bits of the lanes that were off do not come
+    // back on)
+    setUp()
+    begin()
+    movl(20, 0x0000FFFF)
+    movl(21, 0)
+    sop1(isa.S_MOV_B64, encode.EXEC, 20)
+    var x = encode.blank(isa.V_CMPX_LT_U32)
+    x.src0 = k(3)
+    x.src1 = v(0)
+    emit(x)
+    sop1(isa.S_MOV_B64, 22, encode.EXEC)
+    end()
+    check(25, go() == wave.Stop.done && pair(22) == 0x000000000000F0F0)
+}
+
+fn testVector() -> void {
+    // lanes 0..31 on: every lane's v0 is its x (0..7), v1 its y
+    setUp()
+    begin()
+    movl(126, 0xFFFFFFFF)
+    movl(127, 0)
+    vop1l(isa.V_MOV_B32, v(3), 0xFFFFFFFE)
+    vop2(isa.V_ADD_CO_U32, v(4), v(0), v(3))
+    sop1(isa.S_MOV_B64, 20, encode.VCC)
+    vop3(isa.V_ADD_CO_U32, v(5), 22, k(1), v(3), 0)
+    vop2(isa.V_SUB_CO_U32, v(6), v(1), v(0))
+    sop1(isa.S_MOV_B64, 24, encode.VCC)
+    vop2(isa.V_SUBREV_CO_U32, v(7), v(1), v(0))
+    vop2(isa.V_ADDC_CO_U32, v(8), k(0), v(0))
+    vop3(isa.V_MUL_LO_U32, v(9), 0, v(3), v(3), 0)
+    vop3(isa.V_MUL_HI_U32, v(10), 0, v(3), v(3), 0)
+    vop3(isa.V_MUL_HI_I32, v(11), 0, v(3), v(3), 0)
+    vop2(isa.V_LSHLREV_B32, v(12), k(33), v(0))
+    vop2(isa.V_LSHRREV_B32, v(13), k(1), v(3))
+    vop2(isa.V_ASHRREV_I32, v(14), k(1), v(3))
+    vop2(isa.V_AND_B32, v(15), k(6), v(0))
+    vop2(isa.V_OR_B32, v(16), k(8), v(0))
+    vop2(isa.V_XOR_B32, v(17), k(5), v(0))
+    vop1(isa.V_NOT_B32, v(18), v(0))
+    vop2(isa.V_MIN_I32, v(19), v(3), v(0))
+    vop2(isa.V_MAX_U32, v(20), v(3), v(0))
+    vop3(isa.V_CMP_LT_U32, 26, 0, v(0), k(3), 0)
+    vop3(isa.V_CNDMASK_B32, v(21), 0, v(0), v(1), 26)
+    vop2(isa.V_MUL_U32_U24, v(22), v(3), v(0))
+    vop3(isa.V_MAD_U32_U24, v(23), 0, v(0), v(1), k(7))
+    vop3(isa.V_BFE_U32, v(24), 0, v(3), k(4), k(8))
+    vop1(isa.V_READFIRSTLANE_B32, 28, v(1))
+    end()
+    check(30, go() == wave.Stop.done)
+    var ok = true
+    var l: usize = 0
+    while l < 32 {
+        const x = @intCast(u32, l % 8)
+        const y = @intCast(u32, l / 8)
+        if lane(4, l) != x +% 0xFFFFFFFE { ok = false }
+        if lane(5, l) != 0xFFFFFFFF { ok = false }
+        if lane(6, l) != y -% x || lane(7, l) != x -% y { ok = false }
+        // v_addc's carry in: vcc as v_subrev left it (y - x borrowed: y > x)
+        if lane(8, l) != x + (if y > x { @intCast(u32, 1) } else { 0 }) { ok = false }
+        if lane(9, l) != 4 || lane(10, l) != 0xFFFFFFFC || lane(11, l) != 0 { ok = false }
+        if lane(12, l) != x << 1 || lane(13, l) != 0x7FFFFFFF || lane(14, l) != 0xFFFFFFFF { ok = false }
+        if lane(15, l) != (x & 6) || lane(16, l) != (x | 8) || lane(17, l) != (x ^ 5) || lane(18, l) != ~x { ok = false }
+        if lane(19, l) != 0xFFFFFFFE || lane(20, l) != 0xFFFFFFFE { ok = false }
+        if lane(21, l) != (if x < 3 { y } else { x }) { ok = false }
+        if lane(22, l) != x * 0xFFFFFE || lane(23, l) != x * y + 7 || lane(24, l) != 0xFF { ok = false }
+        l += 1
+    }
+    check(31, ok)
+    // the carries: lanes on as computed, lanes off ones
+    check(32, pair(20) == (0xFFFFFFFF00000000 | 0xFCFCFCFC) && pair(22) == 0xFFFFFFFF00000000)
+    check(33, pair(24) == (0xFFFFFFFF00000000 | 0xF0F8FCFE))
+    check(34, s(28) == 0)
+    // a comparison's lanes that are off: ones (x < 3 in the lanes on)
+    check(43, pair(26) == 0xFFFFFFFF07070707)
+    // the lanes that are off kept what they had (never written here)
+    check(35, (wave.wave.vWritten[4] >> 32) == 0)
+
+    // every comparison condition, i32 and u32, as vcc; v_cmpx writes exec
+    setUp()
+    begin()
+    vop1l(isa.V_MOV_B32, v(3), 0xFFFFFFFF)
+    var c: u16 = 0
+    while c < 8 {
+        var i = encode.blank(isa.Op.{ .format = isa.Format.vopc, .number = isa.V_CMP_F_I32.number + c })
+        i.src0 = v(3)
+        i.src1 = v(0)
+        emit(i)
+        sop1(isa.S_MOV_B64, 20 + 2 * c, encode.VCC)
+        i = encode.blank(isa.Op.{ .format = isa.Format.vopc, .number = isa.V_CMP_F_U32.number + c })
+        i.src0 = v(3)
+        i.src1 = v(0)
+        emit(i)
+        sop1(isa.S_MOV_B64, 36 + 2 * c, encode.VCC)
+        c += 1
+    }
+    // 5 < x (the second source is a vector register natively)
+    var x = encode.blank(isa.V_CMPX_LT_U32)
+    x.src0 = k(5)
+    x.src1 = v(0)
+    emit(x)
+    sop1(isa.S_MOV_B64, 52, encode.EXEC)
+    end()
+    check(36, go() == wave.Stop.done)
+    // -1 against x (0..7), signed: less, not equal, less or equal, never
+    // greater (f lt eq le gt lg ge tru)
+    const all: u64 = 0xFFFFFFFFFFFFFFFF
+    var holds = pair(20) == 0 && pair(22) == all && pair(24) == 0 && pair(26) == all && pair(28) == 0 && pair(30) == all && pair(32) == 0 && pair(34) == all
+    check(37, holds)
+    // unsigned: 0xFFFFFFFF is above every x
+    holds = pair(36) == 0 && pair(38) == 0 && pair(40) == 0 && pair(42) == 0 && pair(44) == all && pair(46) == all && pair(48) == all && pair(50) == all
+    check(38, holds)
+    check(39, pair(52) == 0xC0C0C0C0C0C0C0C0)
+    // x against itself: equal, so le, ge and tru hold, lt, gt and lg not
+    setUp()
+    begin()
+    c = 0
+    while c < 8 {
+        var i = encode.blank(isa.Op.{ .format = isa.Format.vopc, .number = isa.V_CMP_F_I32.number + c })
+        i.src0 = v(0)
+        i.src1 = v(0)
+        emit(i)
+        sop1(isa.S_MOV_B64, 20 + 2 * c, encode.VCC)
+        c += 1
+    }
+    end()
+    check(44, go() == wave.Stop.done)
+    check(45, pair(20) == 0 && pair(22) == 0 && pair(24) == all && pair(26) == all && pair(28) == 0 && pair(30) == 0 && pair(32) == all && pair(34) == all)
+    // v_readfirstlane: the first lane that is on
+    setUp()
+    begin()
+    movl(126, 0xFFFFFFF8)
+    movl(127, 0)
+    vop1(isa.V_READFIRSTLANE_B32, 20, v(0))
+    end()
+    check(46, go() == wave.Stop.done && s(20) == 3)
+
+    // conversions, the reciprocal, a float product
+    setUp()
+    begin()
+    vop1l(isa.V_MOV_B32, v(3), 0xFFFFFFFF)
+    vop1(isa.V_CVT_F32_U32, v(4), v(3))
+    vop1l(isa.V_MOV_B32, v(5), 0x40400000)
+    vop1(isa.V_RCP_F32, v(6), v(5))
+    vop1l(isa.V_MOV_B32, v(7), 0x4B000003)
+    vop1(isa.V_CVT_U32_F32, v(8), v(7))
+    vop1l(isa.V_MOV_B32, v(9), 0xBF000000)
+    vop1(isa.V_CVT_U32_F32, v(10), v(9))
+    // the inline float -2.0 (operand 245) times 3.0
+    vop2(isa.V_MUL_F32, v(11), encode.FLOAT_HALF + 5, v(5))
+    vop1(isa.V_CVT_F32_I32, v(12), v(3))
+    end()
+    check(40, go() == wave.Stop.done)
+    check(41, lane(4, 0) == 0x4F800000 && lane(6, 0) == 0x3EAAAAAB && lane(8, 0) == 8388611 && lane(10, 0) == 0)
+    check(42, lane(11, 0) == 0xC0C00000 && lane(12, 0) == 0xBF800000)
+}
+
+fn testUnknown() -> void {
+    // what the sources do not give stops the run
+    setUp()
+    begin()
+    vop1l(isa.V_MOV_B32, v(3), 0x4F800000)
+    vop1(isa.V_CVT_U32_F32, v(4), v(3))
+    end()
+    check(50, go() == wave.Stop.unknown && result.detail == 0x4F800000)
+    setUp()
+    begin()
+    vop1(isa.V_RCP_F32, v(4), k(0))
+    end()
+    check(51, go() == wave.Stop.unknown)
+    setUp()
+    begin()
+    movl(126, 0)
+    movl(127, 0)
+    vop1(isa.V_READFIRSTLANE_B32, 20, v(0))
+    end()
+    check(52, go() == wave.Stop.unknown)
+    // the scratch descriptor
+    setUp()
+    begin()
+    sop1(isa.S_MOV_B32, 20, 0)
+    end()
+    check(53, go() == wave.Stop.unknown && result.detail == 0)
+    // not modelled: an image instruction, DPP, v_div_fmas
+    setUp()
+    begin()
+    var i = encode.blank(isa.V_SIN_F32)
+    i.dst = v(4)
+    i.src0 = v(0)
+    emit(i)
+    end()
+    check(54, go() == wave.Stop.notModelled && result.pc == 0)
+}
+
+fn testMemory() -> void {
+    setUp()
+    begin()
+    smem(isa.S_LOAD_DWORD, 20, 2, 32)
+    smem(isa.S_LOAD_DWORDX2, 22, 2, 36)
+    smem(isa.S_LOAD_DWORDX4, 12, 2, 0)
+    wait(15, 0)
+    vop2(isa.V_LSHLREV_B32, v(3), k(2), v(0))
+    mubuf(isa.BUFFER_LOAD_DWORD, v(4), v(3), 12, k(8), 4, true)
+    wait(0, 15)
+    vop2(isa.V_ADD_CO_U32, v(5), k(1), v(4))
+    mubuf(isa.BUFFER_STORE_DWORD, v(5), v(3), 12, k(0), 128, true)
+    end()
+    check(60, go() == wave.Stop.done)
+    check(61, s(20) == 0x2008 && s(22) == 0x2009 && s(23) == 0x200A && s(12) == @intCast(u32, DATA) && s(15) == 0)
+    // lane l read word 3 + x (soffset 8 + offset 4 + 4x bytes), stored at 32 + x
+    var ok = true
+    var l: usize = 0
+    while l < 64 {
+        const x = l % 8
+        if lane(4, l) != 0x1000 + @intCast(u32, 3 + x) { ok = false }
+        l += 1
+    }
+    var w: usize = 0
+    while w < 8 {
+        if data[32 + w] != 0x1001 + @intCast(u32, 3 + w) { ok = false }
+        w += 1
+    }
+    check(62, ok)
+    // past the range (64 words: byte 256)
+    setUp()
+    begin()
+    descriptor()
+    mubuf(isa.BUFFER_LOAD_DWORD, v(4), v(0), 12, k(0), 255, true)
+    end()
+    check(63, go() == wave.Stop.range)
+    // an address no region holds: the descriptor's base moved
+    setUp()
+    table[0] = 0x900000
+    begin()
+    descriptor()
+    mubuf(isa.BUFFER_LOAD_DWORD, v(4), v(0), 12, k(0), 0, true)
+    end()
+    check(64, go() == wave.Stop.unmapped)
+    // a store where it may not be written
+    setUp()
+    begin()
+    smem(isa.S_LOAD_DWORDX4, 12, 2, 16)
+    wait(15, 0)
+    mubuf(isa.BUFFER_STORE_DWORD, v(0), v(0), 12, k(0), 0, false)
+    end()
+    check(65, go() == wave.Stop.unmapped)
+    // a scalar load from nowhere
+    setUp()
+    begin()
+    smem(isa.S_LOAD_DWORD, 20, 2, 0x20000)
+    end()
+    check(66, go() == wave.Stop.unmapped)
+}
+
+fn testBranches() -> void {
+    // a loop: s20 counts to 5 by s_cbranch_scc1 backwards
+    setUp()
+    begin()
+    movl(20, 0)
+    movl(21, 0)
+    sop2(isa.S_ADD_U32, 20, 20, k(1))
+    sop2(isa.S_ADD_U32, 21, 21, k(3))
+    sopc(isa.S_CMP_LT_U32, 20, k(5))
+    sopp(isa.S_CBRANCH_SCC1, 0xFFFC)
+    // vcc: zero, a branch over a move
+    sop1(isa.S_MOV_B64, encode.VCC, k(0))
+    sopp(isa.S_CBRANCH_VCCZ, 1)
+    movl(22, 9)
+    sopp(isa.S_CBRANCH_VCCNZ, 1)
+    movl(23, 7)
+    // exec: none on, the branch taken; back on
+    sop1(isa.S_MOV_B64, 40, encode.EXEC)
+    sop1(isa.S_MOV_B64, encode.EXEC, k(0))
+    sopp(isa.S_CBRANCH_EXECZ, 1)
+    movl(25, 9)
+    sop1(isa.S_MOV_B64, encode.EXEC, 40)
+    sopp(isa.S_CBRANCH_EXECNZ, 1)
+    movl(26, 9)
+    sopp(isa.S_BRANCH, 1)
+    movl(27, 9)
+    end()
+    check(70, go() == wave.Stop.done)
+    check(71, s(20) == 5 && s(21) == 15 && !wave.wave.sWritten[22] && s(23) == 7 && !wave.wave.sWritten[25] && !wave.wave.sWritten[26] && !wave.wave.sWritten[27])
+    // a branch off the program
+    setUp()
+    begin()
+    sopp(isa.S_BRANCH, 100)
+    end()
+    check(72, go() == wave.Stop.undecodable)
+    // a run that does not end
+    setUp()
+    begin()
+    sopp(isa.S_BRANCH, 0xFFFF)
+    launch.maxSteps = 1000
+    check(73, go() == wave.Stop.steps)
+    // words that are no instruction (a VOP3 number that is none)
+    setUp()
+    begin()
+    code[0] = 0xD3FF0000
+    code[1] = 0
+    count = 2
+    check(74, go() == wave.Stop.undecodable)
+}
+
+fn testStart() -> void {
+    setUp()
+    begin()
+    end()
+    check(80, go() == wave.Stop.done)
+    check(81, s(2) == @intCast(u32, TABLE) && s(3) == 0 && s(4) == 0x1234 && s(6) == 3 && s(7) == 5 && s(8) == 7)
+    var ok = true
+    var l: usize = 0
+    while l < 64 {
+        if lane(0, l) != @intCast(u32, l % 8) || lane(1, l) != @intCast(u32, l / 8) || lane(2, l) != 0 { ok = false }
+        l += 1
+    }
+    check(82, ok && pair(126) == 0xFFFFFFFFFFFFFFFF)
+    // a group of 100: its second wave has 36 lanes
+    launch.groupSizeX = 10
+    launch.groupSizeY = 10
+    check(83, wave.start(&launch, 0, 0, 0, 64))
+    check(84, pair(126) == 0x0000000FFFFFFFFF && wave.wave.v[0 * wave.LANES + 0] == 4 && wave.wave.v[1 * wave.LANES + 0] == 6)
+    // a register nothing wrote, one beyond the count
+    setUp()
+    begin()
+    vop1(isa.V_MOV_B32, v(4), v(3))
+    end()
+    check(85, go() == wave.Stop.register && result.detail == 259)
+    setUp()
+    launch.vgprs = 4
+    begin()
+    vop1(isa.V_MOV_B32, v(4), v(0))
+    end()
+    check(86, go() == wave.Stop.register && result.detail == 260)
+    // a lane that is on now but was off when the register was written
+    setUp()
+    begin()
+    sop1(isa.S_MOV_B64, 20, encode.EXEC)
+    movl(126, 1)
+    movl(127, 0)
+    vop1(isa.V_MOV_B32, v(4), k(1))
+    sop1(isa.S_MOV_B64, encode.EXEC, 20)
+    vop1(isa.V_MOV_B32, v(5), v(4))
+    end()
+    check(87, go() == wave.Stop.register && result.detail == 260)
+}
+
+fn testWaits() -> void {
+    // read before the wait
+    setUp()
+    begin()
+    smem(isa.S_LOAD_DWORD, 20, 2, 0)
+    sop1(isa.S_MOV_B32, 21, 20)
+    end()
+    check(90, go() == wave.Stop.wait && result.detail == 20)
+    // written before the wait
+    setUp()
+    begin()
+    smem(isa.S_LOAD_DWORD, 20, 2, 0)
+    sop1(isa.S_MOV_B32, 20, k(1))
+    end()
+    check(91, go() == wave.Stop.wait)
+    // lgkmcnt(1) with two scalar loads out says nothing of either
+    setUp()
+    begin()
+    smem(isa.S_LOAD_DWORD, 20, 2, 0)
+    smem(isa.S_LOAD_DWORD, 21, 2, 4)
+    wait(15, 1)
+    sop1(isa.S_MOV_B32, 22, 20)
+    end()
+    check(92, go() == wave.Stop.wait)
+    // vmcnt counts in order: vmcnt(1) after two loads lets the first come
+    setUp()
+    begin()
+    descriptor()
+    mubuf(isa.BUFFER_LOAD_DWORD, v(4), v(0), 12, k(0), 0, false)
+    mubuf(isa.BUFFER_LOAD_DWORD, v(5), v(0), 12, k(0), 4, false)
+    wait(1, 15)
+    vop1(isa.V_MOV_B32, v(6), v(4))
+    vop1(isa.V_MOV_B32, v(7), v(5))
+    end()
+    check(93, go() == wave.Stop.wait && result.detail == 261)
+    setUp()
+    begin()
+    descriptor()
+    mubuf(isa.BUFFER_LOAD_DWORD, v(4), v(0), 12, k(0), 0, false)
+    mubuf(isa.BUFFER_LOAD_DWORD, v(5), v(0), 12, k(0), 4, false)
+    wait(1, 15)
+    vop1(isa.V_MOV_B32, v(6), v(4))
+    wait(0, 15)
+    vop1(isa.V_MOV_B32, v(7), v(5))
+    end()
+    check(94, go() == wave.Stop.done && lane(7, 0) == 0x1001)
+    // the end with a store still counted
+    setUp()
+    begin()
+    descriptor()
+    mubuf(isa.BUFFER_STORE_DWORD, v(0), v(0), 12, k(0), 0, false)
+    sopp(isa.S_ENDPGM, 0)
+    check(95, go() == wave.Stop.wait)
+}
+
+fn testBus() -> void {
+    setUp()
+    begin()
+    movl(20, 1)
+    movl(21, 2)
+    vop3(isa.V_ADD_CO_U32, v(4), 22, 20, 21, 0)
+    end()
+    check(100, go() == wave.Stop.bus)
+    setUp()
+    begin()
+    movl(20, 1)
+    vop3(isa.V_MUL_LO_U32, v(4), 0, 20, 20, 0)
+    end()
+    check(101, go() == wave.Stop.done && lane(4, 5) == 1)
+    setUp()
+    begin()
+    movl(20, 1)
+    vop1l(isa.V_MOV_B32, v(3), 1)
+    vop2l(isa.V_CNDMASK_B32, v(4), 20, v(3), 0)
+    end()
+    // v_cndmask natively reads vcc beside its SGPR (vcc unwritten would
+    // stop otherwise: written first)
+    setUp()
+    begin()
+    sop1(isa.S_MOV_B64, encode.VCC, k(0))
+    movl(20, 1)
+    vop1l(isa.V_MOV_B32, v(3), 1)
+    vop2(isa.V_CNDMASK_B32, v(4), 20, v(3))
+    end()
+    check(102, go() == wave.Stop.bus)
+    // an SGPR and the literal (v_madak takes one)
+    setUp()
+    begin()
+    movl(20, 1)
+    vop2l(isa.V_ADD_CO_U32, v(4), encode.LITERAL, v(0), 5)
+    vop2(isa.V_ADD_CO_U32, v(5), 20, v(4))
+    end()
+    check(103, go() == wave.Stop.done && lane(5, 2) == 8)
+}
+
+// Each rule one short (refused, its number) and with its states (passes).
+fn testHazards() -> void {
+    // 1: VALU writes an SGPR (v_readfirstlane), a buffer load reads it as
+    // its scalar offset: 5
+    var states: u32 = 4
+    while states <= 5 {
+        setUp()
+        begin()
+        descriptor()
+        vop1(isa.V_READFIRSTLANE_B32, 20, v(0))
+        if states > 0 { nop(states) }
+        mubuf(isa.BUFFER_LOAD_DWORD, v(4), v(0), 12, 20, 0, false)
+        end()
+        const stop = go()
+        if states == 4 { check(110, stop == wave.Stop.hazard && result.detail == 1) } else { check(111, stop == wave.Stop.done) }
+        states += 1
+    }
+    // ... or as its descriptor: the comparison's pair written into s12
+    setUp()
+    begin()
+    descriptor()
+    sop1(isa.S_MOV_B64, 20, 12)
+    vop3(isa.V_CMP_EQ_U32, 12, 0, v(0), v(0), 0)
+    sop1(isa.S_MOV_B64, 12, 20)
+    nop(3)
+    mubuf(isa.BUFFER_LOAD_DWORD, v(4), v(0), 12, k(0), 0, false)
+    end()
+    check(112, go() == wave.Stop.hazard && result.detail == 1)
+    // 2: v_readlane's lane from a VALU: 4
+    setUp()
+    begin()
+    vop1(isa.V_READFIRSTLANE_B32, 20, v(0))
+    nop(3)
+    vop3(isa.V_READLANE_B32_E64, 21, 0, v(0), 20, 0)
+    end()
+    check(113, go() == wave.Stop.hazard && result.detail == 2)
+    setUp()
+    begin()
+    vop1(isa.V_READFIRSTLANE_B32, 20, v(0))
+    nop(4)
+    vop3(isa.V_READLANE_B32_E64, 21, 0, v(0), 20, 0)
+    end()
+    check(114, go() == wave.Stop.notModelled)
+    // 3: vcc from a VALU, v_div_fmas: 4
+    setUp()
+    begin()
+    vop2(isa.V_ADD_CO_U32, v(4), v(0), v(0))
+    nop(3)
+    vop3(isa.V_DIV_FMAS_F32, v(5), 0, v(0), v(0), v(0))
+    end()
+    check(115, go() == wave.Stop.hazard && result.detail == 3)
+    setUp()
+    begin()
+    vop2(isa.V_ADD_CO_U32, v(4), v(0), v(0))
+    nop(4)
+    vop3(isa.V_DIV_FMAS_F32, v(5), 0, v(0), v(0), v(0))
+    end()
+    check(116, go() == wave.Stop.notModelled)
+    // 4: exec from a VALU (v_cmpx), DPP: 5
+    var dpp = encode.blank(isa.V_MOV_B32)
+    dpp.form = encode.Form.dpp
+    dpp.dst = v(4)
+    dpp.src0 = v(0)
+    dpp.mods = 0xFF
+    setUp()
+    begin()
+    var x = encode.blank(isa.V_CMPX_LE_U32)
+    x.src0 = k(0)
+    x.src1 = v(0)
+    emit(x)
+    nop(4)
+    emit(dpp)
+    end()
+    check(117, go() == wave.Stop.hazard && result.detail == 4)
+    setUp()
+    begin()
+    emit(x)
+    nop(5)
+    emit(dpp)
+    end()
+    check(118, go() == wave.Stop.notModelled)
+    // 5: DPP's first source written by a VALU: 2
+    setUp()
+    begin()
+    vop1(isa.V_MOV_B32, v(0), v(1))
+    nop(1)
+    emit(dpp)
+    end()
+    check(119, go() == wave.Stop.hazard && result.detail == 5)
+    setUp()
+    begin()
+    vop1(isa.V_MOV_B32, v(0), v(1))
+    nop(2)
+    emit(dpp)
+    end()
+    check(120, go() == wave.Stop.notModelled)
+    // 6: s_setreg, then s_getreg: 2
+    var setreg = encode.blank(isa.S_SETREG_B32)
+    setreg.dst = 20
+    setreg.imm = 0x0802
+    var getreg = encode.blank(isa.S_GETREG_B32)
+    getreg.dst = 21
+    getreg.imm = 0x0802
+    setUp()
+    begin()
+    movl(20, 5)
+    emit(setreg)
+    nop(1)
+    emit(getreg)
+    end()
+    check(121, go() == wave.Stop.hazard && result.detail == 6)
+    setUp()
+    begin()
+    movl(20, 5)
+    emit(setreg)
+    nop(2)
+    emit(getreg)
+    end()
+    // the field (register 2, bits 1..2) set and read back
+    check(122, go() == wave.Stop.done && s(21) == 1)
+    // 7: s_setreg of MODE's vskip (register 1, offset 28: 0, no lane
+    // skipped), then a vector instruction: 2
+    var vskip = encode.blank(isa.S_SETREG_B32)
+    vskip.dst = 20
+    vskip.imm = 1 | (28 << 6)
+    setUp()
+    begin()
+    movl(20, 0)
+    emit(vskip)
+    nop(1)
+    vop1(isa.V_MOV_B32, v(4), v(0))
+    end()
+    check(129, go() == wave.Stop.hazard && result.detail == 7)
+    setUp()
+    begin()
+    movl(20, 0)
+    emit(vskip)
+    nop(2)
+    vop1(isa.V_MOV_B32, v(4), v(0))
+    end()
+    check(130, go() == wave.Stop.done)
+    // 8: m0 by a SALU, s_sendmsg: 1
+    setUp()
+    begin()
+    movl(encode.M0, 0)
+    sopp(isa.S_SENDMSG, 0)
+    end()
+    check(123, go() == wave.Stop.hazard && result.detail == 8)
+    setUp()
+    begin()
+    movl(encode.M0, 0)
+    nop(1)
+    sopp(isa.S_SENDMSG, 0)
+    end()
+    check(124, go() == wave.Stop.notModelled)
+    // 9: a store of four registers with a constant offset, then a VALU
+    // writes one of them: 1
+    setUp()
+    begin()
+    descriptor()
+    vop1(isa.V_MOV_B32, v(4), k(1))
+    vop1(isa.V_MOV_B32, v(5), k(2))
+    vop1(isa.V_MOV_B32, v(6), k(3))
+    vop1(isa.V_MOV_B32, v(7), k(4))
+    mubuf(isa.BUFFER_STORE_DWORDX4, v(4), v(0), 12, k(0), 0, false)
+    vop1(isa.V_MOV_B32, v(6), k(9))
+    end()
+    check(125, go() == wave.Stop.hazard && result.detail == 9)
+    setUp()
+    begin()
+    descriptor()
+    vop1(isa.V_MOV_B32, v(4), k(1))
+    vop1(isa.V_MOV_B32, v(5), k(2))
+    vop1(isa.V_MOV_B32, v(6), k(3))
+    vop1(isa.V_MOV_B32, v(7), k(4))
+    mubuf(isa.BUFFER_STORE_DWORDX4, v(4), v(0), 12, k(0), 0, false)
+    nop(1)
+    vop1(isa.V_MOV_B32, v(6), k(9))
+    end()
+    check(126, go() == wave.Stop.done && data[0] == 1 && data[3] == 4)
+    // ... and of three registers; not with an SGPR as the scalar offset
+    // (aco_insert_NOPs.cpp: operands[2].physReg() >= 128, a constant)
+    setUp()
+    begin()
+    descriptor()
+    vop1(isa.V_MOV_B32, v(4), k(1))
+    vop1(isa.V_MOV_B32, v(5), k(2))
+    vop1(isa.V_MOV_B32, v(6), k(3))
+    mubuf(isa.BUFFER_STORE_DWORDX3, v(4), v(0), 12, k(0), 0, false)
+    vop1(isa.V_MOV_B32, v(5), k(9))
+    end()
+    check(131, go() == wave.Stop.hazard && result.detail == 9)
+    setUp()
+    begin()
+    descriptor()
+    sop1(isa.S_MOV_B32, 20, k(0))
+    vop1(isa.V_MOV_B32, v(4), k(1))
+    vop1(isa.V_MOV_B32, v(5), k(2))
+    vop1(isa.V_MOV_B32, v(6), k(3))
+    mubuf(isa.BUFFER_STORE_DWORDX3, v(4), v(0), 12, 20, 0, false)
+    vop1(isa.V_MOV_B32, v(5), k(9))
+    end()
+    check(132, go() == wave.Stop.done && data[0] == 1 && data[2] == 3)
+    // 10: a scalar store in a clause of scalar loads: 1 (the s_nop breaks
+    // the clause)
+    var store = encode.blank(isa.S_STORE_DWORD)
+    store.dst = 20
+    store.src0 = 2
+    store.flags = encode.IMM
+    setUp()
+    begin()
+    movl(20, 0)
+    smem(isa.S_LOAD_DWORD, 21, 2, 0)
+    emit(store)
+    end()
+    check(127, go() == wave.Stop.hazard && result.detail == 10)
+    setUp()
+    begin()
+    movl(20, 0)
+    smem(isa.S_LOAD_DWORD, 21, 2, 0)
+    nop(1)
+    emit(store)
+    end()
+    check(128, go() == wave.Stop.notModelled)
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    show = arguments.length > 1
+    testScalar()
+    testExec()
+    testVector()
+    testUnknown()
+    testMemory()
+    testBranches()
+    testStart()
+    testWaits()
+    testBus()
+    testHazards()
+    if failed != 0 {
+        if show {
+            say("first failing check ")
+            sayNumber(@intCast(u64, failed))
+            say("\n")
+        }
+        return if failed > 255 { 255 } else { @intCast(u8, failed) }
+    }
+    return 13
+}

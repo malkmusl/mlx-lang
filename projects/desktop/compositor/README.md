@@ -904,6 +904,75 @@ says so (`drm: the monitor has no such display-mode; its native one
 instead`). The Display page lists the modes and writes the choice, which
 applies at the next start.
 
+On brixOS the mode changes at once instead, and the kernel keeps it
+([`mode_change.mlx`](mode_change.mlx),
+[`mode_question.mlx`](mode_question.mlx),
+[`output_size.mlx`](output_size.mlx)). The file says more there: who
+sets the display's modes, where to ask for one, and each mode the kernel
+lists, with its rate in millihertz, whether it is the monitor's own, the
+one that runs, the one the next boots set, or why it cannot be set:
+
+```
+driver = QEMU's adapter
+ask = /temporary/wayland-mlx.modes
+available = 1280x800@75 74993 own
+available = 1024x768@60 60003 runs
+unavailable = 3840x2160@60 60000: more than the adapter's memory holds
+pending = 12
+```
+
+What you do and see:
+
+1. Open Settings, Display. The page lists every mode the display can
+   run, the largest first, the one that runs chosen and the monitor's
+   own marked; under "Not available" the ones it cannot, each with the
+   kernel's reason.
+2. Click a mode. The page asks the compositor (`org.mlx.Display.Ask`,
+   MLXIPC's native format on a channel of the listener at `ask`), the
+   compositor asks the kernel (std.displaymodes), and the screen takes
+   the new mode at once: the top bar and the dock are laid out for it,
+   maximized and tiled windows take the new work area, fullscreen ones
+   (the greeter's among them) and the lock the whole screen, every other
+   window stays where it was in proportion to the screen and inside it,
+   and every client is told the new size (wl_output, xdg_output, layer
+   and toplevel configures).
+3. In the middle of the new picture the compositor asks "Keep this
+   display mode?" with the seconds left ("1920 × 1080 at 60 Hz. It goes
+   back in 12 s."), the rest of the screen dimmed. Enter or Keep keeps
+   it: the kernel remembers it and sets it at the next boots too. Escape
+   or Go back brings the mode before back at once. While the question is
+   up the keys and clicks go to it alone; a key or button already held
+   when it came up is let go to whoever had it (a window being dragged
+   is let go, a terminal stops repeating the key).
+4. No answer, or a picture you cannot see: after fifteen seconds the
+   kernel brings the mode before back by itself, and the desktop follows
+   that like any change. The question is the compositor's own, drawn on
+   the screen, so it needs no other program to be alive; the time is the
+   kernel's, so it needs not even the compositor.
+
+The compositor follows any change of the display, whoever made it (a
+mode asked for by root's `display` tool, the kernel taking one back):
+the display's node says it changed (its handle's CHANGED, looked at every
+turn of the loop, which wakes at least once a second and five times a
+second while a mode waits to be kept; a mode kept by another program
+changes no picture, so while the question is up the kernel is asked
+whether the mode still waits, and the question goes when it does not);
+the picture is mapped anew, the
+frame made for the new size, the further displays fitted anew, and
+everything drawn. A frame where nothing about the display changes costs
+what it did before: what is added is a test in the composing and, at
+each turn of the loop, two calls of the kernel's (the display's handle
+looked at, the listener asked for an asker). Measured on QEMU with its
+clock counting instructions (so the host's load is not in it), the same
+input before and after this was built: 48.4 and 49.6 ms a frame before,
+50.0 and 49.1 ms after, within what the runs of either differ by.
+`--verbose` says each step (`output: 1024x768 is 1920x1080 now`,
+`layer: horizon configured 1920x30`, `output: Settings kept at ...`,
+`display: asks whether to keep 1920x1080`, `display: kept`).
+tests/491 holds the layout and the question on the host, tests/492 the
+page and the wire; tools/check_brix_modes_desktop.sh runs all of it on
+QEMU, with screenshots.
+
 Night light warms the colours the monitor shows through the CRTC's gamma
 table ([`kms.mlx`](kms.mlx), `setTemperature`): the table the CRTC had
 (read once, `DRM_IOCTL_MODE_GETGAMMA`) with its green and blue scaled to

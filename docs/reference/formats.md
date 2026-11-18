@@ -58,19 +58,25 @@ from the code:
   only when the program has a data area (module-level `var` globals, see
   [Globals](#globals) below): `elf64.dataOffsetAfterCode` names its place
   and the pipeline resolves the code's RIP-relative references against it
-  before writing.
+  before writing. A program's globals that start zero follow the data in
+  memory only (`.bss`, `elf64.zeroOffsetAfterData`): the segment's
+  `p_memsz` covers them, its `p_filesz` does not, and the loader gives
+  them zero pages.
 - **Section headers:** a `SHT_NULL` entry, a `.text` `SHT_PROGBITS` section
   (`SHF_ALLOC | SHF_EXECINSTR`), an optional `.data` `SHT_PROGBITS` section
-  (`SHF_ALLOC | SHF_WRITE`) when there is a data area, and a trailing
-  `.shstrtab` `SHT_STRTAB` section. `num_shdrs` is 3 or 4 depending on
-  whether `.data` is present — there is no `.rodata` or `.bss` section
-  written by this function (`.symtab` and `.strtab` are appended afterwards,
-  see below), so this writer covers the "directly executable static ELF"
-  requirement rather than the spec's full required-section list.
+  (`SHF_ALLOC | SHF_WRITE`) when there is a data area, an optional `.bss`
+  `SHT_NOBITS` section (`SHF_ALLOC | SHF_WRITE`, its `sh_addralign` that
+  of its most aligned global, 8 at least) when there are globals that
+  start zero, and a trailing `.shstrtab` `SHT_STRTAB` section.
+  `num_shdrs` is 3, 4 or 5 depending on whether `.data` and `.bss` are
+  present — there is no `.rodata` section written by this function
+  (`.symtab` and `.strtab` are appended afterwards, see below), so this
+  writer covers the "directly executable static ELF" requirement rather
+  than the spec's full required-section list.
 - **`.shstrtab` contents:** the section name string table is hand-written
   byte-by-byte as the literal string `"\0.text\0.data\0.shstrtab\0"`
-  (23 bytes, matching `shstrtab_size`), rather than built from a general
-  string-table builder.
+  (23 bytes, matching `shstrtab_size`; `.bss\0` after it with a `.bss`),
+  rather than built from a general string-table builder.
 - **File writing:** `writeExecutable` calls `buildExecutable` to produce an
   in-memory buffer, then opens the output path with
   `fs.WRITE_ONLY | fs.CREATE | fs.TRUNCATE` and mode `493` (`0o755`),
@@ -97,7 +103,8 @@ same fixed address, but loaded by the system dynamic linker
 - an `R+W` segment with `.dynamic`, `.got` (one slot per import, filled by an
   `R_X86_64_GLOB_DAT` relocation) and `.data` (the aggregate-arena words
   `_start` records for exported functions, then the globals, see
-  [Globals](#globals));
+  [Globals](#globals)), then `.bss` (`SHT_NOBITS`: the globals that start
+  zero, in memory only, the segment's `p_memsz` past its `p_filesz`);
 - `PT_DYNAMIC`, `PT_PHDR` and a non-executable `PT_GNU_STACK`.
 
 Imports are unversioned undefined symbols, bound immediately (`DF_BIND_NOW`,
@@ -230,6 +237,19 @@ is written by `__mlx_init_globals` before `main`: see the ABI reference)
 lowered yet and are reported with the module's position. A static
 executable with globals gets the `.data` segment described above; a dynamic
 image keeps them in its `R+W` segment.
+
+A global whose initial bytes are all zero (`undefined` of any type, `= 0`,
+`null`, `false`, `0.0` but not `-0.0`, an array or struct of zeros, a
+pointer `__mlx_init_globals` writes) is a program's `.bss`
+(`encoder.placeZeroDataApart`, `holdsZero`): its slot is in a part of its
+own after the file's data (and the TLS image), in the writable segment's
+memory but not in the file, so a program's file does not grow with its
+working arrays. Its references resolve there (`applyLinkFixups`), an
+`export var` of it is a data symbol in `.bss`. The kernel
+(`--target=x86_64-freestanding`) keeps every global in `.data`: brix-image
+copies its file bytes as they are. mlx-cc's objects and mlx-ld's programs
+lay out their data as before (their own `.bss` sections are file zeros in
+the program for now).
 
 An `export var` is such a slot and a data symbol too (`STT_OBJECT`, its size
 that of `T`, in `.dynsym`): C code reads and writes the same word the Mlx

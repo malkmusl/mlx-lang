@@ -1,0 +1,297 @@
+// The self-test at every vkCreateDevice (the study's 8.2 (b), 11.3): the
+// doubler (doubler.mlx: values[i] = values[i] * 2 + i) compiled by our
+// compiler and dispatched over 256 words through the driver's own
+// commands, as a program would (a buffer in host-visible memory, a set,
+// a pipeline, a command buffer with the dispatch and a barrier to the
+// host, a submit with a fence, the wait), and every word held against
+// the processor's; then on the same buffer the division by a variable
+// (divider.mlx: 64 quotients and remainders, the second reading's silent
+// need 1: the card's v_rcp_f32 is not the host's, 11.14). A mismatch, or
+// anything that does not run, fails the device's creation and says the
+// first wrong word: a silent miscompile, a wrong packet or a reciprocal
+// the division does not survive becomes "the program stays on the
+// processor, and its log says why" instead of wrong pixels.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const builder = @import("std.spirv.builder")
+const spv = @import("std.spirv.core")
+const device = @import("./device.mlx")
+const memory = @import("./memory.mlx")
+const pipeline = @import("./pipeline.mlx")
+const commands = @import("./commands.mlx")
+const queue = @import("./queue.mlx")
+const doubler = @import("./doubler.mlx")
+const divider = @import("./divider.mlx")
+
+pub const WORDS: usize = 256
+
+// How it ended: passed, a word wrong, a step that failed.
+pub const Outcome = enum(u8) { passed, wrong, failed }
+
+pub const Result = struct {
+    outcome: Outcome
+    // The first wrong word, what it was and what the processor makes of
+    // it; or the step that failed and what it answered.
+    word: usize
+    got: u32
+    wanted: u32
+    step: []const u8
+    answer: vk.Result
+    // Whether the wrong word is the division's (else the doubler's).
+    division: bool
+}
+
+pub var last: Result = undefined // (per run)
+
+fn before(index: usize) -> u32 { return @intCast(u32, index) *% 2654435761 }
+
+fn failed(step: []const u8, answer: vk.Result) -> bool {
+    last.outcome = Outcome.failed
+    last.step = step
+    last.answer = answer
+    return false
+}
+
+// The objects made, given back whatever happened.
+const Made = struct {
+    buffer: vk.Buffer
+    memory: vk.DeviceMemory
+    module: vk.ShaderModule
+    setLayout: vk.DescriptorSetLayout
+    layout: vk.PipelineLayout
+    pipe: vk.Pipeline
+    divisionModule: vk.ShaderModule
+    divisionPipe: vk.Pipeline
+    pool: vk.DescriptorPool
+    commandPool: vk.CommandPool
+    fence: vk.Fence
+}
+
+fn giveBack(handle: vk.Device, made: *Made) -> void {
+    if made.*.fence != 0 { queue.destroyFence(handle, made.*.fence, null) }
+    if made.*.commandPool != 0 { commands.destroyCommandPool(handle, made.*.commandPool, null) }
+    if made.*.pool != 0 { pipeline.destroyDescriptorPool(handle, made.*.pool, null) }
+    if made.*.pipe != 0 { pipeline.destroyPipeline(handle, made.*.pipe, null) }
+    if made.*.divisionPipe != 0 { pipeline.destroyPipeline(handle, made.*.divisionPipe, null) }
+    if made.*.divisionModule != 0 { pipeline.destroyShaderModule(handle, made.*.divisionModule, null) }
+    if made.*.layout != 0 { pipeline.destroyPipelineLayout(handle, made.*.layout, null) }
+    if made.*.setLayout != 0 { pipeline.destroyDescriptorSetLayout(handle, made.*.setLayout, null) }
+    if made.*.module != 0 { pipeline.destroyShaderModule(handle, made.*.module, null) }
+    if made.*.buffer != 0 { memory.destroyBuffer(handle, made.*.buffer, null) }
+    if made.*.memory != 0 { memory.freeMemory(handle, made.*.memory, null) }
+}
+
+// The doubler's run on device `handle`: true when every word is right.
+pub fn run(handle: vk.Device) -> bool {
+    var made = Made.{ .buffer = 0, .memory = 0, .module = 0, .setLayout = 0, .layout = 0, .pipe = 0, .divisionModule = 0, .divisionPipe = 0, .pool = 0, .commandPool = 0, .fence = 0 }
+    const passed = runWith(handle, &made)
+    giveBack(handle, &made)
+    return passed
+}
+
+fn runWith(handle: vk.Device, made: *Made) -> bool {
+    last.outcome = Outcome.passed
+    last.word = 0
+    last.got = 0
+    last.wanted = 0
+    last.step = ""
+    last.answer = vk.Result.success
+    last.division = false
+    const owner = device.deviceOf(handle)
+    // The buffer, in memory the processor maps.
+    var bufferInfo = vk.BufferCreateInfo.init()
+    bufferInfo.size = @intCast(u64, WORDS * 4)
+    bufferInfo.usage = vk.BUFFER_USAGE_STORAGE_BUFFER_BIT
+    var answer = memory.createBuffer(handle, &bufferInfo, null, &made.*.buffer)
+    if answer != vk.Result.success { return failed("vkCreateBuffer", answer) }
+    var requirements: vk.MemoryRequirements = undefined
+    memory.getBufferMemoryRequirements(handle, made.*.buffer, &requirements)
+    var kind: u32 = 0
+    const visible = vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    while kind < owner.*.memory.memoryTypeCount && (owner.*.memory.memoryTypes[kind].propertyFlags & visible) != visible { kind += 1 }
+    if kind == owner.*.memory.memoryTypeCount { return failed("a memory type the processor maps", vk.Result.errorOutOfDeviceMemory) }
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.allocationSize = requirements.size
+    allocation.memoryTypeIndex = kind
+    answer = memory.allocateMemory(handle, &allocation, null, &made.*.memory)
+    if answer != vk.Result.success { return failed("vkAllocateMemory", answer) }
+    answer = memory.bindBufferMemory(handle, made.*.buffer, made.*.memory, 0)
+    if answer != vk.Result.success { return failed("vkBindBufferMemory", answer) }
+    var mapped: ?*anyopaque = null
+    answer = memory.mapMemory(handle, made.*.memory, 0, vk.WHOLE_SIZE, 0, &mapped)
+    if answer != vk.Result.success { return failed("vkMapMemory", answer) }
+    const values: [*]u32 = unsafe { @ptrCast([*]u32, mapped.?) }
+    var k: usize = 0
+    while k < WORDS {
+        values[k] = before(k)
+        k += 1
+    }
+    // The shaders.
+    answer = moduleOf(handle, false, &made.*.module)
+    if answer != vk.Result.success { return failed("vkCreateShaderModule", answer) }
+    answer = moduleOf(handle, true, &made.*.divisionModule)
+    if answer != vk.Result.success { return failed("vkCreateShaderModule", answer) }
+    var binding = vk.DescriptorSetLayoutBinding.init()
+    binding.binding = 0
+    binding.descriptorType = vk.DescriptorType.storageBuffer
+    binding.descriptorCount = 1
+    binding.stageFlags = vk.SHADER_STAGE_COMPUTE_BIT
+    var setInfo = vk.DescriptorSetLayoutCreateInfo.init()
+    setInfo.bindingCount = 1
+    setInfo.pBindings = unsafe { @ptrCast([*]const vk.DescriptorSetLayoutBinding, &binding) }
+    answer = pipeline.createDescriptorSetLayout(handle, &setInfo, null, &made.*.setLayout)
+    if answer != vk.Result.success { return failed("vkCreateDescriptorSetLayout", answer) }
+    var setLayout = made.*.setLayout
+    var layoutInfo = vk.PipelineLayoutCreateInfo.init()
+    layoutInfo.setLayoutCount = 1
+    layoutInfo.pSetLayouts = unsafe { @ptrCast([*]const vk.DescriptorSetLayout, &setLayout) }
+    answer = pipeline.createPipelineLayout(handle, &layoutInfo, null, &made.*.layout)
+    if answer != vk.Result.success { return failed("vkCreatePipelineLayout", answer) }
+    var pipelineInfo = vk.ComputePipelineCreateInfo.init()
+    pipelineInfo.stage = vk.PipelineShaderStageCreateInfo.init()
+    pipelineInfo.stage.stage = vk.SHADER_STAGE_COMPUTE_BIT
+    pipelineInfo.stage.module = made.*.module
+    pipelineInfo.stage.pName = "main".pointer
+    pipelineInfo.layout = made.*.layout
+    answer = pipeline.createComputePipelines(handle, 0, 1, unsafe { @ptrCast([*]const vk.ComputePipelineCreateInfo, &pipelineInfo) }, null, unsafe { @ptrCast([*]vk.Pipeline, &made.*.pipe) })
+    if answer != vk.Result.success { return failed("vkCreateComputePipelines", answer) }
+    pipelineInfo.stage.module = made.*.divisionModule
+    answer = pipeline.createComputePipelines(handle, 0, 1, unsafe { @ptrCast([*]const vk.ComputePipelineCreateInfo, &pipelineInfo) }, null, unsafe { @ptrCast([*]vk.Pipeline, &made.*.divisionPipe) })
+    if answer != vk.Result.success { return failed("vkCreateComputePipelines", answer) }
+    // The set.
+    var size = vk.DescriptorPoolSize.init()
+    size.type_ = vk.DescriptorType.storageBuffer
+    size.descriptorCount = 1
+    var poolInfo = vk.DescriptorPoolCreateInfo.init()
+    poolInfo.maxSets = 1
+    poolInfo.poolSizeCount = 1
+    poolInfo.pPoolSizes = unsafe { @ptrCast([*]const vk.DescriptorPoolSize, &size) }
+    answer = pipeline.createDescriptorPool(handle, &poolInfo, null, &made.*.pool)
+    if answer != vk.Result.success { return failed("vkCreateDescriptorPool", answer) }
+    var setAllocation = vk.DescriptorSetAllocateInfo.init()
+    setAllocation.descriptorPool = made.*.pool
+    setAllocation.descriptorSetCount = 1
+    setAllocation.pSetLayouts = unsafe { @ptrCast([*]const vk.DescriptorSetLayout, &setLayout) }
+    var set: vk.DescriptorSet = 0
+    answer = pipeline.allocateDescriptorSets(handle, &setAllocation, unsafe { @ptrCast([*]vk.DescriptorSet, &set) })
+    if answer != vk.Result.success { return failed("vkAllocateDescriptorSets", answer) }
+    var bufferRange = vk.DescriptorBufferInfo.init()
+    bufferRange.buffer = made.*.buffer
+    bufferRange.range = vk.WHOLE_SIZE
+    var write = vk.WriteDescriptorSet.init()
+    write.dstSet = set
+    write.descriptorCount = 1
+    write.descriptorType = vk.DescriptorType.storageBuffer
+    write.pBufferInfo = unsafe { @ptrCast([*]const vk.DescriptorBufferInfo, &bufferRange) }
+    pipeline.updateDescriptorSets(handle, 1, unsafe { @ptrCast([*]const vk.WriteDescriptorSet, &write) }, 0, null)
+    // The commands.
+    var commandPoolInfo = vk.CommandPoolCreateInfo.init()
+    answer = commands.createCommandPool(handle, &commandPoolInfo, null, &made.*.commandPool)
+    if answer != vk.Result.success { return failed("vkCreateCommandPool", answer) }
+    var commandInfo = vk.CommandBufferAllocateInfo.init()
+    commandInfo.commandPool = made.*.commandPool
+    commandInfo.level = vk.CommandBufferLevel.primary
+    commandInfo.commandBufferCount = 1
+    var cb: vk.CommandBuffer = 0
+    answer = commands.allocateCommandBuffers(handle, &commandInfo, unsafe { @ptrCast([*]vk.CommandBuffer, &cb) })
+    if answer != vk.Result.success { return failed("vkAllocateCommandBuffers", answer) }
+    var fenceInfo = vk.FenceCreateInfo.init()
+    answer = queue.createFence(handle, &fenceInfo, null, &made.*.fence)
+    if answer != vk.Result.success { return failed("vkCreateFence", answer) }
+    if !dispatchOnce(handle, made, made.*.pipe, cb, set, @intCast(u32, WORDS) / doubler.LOCAL_SIZE) { return false }
+    k = 0
+    while k < WORDS {
+        const wanted = before(k) *% 2 +% @intCast(u32, k)
+        if values[k] != wanted { return wrong(k, values[k], wanted) }
+        k += 1
+    }
+    // The division: the pairs, their quotients and remainders 0 before.
+    k = 0
+    while k < divider.PAIRS {
+        values[4 * k] = divider.dividend(k)
+        values[4 * k + 1] = divider.divisor(k)
+        values[4 * k + 2] = 0
+        values[4 * k + 3] = 0
+        k += 1
+    }
+    last.division = true
+    var fence = made.*.fence
+    _ = queue.resetFences(handle, 1, unsafe { @ptrCast([*]const vk.Fence, &fence) })
+    _ = commands.resetCommandBuffer(cb, 0)
+    if !dispatchOnce(handle, made, made.*.divisionPipe, cb, set, @intCast(u32, divider.PAIRS) / divider.LOCAL_SIZE) { return false }
+    k = 0
+    while k < divider.PAIRS {
+        const n = divider.dividend(k)
+        const d = divider.divisor(k)
+        if values[4 * k + 2] != n / d { return wrong(4 * k + 2, values[4 * k + 2], n / d) }
+        if values[4 * k + 3] != n % d { return wrong(4 * k + 3, values[4 * k + 3], n % d) }
+        k += 1
+    }
+    last.division = false
+    return true
+}
+
+fn wrong(word: usize, got: u32, wanted: u32) -> bool {
+    last.outcome = Outcome.wrong
+    last.word = word
+    last.got = got
+    last.wanted = wanted
+    return false
+}
+
+// The SPIR-V of the doubler, or of the division when `division`, as a
+// shader module.
+fn moduleOf(handle: vk.Device, division: bool, into: *vk.ShaderModule) -> vk.Result {
+    const allocator = std.page_allocator.init()
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    if division { divider.build(&b) } else { doubler.build(&b) }
+    const count = builder.wordCount(&b)
+    const words = allocator.alloc(count * 4, 4)
+    if words == null { return vk.Result.errorOutOfHostMemory }
+    const spirv: [*]u32 = unsafe { @ptrCast([*]u32, words.?) }
+    builder.writeWords(&b, spirv)
+    var moduleInfo = vk.ShaderModuleCreateInfo.init()
+    moduleInfo.codeSize = count * 4
+    moduleInfo.pCode = spirv
+    const answer = pipeline.createShaderModule(handle, &moduleInfo, null, into)
+    allocator.free(words.?, count * 4, 4)
+    return answer
+}
+
+// `pipe` over the set, `groups` groups, a barrier to the host; submitted
+// with the self-test's fence and waited for.
+fn dispatchOnce(handle: vk.Device, made: *Made, pipe: vk.Pipeline, cb: vk.CommandBuffer, set: vk.DescriptorSet, groups: u32) -> bool {
+    const owner = device.deviceOf(handle)
+    var given = set
+    var beginInfo = vk.CommandBufferBeginInfo.init()
+    beginInfo.flags = vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    _ = commands.beginCommandBuffer(cb, &beginInfo)
+    commands.cmdBindPipeline(cb, vk.PipelineBindPoint.compute, pipe)
+    commands.cmdBindDescriptorSets(cb, vk.PipelineBindPoint.compute, made.*.layout, 0, 1, unsafe { @ptrCast([*]const vk.DescriptorSet, &given) }, 0, null)
+    commands.cmdDispatch(cb, groups, 1, 1)
+    var barrier = vk.MemoryBarrier.init()
+    barrier.srcAccessMask = vk.ACCESS_SHADER_WRITE_BIT
+    barrier.dstAccessMask = vk.ACCESS_HOST_READ_BIT
+    commands.cmdPipelineBarrier(cb, vk.PIPELINE_STAGE_COMPUTE_SHADER_BIT, vk.PIPELINE_STAGE_HOST_BIT, 0, 1, unsafe { @ptrCast([*]const vk.MemoryBarrier, &barrier) }, 0, null, 0, null)
+    var answer = commands.endCommandBuffer(cb)
+    if answer != vk.Result.success { return failed("vkEndCommandBuffer", answer) }
+    var buffer = cb
+    var submit = vk.SubmitInfo.init()
+    submit.commandBufferCount = 1
+    submit.pCommandBuffers = unsafe { @ptrCast([*]const vk.CommandBuffer, &buffer) }
+    answer = queue.queueSubmit(@intFromPtr(&owner.*.queue), 1, unsafe { @ptrCast([*]const vk.SubmitInfo, &submit) }, made.*.fence)
+    if answer != vk.Result.success { return failed("vkQueueSubmit", answer) }
+    var fence = made.*.fence
+    // (Five seconds, as std.gpu waits for a frame.)
+    answer = queue.waitForFences(handle, 1, unsafe { @ptrCast([*]const vk.Fence, &fence) }, vk.TRUE, 5000000000)
+    if answer != vk.Result.success { return failed("vkWaitForFences", answer) }
+    return true
+}
+
+// What the result says, in a line's words (vkinfo's, the compositor's).
+pub fn outcomeText(outcome: Outcome) -> []const u8 {
+    if outcome == Outcome.passed { return "the self-test passed" }
+    if outcome == Outcome.wrong { return if last.division { "the self-test's division gave a wrong word" } else { "the self-test's doubler gave a wrong word" } }
+    return "a step of the self-test failed"
+}

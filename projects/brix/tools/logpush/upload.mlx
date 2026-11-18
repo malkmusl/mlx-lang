@@ -1,0 +1,523 @@
+// One run of logpush: the kernel log, the log of the boot before and the
+// graphics card's ROM uploaded into the repository of the settings, each
+// as a new file, and what was done said in a line each.
+//
+// The connection is std.http.client's: TLS (std.tls) whose certificate
+// chain must verify against the roots the system trusts
+// (/system/settings/certificates on brixOS) for the host of the
+// settings, whose name must be the certificate's. Nothing here can
+// switch that off: the session's `insecure` is never set, redirects are
+// not followed (a redirect would take the token to wherever the answer
+// points), and a clock that is not set ends the run before anything is
+// sent, because a certificate cannot be judged without the date. The
+// one way without TLS is a test endpoint the settings name, which takes
+// a test's token only (settings.mlx).
+//
+// Before anything is uploaded the repository is asked about: it must be
+// there for the token, and it must be private. A kernel log names the
+// machine's parts and addresses, and a card's ROM is its maker's: into a
+// repository everyone reads, nothing goes.
+//
+// A run that is tried again (the service does, when what stood in the
+// way may pass) does not upload again what an earlier try of it got
+// through: the caller keeps what went (`Went`) from try to try. A kernel
+// log that is uploaded stays the one file of that upload, however often
+// the log of the boot before or the ROM has to be tried after it.
+const std = @import("std")
+const net = @import("std.net")
+const tls = @import("std.tls")
+const x509 = @import("std.x509")
+const client = @import("std.http.client")
+const settings_module = @import("./settings.mlx")
+const names = @import("./names.mlx")
+const request = @import("./request.mlx")
+const answer = @import("./answer.mlx")
+const line_module = @import("./line.mlx")
+
+const Settings = settings_module.Settings
+const Line = line_module.Line
+const Out = line_module.Out
+
+// What stands in the way on this machine's side, as its network link
+// says it (machine.mlx).
+pub const Trouble = enum(u8) {
+    none,
+    // The machine has no network device.
+    noDevice,
+    // No link is up: no cable, or nothing at its other end.
+    linkDown,
+    // No link has an address (yet).
+    noAddress
+}
+
+// What of one upload went through already, kept by the caller from one
+// try of it to the next: what is true here is not uploaded again.
+pub const Went = struct {
+    klog: bool
+    previous: bool
+    rom: bool
+
+    pub fn nothing(self: *Self) -> void {
+        self.*.klog = false
+        self.*.previous = false
+        self.*.rom = false
+    }
+}
+
+pub const Run = struct {
+    settings: *const Settings
+    // The kernel log as it is now.
+    klog: []const u8
+    // The log of the boot before ("" when there is none) and where it
+    // was kept, for the line about it ("boot.previous.log of disk0").
+    previous: []const u8
+    previousFrom: []const u8
+    // The graphics card's ROM ("" when the kernel read none).
+    rom: []const u8
+    // The clock: seconds since 1970 now and at the boot, and the
+    // milliseconds since the boot.
+    now: usize
+    boot: usize
+    uptime: usize
+    // Whether the system's random numbers are fit for a TLS key (brixOS:
+    // the kernel's generator is keyed from the processor's source).
+    randomFit: bool
+    trouble: fn() -> Trouble
+    out: *const Out
+    // The longest a step on the network may take.
+    timeoutMs: isize
+    // The roots the server's chain must lead to: null for the system's
+    // (what the program itself always gives); a test's own, to try a
+    // server of its own against them.
+    roots: ?*x509.TrustStore
+    // What an earlier try of this same upload got through (all false at
+    // an upload's first try); this run marks what it gets through.
+    went: *Went
+}
+
+pub const Result = enum(u8) {
+    // The kernel log is uploaded (and what else there was, or why not).
+    done,
+    // Not now; later perhaps.
+    again,
+    // Not as things are.
+    stop
+}
+
+fn worse(left: Result, right: Result) -> Result {
+    if left == Result.stop || right == Result.stop { return Result.stop }
+    if left == Result.again || right == Result.again { return Result.again }
+    return Result.done
+}
+
+var session: client.Session = undefined // (per run)
+var headerLines: [request.HEADERS]u8 = undefined // (per run)
+var body: request.Body = undefined // (per run)
+
+// What stands in the way on this machine's side, in words ("" for
+// nothing).
+fn troubleText(trouble: Trouble) -> []const u8 {
+    if trouble == Trouble.noDevice { return "this machine has no network device" }
+    if trouble == Trouble.linkDown { return "the network link is down (no cable, or nothing at its other end)" }
+    if trouble == Trouble.noAddress { return "this machine has no address yet (DHCP has not answered)" }
+    return ""
+}
+
+// What is wrong with a certificate chain that did not verify, added to
+// `line`: each of x509's flags in words.
+pub fn chainText(line: *Line, flags: u32, host: []const u8, now: usize) -> void {
+    var said = false
+    if flags & x509.UNKNOWN_CA != 0 {
+        line.add("no certificate authority this system trusts has signed it")
+        said = true
+    }
+    if flags & x509.BAD_IDENTITY != 0 {
+        line.add(if said { "; " } else { "" })
+        line.add("it is not ")
+        line.add(host)
+        line.add("'s (something stands between this machine and that host: a proxy, a network's login page)")
+        said = true
+    }
+    if flags & (x509.NOT_ACTIVATED | x509.EXPIRED) != 0 {
+        line.add(if said { "; " } else { "" })
+        line.add(if flags & x509.EXPIRED != 0 { "it has expired by this machine's clock, which says " } else { "it is not valid yet by this machine's clock, which says " })
+        names.stamp(line, now, false)
+        said = true
+    }
+    if flags & x509.INSECURE != 0 {
+        line.add(if said { "; " } else { "" })
+        line.add("it is signed with SHA-1")
+        said = true
+    }
+    if flags & (x509.GENERIC_ERROR | x509.REVOKED) != 0 || !said {
+        line.add(if said { "; " } else { "" })
+        line.add("it is not a certificate a server may show")
+    }
+}
+
+// Why the TLS handshake failed, added to `line`.
+fn handshakeText(line: *Line, run: *const Run) -> void {
+    const host = run.*.settings.hostText()
+    if session.certificateFlags != 0 || session.tlsFailure == tls.Failure.badCertificate {
+        line.add("the certificate of ")
+        line.add(host)
+        line.add(" is not trusted: ")
+        chainText(line, session.certificateFlags, run.*.settings.hostName(), run.*.now)
+        return
+    }
+    line.add("no TLS connection to ")
+    line.add(host)
+    line.add(": ")
+    if session.tlsFailure == tls.Failure.eof {
+        line.add("the connection ended during the handshake")
+    } else if session.tlsFailure == tls.Failure.alertReceived {
+        line.add("the server refused the handshake")
+    } else if session.tlsFailure == tls.Failure.handshake {
+        line.add("the server offers no TLS version or cipher this system has")
+    } else if session.tlsFailure == tls.Failure.internal {
+        line.add("no memory or no random numbers for it")
+    } else {
+        line.add("what answers there does not speak TLS as it should (a proxy?)")
+    }
+}
+
+// Why a request got no answer, added to `line`; whether another try is
+// worth it.
+fn failureText(line: *Line, run: *const Run, outcome: client.Error) -> Result {
+    const host = run.*.settings.hostText()
+    if outcome == client.Error.resolve {
+        line.add("the name ")
+        line.add(host)
+        line.add(" has no address")
+        return Result.again
+    }
+    if outcome == client.Error.connect {
+        if session.connectError == net.ECONNREFUSED {
+            line.add(host)
+            line.add(" refused the connection")
+        } else if session.connectError == net.ETIMEDOUT {
+            line.add(host)
+            line.add(" did not answer")
+        } else if session.connectError == net.ENETUNREACH {
+            const here = troubleText(run.*.trouble())
+            line.add(if here.length > 0 { here } else { "no way from this machine's network to that host (no gateway)" })
+        } else {
+            line.add("no connection to ")
+            line.add(host)
+        }
+        return Result.again
+    }
+    if outcome == client.Error.tls {
+        handshakeText(line, run)
+        // (A chain that does not verify does not verify a minute later.)
+        return if session.certificateFlags != 0 || session.tlsFailure == tls.Failure.badCertificate { Result.stop } else { Result.again }
+    }
+    if outcome == client.Error.send || outcome == client.Error.receive {
+        line.add("the connection ended before the answer was whole")
+        return Result.again
+    }
+    if outcome == client.Error.malformed {
+        line.add("what answered is not HTTP")
+        return Result.again
+    }
+    if outcome == client.Error.noMemory {
+        line.add("no memory for it")
+        return Result.again
+    }
+    line.add("the answer is not one logpush can read")
+    return Result.stop
+}
+
+// Where the uploads go, after a path in a line: nothing for GitHub
+// itself; the host when the settings name another; and that there is no
+// TLS when it is a test endpoint.
+fn destination(line: *Line, run: *const Run) -> void {
+    const s = run.*.settings
+    if s.*.plain {
+        line.add(" at the test endpoint ")
+        line.add(s.apiText())
+        line.add(" (no TLS)")
+    } else if !std.text.same(s.apiText(), settings_module.DEFAULT_API) {
+        line.add(" at ")
+        line.add(s.hostText())
+    }
+}
+
+// One request: `method` for the contents of `path`, with `content` as
+// the file's bytes when it is a PUT. `status` and the answer's body
+// (in `response`, to be freed when the call gave none-error).
+fn exchange(run: *const Run, method: []const u8, path: []const u8, sending: bool, response: *client.Response) -> client.Error {
+    const s = run.*.settings
+    var url: [request.URL]u8 = undefined
+    const urlLength = request.url(&url, s.apiText(), s.repositoryText(), path)
+    const headersLength = request.headers(&headerLines, s.tokenText(), sending)
+    if urlLength == 0 || headersLength == 0 { return client.Error.badUrl }
+    const asked = client.Request.{ .method = method, .url = url[0..urlLength], .headers = headerLines[0..headersLength], .body = body.text(), .hasBody = sending }
+    return client.request(&session, &asked, response)
+}
+
+// The header lines hold the token: overwritten when the run is over.
+fn forgetHeaders() -> void {
+    var k: usize = 0
+    while k < request.HEADERS {
+        headerLines[k] = 0
+        k += 1
+    }
+}
+
+// Whether the last put found its name taken (GitHub's 422) and said
+// nothing of it: its caller tries another name.
+var nameTaken: bool = false // (per run)
+
+// Uploads `content` as the file `path` (`what`: "the kernel log", for
+// the lines; `detail`: what is said in brackets after it, with the
+// size), with the commit message `message`. `renames`: a name that is
+// taken is not said but left to the caller (nameTaken).
+fn put(run: *const Run, what: []const u8, detail: []const u8, path: []const u8, content: []const u8, message: []const u8, renames: bool) -> Result {
+    nameTaken = false
+    var line: Line = undefined
+    line.init()
+    if !body.make(message, content, run.*.settings.branchText()) {
+        line.add("logpush: ")
+        line.add(what)
+        line.add(" was not uploaded: no memory for the request")
+        run.*.out.say(&line)
+        return Result.again
+    }
+    var response: client.Response = undefined
+    const outcome = exchange(run, "PUT", path, true, &response)
+    body.free()
+    if outcome != client.Error.none {
+        line.add("logpush: ")
+        line.add(what)
+        line.add(" was not uploaded: ")
+        const result = failureText(&line, run, outcome)
+        run.*.out.say(&line)
+        return result
+    }
+    const verdict = answer.verdict(response.status, false)
+    if renames && response.status == 422 {
+        client.freeResponse(&session, &response)
+        nameTaken = true
+        return Result.stop
+    }
+    if verdict == answer.Verdict.done {
+        line.add("logpush: uploaded ")
+        line.add(what)
+        line.add(" (")
+        line.add(detail)
+        line.number(content.length)
+        line.add(" bytes) as ")
+        line.add(path)
+        destination(&line, run)
+    } else {
+        line.add("logpush: ")
+        line.add(what)
+        line.add(" was not uploaded: ")
+        answer.reason(&line, response.status, client.body(&response), run.*.settings.repositoryText())
+    }
+    client.freeResponse(&session, &response)
+    run.*.out.say(&line)
+    if verdict == answer.Verdict.done { return Result.done }
+    return if verdict == answer.Verdict.again { Result.again } else { Result.stop }
+}
+
+// Uploads `content` as `path` unless a file of that name is there
+// already (then said, and done).
+fn putOnce(run: *const Run, what: []const u8, detail: []const u8, path: []const u8, content: []const u8, message: []const u8) -> Result {
+    var line: Line = undefined
+    line.init()
+    var response: client.Response = undefined
+    const outcome = exchange(run, "GET", path, false, &response)
+    if outcome != client.Error.none {
+        line.add("logpush: ")
+        line.add(what)
+        line.add(" was not uploaded: ")
+        const result = failureText(&line, run, outcome)
+        run.*.out.say(&line)
+        return result
+    }
+    const verdict = answer.verdict(response.status, true)
+    if verdict == answer.Verdict.absent {
+        client.freeResponse(&session, &response)
+        return put(run, what, detail, path, content, message, false)
+    }
+    if verdict == answer.Verdict.done {
+        line.add("logpush: ")
+        line.add(what)
+        line.add(" is there already (")
+        line.add(path)
+        line.add(")")
+    } else {
+        line.add("logpush: ")
+        line.add(what)
+        line.add(" was not uploaded: ")
+        answer.reason(&line, response.status, client.body(&response), run.*.settings.repositoryText())
+    }
+    client.freeResponse(&session, &response)
+    run.*.out.say(&line)
+    if verdict == answer.Verdict.done { return Result.done }
+    return if verdict == answer.Verdict.again { Result.again } else { Result.stop }
+}
+
+// The repository asked about: Result.done when it is there for the
+// token and private; else why not, said, and whether it may pass.
+fn repository(run: *const Run) -> Result {
+    const name = run.*.settings.repositoryText()
+    var line: Line = undefined
+    line.init()
+    line.add("logpush: nothing was uploaded: ")
+    var response: client.Response = undefined
+    const outcome = exchange(run, "GET", "", false, &response)
+    if outcome != client.Error.none {
+        const result = failureText(&line, run, outcome)
+        run.*.out.say(&line)
+        return result
+    }
+    var result = Result.stop
+    if response.status != 200 {
+        answer.reason(&line, response.status, client.body(&response), name)
+        if answer.verdict(response.status, false) == answer.Verdict.again { result = Result.again }
+    } else {
+        const privacy = answer.privacy(client.body(&response))
+        if privacy == answer.Privacy.private {
+            client.freeResponse(&session, &response)
+            return Result.done
+        }
+        line.add(name)
+        line.add(if privacy == answer.Privacy.public { " is a public repository, and a machine's kernel log and its card's ROM are not for everyone to read: make it private, or name a private one in the settings" } else { " may be a public repository (GitHub's answer does not say that it is private)" })
+    }
+    client.freeResponse(&session, &response)
+    run.*.out.say(&line)
+    return result
+}
+
+// What can be said before anything is sent: a line and a result when
+// the run cannot go on, Result.done when it can.
+fn before(run: *const Run) -> Result {
+    const s = run.*.settings
+    var line: Line = undefined
+    line.init()
+    if !s.*.plain {
+        // A certificate is judged by the date: without one, nothing is
+        // sent.
+        if !names.clockSet(run.*.now) {
+            line.add("logpush: nothing was uploaded: this machine's clock is not set (it says ")
+            names.stamp(&line, run.*.now, false)
+            line.add("), and without the date the certificate of ")
+            line.add(s.hostText())
+            line.add(" cannot be judged: set the date and the time (UTC) in the firmware's setup")
+            run.*.out.say(&line)
+            return Result.stop
+        }
+        if !run.*.randomFit {
+            line.add("logpush: nothing was uploaded: this machine's processor has no source of random numbers, and a TLS key made without one could be worked out by someone who listens: the token is not sent")
+            run.*.out.say(&line)
+            return Result.stop
+        }
+    }
+    const trouble = run.*.trouble()
+    if trouble != Trouble.none {
+        line.add("logpush: nothing was uploaded: ")
+        line.add(troubleText(trouble))
+        run.*.out.say(&line)
+        return if trouble == Trouble.noDevice { Result.stop } else { Result.again }
+    }
+    // The name: asked here, so that what a name server said can be said.
+    const host = s.hostName()
+    var found: [4]net.Address = undefined
+    var why = net.Lookup.found
+    if net.lookup(host, 443, &found, 4, run.*.timeoutMs, &why) == 0 {
+        line.add("logpush: nothing was uploaded: the name ")
+        line.add(host)
+        if why == net.Lookup.no_server {
+            line.add(" cannot be looked up: this machine knows no name server (none came with its address)")
+        } else if why == net.Lookup.no_answer {
+            line.add(" cannot be looked up: no name server answered")
+        } else if why == net.Lookup.unable {
+            line.add(" cannot be looked up: the name server says it cannot look names up (it has no way out?)")
+        } else if why == net.Lookup.bad_name {
+            line.add(" is no name a host can have")
+        } else {
+            line.add(" was not found (the name server knows no such host)")
+        }
+        run.*.out.say(&line)
+        // (A name server that does not know GitHub's name yet is one
+        // that has just come up: asked again.)
+        return if why == net.Lookup.bad_name { Result.stop } else { Result.again }
+    }
+    return Result.done
+}
+
+// The run: see the head of this file.
+pub fn run(r: *const Run) -> Result {
+    const s = r.*.settings
+    const ready = before(r)
+    if ready != Result.done { return ready }
+    client.init(&session, std.heap.allocator())
+    session.followRedirects = false
+    if r.*.roots != null { client.setTrustStore(&session, r.*.roots.?) }
+    session.timeoutMs = r.*.timeoutMs
+    session.userAgent = request.AGENT
+    // (An upload is half a megabyte at most; an answer is a few KiB.)
+    session.maxBody = 1024 * 1024
+    body.init()
+    var path: Line = undefined
+    var message: Line = undefined
+    var detail: Line = undefined
+    path.init()
+    message.init()
+    detail.init()
+    var result = repository(r)
+    if result != Result.done {
+        client.deinit(&session)
+        forgetHeaders()
+        return result
+    }
+    // (The kernel log, unless an earlier try of this upload got it
+    // through: tried again for the log of the boot before or the ROM, a
+    // run does not make one more file of the kernel log each time.)
+    if !r.*.went.*.klog {
+        names.klog(&path, s.machineText(), r.*.boot, r.*.uptime)
+        message.add(s.machineText())
+        message.add(": the kernel log ")
+        message.number(r.*.uptime / 1000)
+        message.add(" s after the boot of ")
+        names.stamp(&message, r.*.boot, true)
+        result = put(r, "the kernel log", "", path.text(), r.*.klog, message.text(), true)
+        if nameTaken {
+            // Another upload of this boot has the name of this very
+            // millisecond (or the clock stands still): the next one's.
+            path.init()
+            names.klog(&path, s.machineText(), r.*.boot, r.*.uptime + 1)
+            result = put(r, "the kernel log", "", path.text(), r.*.klog, message.text(), false)
+        }
+        if result == Result.done { r.*.went.*.klog = true }
+    }
+    if r.*.went.*.klog && r.*.previous.length > 0 && !r.*.went.*.previous {
+        path.init()
+        message.init()
+        names.previous(&path, s.machineText(), r.*.boot)
+        message.add(s.machineText())
+        message.add(": the kernel log of the boot before that of ")
+        names.stamp(&message, r.*.boot, true)
+        detail.add(r.*.previousFrom)
+        detail.add(", ")
+        const part = putOnce(r, "the log of the boot before", detail.text(), path.text(), r.*.previous, message.text())
+        if part == Result.done { r.*.went.*.previous = true }
+        result = worse(result, part)
+    }
+    if result != Result.stop && r.*.rom.length > 0 && !r.*.went.*.rom {
+        path.init()
+        message.init()
+        names.rom(&path, s.machineText(), r.*.rom)
+        message.add(s.machineText())
+        message.add(": the graphics card's ROM as the kernel read it")
+        const part = putOnce(r, "the graphics card's ROM", "", path.text(), r.*.rom, message.text())
+        if part == Result.done { r.*.went.*.rom = true }
+        result = worse(result, part)
+    }
+    client.deinit(&session)
+    forgetHeaders()
+    return result
+}

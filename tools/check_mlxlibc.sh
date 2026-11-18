@@ -47,8 +47,10 @@ defined=$(nm -D --defined-only "$lib")
 for name in malloc free printf fopen pthread_create strtod qsort __errno_location; do
     grep -q " T $name\$" <<< "$defined" || fail "$name is not exported"
 done
+# (In .data, or in .bss when its image is zero: stdin, stdout and stderr,
+# which the start writes, environ and optarg; nm says B for those.)
 for name in stdin stdout stderr environ optind optarg; do
-    grep -q " D $name\$" <<< "$defined" || fail "$name is not a data symbol"
+    grep -qE " [DB] $name\$" <<< "$defined" || fail "$name is not a data symbol"
 done
 count=$(awk '{print $3}' <<< "$defined" | grep -c .)
 echo "ok   libmlxc.so.1: $count symbols, soname, nothing needed"

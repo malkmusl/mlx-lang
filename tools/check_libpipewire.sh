@@ -63,7 +63,9 @@ if command -v readelf > /dev/null; then
     [[ "$needed" == "Shared library: [libc.so.6] " ]] || fail "needs more than libc: $needed"
 fi
 defined=$(nm -D --defined-only "$lib")
-[[ "$defined" == *" D pw_log_level"* && "$defined" == *" D PW_LOG_TOPIC_DEFAULT"* ]] || fail "pw_log_level and PW_LOG_TOPIC_DEFAULT are not data symbols"
+# (In .data, or in .bss when its value is zero, as PW_LOG_TOPIC_DEFAULT's
+# is; nm says B for that.)
+grep -qE " [DB] pw_log_level$" <<< "$defined" && grep -qE " [DB] PW_LOG_TOPIC_DEFAULT$" <<< "$defined" || fail "pw_log_level and PW_LOG_TOPIC_DEFAULT are not data symbols"
 if [[ -n "$system" ]]; then
     ours=$(awk '{print $3}' <<< "$defined" | grep '^pw_\|^PW_' | sort)
     theirs=$(nm -D --defined-only "$system" | awk '{print $3}' | grep '^pw_\|^PW_' | sort)

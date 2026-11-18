@@ -1,0 +1,1229 @@
+// The native calls 80 to 85 on a context of the card served for real
+// (projects/brix/kernel/gpu_work.mlx, built for the host as the kernel
+// builds it), end to end on the user's RX 580 as a table (the card of
+// tests 504 to 507: tests/support/mec_card.mlx's processors over
+// vm_card.mlx's memory controller, after stages 0 to 7 passed), with the
+// kernel's own frames and a process's pages as a table of frames here:
+// - the start: the calls served after V1 (one line), not at a boot of
+//   stage 6 or when V1 failed; the record lists compute ring 0 then, and
+//   not before (gpu_offer.mlx);
+// - memory: the system's (frames, zeroed, held), the card's beyond the
+//   aperture (first fit, a large one on 2 MiB, cleared by the card's
+//   DMA_DATA fills on compute ring 0 in the kernel's space: the words
+//   word for word), a process's own pages held and let go; every refusal
+//   (no size, a flag unknown, no place, the card's memory for the
+//   processor, a process's page that is not there, the limits per process
+//   and in all); freed when the last handle and mapping are gone and the
+//   ring passed the work that could touch it, not before;
+// - mapping: page for page into the context's space with the rights asked
+//   (the table entries bit for bit), every refusal (rights, pages, the
+//   range, the bottom 2 MiB, the space's end, another mapping), unmap as
+//   made, a buffer mapped by two contexts;
+// - submit: the streams copied and checked into the context's copy area
+//   (read and execute at 1 MiB of its space) and run from there as one
+//   buffer in its space through submitIn, word for word; the words it
+//   wrote through the space; a change of the program's words after the
+//   call changes nothing; every packet a stream may have, and every one it
+//   may not (a register by number, another buffer, GDS, packet 0, a
+//   register beyond the shader registers, COMPUTE_VMID alone and in a
+//   run, a memory space or a select vid.h does not name, a select's bit
+//   above its values, a packet past the end), each refused with nothing
+//   run; every other refusal (engine, flags, words,
+//   not executable, the card's memory, counts, another's fence); the copy
+//   area full while the ring holds the work, then free again;
+// - fences: not readable before its submit's end, readable after the
+//   interrupt, given to another submit waiting again; peer_gone for a lost
+//   context's;
+// - faults: a write where nothing is mapped (the context lost, its fence
+//   peer_gone, its later calls peer_gone, another context going on); a
+//   privileged register fault for the ring (the running context lost);
+// - a hang: the ring that does not move for 10 s left down, said, every
+//   context with work on it lost, the record without a ring (why 4),
+//   submits unsupported, the memory a hung ring may touch never freed;
+//   a ring that moves is no hang;
+// - a process that ends with work in flight: its context ends once the
+//   ring passed it, then its memory comes back; the limits of contexts
+//   per process and in all;
+// - what a hostile program tries: its stream's words changed while the
+//   kernel copies them (what the check saw is what runs, or nothing
+//   does), RELEASE_MEM asking for an interrupt, a SET_SH_REG offset word
+//   with a bit above the offset; the copy area exactly full while the
+//   ring holds its oldest copy (never written over); a buffer of the
+//   card's memory larger than one ring of fills (cleared batch after
+//   batch); a lost context's fence no submit was given (peer_gone), an
+//   ended context's fence (done when its work passed, no later context's);
+//   the fences and the mappings one process may have; a context's number
+//   kept while its work is in flight, not given to the next open; a
+//   privileged fault told to the context whose stream it came in (by the
+//   end-of-pipe entries before it), the card going on after it or not;
+//   memory unmapped and let go while work that writes it is in flight
+//   (kept until the ring passed it), the contexts behind work that hangs;
+// - the way down: every context lost.
+// With an argument the log of every case is printed.
+// Exits 13.
+const std = @import("std")
+const engines = @import("../projects/brix/kernel/gpu_engines.mlx")
+const loaded = @import("../projects/brix/kernel/gpu_smc_sdma.mlx")
+const compute = @import("../projects/brix/kernel/gpu_compute.mlx")
+const graphics = @import("../projects/brix/kernel/gpu_graphics.mlx")
+const spaces = @import("../projects/brix/kernel/gpu_space.mlx")
+const first = @import("../projects/brix/kernel/gpu_first_space.mlx")
+const ring = @import("../projects/brix/kernel/gpu_ring.mlx")
+const work = @import("../projects/brix/kernel/gpu_work.mlx")
+const Status = @import("../projects/brix/kernel/status.mlx").Status
+const card = @import("./support/engine_card.mlx")
+const smc = @import("./support/smc_card.mlx")
+const mec = @import("./support/mec_card.mlx")
+const vm = @import("./support/vm_card.mlx")
+const crash = @import("std.crash")
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+
+var show = false
+var failed: u8 = 0
+
+fn expect(holds: bool, what: []const u8) -> void {
+    if holds { return }
+    say("not as expected: ")
+    say(what)
+    say("\n")
+    if failed == 0 { failed = 1 }
+}
+
+fn line(text: []const u8) -> void { expect(card.has(text), text) }
+
+fn noLine(text: []const u8) -> void {
+    if !card.has(text) { return }
+    say("said, but should not be: ")
+    say(text)
+    say("\n")
+    if failed == 0 { failed = 2 }
+}
+
+fn hex(value: usize) -> void {
+    var digits: usize = 1
+    while digits < 16 && (value >> @intCast(u6, digits * 4)) != 0 { digits += 1 }
+    var text: [18]u8 = undefined
+    text[0] = 48
+    text[1] = 120
+    var k: usize = 0
+    while k < digits {
+        const digit = (value >> @intCast(u6, (digits - 1 - k) * 4)) & 15
+        text[2 + k] = @intCast(u8, if digit < 10 { 48 + digit } else { 87 + digit })
+        k += 1
+    }
+    say(text[0..2 + digits])
+}
+
+fn shown() -> void {
+    if show {
+        say(card.log[0..card.logged])
+        say("--\n")
+    }
+}
+
+const N = card.NEVER
+const NONE = work.NONE
+const VRAM: usize = 0xF400000000
+const NOP: usize = 0xFFFF1000
+
+// ---- The system's memory for the calls: frames here, "physical" from
+// FRAMES_FROM, each with its holders; a process's own pages (USER_PAGES of
+// them from USER_AT) are frames of it too.
+
+const FRAMES_FROM: usize = 0x0000000200000000
+const FRAMES: usize = 16384
+const FRAME_BYTES: usize = FRAMES * 4096
+var frames: usize = 0
+var holders: [FRAMES]u32 = undefined
+var nextFrame: usize = 0
+var freeList: [FRAMES]usize = undefined
+var freeCount: usize = 0
+var taken: usize = 0
+var given: usize = 0
+var refuseFrames = false
+const USER_AT: usize = 0x7F0000000000
+const USER_PAGES: usize = 64
+var userFrames: [USER_PAGES]usize = undefined
+
+fn frameIndex(physical: usize) -> usize { return (physical - FRAMES_FROM) / 4096 }
+
+fn takeFrame() -> usize {
+    if refuseFrames { return 0 }
+    var at: usize = 0
+    if freeCount > 0 {
+        freeCount -= 1
+        at = freeList[freeCount]
+    } else {
+        if nextFrame == FRAMES { return 0 }
+        at = FRAMES_FROM + nextFrame * 4096
+        nextFrame += 1
+    }
+    var k: usize = 0
+    while k < 4096 {
+        const place: *usize = unsafe { @ptrFromInt(*usize, frames + (at - FRAMES_FROM) + k) }
+        place.* = 0
+        k += 8
+    }
+    holders[frameIndex(at)] = 1
+    taken += 1
+    return at
+}
+
+fn freeFrame(physical: usize) -> void {
+    const k = frameIndex(physical)
+    expect(holders[k] > 0, "a frame let go that nobody holds")
+    if holders[k] == 0 { return }
+    holders[k] -= 1
+    if holders[k] == 0 {
+        freeList[freeCount] = physical
+        freeCount += 1
+        given += 1
+    }
+}
+
+fn viewOf(physical: usize) -> usize { return frames + physical - FRAMES_FROM }
+
+fn pinPage(process: usize, address: usize) -> usize {
+    if process != 100 || address < USER_AT || address >= USER_AT + USER_PAGES * 4096 { return 0 }
+    const physical = userFrames[(address - USER_AT) / 4096]
+    holders[frameIndex(physical)] += 1
+    return physical
+}
+
+fn word(physical: usize, at: usize) -> usize { return @intCast(usize, unsafe { @ptrFromInt(*u32, viewOf(physical) + at) }.*) }
+
+fn setWord(physical: usize, at: usize, value: usize) -> void {
+    const place: *u32 = unsafe { @ptrFromInt(*u32, viewOf(physical) + at) }
+    place.* = @intCast(u32, value)
+}
+
+// The frames in use now (not on the free list).
+fn framesHeld() -> usize { return nextFrame - freeCount }
+
+// The card's memory beyond the aperture (offset in the card's memory).
+fn cardWord(offset: usize) -> usize { return @intCast(usize, unsafe { @ptrFromInt(*u32, card.beyondVram + offset - card.VIEW) }.*) }
+
+fn setCardWord(offset: usize, value: usize) -> void {
+    const place: *u32 = unsafe { @ptrFromInt(*u32, card.beyondVram + offset - card.VIEW) }
+    place.* = @intCast(u32, value)
+}
+
+// ---- The card brought to stage 7, the calls served.
+
+var e: engines.Engines = undefined
+var l: loaded.Loaded = undefined
+var c: compute.Compute = undefined
+var g: graphics.Graphics = undefined
+var s: spaces.Spaces = undefined
+var f: first.FirstSpace = undefined
+var w: work.Work = undefined
+var where: engines.Card = undefined
+const SYSTEM_MOST: usize = 32 * 1024 * 1024
+
+fn fresh(stage: usize) -> void {
+    mec.reset()
+    card.picture(0, 1280, 960, 1800, 1000)
+    card.registers[loaded.SMC_RESP_0] = 1
+    where = engines.Card.{ .device = 0x67DF, .revision = 0xE7, .view = card.VIEW, .pictureOffset = 0, .pictureBytes = 1280 * 960 * 4, .dmaBase = card.DMA_BASE, .dmaPages = 2048, .rom = &card.machine }
+    const hands = mec.hands()
+    engines.begin(&e, &hands, &where, stage)
+    const more = mec.more()
+    loaded.begin(&l, &more)
+    compute.begin(&c)
+    graphics.begin(&g)
+    spaces.begin(&s)
+    first.begin(&f)
+    if frames == 0 { frames = std.linux.mapAnonymous(FRAME_BYTES) }
+    vm.systemFrom = FRAMES_FROM
+    vm.systemBytes = FRAME_BYTES
+    vm.systemMemory = frames
+    nextFrame = 0
+    freeCount = 0
+    taken = 0
+    given = 0
+    refuseFrames = false
+    var k: usize = 0
+    while k < FRAMES {
+        holders[k] = 0
+        k += 1
+    }
+    k = 0
+    while k < USER_PAGES {
+        userFrames[k] = takeFrame()
+        setWord(userFrames[k], 0, 0x55500000 + k)
+        k += 1
+    }
+    const lent = work.Hands.{ .frame = takeFrame, .free = freeFrame, .view = viewOf }
+    work.begin(&w, &lent, SYSTEM_MOST)
+}
+
+// Stages 0 to 7 at a boot of `stage`, the calls served when they can be.
+fn boot(stage: usize) -> bool {
+    fresh(stage)
+    engines.run(&e)
+    first.run(&e, &l, &c, &g, &s, &f)
+    card.interruptsOn = true
+    card.waitingMessage = false
+    return work.serve(&w, &e, &l, &c, &s, f.v1)
+}
+
+fn gart(physical: usize) -> usize { return 0xFF00000000 + physical - card.DMA_BASE }
+
+fn memoryWord(at: usize) -> usize { return @intCast(usize, card.memoryRead(at)) }
+
+// The words of compute ring 0 from `at` (words into it) are `words`.
+fn ringIs(at: usize, words: []const usize) -> bool {
+    var k: usize = 0
+    while k < words.length {
+        const got = memoryWord(c.rings[1] + ((at + k) % c.compute.words) * 4)
+        if got != words[k] {
+            say("ring word ")
+            hex(at + k)
+            say(" is ")
+            hex(got)
+            say(", not ")
+            hex(words[k])
+            say("\n")
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// A memory object's frame `page` (a system buffer's).
+fn frameOf(m: usize, page: usize) -> usize { return work.pageOf(&w, m, page) }
+
+// A stream of `count` words written into memory `m` from byte `at`.
+fn writeStream(m: usize, at: usize, words: []const usize) -> void {
+    var k: usize = 0
+    while k < words.length {
+        const byte = at + k * 4
+        setWord(frameOf(m, byte / 4096), byte % 4096, words[k])
+        k += 1
+    }
+}
+
+fn status(code: isize) -> isize { return code }
+
+// ---- One context's work, end to end.
+
+const BASE: usize = 0x200000
+const HIGH: usize = 0x100000000
+
+fn oneContext() -> void {
+    expect(boot(7), "the calls served after V1")
+    line("gpu: programs' work on compute ring 0: 7936 MiB of the card's memory and 32 MiB of the system's for programs, address spaces 1 to 7, streams checked and copied")
+    expect(work.served(&w), "served")
+    expect(work.open(&w, 0, 100) == 0, "a context of process 100")
+    expect(work.spaceOf(&w, 0) == 1, "its address space 1 (V1 gave it back)")
+    const held = framesHeld()
+    // The system's memory: frames, zeroed.
+    const m1 = work.memory(&w, 0, 8192, work.SYSTEM | work.PROCESSOR | work.ZEROED)
+    expect(m1 >= 0, "two pages of the system's memory")
+    const sys = @bitCast(usize, m1)
+    expect(framesHeld() == held + 3, "two frames and their list page held")
+    expect(work.sizeOf(&w, sys) == 8192 && work.mappable(&w, sys), "its size, mapped by the processor")
+    // The card's memory: beyond the aperture, cleared by the card.
+    var k: usize = 0
+    while k < 16384 {
+        setCardWord(card.VIEW + k * 4, 0xABABABAB)
+        k += 1
+    }
+    const ringAt = c.compute.wptr
+    const sent = c.compute.sent
+    const m2 = work.memory(&w, 0, 4 * 4096, work.CARD | work.ZEROED)
+    expect(m2 >= 0, "four pages of the card's memory")
+    const vram = @bitCast(usize, m2)
+    expect(!work.mappable(&w, vram) && work.pageOf(&w, vram, 0) == 0, "the card's memory is not the processor's to map")
+    const fillWords = [_]usize{ 0xC0055000, 0xC0000000, 0, 0, (VRAM + card.VIEW) & 0xFFFFFFFF, (VRAM + card.VIEW) >> 32, 0x4000 }
+    expect(ringIs(ringAt, fillWords[0..]), "the fill word for word: DMA_DATA, a word (SRC_SEL 2) and CP_SYNC, 0, to the card's memory beyond the aperture by its card address (0xf410000000), 16384 bytes")
+    expect(c.compute.sent == sent + 1 && mec.dmaPackets == 1, "one fill, one fence after it")
+    expect(cardWord(card.VIEW) == 0 && cardWord(card.VIEW + 0x3FFC) == 0 && cardWord(card.VIEW + 0x4000) == 0xABABABAB, "the four pages cleared by the card, not one word more")
+    // Mapped.
+    expect(work.map(&w, 0, sys, 0, 8192, BASE, work.READ | work.WRITE | work.EXECUTE) == 0, "the system buffer at 2 MiB, read, write, execute")
+    expect(work.map(&w, 0, vram, 0, 4 * 4096, HIGH, work.READ | work.WRITE) == 0, "the card's buffer at 4 GiB, read and write")
+    expect(spaces.entry(&e, &s, 1, BASE) == ((frameOf(sys, 0) & 0xFFFFFFFFFF000) | 0x77), "the system page's entry: its address | valid, system, snooped, executable, readable, writeable")
+    expect(spaces.entry(&e, &s, 1, HIGH + 4096) == ((card.VIEW + 4096) | 0x61), "the card page's entry: its offset in the card's memory | valid, readable, writeable")
+    expect(work.mapped(&w) == 1 + 1, "two mappings (and the copy area is none yet)")
+    // A stream: two words written through the space, padded to 8 words.
+    const stream = [_]usize{ 0xC0033700, 0x00100500, HIGH & 0xFFFFFFFF, HIGH >> 32, 0x51700001, 0xC0033700, 0x00100500, (BASE + 0x1800) & 0xFFFFFFFF, 0, 0x51700002, NOP, NOP, NOP, NOP, NOP, NOP }
+    writeStream(sys, 0x100, stream[0..])
+    const fence = work.fence(&w, 0)
+    expect(fence >= 0, "a fence")
+    const fx = @bitCast(usize, fence)
+    expect(work.fenceState(&w, fx) == 0, "a fence not given to a submit: not readable")
+    var records = [1]work.Stream{ work.Stream.{ .engine = 1, .flags = 0, .address = @intCast(u64, BASE + 0x100), .words = 16 } }
+    const at = c.compute.wptr
+    const before = mec.buffers
+    expect(work.submit(&w, 0, &records, 1, fx) == 1, "submit 1")
+    shown()
+    expect(mec.buffers == before + 1 && mec.bufferSpace == 1, "one buffer run, in address space 1")
+    expect(cardWord(card.VIEW) == 0x51700001 && word(frameOf(sys, 1), 0x800) == 0x51700002, "the two words written through the space: the card's page and the system's")
+    // The copy area: the stream's words at 1 MiB of the space, read and
+    // execute, and what ran was the copy.
+    const copy = spaces.entry(&e, &s, 1, work.COPY_AT)
+    expect(copy & 0xFFF == 0x37, "the copy area's entry: valid, system, snooped, executable, readable, not writeable")
+    k = 0
+    var same = true
+    while k < 16 {
+        if word(copy & 0xFFFFFFFFFF000, k * 4) != stream[k] { same = false }
+        k += 1
+    }
+    expect(same, "the copy area holds the stream word for word")
+    // The frame of a program's buffer (no memory sync: amdgpu_ib_get's flag
+    // is the kernel's buffers'): the wait for the ring's last fence, the
+    // base register and the flush, its wait, the interrupt ring's number
+    // for the space (context 0's: 1), the flush's fence, the host path's
+    // flush, the buffer at the copy, the invalidate, the fence: 59 words.
+    const head = [_]usize{ 0xC0053C00, 0x13 }
+    const middle = [_]usize{ 0xC0033700, 0x100000, 0xE01, 0, 1, 0xC0054900 }
+    const buffer = [_]usize{ 0xC0023F00, work.COPY_AT, 0, 0x800000 | 16 | (1 << 24), 0xC0033700, 0x100000, 0xBCC, 0, 1, 0xC0054900 }
+    expect(ringIs(at, head[0..]) && ringIs(at + 24, middle[0..]) && ringIs(at + 43, buffer[0..]) && ringIs(at + 59, [_]usize{ NOP }[0..]), "the frame word for word where it matters: the wait for the last fence first (no memory sync), the space's number 1 told, the buffer packet names the copy at 1 MiB, 16 words, address space 1, valid")
+    expect(work.fenceState(&w, fx) == work.READABLE, "the fence readable once the ring passed it")
+    work.interrupted(&w)
+    expect(work.fenceState(&w, fx) == work.READABLE, "still readable after the interrupt")
+    // Out again: the frames back, the card's memory free again.
+    expect(work.unmap(&w, 0, BASE, 4096) == Status.not_found, "an unmap not as mapped: not found")
+    expect(work.unmap(&w, 0, BASE, 8192) == 0 && work.unmap(&w, 0, HIGH, 4 * 4096) == 0, "both unmapped")
+    expect(spaces.entry(&e, &s, 1, BASE) == 0 && spaces.entry(&e, &s, 1, HIGH) == 0, "their entries 0")
+    work.releaseMemory(&w, sys)
+    work.releaseMemory(&w, vram)
+    work.releaseFence(&w, fx)
+    expect(work.objects(&w) == 1 && work.cardFree(&w) == 7936 * 1024 * 1024, "the two buffers freed (the copy area stays with the context)")
+    work.end(&w, 0)
+    expect(work.living(&w) == 0 && work.objects(&w) == 0 && framesHeld() == held && work.holding(&w, 100).system == 0, "the context ended: its copy area's frames back, nothing held")
+    expect(!spaces.held(&s, 1), "its address space given back")
+}
+
+// ---- Helpers for the cases.
+
+const offering = @import("../projects/brix/kernel/gpu_offer.mlx")
+const record = @import("../projects/brix/kernel/gpu_record.mlx")
+
+// A context `k` of process `process` with a system buffer of `pages`
+// pages mapped at BASE read, write, execute: the buffer's index.
+fn withBuffer(k: usize, process: usize, pages: usize) -> usize {
+    expect(work.open(&w, k, process) == 0, "a context")
+    const made = work.memory(&w, k, pages * 4096, work.SYSTEM | work.PROCESSOR)
+    expect(made >= 0, "its buffer")
+    const m = @bitCast(usize, made)
+    expect(work.map(&w, k, m, 0, pages * 4096, BASE, work.READ | work.WRITE | work.EXECUTE) == 0, "its buffer mapped at 2 MiB")
+    return m
+}
+
+// `words` written into buffer `m` from byte `at`, padded with NOPs to 8,
+// submitted by context `k` (fence `f`, NONE: none): what submit answered.
+var padded: [64]usize = undefined
+
+fn submitWords(k: usize, m: usize, at: usize, words: []const usize, f: usize) -> isize {
+    var n: usize = 0
+    while n < words.length {
+        padded[n] = words[n]
+        n += 1
+    }
+    while n % 8 != 0 {
+        padded[n] = NOP
+        n += 1
+    }
+    writeStream(m, at, padded[0..n])
+    var records = [1]work.Stream{ work.Stream.{ .engine = 1, .flags = 0, .address = @intCast(u64, BASE + at), .words = @intCast(u64, n) } }
+    return work.submit(&w, k, &records, 1, f)
+}
+
+// The ring that does not run its queue until `resume`.
+fn deafen() -> void { mec.ringDeaf = true }
+
+fn resume() -> void {
+    mec.ringDeaf = false
+    mec.doorbell(c.compute.doorbell, @intCast(u32, c.compute.wptr))
+}
+
+// The record as the kernel makes it now.
+fn recordNow() -> record.Facts {
+    const lent = offering.Card.{ .present = true, .vendor = 0x1002, .device = 0x67DF, .revision = 0xE7, .pci = 0x2100, .visible = card.VIEW, .picture = 1280 * 960 * 4, .name = "Radeon RX 580 (Polaris 10)" }
+    var facts: record.Facts = undefined
+    offering.gather(&lent, &e, &facts)
+    offering.served(&w, &facts)
+    return facts
+}
+
+// ---- Not served: a boot of stage 6, a V1 that failed.
+
+fn notServed() -> void {
+    expect(!boot(6), "a boot of stage 6: the calls not served")
+    noLine("gpu: programs' work")
+    var facts = recordNow()
+    expect(facts.computeRings == 0 && facts.why == record.Why.NOT_STARTED_YET && facts.flags & record.Flag.PROGRAMS == 0, "its record: no ring, why 1, no flag (as before)")
+    expect(work.open(&w, 0, 100) == 0 && work.spaceOf(&w, 0) == NONE, "a context all the same, without an address space")
+    expect(work.memory(&w, 0, 4096, work.SYSTEM) == Status.unsupported && work.fence(&w, 0) == Status.unsupported && work.unmap(&w, 0, BASE, 4096) == Status.unsupported, "its calls unsupported")
+    work.end(&w, 0)
+    expect(work.living(&w) == 0, "ended")
+    // V1 that fails: no fault entry comes.
+    fresh(7)
+    vm.noFaultEntry = true
+    engines.run(&e)
+    first.run(&e, &l, &c, &g, &s, &f)
+    expect(f.v1 == engines.Outcome.failed && !work.serve(&w, &e, &l, &c, &s, f.v1), "V1 failed: the calls not served")
+    facts = recordNow()
+    expect(facts.computeRings == 0, "no ring in the record")
+    // Served: the record lists compute ring 0, the flag, the system's
+    // memory for programs.
+    expect(boot(7), "served")
+    facts = recordNow()
+    expect(facts.computeRings == 1 && facts.why == record.Why.NONE && facts.flags & record.Flag.PROGRAMS != 0 && facts.system == SYSTEM_MOST, "the record: compute ring 0, why 0, the flag, the system's memory programs may have")
+}
+
+// ---- Memory.
+
+fn memoryCases() -> void {
+    expect(boot(7), "served")
+    expect(work.open(&w, 0, 100) == 0, "a context")
+    expect(work.memory(&w, 0, 0, work.SYSTEM) == Status.invalid, "no size: invalid")
+    expect(work.memory(&w, 0, 4096, work.SYSTEM | 0x200) == Status.invalid, "a flag unknown: invalid")
+    expect(work.memory(&w, 0, 4096, work.PROCESSOR) == Status.invalid, "no place: invalid")
+    expect(work.memory(&w, 0, 4096, work.CARD | work.PROCESSOR) == Status.no_memory, "the card's memory for the processor: no_memory (none is a program's)")
+    const held = framesHeld()
+    // Either: the card's first; either with the processor: the system's.
+    const either = work.memory(&w, 0, 4096, work.EITHER)
+    const eitherMapped = work.memory(&w, 0, 4096, work.EITHER | work.PROCESSOR)
+    expect(either >= 0 && !work.mappable(&w, @bitCast(usize, either)) && eitherMapped >= 0 && work.mappable(&w, @bitCast(usize, eitherMapped)), "either: the card's; either for the processor: the system's")
+    work.releaseMemory(&w, @bitCast(usize, either))
+    work.releaseMemory(&w, @bitCast(usize, eitherMapped))
+    expect(framesHeld() == held && work.cardFree(&w) == 7936 * 1024 * 1024, "both freed")
+    // A large one on 2 MiB, cleared in three packets.
+    const packets = mec.dmaPackets
+    const large = work.memory(&w, 0, 3 * 1024 * 1024, work.CARD)
+    expect(large >= 0 && mec.dmaPackets == packets + 2, "three MiB of the card's memory cleared by two fills of at most 511 pages")
+    const small = work.memory(&w, 0, 4096, work.CARD)
+    const big = work.memory(&w, 0, 2 * 1024 * 1024, work.CARD)
+    expect(small >= 0 && big >= 0, "another small and another large")
+    // (The large ones on 2 MiB: the small one fills the gap first.)
+    expect(work.cardFree(&w) == 7936 * 1024 * 1024 - 3 * 1024 * 1024 - 4096 - 2 * 1024 * 1024, "the card's memory counted")
+    work.releaseMemory(&w, @bitCast(usize, large))
+    work.releaseMemory(&w, @bitCast(usize, small))
+    work.releaseMemory(&w, @bitCast(usize, big))
+    expect(work.cardFree(&w) == 7936 * 1024 * 1024 && w.freeCount == 1, "all of it back in one run")
+    // The limits: per process (half of each), in all.
+    expect(work.memory(&w, 0, 3968 * 1024 * 1024 + 4096, work.CARD) == Status.no_memory, "more of the card's memory than a process may have: no_memory")
+    expect(work.memory(&w, 0, SYSTEM_MOST / 2 + 4096, work.SYSTEM) == Status.no_memory, "more of the system's than a process may have: no_memory")
+    expect(work.holding(&w, 100).system == 0 && framesHeld() == held, "nothing kept of either")
+    refuseFrames = true
+    expect(work.memory(&w, 0, 4096, work.SYSTEM) == Status.no_memory, "no frame: no_memory")
+    refuseFrames = false
+    // A process's own pages.
+    expect(work.memoryOf(&w, 0, pinPage, 100, USER_AT + 1, 4096) == Status.invalid && work.memoryOf(&w, 0, pinPage, 100, USER_AT, 4095) == Status.invalid, "not on pages: invalid")
+    expect(work.memoryOf(&w, 0, pinPage, 100, USER_AT + (USER_PAGES - 1) * 4096, 2 * 4096) == Status.bad_address, "a page the process does not have: bad_address")
+    expect(holders[frameIndex(userFrames[USER_PAGES - 1])] == 1, "the page it had let go again")
+    const mine = work.memoryOf(&w, 0, pinPage, 100, USER_AT, 2 * 4096)
+    expect(mine >= 0 && holders[frameIndex(userFrames[0])] == 2 && holders[frameIndex(userFrames[1])] == 2, "two of its pages held for the card")
+    expect(work.pageOf(&w, @bitCast(usize, mine), 1) == userFrames[1] && word(userFrames[1], 0) == 0x55500001, "its own frames, its own words")
+    work.releaseMemory(&w, @bitCast(usize, mine))
+    expect(holders[frameIndex(userFrames[0])] == 1 && holders[frameIndex(userFrames[1])] == 1, "let go with the object")
+    // The objects a process may have.
+    var made: [work.MEMORY_PER_PROCESS]usize = undefined
+    var k: usize = 0
+    var all = true
+    while k < work.MEMORY_PER_PROCESS {
+        const one = work.memory(&w, 0, 4096, work.CARD)
+        if one < 0 { all = false } else { made[k] = @bitCast(usize, one) }
+        k += 1
+    }
+    expect(all && work.memory(&w, 0, 4096, work.CARD) == Status.too_many, "512 objects, the 513th too_many")
+    k = 0
+    while k < work.MEMORY_PER_PROCESS {
+        work.releaseMemory(&w, made[k])
+        k += 1
+    }
+    expect(work.objects(&w) == 0 && work.holding(&w, 100).objects == 0, "all freed")
+    work.end(&w, 0)
+}
+
+// ---- Mapping.
+
+fn mapCases() -> void {
+    expect(boot(7), "served")
+    expect(work.open(&w, 0, 100) == 0 && work.open(&w, 1, 101) == 0, "two contexts of two processes")
+    const m = @bitCast(usize, work.memory(&w, 0, 4 * 4096, work.SYSTEM | work.PROCESSOR))
+    const v = @bitCast(usize, work.memory(&w, 0, 2 * 4096, work.CARD))
+    expect(work.map(&w, 0, m, 0, 4096, BASE, 0) == Status.invalid && work.map(&w, 0, m, 0, 4096, BASE, 8) == Status.invalid, "no rights, a right unknown: invalid")
+    expect(work.map(&w, 0, m, 0, 0, BASE, 1) == Status.invalid && work.map(&w, 0, m, 1, 4096, BASE, 1) == Status.invalid && work.map(&w, 0, m, 0, 100, BASE, 1) == Status.invalid && work.map(&w, 0, m, 0, 4096, BASE + 8, 1) == Status.invalid, "no size, an offset, a size, an address not on pages: invalid")
+    expect(work.map(&w, 0, m, 4096, 4 * 4096, BASE, 1) == Status.invalid, "beyond the buffer: invalid")
+    expect(work.map(&w, 0, m, 0, 4096, 0x1FF000, 1) == Status.bad_address, "below 2 MiB: bad_address")
+    expect(work.map(&w, 0, m, 0, 4096, work.ADDRESS_END, 1) == Status.bad_address && work.map(&w, 0, m, 0, 2 * 4096, work.ADDRESS_END - 4096, 1) == Status.bad_address, "at or past the space's end (64 GiB): bad_address")
+    expect(work.map(&w, 0, m, 0, 4 * 4096, BASE, work.READ) == 0, "mapped read only")
+    expect(spaces.entry(&e, &s, 1, BASE + 3 * 4096) == ((work.pageOf(&w, m, 3) & 0xFFFFFFFFFF000) | 0x27), "a read-only system page's entry: valid, system, snooped, readable (0x27)")
+    expect(work.map(&w, 0, v, 0, 4096, BASE + 3 * 4096, work.READ) == Status.exists, "over another mapping: exists")
+    expect(spaces.entry(&e, &s, 1, BASE + 3 * 4096) & 0xFFF == 0x27, "the one there unchanged")
+    expect(work.map(&w, 0, v, 0, 2 * 4096, 0x40000000, work.WRITE | work.EXECUTE) == 0 && spaces.entry(&e, &s, 1, 0x40001000) == ((card.VIEW + 0x1000) | 0x51), "the card's page write and execute: 0x51")
+    // Context 1 maps context 0's buffer (it was sent its handle).
+    expect(work.map(&w, 1, m, 0, 4096, BASE, work.READ | work.WRITE) == 0 && spaces.entry(&e, &s, 2, BASE) == ((work.pageOf(&w, m, 0) & 0xFFFFFFFFFF000) | 0x67), "the same buffer in context 1's space: its own entry, read and write")
+    const held = framesHeld()
+    work.releaseMemory(&w, m)
+    expect(framesHeld() == held, "context 0's handle gone: still mapped, kept")
+    expect(work.unmap(&w, 0, BASE, 4 * 4096) == 0, "context 0 unmaps it")
+    expect(framesHeld() == held, "context 1 still maps it: kept")
+    expect(work.unmap(&w, 1, BASE, 4096) == 0 && framesHeld() == held - 5, "the last mapping gone: its four frames and list page back")
+    expect(work.unmap(&w, 1, BASE, 4096) == Status.not_found, "unmapped twice: not_found")
+    work.releaseMemory(&w, v)
+    expect(work.unmap(&w, 0, 0x40000000, 2 * 4096) == 0 && work.objects(&w) == 0, "the card's buffer freed with its last mapping")
+    work.end(&w, 0)
+    work.end(&w, 1)
+}
+
+// ---- Submits: what a stream may have and what not.
+
+fn streamCases() -> void {
+    expect(boot(7), "served")
+    const m = withBuffer(0, 100, 4)
+    const v = @bitCast(usize, work.memory(&w, 0, 4096, work.CARD))
+    expect(work.map(&w, 0, v, 0, 4096, 0x40000000, work.READ | work.WRITE | work.EXECUTE) == 0, "a card page mapped executable")
+    const n = @bitCast(usize, work.memory(&w, 0, 4096, work.SYSTEM))
+    expect(work.map(&w, 0, n, 0, 4096, 0x50000000, work.READ | work.WRITE) == 0, "a system page mapped, not executable")
+    const nops = [_]usize{ NOP, NOP, NOP, NOP, NOP, NOP, NOP, NOP }
+    writeStream(m, 0, nops[0..])
+    var one = [1]work.Stream{ work.Stream.{ .engine = 1, .flags = 0, .address = @intCast(u64, BASE), .words = 8 } }
+    const runs = mec.buffers
+    one[0].engine = 0
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.invalid, "the graphics engine: invalid")
+    one[0].engine = 2
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.invalid, "the copy engine: invalid")
+    one[0].engine = 1
+    one[0].flags = 1
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.invalid, "a flag: invalid")
+    one[0].flags = 0
+    one[0].words = 0
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.invalid, "no words: invalid")
+    one[0].words = 8
+    expect(work.submit(&w, 0, &one, 0, NONE) == Status.invalid && work.submit(&w, 0, &one, 65, NONE) == Status.invalid, "0 and 65 streams: invalid")
+    one[0].address = @intCast(u64, BASE + 2)
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.bad_address, "not on 4 bytes: bad_address")
+    one[0].address = 0x50000000
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.bad_address, "not executable: bad_address")
+    one[0].address = 0x40000000
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.bad_address, "in the card's memory (the kernel reads no stream there): bad_address")
+    one[0].address = @intCast(u64, BASE + 4 * 4096 - 16)
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.bad_address, "past its mapping's end: bad_address")
+    one[0].address = @intCast(u64, BASE)
+    expect(work.open(&w, 1, 101) == 0, "another context")
+    const theirs = @bitCast(usize, work.fence(&w, 1))
+    expect(work.submit(&w, 0, &one, 1, theirs) == Status.invalid && work.submit(&w, 0, &one, 1, 500) == Status.invalid_handle, "another context's fence: invalid; no fence: invalid_handle")
+    expect(mec.buffers == runs, "nothing run by any of them")
+    // The packets refused, one by one, nothing run.
+    // (Each a packet; the last one runs past its stream's end.)
+    const refused = [_]usize{
+        0xC0033700, 0x00100000, 0x1234, 0, 1,
+        0xC0033700, 0x00100300, 0, 0, 1,
+        0xC0017900, 0x40, 0xDEADBEEF,
+        0xC0016800, 0x10, 0,
+        0xC0023F00, BASE, 0, 8,
+        0xC0055000, 0, BASE, 0, 0x1234, 0, 0x8000004,
+        0xC0055000, 0, 0x1234, 0, BASE, 0, 0x4000004,
+        0xC0055000, 0x100000, BASE, 0, BASE + 0x100, 0, 4,
+        0xC0055000, 0x20000000, BASE, 0, BASE + 0x100, 0, 4,
+        0xC0053C00, 0x3, 0x1234, 0, 1, 1, 4,
+        0xC0053C00, 0x53, BASE, 0, 1, 1, 4,
+        0x00001234, 0,
+        0x40000000,
+        0xC0027600, 0x3FF, 1, 2,
+        0xC0044000, 0, 0, 0, 0, 0,
+        0xC0012100, 0x1234, 0,
+        0xC0037600, 0x212, 1, 2, 3,
+        0xC0017600, 0x214, 0,
+        0xC0053C00, 0x33, BASE, 0, 1, 1, 4,
+        0xC0055000, 0x200000, BASE, 0, BASE + 0x100, 0, 4,
+        0xC0055000, 0x1000000, BASE, 0, BASE + 0x100, 0, 4,
+        0xC0033700, 0x00101500, BASE, 0, 1,
+        NOP, 0xC0033700, 0x00100500,
+    }
+    const lengths = [_]usize{ 5, 5, 3, 3, 4, 7, 7, 7, 7, 7, 7, 2, 1, 4, 6, 3, 5, 3, 7, 7, 7, 5, 3 }
+    var k: usize = 0
+    var from: usize = 0
+    while k < lengths.length {
+        var words: [16]usize = undefined
+        var j: usize = 0
+        while j < lengths[k] {
+            words[j] = refused[from + j]
+            j += 1
+        }
+        from += lengths[k]
+        // (The one that runs past its end is not padded: it ends the
+        // stream; the others are.)
+        var count = lengths[k]
+        if k + 1 != lengths.length {
+            while count % 8 != 0 {
+                words[count] = NOP
+                count += 1
+            }
+        }
+        writeStream(m, 0, words[0..count])
+        one[0].words = @intCast(u64, count)
+        const answer = work.submit(&w, 0, &one, 1, NONE)
+        if answer != Status.invalid {
+            say("refused packet ")
+            hex(k)
+            say(" was taken\n")
+        }
+        expect(answer == Status.invalid, "a packet a program's stream may not have: invalid")
+        k += 1
+    }
+    expect(mec.buffers == runs && w.refusedStreams == lengths.length, "23 streams refused, none run")
+    // The packets a stream may have: each runs.
+    const target = BASE + 0x2000
+    setWord(work.pageOf(&w, m, 2), 0x100, 0xA1A2A3A4)
+    const taken = [_]usize{
+        0xC0017600, 0x240, 0x1000,
+        0xC0004600, 0x404,
+        0xC0055800, 0x28C40000, 0xFFFFFFFF, 0xFF, 0, 0, 0xA,
+        0xC0055000, 0, (target + 0x100) & 0xFFFFFFFF, 0, (target + 0x200) & 0xFFFFFFFF, 0, 4,
+        0xC0055000, 0x40000000, 0xB1B2B3B4, 0, (target + 0x204) & 0xFFFFFFFF, 0, 4,
+        0xC0053C00, 0x13, target & 0xFFFFFFFF, 0, 0, 0xFFFFFFFF, 4,
+        0xC0033700, 0x00100500, (target + 0x208) & 0xFFFFFFFF, 0, 0xC1C2C3C4,
+        0xC0054900, 0x00038514, 0x20000000, (target + 0x20C) & 0xFFFFFFFF, 0, 0xD1D2D3D4, 0,
+        0xC0031502, 1, 1, 1, 0x45,
+        0x80000000,
+    }
+    const dispatched = mec.dispatches
+    expect(submitWords(0, m, 0, taken[0..], NONE) == 1, "a stream of every packet a program's stream may have: taken")
+    expect(mec.buffers == runs + 1 && mec.dispatches == dispatched + 1, "run, its dispatch seen")
+    expect(word(work.pageOf(&w, m, 2), 0x200) == 0xA1A2A3A4 && word(work.pageOf(&w, m, 2), 0x204) == 0xB1B2B3B4 && word(work.pageOf(&w, m, 2), 0x208) == 0xC1C2C3C4 && word(work.pageOf(&w, m, 2), 0x20C) == 0xD1D2D3D4, "the copy, the fill, the write and the release wrote through the space")
+    // What runs is the kernel's copy: the program's words changed after
+    // the call change nothing.
+    deafen()
+    const late = [_]usize{ 0xC0033700, 0x00100500, (target + 0x300) & 0xFFFFFFFF, 0, 0x11111111 }
+    expect(submitWords(0, m, 0x400, late[0..], NONE) == 2, "a submit held by the ring")
+    setWord(work.pageOf(&w, m, 0), 0x400 + 16, 0x22222222)
+    resume()
+    expect(word(work.pageOf(&w, m, 2), 0x300) == 0x11111111, "the word as it was at the call (the copy ran), not the one changed after it")
+    work.end(&w, 0)
+    work.end(&w, 1)
+}
+
+// ---- Fences.
+
+fn fenceCases() -> void {
+    expect(boot(7), "served")
+    const m = withBuffer(0, 100, 1)
+    const fx = @bitCast(usize, work.fence(&w, 0))
+    const write = [_]usize{ 0xC0033700, 0x00100500, (BASE + 0x800) & 0xFFFFFFFF, 0, 0x1 }
+    deafen()
+    expect(submitWords(0, m, 0, write[0..], fx) == 1, "submitted, held")
+    expect(work.fenceState(&w, fx) == 0, "its fence not readable while the ring holds the work")
+    resume()
+    work.interrupted(&w)
+    expect(work.fenceState(&w, fx) == work.READABLE, "readable once the interrupt came")
+    deafen()
+    expect(submitWords(0, m, 0, write[0..], fx) == 2, "given to another submit")
+    expect(work.fenceState(&w, fx) == 0, "it waits again")
+    resume()
+    work.interrupted(&w)
+    expect(work.fenceState(&w, fx) == work.READABLE, "and is readable again")
+    work.releaseFence(&w, fx)
+    expect(work.fenceCount(&w) == 0, "let go")
+    work.end(&w, 0)
+}
+
+// ---- Faults.
+
+fn faultCases() -> void {
+    expect(boot(7), "served")
+    const m = withBuffer(0, 100, 1)
+    const other = withBufferAt(1, 101)
+    const fx = @bitCast(usize, work.fence(&w, 0))
+    const stray = [_]usize{ 0xC0033700, 0x00100500, 0x7654000, 0, 0x1 }
+    expect(submitWords(0, m, 0, stray[0..], fx) == 1, "a write where nothing is mapped, submitted")
+    work.interrupted(&w)
+    shown()
+    line("gpu: context 0 (process 100) lost: a fault in its address space")
+    expect(work.lost(&w, 0) && work.fenceState(&w, fx) == work.PEER_GONE, "context 0 lost, its fence peer_gone")
+    expect(submitWords(0, m, 0, stray[0..], NONE) == Status.peer_gone && work.memory(&w, 0, 4096, work.SYSTEM) == Status.peer_gone && work.fence(&w, 0) == Status.peer_gone && work.map(&w, 0, m, 0, 4096, 0x60000000, 1) == Status.peer_gone, "its later calls peer_gone")
+    const write = [_]usize{ 0xC0033700, 0x00100500, (BASE + 0x800) & 0xFFFFFFFF, 0, 0x2 }
+    expect(submitWords(1, other, 0, write[0..], NONE) == 1 && word(work.pageOf(&w, other, 0), 0x800) == 2, "context 1 goes on")
+    // (Its process ends: its handles close.)
+    work.releaseMemory(&w, m)
+    work.releaseFence(&w, fx)
+    work.end(&w, 0)
+    expect(work.living(&w) == 1, "the lost context ends")
+    // A privileged register fault for the ring: the context that runs.
+    mec.privFault = true
+    const fy = @bitCast(usize, work.fence(&w, 1))
+    expect(submitWords(1, other, 0, write[0..], fy) == 2, "a submit the card faults on")
+    mec.privFault = false
+    work.interrupted(&w)
+    line("gpu: context 1 (process 101) lost: a privileged register or instruction in its stream (the card's own fault)")
+    expect(work.lost(&w, 1) && work.fenceState(&w, fy) == work.PEER_GONE, "context 1 lost, its fence peer_gone")
+    work.releaseMemory(&w, other)
+    work.releaseFence(&w, fy)
+    work.end(&w, 1)
+    expect(work.living(&w) == 0 && work.objects(&w) == 0 && work.fenceCount(&w) == 0, "both ended, their memory back")
+}
+
+fn withBufferAt(k: usize, process: usize) -> usize { return withBuffer(k, process, 1) }
+
+// ---- A hang, the watchdog.
+
+fn hangCases() -> void {
+    expect(boot(7), "served")
+    const m = withBuffer(0, 100, 1)
+    const write = [_]usize{ 0xC0033700, 0x00100500, (BASE + 0x800) & 0xFFFFFFFF, 0, 0x3 }
+    // A ring that moves is no hang.
+    var k: usize = 0
+    while k < 3 {
+        expect(submitWords(0, m, 0, write[0..], NONE) >= 1, "work that ends")
+        card.clock += 6000000000
+        work.tick(&w)
+        k += 1
+    }
+    expect(!work.ringDown(&w), "18 s of work that moves: no hang")
+    // A ring that does not.
+    const m2 = withBuffer(1, 101, 1)
+    work.releaseMemory(&w, m2)
+    const held = framesHeld()
+    deafen()
+    const fx = @bitCast(usize, work.fence(&w, 0))
+    expect(submitWords(0, m, 0, write[0..], fx) >= 1, "work the ring holds")
+    card.clock += 5000000000
+    work.tick(&w)
+    expect(!work.ringDown(&w), "5 s: not yet")
+    card.clock += 5000000001
+    work.tick(&w)
+    shown()
+    expect(work.ringDown(&w), "10 s: left down")
+    line("gpu: compute ring 0 has not moved for 10 s")
+    line("it stays down until the next boot; Linux's way back for it, the graphics block's soft reset, writes words whose reach on the display the sources do not say")
+    line("gpu: context 0 (process 100) lost: compute ring 0 hung in its work")
+    expect(work.lost(&w, 0) && !work.lost(&w, 1) && work.fenceState(&w, fx) == work.PEER_GONE, "the context in the ring's work lost, its fence peer_gone; the other not")
+    const facts = recordNow()
+    expect(facts.computeRings == 0 && facts.why == record.Why.RING_DOWN && facts.flags & record.Flag.PROGRAMS == 0, "the record: no ring, why 4")
+    expect(submitWords(1, m2, 0, write[0..], NONE) == Status.unsupported, "the other context's submit: unsupported")
+    expect(work.memory(&w, 1, 4096, work.CARD) == Status.unsupported, "nor the card's memory (the ring clears it)")
+    const sys = work.memory(&w, 1, 4096, work.SYSTEM)
+    expect(sys >= 0, "the system's memory still")
+    work.releaseMemory(&w, @bitCast(usize, sys))
+    work.releaseMemory(&w, m)
+    work.end(&w, 0)
+    expect(framesHeld() >= held && work.living(&w) == 2, "the hung context's memory and space kept (the ring may still touch them)")
+    expect(s.kept[1], "its address space emptied and kept")
+    work.end(&w, 1)
+    expect(work.living(&w) == 1, "the other ends")
+}
+
+// ---- A process that ends with work in flight; the limits of contexts.
+
+fn endCases() -> void {
+    expect(boot(7), "served")
+    const held = framesHeld()
+    const m = withBuffer(0, 100, 2)
+    const write = [_]usize{ 0xC0033700, 0x00100500, (BASE + 0x800) & 0xFFFFFFFF, 0, 0x4 }
+    deafen()
+    expect(submitWords(0, m, 0, write[0..], NONE) == 1, "work in flight")
+    work.releaseMemory(&w, m)
+    work.end(&w, 0)
+    expect(work.living(&w) == 1 && framesHeld() > held, "its process ended: the context waits for its work, its memory held")
+    work.interrupted(&w)
+    expect(work.living(&w) == 1, "still, the ring has not run it")
+    resume()
+    work.interrupted(&w)
+    expect(work.living(&w) == 0 && framesHeld() == held && !spaces.held(&s, 1), "the work done: the context ended, its memory and space back")
+    // Contexts per process, in all.
+    var k: usize = 0
+    while k < 4 {
+        expect(work.open(&w, k, 200) == 0, "a context of process 200")
+        k += 1
+    }
+    expect(work.open(&w, 4, 200) == Status.too_many, "the fifth of one process: too_many")
+    k = 4
+    while k < 7 {
+        expect(work.open(&w, k, 201 + k) == 0, "a context of another process")
+        k += 1
+    }
+    expect(work.open(&w, 7, 300) == Status.too_many, "the eighth in all (seven address spaces): too_many")
+    work.end(&w, 3)
+    expect(work.open(&w, 7, 300) == 0, "one ended: one more")
+    k = 0
+    while k < 8 {
+        work.end(&w, k)
+        k += 1
+    }
+    expect(work.living(&w) == 0, "all ended")
+}
+
+// ---- Room: the copy area full while the ring holds the work, the ring
+// full; free again once the card ran it.
+
+fn roomCases() -> void {
+    expect(boot(7), "served")
+    const m = withBuffer(0, 100, 192)
+    var words: usize = 0
+    while words < 196608 {
+        setWord(work.pageOf(&w, m, words / 1024), (words % 1024) * 4, NOP)
+        words += 1
+    }
+    var one = [1]work.Stream{ work.Stream.{ .engine = 1, .flags = 0, .address = @intCast(u64, BASE), .words = 196608 } }
+    deafen()
+    expect(work.submit(&w, 0, &one, 1, NONE) == 1, "0.75 MiB of words, held")
+    const clock = card.clock
+    expect(work.submit(&w, 0, &one, 1, NONE) == Status.busy, "0.75 MiB more: the copy area full: busy")
+    expect(card.clock - clock >= work.ROOM_WAIT_NS, "after waiting its while")
+    resume()
+    expect(work.submit(&w, 0, &one, 1, NONE) == 2, "room again once the ring ran it")
+    // The ring itself: 2048 words, each frame padded to 256.
+    one[0].words = 8
+    deafen()
+    var taken: usize = 0
+    var answer: isize = 0
+    while taken < 16 {
+        answer = work.submit(&w, 0, &one, 1, NONE)
+        if answer < 0 { break }
+        taken += 1
+    }
+    expect(answer == Status.busy && taken >= 4 && taken < 8, "the ring full after a few frames: busy")
+    resume()
+    expect(work.submit(&w, 0, &one, 1, NONE) > 0, "room in the ring again")
+    work.end(&w, 0)
+}
+
+// ---- What a hostile program tries (the review's cases).
+
+// A view of the frames that changes word `flipOffset` of frame
+// `flipFrame` to `flipValue` at its `flipAt`th look at that frame: the
+// program (another of its threads, a process it shares the memory with,
+// the card running its earlier work) writing its stream while the kernel
+// reads it.
+var flipFrame: usize = 0
+var flipCount: usize = 0
+var flipAt: usize = 0
+var flipOffset: usize = 0
+var flipValue: usize = 0
+
+fn changingView(physical: usize) -> usize {
+    if physical == flipFrame {
+        flipCount += 1
+        if flipCount == flipAt { setWord(flipFrame, flipOffset, flipValue) }
+    }
+    return viewOf(physical)
+}
+
+// Whether the copy area of context `k`'s space holds a SET_SH_REG of
+// COMPUTE_VMID.
+fn copyNamesVmid(space: usize) -> bool {
+    const copy = spaces.entry(&e, &s, space, work.COPY_AT) & 0xFFFFFFFFFF000
+    var k: usize = 1
+    while k < 1024 {
+        if word(copy, k * 4) == 0x214 && word(copy, (k - 1) * 4) == 0xC0017600 { return true }
+        k += 1
+    }
+    return false
+}
+
+fn hostileCases() -> void {
+    expect(boot(7), "served")
+    const m = withBuffer(0, 100, 1)
+    var one = [1]work.Stream{ work.Stream.{ .engine = 1, .flags = 0, .address = @intCast(u64, BASE), .words = 8 } }
+    // The register's offset word changed to COMPUTE_VMID's at each look
+    // in turn: what the check saw is what runs, or nothing does.
+    var look: usize = 1
+    while look < 8 {
+        const words = [_]usize{ 0xC0017600, 0x240, 0x1000, NOP, NOP, NOP, NOP, NOP }
+        writeStream(m, 0, words[0..])
+        flipFrame = frameOf(m, 0)
+        flipCount = 0
+        flipAt = look
+        flipOffset = 4
+        flipValue = 0x214
+        w.hands.view = changingView
+        const runs = mec.buffers
+        const answer = work.submit(&w, 0, &one, 1, NONE)
+        w.hands.view = viewOf
+        work.interrupted(&w)
+        expect(answer < 0 || !copyNamesVmid(1), "a word changed while the kernel copies: never one the check did not see in what the card runs")
+        expect(answer >= 0 || mec.buffers == runs, "refused: nothing run")
+        look += 1
+    }
+    // RELEASE_MEM with an interrupt (the kernel's to raise), SET_SH_REG
+    // with a bit above its offset: refused.
+    const interrupting = [_]usize{ 0xC0054900, 0x00038514, 0x22000000, (BASE + 0x900) & 0xFFFFFFFF, 0, 1, 0 }
+    expect(submitWords(0, m, 0, interrupting[0..], NONE) == Status.invalid, "RELEASE_MEM asking for an interrupt (INT_SEL 2): invalid")
+    const interruptOnly = [_]usize{ 0xC0054900, 0x00038514, 0x01000000, (BASE + 0x900) & 0xFFFFFFFF, 0, 1, 0 }
+    expect(submitWords(0, m, 0, interruptOnly[0..], NONE) == Status.invalid, "RELEASE_MEM with an interrupt alone (INT_SEL 1): invalid")
+    const shortRelease = [_]usize{ 0xC0044900, 0x00038514, 0x20000000, (BASE + 0x900) & 0xFFFFFFFF, 0, 1 }
+    expect(submitWords(0, m, 0, shortRelease[0..], NONE) == Status.invalid, "RELEASE_MEM of five words: invalid")
+    const high = [_]usize{ 0xC0017600, 0x10240, 0x1000 }
+    expect(submitWords(0, m, 0, high[0..], NONE) == Status.invalid, "SET_SH_REG whose offset word has bit 16: invalid")
+    const quiet = [_]usize{ 0xC0054900, 0x00038514, 0x20000000, (BASE + 0x900) & 0xFFFFFFFF, 0, 0x5151, 0 }
+    expect(submitWords(0, m, 0, quiet[0..], NONE) >= 1 && word(frameOf(m, 0), 0x900) == 0x5151, "RELEASE_MEM without an interrupt: taken, written")
+    work.end(&w, 0)
+}
+
+// The copy area: a copy never written over one the ring has not run, even
+// when the room before the oldest copy in flight is exactly what is asked:
+// the first copy `first` words (64: the room after the wrap is exactly
+// one more copy; 128: the room left after one more copy is exactly
+// another), the rest of the area held behind another context's work that
+// stops the ring, then copies of 64 words.
+fn copyAreaCases(first: usize) -> void {
+    expect(boot(7), "served")
+    const big = (work.COPY_BYTES - first * 4) / 4
+    const m = withBuffer(0, 100, 257)
+    var n: usize = 0
+    while n < big + 64 {
+        setWord(work.pageOf(&w, m, n / 1024), (n % 1024) * 4, NOP)
+        n += 1
+    }
+    const other = withBuffer(1, 101, 1)
+    deafen()
+    var one = [1]work.Stream{ work.Stream.{ .engine = 1, .flags = 0, .address = @intCast(u64, BASE), .words = @intCast(u64, first) } }
+    expect(work.submit(&w, 0, &one, 1, NONE) == 1, "a first copy at the copy area's start")
+    // (Another context's work that stops the ring after the first ran.)
+    const stray = [_]usize{ 0xC0033700, 0x00100500, 0x7654000, 0, 0x1 }
+    expect(submitWords(1, other, 0, stray[0..], NONE) == 1, "another context's work that faults and stops the ring")
+    one[0].words = @intCast(u64, big)
+    expect(work.submit(&w, 0, &one, 1, NONE) == 2, "the rest of the area, held behind it")
+    vm.faultHangs = true
+    resume()
+    one[0].words = 64
+    _ = work.submit(&w, 0, &one, 1, NONE)
+    _ = work.submit(&w, 0, &one, 1, NONE)
+    _ = work.submit(&w, 0, &one, 1, NONE)
+    var overlap = false
+    var a: usize = 0
+    while a < w.queued {
+        const qa = &w.queue[(w.first + a) % work.MOST_QUEUED]
+        var b: usize = a + 1
+        while b < w.queued {
+            const qb = &w.queue[(w.first + b) % work.MOST_QUEUED]
+            if qa.*.context == qb.*.context && qa.*.start < qb.*.end && qb.*.start < qa.*.end { overlap = true }
+            b += 1
+        }
+        a += 1
+    }
+    expect(!overlap, "no copy over one the ring has not run (the area full is not taken for empty)")
+    vm.faultHangs = false
+}
+
+// A buffer of the card's memory larger than the fills one ring's room
+// holds: cleared all the same, batch after batch.
+fn largeCases() -> void {
+    expect(boot(7), "served")
+    expect(work.open(&w, 0, 100) == 0, "a context")
+    setCardWord(card.VIEW, 0xABABABAB)
+    setCardWord(card.VIEW + 60 * 1024 * 1024, 0xABABABAB)
+    const packets = mec.dmaPackets
+    const fills = w.filled
+    const fences = c.compute.sent
+    const big = work.memory(&w, 0, 496 * 1024 * 1024, work.CARD)
+    expect(big >= 0, "496 MiB of the card's memory in one buffer (more fills than the ring holds at once)")
+    expect(mec.dmaPackets - packets == (496 * 1024 * 1024 + work.FILL_BYTES - 1) / work.FILL_BYTES && w.filled == fills + 1 && c.compute.sent == fences + 1, "every fill packet, one fill, one fence after the last")
+    expect(cardWord(card.VIEW) == 0 && cardWord(card.VIEW + 60 * 1024 * 1024) == 0, "cleared by the card")
+    work.releaseMemory(&w, @bitCast(usize, big))
+    work.end(&w, 0)
+}
+
+// Fences: a lost context's fence never given to a submit ends peer_gone;
+// a context's fences when it ends: done if their work passed, and no
+// later context's; the fences a process may have.
+fn fenceLimitCases() -> void {
+    expect(boot(7), "served")
+    const m = withBuffer(0, 100, 1)
+    const unused = @bitCast(usize, work.fence(&w, 0))
+    const stray = [_]usize{ 0xC0033700, 0x00100500, 0x7654000, 0, 0x1 }
+    expect(submitWords(0, m, 0, stray[0..], NONE) == 1, "a write where nothing is mapped")
+    work.interrupted(&w)
+    expect(work.lost(&w, 0) && work.fenceState(&w, unused) == work.PEER_GONE, "a lost context's fence that no submit was given: peer_gone (a wait on it ends)")
+    work.releaseFence(&w, unused)
+    work.releaseMemory(&w, m)
+    work.end(&w, 0)
+    // Its work passed, the context ends at once: its fence readable.
+    const n = withBuffer(0, 100, 1)
+    const fx = @bitCast(usize, work.fence(&w, 0))
+    const write = [_]usize{ 0xC0033700, 0x00100500, (BASE + 0x800) & 0xFFFFFFFF, 0, 0x6 }
+    expect(submitWords(0, n, 0, write[0..], fx) == 1, "work that ends")
+    work.releaseMemory(&w, n)
+    work.end(&w, 0)
+    expect(work.living(&w) == 0 && work.fenceState(&w, fx) == work.READABLE, "the context ended: the fence of its work that passed readable, not peer_gone")
+    // The number again, another process's context: the old fence is not its.
+    const o = withBuffer(0, 101, 1)
+    expect(submitWords(0, o, 0, write[0..], fx) == Status.invalid, "a fence of the context that had the number before: invalid")
+    work.releaseFence(&w, fx)
+    // The fences one process may have; another's still there.
+    expect(work.open(&w, 1, 102) == 0, "a context of process 102")
+    var k: usize = 0
+    while k < work.FENCES_PER_PROCESS {
+        if work.fence(&w, 1) < 0 { break }
+        k += 1
+    }
+    expect(k == work.FENCES_PER_PROCESS && work.fence(&w, 1) == Status.too_many, "64 fences for one process, the 65th too_many")
+    const theirs = work.fence(&w, 0)
+    expect(theirs >= 0, "another process still has a fence")
+    expect(work.holding(&w, 102).fences == work.FENCES_PER_PROCESS, "counted to the process")
+    // The mappings one process may have.
+    const pages = @bitCast(usize, work.memory(&w, 1, 4096, work.SYSTEM))
+    k = 0
+    while k < work.MAPPINGS_PER_PROCESS {
+        if work.map(&w, 1, pages, 0, 4096, 0x40000000 + k * 4096, work.READ) != 0 { break }
+        k += 1
+    }
+    expect(k == work.MAPPINGS_PER_PROCESS && work.map(&w, 1, pages, 0, 4096, 0x50000000, work.READ) == Status.too_many, "256 mappings for one process, the 257th too_many")
+    expect(work.map(&w, 0, o, 0, 4096, 0x60000000, work.READ) == 0, "another process still maps")
+    expect(work.unmap(&w, 1, 0x40000000, 4096) == 0 && work.map(&w, 1, pages, 0, 4096, 0x50000000, work.READ) == 0, "one unmapped: one more")
+    work.end(&w, 1)
+    work.end(&w, 0)
+    expect(work.holding(&w, 102).mappings == 0, "the mappings uncounted with the context")
+}
+
+// A context's number while its work is in flight: kept (gpu_offer.mlx, as
+// gpu_programs.mlx keeps it), not given to the next open; free again once
+// the ring passed the work.
+fn numberCases() -> void {
+    expect(boot(7), "served")
+    var table: offering.Contexts = undefined
+    table.reset()
+    const a = table.begin(0)
+    expect(work.open(&w, a, 100) == 0, "A's context")
+    const m = @bitCast(usize, work.memory(&w, a, 4096, work.SYSTEM | work.PROCESSOR))
+    expect(work.map(&w, a, m, 0, 4096, BASE, work.READ | work.WRITE | work.EXECUTE) == 0, "A's buffer mapped")
+    const write = [_]usize{ 0xC0033700, 0x00100500, (BASE + 0x800) & 0xFFFFFFFF, 0, 0x7 }
+    deafen()
+    expect(submitWords(a, m, 0, write[0..], NONE) == 1, "A's work in flight")
+    work.releaseMemory(&w, m)
+    // A's process ends: its last handle, as gpu_programs.release does it.
+    table.release(a)
+    if !table.used[a] {
+        work.end(&w, a)
+        if work.inUse(&w, a) { table.keep(a) }
+    }
+    const space = work.spaceOf(&w, a)
+    expect(work.inUse(&w, a) && table.used[a], "A's context waits for its work, its number kept")
+    expect(work.open(&w, a, 101) == Status.too_many, "its number not open to another")
+    // B opens, as gpu_programs.begin does.
+    table.reclaim(&w)
+    const b = table.begin(0)
+    expect(b != a && work.open(&w, b, 101) == 0, "B gets another number")
+    expect(work.spaceOf(&w, b) != space, "and another address space")
+    resume()
+    work.interrupted(&w)
+    expect(!work.inUse(&w, a) && !spaces.held(&s, space), "A's work passed: A's context ended, its space given back")
+    table.reclaim(&w)
+    expect(!table.used[a] && table.begin(0) == a, "its number free again")
+    work.end(&w, b)
+}
+
+// A privileged fault told to the context whose stream it came in, not to
+// the one before it whose work had ended, whether the card goes on after
+// the fault (`on`) or stops there.
+var faultingSpace: usize = 0
+var faultingGoesOn = true
+
+fn faultingProgram(space: usize, address: usize, length: usize) -> bool {
+    if space != faultingSpace { return true }
+    smc.deliver(ring.VISLANDS30_IV_SRCID_CP_PRIV_REG_FAULT, 0x1234, ring.ringId(1, 0, 0))
+    return faultingGoesOn
+}
+
+fn privilegedCases(on: bool) -> void {
+    expect(boot(7), "served")
+    const a = withBuffer(0, 100, 1)
+    const b = withBuffer(1, 101, 1)
+    const write = [_]usize{ 0xC0033700, 0x00100500, (BASE + 0x800) & 0xFFFFFFFF, 0, 0x2 }
+    deafen()
+    expect(submitWords(0, a, 0, write[0..], NONE) == 1, "A's work")
+    expect(submitWords(1, b, 0, write[0..], NONE) == 1, "B's work, whose stream the card faults on")
+    faultingSpace = work.spaceOf(&w, 1)
+    faultingGoesOn = on
+    mec.programRuns = true
+    mec.programHook = faultingProgram
+    resume()
+    work.interrupted(&w)
+    mec.programRuns = false
+    expect(!work.lost(&w, 0) && work.lost(&w, 1), "the privileged fault told to B, whose stream it came in, not to A whose work ended before it (A's entries and B's fault in one pass)")
+}
+
+// Memory unmapped and let go while work that writes it is in flight:
+// kept (its frames, its run of the card's memory) until the ring passed
+// that work; the contexts behind work that hangs lost with it.
+fn inFlightCases() -> void {
+    expect(boot(7), "served")
+    const m = withBuffer(0, 100, 1)
+    const target = @bitCast(usize, work.memory(&w, 0, 4096, work.SYSTEM | work.PROCESSOR))
+    const cardPage = @bitCast(usize, work.memory(&w, 0, 4096, work.CARD))
+    expect(work.map(&w, 0, target, 0, 4096, 0x40000000, work.READ | work.WRITE) == 0 && work.map(&w, 0, cardPage, 0, 4096, 0x40001000, work.READ | work.WRITE) == 0, "two buffers mapped")
+    const write = [_]usize{ 0xC0033700, 0x00100500, 0x40000000, 0, 0x9, 0xC0033700, 0x00100500, 0x40001000, 0, 0xA }
+    deafen()
+    expect(submitWords(0, m, 0, write[0..], NONE) == 1, "work that writes both, held by the ring")
+    // (Counted after the submit: its copy area is made at the first.)
+    const held = framesHeld()
+    const free = work.cardFree(&w)
+    expect(work.unmap(&w, 0, 0x40000000, 4096) == 0 && work.unmap(&w, 0, 0x40001000, 4096) == 0, "both unmapped")
+    work.releaseMemory(&w, target)
+    work.releaseMemory(&w, cardPage)
+    work.interrupted(&w)
+    expect(framesHeld() == held && work.cardFree(&w) == free, "unmapped, their last handles gone, the work in flight: nothing freed (the card may still write them)")
+    resume()
+    work.interrupted(&w)
+    expect(framesHeld() == held - 2 && work.cardFree(&w) == free + 4096, "the ring passed it: both freed")
+    work.end(&w, 0)
+    // Work behind work that hangs: its context lost too.
+    expect(boot(7), "served")
+    const a = withBuffer(0, 100, 1)
+    const b = withBuffer(1, 101, 1)
+    _ = withBuffer(2, 102, 1)
+    const one = [_]usize{ 0xC0033700, 0x00100500, (BASE + 0x800) & 0xFFFFFFFF, 0, 0x3 }
+    deafen()
+    expect(submitWords(0, a, 0, one[0..], NONE) >= 1 && submitWords(1, b, 0, one[0..], NONE) >= 1, "A's work, B's behind it")
+    work.tick(&w)
+    card.clock += 10000000001
+    work.tick(&w)
+    expect(work.ringDown(&w), "left down")
+    line("gpu: context 0 (process 100) lost: compute ring 0 hung in its work")
+    line("gpu: context 1 (process 101) lost: its work was behind the work that hung")
+    expect(work.lost(&w, 0) && work.lost(&w, 1) && !work.lost(&w, 2), "A and B lost, C (no work) not")
+}
+
+// ---- The way down.
+
+fn wayDown() -> void {
+    expect(boot(7), "served")
+    _ = withBuffer(0, 100, 1)
+    work.stop(&w)
+    line("gpu: context 0 (process 100) lost: the system goes down")
+    expect(!work.served(&w) && work.memory(&w, 0, 4096, work.SYSTEM) == Status.unsupported, "nothing served after it")
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    show = std.process.count(arguments) == 2
+    _ = crash.install()
+    if !card.makeRom(true) {
+        say("the ROM could not be made\n")
+        return 5
+    }
+    const names = [_][]const u8{ "polaris10_pfp_2.bin", "polaris10_me_2.bin", "polaris10_ce_2.bin", "polaris10_mec_2.bin", "polaris10_rlc.bin", "polaris10_sdma.bin", "polaris10_sdma1.bin", "polaris10_k_smc.bin", "polaris10_smc_sk.bin" }
+    for name in names {
+        if !card.load(name) {
+            say("the firmware files could not be read (run from the repository's top)\n")
+            return 6
+        }
+    }
+    oneContext()
+    notServed()
+    memoryCases()
+    mapCases()
+    streamCases()
+    fenceCases()
+    faultCases()
+    hangCases()
+    endCases()
+    roomCases()
+    hostileCases()
+    copyAreaCases(64)
+    copyAreaCases(128)
+    largeCases()
+    fenceLimitCases()
+    numberCases()
+    privilegedCases(true)
+    privilegedCases(false)
+    inFlightCases()
+    wayDown()
+    if failed != 0 { return failed }
+    return 13
+}

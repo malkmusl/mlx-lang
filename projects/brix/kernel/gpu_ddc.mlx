@@ -1,0 +1,962 @@
+// A monitor's EDID read by the driver itself over the DDC line of an HDMI
+// or DVI connector (and of a DisplayPort connector that sends TMDS through
+// a passive adapter), by the card's own I2C engine, on a Polaris card (DCE
+// 11.2). So far the only EDID the driver had was the one the EFI loader
+// got from the firmware: one monitor's, read once, before brixOS started.
+// With this the driver asks the monitor that is on a connector now: at
+// boot, and when something is plugged in while brixOS runs (gpu_plug.mlx
+// says when; gpu.mlx lends the card). Built for the host too
+// (tests/484_gpu_ddc_edid_runtime.mlx, against a card that is a table
+// with an EDID memory behind it): the card is reached through
+// gpu_display's `Card` (a register read, the clock) and `Hands` here (a
+// register write).
+//
+// Everything is Linux 6.6's display core as it runs on this card, read
+// function by function (drivers/gpu/drm/amd/display/dc): dce/dce_i2c.c
+// and dce_i2c_hw.c (the engine), gpio/hw_ddc.c, hw_gpio.c and
+// gpio_service.c (the pins), dce112/dce112_resource.c (which engine, the
+// speed), bios/bios_parser.c (the line from the ROM), and above them
+// drivers/gpu/drm/drm_edid.c (which bytes are asked for, how often) by
+// way of amdgpu_dm.c's amdgpu_dm_i2c_xfer. Register numbers and fields
+// are dce_11_2_d.h's and dce_11_2_sh_mask.h's, held against them by
+// tools/check_gpu_registers.py; none is from memory.
+//
+// WHICH LINE. A connector's I2C record in the ROM's object table names an
+// entry of the ROM's table of DDC lines (GPIO_I2C_Info) by number, and
+// says whether the card's own I2C engine may be used on it (bit 7:
+// bios_parser.c's get_gpio_i2c_info). The entry's register for the clock
+// pin is one of DC_GPIO_DDC1_A to DC_GPIO_DDC6_A, and which one says the
+// line: 0 to 5 (gpio/dce110/hw_translate_dce110.c's offset_to_id). The
+// engine has a SPEED and a SETUP word for each line and is told the line
+// in DC_I2C_DDC_SELECT (dce112_i2c_hw_create: the engine's number is the
+// line's). `wireOf` works that out. The log names a line by the ROM's
+// number for it (the record's, as the connector's own line of the video
+// BIOS says it) and by the card's name for it, DDC1 to DDC6: "DDC line
+// 0, the card's DDC3" is line 2 here on a ROM whose entry 0 is DDC3.
+//
+// A TRANSFER (`Transfer`: begin, the engine's run waited for, the bytes
+// taken, the engine let go), with every word, in order:
+//   is the engine free: the line's HW_STATUS not "used by the hardware",
+//   DC_I2C_ARBITRATION's DC_I2C_REG_RW_CNTL_STATUS not "the
+//   microcontroller's alone" (is_engine_available). Linux then drives the
+//   two pins itself (dce_i2c_sw.c); that is not built: the transfer is
+//   refused, and said.
+//   The pins (acquire_i2c_hw_engine -> dal_ddc_open in hardware mode,
+//   hw_ddc.c's set_config for I2C): DC_GPIO_DDCn_MASK with the data and
+//   the clock pin's mask bits 0 (the pins are the engine's) and both
+//   pull-down enables set; then, when the pad is the AUX channel's
+//   (AUX_PADn_MODE), 2 ms waited if a pin's output enable was set, and the
+//   bit cleared.
+//   The engine (setup_engine, set_speed): DC_I2C_ARBITRATION's
+//   DC_I2C_SW_USE_I2C_REG_REQ set; the line's SPEED: the prescale for
+//   100 kHz out of MICROSECOND_TIME_BASE_DIV (read only) or the ROM's
+//   crystal, threshold 2, start and stop timing 2; DC_I2C_CONTROL: the
+//   status reset, the line selected; the line's SETUP: time limit 255,
+//   enabled; DC_I2C_ARBITRATION's DC_I2C_NO_QUEUED_SW_GO cleared.
+//   Each message (process_transaction): DC_I2C_TRANSACTIONk (start, stop
+//   on a missing acknowledge, read or write, how many bytes, a stop after
+//   the last), its address byte and a write's bytes into DC_I2C_DATA (the
+//   first with the buffer's index set to 0).
+//   The run (submit_channel_request_hw, execute_transaction):
+//   DC_I2C_CONTROL's status reset; the line's SETUP's drive bits and
+//   delays 0; DC_I2C_CONTROL: resets off, the count of messages less one;
+//   DC_I2C_CONTROL's DC_I2C_GO.
+//   The wait (dce_i2c_hw_engine_wait_on_operation_result): DC_I2C_SW_
+//   STATUS read every microsecond while it says "used by software", at
+//   most 320 us times (2 + 8 for each byte of the last message and its
+//   address + 10 for each message before it) times: 0.334 s for an EDID
+//   block. Then judged (get_channel_status): stopped on a missing
+//   acknowledge, the engine's time limit, aborted, else done.
+//   A read's bytes (process_channel_reply): DC_I2C_DATA's index set
+//   behind the bytes that were sent, for reading; then DC_I2C_DATA read
+//   once a byte. (Reading that word moves the index on: it is read here
+//   and nowhere else.)
+//   The engine let go (release_engine): DC_I2C_CONTROL's status reset,
+//   with a soft reset when the engine still says "used by software";
+//   DC_I2C_ARBITRATION: done, the request cleared.
+// Where Linux writes one word twice in a row with the same value (the
+// request in setup_engine, the speed three times a transfer), it is
+// written once here.
+//
+// WHAT IS WRITTEN, AND PUT BACK. A transfer writes these words of the
+// card and no others: DC_GPIO_DDCn_MASK of the line; DC_I2C_ARBITRATION;
+// DC_I2C_CONTROL; the line's DC_I2C_DDCn_SPEED and DC_I2C_DDCn_SETUP;
+// DC_I2C_TRANSACTION0 to 2, as many as it has messages; DC_I2C_DATA. None
+// of them is a controller's, a clock's, an encoder's or a transmitter's:
+// a picture that runs is not touched. Each but the last is read before
+// the first write and, when the transfer is over, written back as it was
+// found where it holds something else (ours: Linux leaves the engine as a
+// transfer left it, the pull-downs on and the pad in I2C mode);
+// DC_I2C_CONTROL goes back without its DC_I2C_GO, which starts a run.
+// What cannot be put back: DC_I2C_DATA (the engine's buffer and the index
+// into it; every transfer fills it anew before it runs) and the engine's
+// status word (never written: its bits are cleared through
+// DC_I2C_CONTROL). The pins' output words (DC_GPIO_DDCn_A and _EN) are
+// only read. `restored` says whether every word took its old value again.
+//
+// AN EDID (`Reader`), as drm_edid.c asks for it: first one byte, to see
+// whether anything answers at the EDID's address 0x50 (drm_probe_ddc);
+// then the base block; then as many extension blocks as its byte 126
+// names, three at most here (512 bytes are kept). A block: its place
+// written to 0x50 (0 or 128), 128 bytes read, in one run of the engine;
+// for a block beyond the second the segment pointer (the block's number
+// halved) is written to 0x30 first in the same run (it falls back to 0 at
+// the run's stop). A transfer that fails is made again, five times in all
+// (drm_do_probe_ddc_edid); a block that does not hold (the base block's
+// header, a block's sum) is read again, four times in all
+// (edid_block_read). Ours: the whole read has two seconds and begins no
+// transfer after them; an extension block that cannot be read or does not
+// hold ends the EDID before it (Linux gives the whole EDID up when one
+// cannot be read, drops one that does not hold and mends the count, and
+// keeps a CTA extension whose sum is wrong, with a word in its log:
+// edid_block_status_valid; here that block is not taken, as edid.mlx
+// reads no HDMI block out of an extension that does not add up, so such
+// a monitor counts as a DVI one where Linux would send it HDMI); a
+// header with a few wrong bytes is not mended; a base block of another
+// version than 1 is not refused here (edid.mlx reads what it can of
+// it); the HDMI Forum's count of blocks is not followed.
+//
+// NOTHING HERE WAITS BY ITSELF. `Transfer.step` and `Reader.step` do a
+// bounded piece of work and say what they need next: to be called again
+// at once, or after a pause while the engine runs or the pad settles
+// (`pause`: how many microseconds at least). At boot `read` goes through
+// the steps with the pauses Linux makes (a microsecond between two looks
+// at the status); while brixOS runs the timer's tick takes a step each
+// time (`paced` false: the bound is then by the clock), so the timer's
+// interrupt never waits for a monitor. One transfer at a time on the
+// whole card: the engine is one for all lines (Linux's
+// i2c_hw_buffer_in_use), and the AUX channel of a DisplayPort connector
+// uses the same two pins.
+const scanout = @import("./gpu_display.mlx")
+const atom = @import("./atom.mlx")
+const videorom = @import("./gpu_rom.mlx")
+
+pub const NONE: usize = 0xFFFFFFFF
+// The card's DDC lines (dce112_resource.c's num_ddc: six on Polaris 10,
+// five on Polaris 11 and 12).
+pub const LINES: usize = 6
+pub const LINES_SMALL: usize = 5
+
+// The engine: one control, arbitration and status word, four messages'
+// words and the data word for all lines; a status, a speed and a setup
+// word for each line (the first line's numbers; HW_STATUS a number
+// apart, SPEED and SETUP two).
+pub const DC_I2C_CONTROL: usize = 0x16D4
+pub const DC_I2C_ARBITRATION: usize = 0x16D5
+pub const DC_I2C_SW_STATUS: usize = 0x16D7
+pub const DC_I2C_DDC1_HW_STATUS: usize = 0x16D8
+pub const DC_I2C_DDC1_SPEED: usize = 0x16DE
+pub const DC_I2C_DDC1_SETUP: usize = 0x16DF
+pub const DC_I2C_TRANSACTION0: usize = 0x16EA
+pub const DC_I2C_DATA: usize = 0x16EE
+// What the engine's clock is made from (read only).
+pub const MICROSECOND_TIME_BASE_DIV: usize = 0x13B
+// A line's two pins (the first line's numbers; four apart): which of
+// them the hardware has, what they would put out, and whether they do.
+pub const DC_GPIO_DDC1_MASK: usize = 0x4868
+pub const DC_GPIO_DDC1_A: usize = 0x4869
+pub const DC_GPIO_DDC1_EN: usize = 0x486A
+
+pub const DC_I2C_CONTROL__DC_I2C_GO: usize = 0x1
+pub const DC_I2C_CONTROL__DC_I2C_SOFT_RESET: usize = 0x2
+pub const DC_I2C_CONTROL__DC_I2C_SEND_RESET: usize = 0x4
+pub const DC_I2C_CONTROL__DC_I2C_SW_STATUS_RESET: usize = 0x8
+pub const DC_I2C_CONTROL__DC_I2C_DDC_SELECT: usize = 0x700
+pub const DC_I2C_CONTROL__DC_I2C_TRANSACTION_COUNT: usize = 0x300000
+pub const DC_I2C_ARBITRATION__DC_I2C_REG_RW_CNTL_STATUS: usize = 0xC
+pub const DC_I2C_ARBITRATION__DC_I2C_NO_QUEUED_SW_GO: usize = 0x10
+pub const DC_I2C_ARBITRATION__DC_I2C_SW_USE_I2C_REG_REQ: usize = 0x100000
+pub const DC_I2C_ARBITRATION__DC_I2C_SW_DONE_USING_I2C_REG: usize = 0x200000
+pub const DC_I2C_SW_STATUS__DC_I2C_SW_STATUS: usize = 0x3
+pub const DC_I2C_SW_STATUS__DC_I2C_SW_DONE: usize = 0x4
+pub const DC_I2C_SW_STATUS__DC_I2C_SW_ABORTED: usize = 0x10
+pub const DC_I2C_SW_STATUS__DC_I2C_SW_TIMEOUT: usize = 0x20
+pub const DC_I2C_SW_STATUS__DC_I2C_SW_STOPPED_ON_NACK: usize = 0x100
+pub const DC_I2C_DDC1_HW_STATUS__DC_I2C_DDC1_HW_STATUS: usize = 0x3
+pub const DC_I2C_DDC1_SPEED__DC_I2C_DDC1_THRESHOLD: usize = 0x3
+pub const DC_I2C_DDC1_SPEED__DC_I2C_DDC1_START_STOP_TIMING_CNTL: usize = 0x300
+pub const DC_I2C_DDC1_SPEED__DC_I2C_DDC1_PRESCALE: usize = 0xFFFF0000
+pub const DC_I2C_DDC1_SETUP__DC_I2C_DDC1_DATA_DRIVE_EN: usize = 0x1
+pub const DC_I2C_DDC1_SETUP__DC_I2C_DDC1_DATA_DRIVE_SEL: usize = 0x2
+pub const DC_I2C_DDC1_SETUP__DC_I2C_DDC1_ENABLE: usize = 0x40
+pub const DC_I2C_DDC1_SETUP__DC_I2C_DDC1_CLK_DRIVE_EN: usize = 0x80
+pub const DC_I2C_DDC1_SETUP__DC_I2C_DDC1_INTRA_BYTE_DELAY: usize = 0xFF00
+pub const DC_I2C_DDC1_SETUP__DC_I2C_DDC1_INTRA_TRANSACTION_DELAY: usize = 0xFF0000
+pub const DC_I2C_DDC1_SETUP__DC_I2C_DDC1_TIME_LIMIT: usize = 0xFF000000
+pub const DC_I2C_TRANSACTION0__DC_I2C_RW0: usize = 0x1
+pub const DC_I2C_TRANSACTION0__DC_I2C_STOP_ON_NACK0: usize = 0x100
+pub const DC_I2C_TRANSACTION0__DC_I2C_START0: usize = 0x1000
+pub const DC_I2C_TRANSACTION0__DC_I2C_STOP0: usize = 0x2000
+pub const DC_I2C_TRANSACTION0__DC_I2C_COUNT0: usize = 0x3FF0000
+pub const DC_I2C_DATA__DC_I2C_DATA_RW: usize = 0x1
+pub const DC_I2C_DATA__DC_I2C_DATA: usize = 0xFF00
+pub const DC_I2C_DATA__DC_I2C_INDEX: usize = 0x3FF0000
+pub const DC_I2C_DATA__DC_I2C_INDEX_WRITE: usize = 0x80000000
+pub const MICROSECOND_TIME_BASE_DIV__MICROSECOND_TIME_BASE_DIV: usize = 0x7F
+pub const MICROSECOND_TIME_BASE_DIV__XTAL_REF_DIV: usize = 0x7F00
+pub const DC_GPIO_DDC1_MASK__DC_GPIO_DDC1CLK_MASK: usize = 0x1
+pub const DC_GPIO_DDC1_MASK__DC_GPIO_DDC1CLK_PD_EN: usize = 0x10
+pub const DC_GPIO_DDC1_MASK__DC_GPIO_DDC1DATA_MASK: usize = 0x100
+pub const DC_GPIO_DDC1_MASK__DC_GPIO_DDC1DATA_PD_EN: usize = 0x1000
+pub const DC_GPIO_DDC1_MASK__AUX_PAD1_MODE: usize = 0x10000
+pub const DC_GPIO_DDC1_EN__DC_GPIO_DDC1CLK_EN: usize = 0x1
+pub const DC_GPIO_DDC1_EN__DC_GPIO_DDC1DATA_EN: usize = 0x100
+
+// What the status fields say (dce_i2c_hw.h's dc_i2c_status).
+pub const DC_I2C_STATUS__DC_I2C_STATUS_IDLE: usize = 0
+pub const DC_I2C_STATUS__DC_I2C_STATUS_USED_BY_SW: usize = 1
+pub const DC_I2C_STATUS__DC_I2C_STATUS_USED_BY_HW: usize = 2
+pub const DC_I2C_REG_RW_CNTL_STATUS_DMCU_ONLY: usize = 2
+// Linux's numbers for the engine on this card (dce_i2c_hw.h, dce112_
+// resource.c's i2c_speed_in_khz): the buffer's bytes, the setup word's
+// time limit, how many clock periods a byte's bit may take, the speed in
+// kHz; and what a speed word gets beside the prescale (set_speed).
+pub const I2C_HW_BUFFER_SIZE_DCE100: usize = 538
+pub const I2C_SETUP_TIME_LIMIT_DCE: usize = 255
+pub const TRANSACTION_TIMEOUT_IN_I2C_CLOCKS: usize = 32
+pub const SPEED: usize = 100
+pub const THRESHOLD: usize = 2
+pub const START_STOP_TIMING: usize = 2
+// The pad's time to let go before it is switched from AUX to I2C
+// (hw_ddc.c: msleep(2)), in microseconds.
+pub const PAD_SETTLE: usize = 2000
+// drm_edid.c's and drm_edid.h's: the EDID's address and the segment
+// pointer's, a block's bytes, how often a transfer and a block are tried.
+pub const DDC_ADDR: usize = 0x50
+pub const DDC_SEGMENT_ADDR: usize = 0x30
+pub const EDID_LENGTH: usize = 128
+pub const TRANSFER_TRIES: usize = 5
+pub const BLOCK_READS: usize = 4
+// Ours: how many blocks are kept, and how long a whole EDID's reading
+// may take before no further transfer is begun (nanoseconds).
+pub const BLOCKS: usize = 4
+pub const ROOM: usize = 512
+pub const BUDGET: usize = 2000000000
+
+// The ROM's table of DDC lines (atombios.h's ATOM_GPIO_I2C_INFO: a
+// table's four bytes of head, then lines of 27 bytes, ATOM_GPIO_I2C_
+// ASSIGMENT, of which the clock pin's register is read) and its place in
+// the ROM's list of data tables.
+pub const GPIO_I2C_Info: usize = 10
+pub const ATOM_GPIO_I2C_INFO__asGPIO_Info: usize = 4
+pub const ATOM_GPIO_I2C_ASSIGMENT__usClkA_RegisterIndex: usize = 6
+pub const ATOM_GPIO_I2C_ASSIGMENT__size: usize = 27
+
+// The card as a transfer writes to it: a register by its number.
+pub const Hands = struct {
+    write: fn(usize, u32) -> void
+
+    pub fn put(self: *const Self, number: usize, value: usize) -> void {
+        const write = self.*.write
+        write(number, @intCast(u32, value & 0xFFFFFFFF))
+    }
+}
+
+// Why a connector's DDC line is not known.
+pub const Unwired = enum(u8) {
+    wired,
+    // The connector has no I2C record.
+    no_record,
+    // The ROM has no table of DDC lines, or one of another revision than
+    // Linux's display core reads (content revision 1), or one that does
+    // not lie inside the ROM.
+    no_table,
+    // The record names a line the table does not have.
+    beyond_table,
+    // The line's clock pin is none of the card's six DDC lines'.
+    not_a_line
+}
+
+// A connector's DDC line as the ROM gives it: the card's line (0 to 5),
+// the number the ROM's record names it by, and whether the record says
+// the card's own engine may be used on it.
+pub const Wire = struct {
+    line: usize
+    entry: usize
+    hardware: bool
+    why: Unwired
+}
+
+fn byteAt(bytes: []const u8, at: usize) -> usize { return if at < bytes.length { @intCast(usize, bytes[at]) } else { 0 } }
+
+fn wordAt(bytes: []const u8, at: usize) -> usize { return byteAt(bytes, at) | (byteAt(bytes, at + 1) << 8) }
+
+// The DDC line of a connector (get_gpio_i2c_info, then offset_to_id).
+// Linux takes a record's number that is the table's count too, and reads
+// behind the table for it; here it has to be below the count.
+pub fn wireOf(machine: *const atom.Atom, connector: *const videorom.Connector) -> Wire {
+    var wire = Wire.{ .line = NONE, .entry = connector.*.ddc, .hardware = connector.*.ddcHardware, .why = Unwired.no_record }
+    if connector.*.ddc == videorom.NONE { return wire }
+    const image = machine.*.rom
+    const table = machine.dataTable(GPIO_I2C_Info)
+    wire.why = Unwired.no_table
+    if table == 0 || table + ATOM_GPIO_I2C_INFO__asGPIO_Info > image.length || byteAt(image, table + 3) != 1 { return wire }
+    const length = wordAt(image, table)
+    if length < ATOM_GPIO_I2C_INFO__asGPIO_Info + ATOM_GPIO_I2C_ASSIGMENT__size || table + length > image.length { return wire }
+    const count = (length - ATOM_GPIO_I2C_INFO__asGPIO_Info) / ATOM_GPIO_I2C_ASSIGMENT__size
+    wire.why = Unwired.beyond_table
+    if connector.*.ddc >= count { return wire }
+    const register = wordAt(image, table + ATOM_GPIO_I2C_INFO__asGPIO_Info + connector.*.ddc * ATOM_GPIO_I2C_ASSIGMENT__size + ATOM_GPIO_I2C_ASSIGMENT__usClkA_RegisterIndex)
+    wire.why = Unwired.not_a_line
+    if register < DC_GPIO_DDC1_A || (register - DC_GPIO_DDC1_A) % 4 != 0 || (register - DC_GPIO_DDC1_A) / 4 >= LINES { return wire }
+    wire.line = (register - DC_GPIO_DDC1_A) / 4
+    wire.why = Unwired.wired
+    return wire
+}
+
+// How a transfer ended.
+pub const Failure = enum(u8) {
+    none,
+    // Refused before anything was written: there is no line; the ROM
+    // does not say the card's engine may be used on it; the card has
+    // fewer lines; the engine's words do not answer; no clock for the
+    // engine can be worked out; the line is used by the card's hardware,
+    // or the engine's words are the card's microcontroller's alone.
+    no_line,
+    not_hardware,
+    no_such_line,
+    no_answer_from_card,
+    no_clock,
+    taken_by_hardware,
+    taken_by_controller,
+    // The engine says it is busy before it was started.
+    busy,
+    // Nobody acknowledged an address or a byte: nothing is there, or it
+    // refused.
+    not_acknowledged,
+    // The engine's own time limit; the engine gave the run up.
+    time_limit,
+    aborted,
+    // The engine still says "used by software" after Linux's bound.
+    stays_busy
+}
+
+pub fn failureText(failure: Failure) -> []const u8 {
+    return match failure {
+        .none => "nothing failed",
+        .no_line => "the ROM names no DDC line of the card's for the connector",
+        .not_hardware => "the ROM does not say the card's I2C engine may be used on the line (Linux then drives the pins itself, which is not built)",
+        .no_such_line => "the card has no such DDC line",
+        .no_answer_from_card => "the I2C engine's registers do not answer",
+        .no_clock => "no clock for the I2C engine can be worked out",
+        .taken_by_hardware => "the card's hardware uses the line",
+        .taken_by_controller => "the I2C engine is the card's microcontroller's alone",
+        .busy => "the I2C engine says it is busy before it was started",
+        .not_acknowledged => "nothing acknowledged",
+        .time_limit => "the I2C engine ran into its time limit",
+        .aborted => "the I2C engine gave the run up",
+        .stays_busy => "the I2C engine stayed busy"
+    }
+}
+
+// One message of a transfer: the address (seven bits), which way, how
+// many bytes, and a write's bytes.
+pub const Message = struct {
+    address: usize
+    read: bool
+    count: usize
+    bytes: [2]u8
+}
+
+pub const MESSAGES: usize = 3
+
+// What `step` needs next: to be called again at once; again after
+// `pause` microseconds at least; nothing, it is over.
+pub const Next = enum(u8) { again, wait, done }
+
+const Phase = enum(u8) { fresh, pad, loading, running, over }
+
+// The words a transfer found, to put them back.
+pub const Kept = struct {
+    mask: usize
+    arbitration: usize
+    control: usize
+    speed: usize
+    setup: usize
+    transaction: [MESSAGES]usize
+}
+
+// The lowest bit of a field.
+fn shiftOf(mask: usize) -> u6 {
+    var shift: usize = 0
+    while shift < 32 && (mask >> @intCast(u6, shift)) & 1 == 0 { shift += 1 }
+    return @intCast(u6, shift)
+}
+
+// `word` with the field `mask` holding `value`.
+fn with(word: usize, mask: usize, value: usize) -> usize { return (word & ~mask) | ((value << shiftOf(mask)) & mask) }
+
+fn fieldOf(word: usize, mask: usize) -> usize { return (word & mask) >> shiftOf(mask) }
+
+// What a status word says of a run that is over (get_channel_status).
+fn judged(status: usize) -> Failure {
+    if status & DC_I2C_SW_STATUS__DC_I2C_SW_STOPPED_ON_NACK != 0 { return Failure.not_acknowledged }
+    if status & DC_I2C_SW_STATUS__DC_I2C_SW_TIMEOUT != 0 { return Failure.time_limit }
+    if status & DC_I2C_SW_STATUS__DC_I2C_SW_ABORTED != 0 { return Failure.aborted }
+    return Failure.none
+}
+
+pub const Transfer = struct {
+    // What is asked: the line (0 to 5), how many lines the card has, the
+    // ROM's crystal in kHz (the engine's clock when the card's time base
+    // word names none), and the messages: writes, then at most one read,
+    // which is the last.
+    line: usize
+    lines: usize
+    crystal: usize
+    messages: [MESSAGES]Message
+    count: usize
+    // How it stands: what `step` needs, how it ended, the microseconds to
+    // pause when it waits.
+    phase: Phase
+    failure: Failure
+    pause: usize
+    // The words found; whether anything was written (then the engine is
+    // let go and the words put back whatever happens); whether each word
+    // took its old value again, and the first that did not.
+    kept: Kept
+    touched: bool
+    restored: bool
+    stuck: usize
+    // The prescale worked out, the bytes put into the engine's buffer,
+    // the bound of the wait (Linux's count of looks a microsecond apart:
+    // so many microseconds), the looks made and the clock when the run
+    // was started, when the pad may be switched, the status word as last
+    // read, how many writes were made.
+    prescale: usize
+    used: usize
+    bound: usize
+    looks: usize
+    started: usize
+    padUntil: usize
+    status: usize
+    writes: usize
+    // A read's bytes.
+    received: [EDID_LENGTH]u8
+    got: usize
+
+    // The transfer set up for `count` messages on `line`; nothing of the
+    // card is touched yet.
+    pub fn begin(self: *Self, line: usize, lines: usize, crystal: usize) -> void {
+        self.*.line = line
+        self.*.lines = lines
+        self.*.crystal = crystal
+        self.*.count = 0
+        self.*.phase = Phase.fresh
+        self.*.failure = Failure.none
+        self.*.pause = 0
+        self.*.touched = false
+        self.*.restored = true
+        self.*.stuck = NONE
+        self.*.prescale = 0
+        self.*.used = 0
+        self.*.bound = 0
+        self.*.looks = 0
+        self.*.started = 0
+        self.*.padUntil = 0
+        self.*.status = 0
+        self.*.writes = 0
+        self.*.got = 0
+    }
+
+    // A message more: `value` written to `address`, or `count` bytes read
+    // from it.
+    pub fn write(self: *Self, address: usize, value: usize) -> void {
+        if self.*.count == MESSAGES { return }
+        self.*.messages[self.*.count] = Message.{ .address = address, .read = false, .count = 1, .bytes = [_]u8{ @intCast(u8, value & 0xFF), 0 } }
+        self.*.count += 1
+    }
+
+    // (A block's 128 bytes and the few before them are far below what
+    // the engine's buffer holds, I2C_HW_BUFFER_SIZE_DCE100, which Linux
+    // holds every message against.)
+    pub fn read(self: *Self, address: usize, count: usize) -> void {
+        if self.*.count == MESSAGES { return }
+        self.*.messages[self.*.count] = Message.{ .address = address, .read = true, .count = if count > EDID_LENGTH { EDID_LENGTH } else { count }, .bytes = [_]u8{ 0, 0 } }
+        self.*.count += 1
+    }
+
+    pub fn over(self: *const Self) -> bool { return self.*.phase == Phase.over }
+
+    pub fn succeeded(self: *const Self) -> bool { return self.*.phase == Phase.over && self.*.failure == Failure.none }
+
+    fn put(self: *Self, hands: *const Hands, number: usize, value: usize) -> void {
+        hands.put(number, value)
+        self.*.writes += 1
+        self.*.touched = true
+    }
+
+    // A word read, changed and written (Linux's REG_UPDATE): the bits of
+    // `clear` 0, then those of `set` 1.
+    fn update(self: *Self, card: *const scanout.Card, hands: *const Hands, number: usize, clear: usize, set: usize) -> void {
+        self.put(hands, number, (card.reg(number) & ~clear) | set)
+    }
+
+    fn ended(self: *Self, failure: Failure) -> Next {
+        self.*.failure = failure
+        self.*.phase = Phase.over
+        return Next.done
+    }
+
+    // Whether the engine may be used: the line is not the hardware's and
+    // the engine's words are not the microcontroller's alone
+    // (is_engine_available).
+    fn available(self: *const Self, card: *const scanout.Card) -> Failure {
+        if card.reg(DC_I2C_DDC1_HW_STATUS + self.*.line) & DC_I2C_DDC1_HW_STATUS__DC_I2C_DDC1_HW_STATUS == DC_I2C_STATUS__DC_I2C_STATUS_USED_BY_HW { return Failure.taken_by_hardware }
+        if fieldOf(card.reg(DC_I2C_ARBITRATION), DC_I2C_ARBITRATION__DC_I2C_REG_RW_CNTL_STATUS) == DC_I2C_REG_RW_CNTL_STATUS_DMCU_ONLY { return Failure.taken_by_controller }
+        return Failure.none
+    }
+
+    // Whether the engine is busy with something else (is_hw_busy): its
+    // status is not idle and it may not be used.
+    fn busy(self: *const Self, card: *const scanout.Card) -> bool {
+        if card.reg(DC_I2C_SW_STATUS) & DC_I2C_SW_STATUS__DC_I2C_SW_STATUS == DC_I2C_STATUS__DC_I2C_STATUS_IDLE { return false }
+        return self.available(card) != Failure.none
+    }
+
+    // The engine's prescale for SPEED kHz (set_speed); 0 when none can be
+    // worked out or it does not fit its field.
+    fn prescaleOf(self: *const Self, card: *const scanout.Card) -> usize {
+        const base = card.reg(MICROSECOND_TIME_BASE_DIV)
+        if base == 0xFFFFFFFF { return 0 }
+        var divider = fieldOf(base, MICROSECOND_TIME_BASE_DIV__XTAL_REF_DIV)
+        if divider == 0 { divider = 2 }
+        const microsecond = base & MICROSECOND_TIME_BASE_DIV__MICROSECOND_TIME_BASE_DIV
+        const clock = if microsecond == 0 { (self.*.crystal >> 1) * 2 } else { microsecond * 1000 }
+        const prescale = clock / divider / SPEED
+        return if prescale > 0xFFFF { 0 } else { prescale }
+    }
+
+    // The next piece of the transfer. `paced`: the caller pauses as
+    // `pause` says between two calls (then the run's wait is counted in
+    // looks, as Linux counts it); else it comes back when it likes and
+    // the waits are held against the clock.
+    pub fn step(self: *Self, card: *const scanout.Card, hands: *const Hands, paced: bool) -> Next {
+        if self.*.phase == Phase.over { return Next.done }
+        const mask = DC_GPIO_DDC1_MASK + 4 * self.*.line
+        const setup = DC_I2C_DDC1_SETUP + 2 * self.*.line
+        if self.*.phase == Phase.fresh {
+            // Everything that can refuse, before a write.
+            if self.*.line == NONE { return self.ended(Failure.no_line) }
+            if self.*.line >= self.*.lines || self.*.line >= LINES { return self.ended(Failure.no_such_line) }
+            if self.*.count == 0 { return self.ended(Failure.none) }
+            self.*.kept.mask = card.reg(mask)
+            self.*.kept.arbitration = card.reg(DC_I2C_ARBITRATION)
+            self.*.kept.control = card.reg(DC_I2C_CONTROL)
+            self.*.kept.speed = card.reg(DC_I2C_DDC1_SPEED + 2 * self.*.line)
+            self.*.kept.setup = card.reg(setup)
+            var k: usize = 0
+            while k < self.*.count {
+                self.*.kept.transaction[k] = card.reg(DC_I2C_TRANSACTION0 + k)
+                k += 1
+            }
+            if self.*.kept.mask == 0xFFFFFFFF || self.*.kept.control == 0xFFFFFFFF || self.*.kept.arbitration == 0xFFFFFFFF { return self.ended(Failure.no_answer_from_card) }
+            const free = self.available(card)
+            if free != Failure.none { return self.ended(free) }
+            self.*.prescale = self.prescaleOf(card)
+            if self.*.prescale == 0 { return self.ended(Failure.no_clock) }
+            // The pins: the engine's, pulled down inside; the pad in I2C
+            // mode, after its pins had time to let go.
+            var pins = self.*.kept.mask & ~(DC_GPIO_DDC1_MASK__DC_GPIO_DDC1DATA_MASK | DC_GPIO_DDC1_MASK__DC_GPIO_DDC1CLK_MASK)
+            pins |= DC_GPIO_DDC1_MASK__DC_GPIO_DDC1DATA_PD_EN | DC_GPIO_DDC1_MASK__DC_GPIO_DDC1CLK_PD_EN
+            if pins != self.*.kept.mask { self.put(hands, mask, pins) }
+            self.*.phase = Phase.loading
+            if pins & DC_GPIO_DDC1_MASK__AUX_PAD1_MODE != 0 {
+                self.*.phase = Phase.pad
+                const driven = card.reg(DC_GPIO_DDC1_EN + 4 * self.*.line) & (DC_GPIO_DDC1_EN__DC_GPIO_DDC1DATA_EN | DC_GPIO_DDC1_EN__DC_GPIO_DDC1CLK_EN) != 0
+                if driven {
+                    self.*.padUntil = card.time() + PAD_SETTLE * 1000
+                    self.*.pause = PAD_SETTLE
+                    return Next.wait
+                }
+                self.*.padUntil = 0
+            }
+            return Next.again
+        }
+        if self.*.phase == Phase.pad {
+            if !paced && self.*.padUntil != 0 && card.time() < self.*.padUntil {
+                self.*.pause = PAD_SETTLE
+                return Next.wait
+            }
+            self.update(card, hands, mask, DC_GPIO_DDC1_MASK__AUX_PAD1_MODE, 0)
+            self.*.phase = Phase.loading
+            return Next.again
+        }
+        if self.*.phase == Phase.loading {
+            // The engine: asked for, its speed, the line, its time limit.
+            self.update(card, hands, DC_I2C_ARBITRATION, 0, DC_I2C_ARBITRATION__DC_I2C_SW_USE_I2C_REG_REQ)
+            const speed = card.reg(DC_I2C_DDC1_SPEED + 2 * self.*.line)
+            self.put(hands, DC_I2C_DDC1_SPEED + 2 * self.*.line, with(with(with(speed, DC_I2C_DDC1_SPEED__DC_I2C_DDC1_PRESCALE, self.*.prescale), DC_I2C_DDC1_SPEED__DC_I2C_DDC1_THRESHOLD, THRESHOLD), DC_I2C_DDC1_SPEED__DC_I2C_DDC1_START_STOP_TIMING_CNTL, START_STOP_TIMING))
+            const control = card.reg(DC_I2C_CONTROL) & ~(DC_I2C_CONTROL__DC_I2C_GO | DC_I2C_CONTROL__DC_I2C_SOFT_RESET | DC_I2C_CONTROL__DC_I2C_SEND_RESET | DC_I2C_CONTROL__DC_I2C_TRANSACTION_COUNT)
+            self.put(hands, DC_I2C_CONTROL, with(control | DC_I2C_CONTROL__DC_I2C_SW_STATUS_RESET, DC_I2C_CONTROL__DC_I2C_DDC_SELECT, self.*.line))
+            self.put(hands, setup, with(card.reg(setup), DC_I2C_DDC1_SETUP__DC_I2C_DDC1_TIME_LIMIT, I2C_SETUP_TIME_LIMIT_DCE) | DC_I2C_DDC1_SETUP__DC_I2C_DDC1_ENABLE)
+            self.update(card, hands, DC_I2C_ARBITRATION, DC_I2C_ARBITRATION__DC_I2C_NO_QUEUED_SW_GO, 0)
+            // The messages into the engine's words and its buffer.
+            var k: usize = 0
+            while k < self.*.count {
+                const message = &self.*.messages[k]
+                const last = k + 1 == self.*.count
+                if self.busy(card) { return self.letGo(card, hands, Failure.busy) }
+                var word = card.reg(DC_I2C_TRANSACTION0 + k) & ~(DC_I2C_TRANSACTION0__DC_I2C_RW0 | DC_I2C_TRANSACTION0__DC_I2C_STOP0)
+                word |= DC_I2C_TRANSACTION0__DC_I2C_STOP_ON_NACK0 | DC_I2C_TRANSACTION0__DC_I2C_START0
+                if message.*.read { word |= DC_I2C_TRANSACTION0__DC_I2C_RW0 }
+                if last { word |= DC_I2C_TRANSACTION0__DC_I2C_STOP0 }
+                self.put(hands, DC_I2C_TRANSACTION0 + k, with(word, DC_I2C_TRANSACTION0__DC_I2C_COUNT0, message.*.count))
+                const address = ((message.*.address << 1) | (if message.*.read { 1 } else { 0 })) & 0xFF
+                self.put(hands, DC_I2C_DATA, (address << shiftOf(DC_I2C_DATA__DC_I2C_DATA)) | (if k == 0 { DC_I2C_DATA__DC_I2C_INDEX_WRITE } else { 0 }))
+                self.*.used += 1
+                if !message.*.read {
+                    var b: usize = 0
+                    while b < message.*.count {
+                        self.put(hands, DC_I2C_DATA, @intCast(usize, message.*.bytes[b]) << shiftOf(DC_I2C_DATA__DC_I2C_DATA))
+                        self.*.used += 1
+                        b += 1
+                    }
+                }
+                if !last {
+                    // (Linux looks at the status after a message that
+                    // does not end the run and finds the engine idle; one
+                    // that says it runs already, or failed, is not
+                    // started.)
+                    const now = card.reg(DC_I2C_SW_STATUS)
+                    self.*.status = now
+                    if now & DC_I2C_SW_STATUS__DC_I2C_SW_STATUS == DC_I2C_STATUS__DC_I2C_STATUS_USED_BY_SW { return self.letGo(card, hands, Failure.busy) }
+                    if judged(now) != Failure.none { return self.letGo(card, hands, judged(now)) }
+                } else {
+                    // The bound of the wait, as Linux works it out before
+                    // the last message goes in (get_transaction_timeout_
+                    // hw): the earlier messages count a byte each.
+                    self.*.bound = 1000 * TRANSACTION_TIMEOUT_IN_I2C_CLOCKS / SPEED * (1 + ((message.*.count + 1) << 3) + 1 + (k << 3) + (k << 1))
+                }
+                k += 1
+            }
+            // The run.
+            if self.busy(card) { return self.letGo(card, hands, Failure.busy) }
+            self.update(card, hands, DC_I2C_CONTROL, 0, DC_I2C_CONTROL__DC_I2C_SW_STATUS_RESET)
+            self.update(card, hands, setup, DC_I2C_DDC1_SETUP__DC_I2C_DDC1_DATA_DRIVE_EN | DC_I2C_DDC1_SETUP__DC_I2C_DDC1_CLK_DRIVE_EN | DC_I2C_DDC1_SETUP__DC_I2C_DDC1_DATA_DRIVE_SEL | DC_I2C_DDC1_SETUP__DC_I2C_DDC1_INTRA_TRANSACTION_DELAY | DC_I2C_DDC1_SETUP__DC_I2C_DDC1_INTRA_BYTE_DELAY, 0)
+            const ready = card.reg(DC_I2C_CONTROL) & ~(DC_I2C_CONTROL__DC_I2C_SOFT_RESET | DC_I2C_CONTROL__DC_I2C_SW_STATUS_RESET | DC_I2C_CONTROL__DC_I2C_SEND_RESET | DC_I2C_CONTROL__DC_I2C_GO)
+            self.put(hands, DC_I2C_CONTROL, with(ready, DC_I2C_CONTROL__DC_I2C_TRANSACTION_COUNT, self.*.count - 1))
+            self.update(card, hands, DC_I2C_CONTROL, 0, DC_I2C_CONTROL__DC_I2C_GO)
+            self.*.started = card.time()
+            self.*.looks = 0
+            self.*.pause = 1
+            self.*.phase = Phase.running
+            return Next.again
+        }
+        // The run waited for: a look at the status.
+        const status = card.reg(DC_I2C_SW_STATUS)
+        self.*.status = status
+        if status & DC_I2C_SW_STATUS__DC_I2C_SW_STATUS == DC_I2C_STATUS__DC_I2C_STATUS_USED_BY_SW {
+            self.*.looks += 1
+            const late = if paced { self.*.looks >= self.*.bound } else { card.time() >= self.*.started + self.*.bound * 1000 }
+            if late { return self.letGo(card, hands, Failure.stays_busy) }
+            self.*.pause = 1
+            return Next.wait
+        }
+        const failure = judged(status)
+        const final = &self.*.messages[self.*.count - 1]
+        if failure == Failure.none && final.*.read {
+            // The bytes received lie behind those that were sent.
+            self.put(hands, DC_I2C_DATA, DC_I2C_DATA__DC_I2C_INDEX_WRITE | DC_I2C_DATA__DC_I2C_DATA_RW | (self.*.used << shiftOf(DC_I2C_DATA__DC_I2C_INDEX)))
+            while self.*.got < final.*.count {
+                self.*.received[self.*.got] = @intCast(u8, fieldOf(card.reg(DC_I2C_DATA), DC_I2C_DATA__DC_I2C_DATA))
+                self.*.got += 1
+            }
+        }
+        return self.letGo(card, hands, failure)
+    }
+
+    // The engine let go (release_engine), then every word that was found
+    // put back where it holds something else.
+    fn letGo(self: *Self, card: *const scanout.Card, hands: *const Hands, failure: Failure) -> Next {
+        const mask = DC_GPIO_DDC1_MASK + 4 * self.*.line
+        const speed = DC_I2C_DDC1_SPEED + 2 * self.*.line
+        const setup = DC_I2C_DDC1_SETUP + 2 * self.*.line
+        const stuck = card.reg(DC_I2C_SW_STATUS) & DC_I2C_SW_STATUS__DC_I2C_SW_STATUS == DC_I2C_STATUS__DC_I2C_STATUS_USED_BY_SW
+        self.update(card, hands, DC_I2C_CONTROL, 0, if stuck { DC_I2C_CONTROL__DC_I2C_SOFT_RESET | DC_I2C_CONTROL__DC_I2C_SW_STATUS_RESET } else { DC_I2C_CONTROL__DC_I2C_SW_STATUS_RESET })
+        self.update(card, hands, DC_I2C_ARBITRATION, DC_I2C_ARBITRATION__DC_I2C_SW_USE_I2C_REG_REQ, DC_I2C_ARBITRATION__DC_I2C_SW_DONE_USING_I2C_REG)
+        var k: usize = 0
+        while k < self.*.count {
+            self.back(card, hands, DC_I2C_TRANSACTION0 + k, self.*.kept.transaction[k], 0)
+            k += 1
+        }
+        self.back(card, hands, speed, self.*.kept.speed, 0)
+        self.back(card, hands, setup, self.*.kept.setup, 0)
+        // (Never the bit that starts a run; the arbitration word's status
+        // field is the card's to say.)
+        self.back(card, hands, DC_I2C_CONTROL, self.*.kept.control & ~DC_I2C_CONTROL__DC_I2C_GO, 0)
+        self.back(card, hands, DC_I2C_ARBITRATION, self.*.kept.arbitration, DC_I2C_ARBITRATION__DC_I2C_REG_RW_CNTL_STATUS)
+        self.back(card, hands, mask, self.*.kept.mask, 0)
+        return self.ended(failure)
+    }
+
+    // The word `number` given what it held (`value`) when it holds
+    // something else, the bits of `apart` not counted; then looked at
+    // once more.
+    fn back(self: *Self, card: *const scanout.Card, hands: *const Hands, number: usize, value: usize, apart: usize) -> void {
+        if card.reg(number) & ~apart == value & ~apart { return }
+        self.put(hands, number, value)
+        if card.reg(number) & ~apart != value & ~apart && self.*.restored {
+            self.*.restored = false
+            self.*.stuck = number
+        }
+    }
+}
+
+// What became of reading an EDID.
+pub const Outcome = enum(u8) {
+    // Nobody was asked.
+    not_asked,
+    // Nothing acknowledged the EDID's address: nothing is there that has
+    // one, or it is off.
+    no_answer,
+    // The engine could not be used, or a transfer failed every time
+    // (`failure` says how).
+    failed,
+    // What was read as the base block does not hold (`sum`: what its
+    // bytes add up to, 0 when it is the header that is wrong).
+    does_not_hold,
+    // `count` bytes in `blocks` blocks.
+    read
+}
+
+// An EDID as read from a connector.
+pub const Heard = struct {
+    outcome: Outcome
+    failure: Failure
+    line: usize
+    bytes: [ROOM]u8
+    count: usize
+    blocks: usize
+    // How many extension blocks the base block names; whether all of
+    // them, up to what is kept here, were read and hold.
+    extensions: usize
+    complete: bool
+    sum: usize
+    // The status word of the transfer that failed last, how many
+    // transfers were made and how many writes, how long it took
+    // (nanoseconds), and whether every word written was put back (`stuck`:
+    // the first that was not).
+    status: usize
+    transfers: usize
+    writes: usize
+    took: usize
+    restored: bool
+    stuck: usize
+
+    pub fn clear(self: *Self) -> void {
+        self.*.outcome = Outcome.not_asked
+        self.*.failure = Failure.none
+        self.*.line = NONE
+        self.*.count = 0
+        self.*.blocks = 0
+        self.*.extensions = 0
+        self.*.complete = false
+        self.*.sum = 0
+        self.*.status = 0
+        self.*.transfers = 0
+        self.*.writes = 0
+        self.*.took = 0
+        self.*.restored = true
+        self.*.stuck = NONE
+    }
+
+    pub fn data(self: *const Self) -> []const u8 { return self.*.bytes[0..self.*.count] }
+}
+
+// What `count` bytes add up to in eight bits.
+fn sumOf(bytes: []const u8, at: usize, count: usize) -> usize {
+    var sum: usize = 0
+    var k: usize = 0
+    while k < count {
+        sum += @intCast(usize, bytes[at + k])
+        k += 1
+    }
+    return sum & 0xFF
+}
+
+fn headed(bytes: []const u8) -> bool {
+    var k: usize = 0
+    while k < 8 {
+        const wanted: u8 = if k == 0 || k == 7 { 0 } else { 0xFF }
+        if bytes[k] != wanted { return false }
+        k += 1
+    }
+    return true
+}
+
+const Stage = enum(u8) { idle, probe, block, over }
+
+pub const Reader = struct {
+    stage: Stage
+    transfer: Transfer
+    heard: Heard
+    lines: usize
+    crystal: usize
+    // The block being read, how many are to be read, how often its
+    // transfer was made and how often the block was read; when the
+    // reading began.
+    block: usize
+    wanted: usize
+    tries: usize
+    reads: usize
+    began: usize
+    pause: usize
+
+    pub fn idle(self: *Self) -> void {
+        self.*.stage = Stage.idle
+        self.*.heard.clear()
+    }
+
+    pub fn busy(self: *const Self) -> bool { return self.*.stage == Stage.probe || self.*.stage == Stage.block }
+
+    // The reading of the EDID on `wire` begun (nothing is touched before
+    // the first `step`). `lines`: how many DDC lines the card has;
+    // `crystal`: the ROM's reference clock in kHz (0: not known).
+    pub fn start(self: *Self, card: *const scanout.Card, wire: *const Wire, lines: usize, crystal: usize) -> void {
+        self.*.heard.clear()
+        self.*.heard.line = wire.*.line
+        self.*.lines = lines
+        self.*.crystal = crystal
+        self.*.block = 0
+        self.*.wanted = 1
+        self.*.tries = 0
+        self.*.reads = 0
+        self.*.pause = 0
+        self.*.began = card.time()
+        self.*.stage = Stage.probe
+        if wire.*.line == NONE {
+            self.give(card, Outcome.failed, Failure.no_line)
+        } else if !wire.*.hardware {
+            self.give(card, Outcome.failed, Failure.not_hardware)
+        } else {
+            self.ask()
+        }
+    }
+
+    // The transfer for where the reading stands.
+    fn ask(self: *Self) -> void {
+        const t = &self.*.transfer
+        t.begin(self.*.heard.line, self.*.lines, self.*.crystal)
+        if self.*.stage == Stage.probe {
+            t.write(DDC_ADDR, 0)
+            t.read(DDC_ADDR, 1)
+        } else {
+            if self.*.block >= 2 { t.write(DDC_SEGMENT_ADDR, self.*.block >> 1) }
+            t.write(DDC_ADDR, (self.*.block * EDID_LENGTH) & 0xFF)
+            t.read(DDC_ADDR, EDID_LENGTH)
+        }
+        self.*.tries += 1
+    }
+
+    fn give(self: *Self, card: *const scanout.Card, outcome: Outcome, failure: Failure) -> void {
+        self.*.heard.outcome = outcome
+        self.*.heard.failure = failure
+        self.*.heard.took = card.time() - self.*.began
+        self.*.stage = Stage.over
+    }
+
+    // What is kept so far is the EDID: whole blocks that hold.
+    fn kept(self: *Self, card: *const scanout.Card) -> void {
+        self.*.heard.count = self.*.heard.blocks * EDID_LENGTH
+        self.*.heard.complete = self.*.heard.blocks == self.*.wanted && self.*.heard.extensions + 1 == self.*.wanted
+        self.give(card, Outcome.read, Failure.none)
+    }
+
+    // The next piece of the reading; see `Transfer.step`.
+    pub fn step(self: *Self, card: *const scanout.Card, hands: *const Hands, paced: bool) -> Next {
+        if !self.busy() { return Next.done }
+        const t = &self.*.transfer
+        const next = t.step(card, hands, paced)
+        if next != Next.done {
+            self.*.pause = t.*.pause
+            return next
+        }
+        const h = &self.*.heard
+        h.*.transfers += 1
+        h.*.writes += t.*.writes
+        if !t.*.restored && h.*.restored {
+            h.*.restored = false
+            h.*.stuck = t.*.stuck
+        }
+        if !t.succeeded() {
+            h.*.status = t.*.status
+            // What no further try can change.
+            const refused = t.*.failure == Failure.no_line || t.*.failure == Failure.no_such_line || t.*.failure == Failure.no_answer_from_card || t.*.failure == Failure.no_clock
+            if !refused && self.*.tries < TRANSFER_TRIES && card.time() - self.*.began < BUDGET {
+                self.ask()
+                return Next.again
+            }
+            if self.*.stage == Stage.block && self.*.block != 0 {
+                // (An extension block that cannot be read: the blocks
+                // before it are the EDID.)
+                self.kept(card)
+            } else if self.*.stage == Stage.probe && t.*.failure == Failure.not_acknowledged {
+                self.give(card, Outcome.no_answer, t.*.failure)
+            } else {
+                self.give(card, Outcome.failed, t.*.failure)
+            }
+            return Next.done
+        }
+        if self.*.stage == Stage.probe {
+            self.*.stage = Stage.block
+            self.*.tries = 0
+            self.ask()
+            return Next.again
+        }
+        // A block: does it hold?
+        const at = self.*.block * EDID_LENGTH
+        var k: usize = 0
+        var zero = true
+        while k < EDID_LENGTH {
+            h.*.bytes[at + k] = t.*.received[k]
+            if t.*.received[k] != 0 { zero = false }
+            k += 1
+        }
+        self.*.reads += 1
+        const sum = sumOf(h.*.bytes[0..], at, EDID_LENGTH)
+        const holds = sum == 0 && (self.*.block != 0 || headed(h.*.bytes[0..]))
+        if !holds {
+            // (A base block of nothing but zeroes is not read again:
+            // edid_block_read's early end.)
+            const again = self.*.reads < BLOCK_READS && !(self.*.block == 0 && zero) && card.time() - self.*.began < BUDGET
+            if again {
+                self.*.tries = 0
+                self.ask()
+                return Next.again
+            }
+            if self.*.block == 0 {
+                h.*.sum = sum
+                self.give(card, Outcome.does_not_hold, Failure.none)
+            } else {
+                self.kept(card)
+            }
+            return Next.done
+        }
+        h.*.blocks = self.*.block + 1
+        if self.*.block == 0 {
+            h.*.extensions = @intCast(usize, h.*.bytes[126])
+            self.*.wanted = if h.*.extensions + 1 > BLOCKS { BLOCKS } else { h.*.extensions + 1 }
+        }
+        if h.*.blocks == self.*.wanted || card.time() - self.*.began >= BUDGET {
+            self.kept(card)
+            return Next.done
+        }
+        self.*.block += 1
+        self.*.tries = 0
+        self.*.reads = 0
+        self.ask()
+        return Next.again
+    }
+}
+
+// The EDID on `wire` read from beginning to end, with Linux's pauses made
+// by `pause` (microseconds): for a boot, where nothing else runs.
+pub fn read(card: *const scanout.Card, hands: *const Hands, pause: fn(usize) -> void, wire: *const Wire, lines: usize, crystal: usize, reader: *Reader) -> void {
+    reader.start(card, wire, lines, crystal)
+    while true {
+        const next = reader.step(card, hands, true)
+        if next == Next.done { break }
+        if next == Next.wait { pause(reader.*.pause) }
+    }
+}

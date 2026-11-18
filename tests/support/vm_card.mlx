@@ -1,0 +1,244 @@
+// The programs' address spaces (1 to 15) of the user's RX 580 as a table,
+// for stage 7 of the kernel's way to a card that takes commands
+// (tests/507_gpu_engines_address_space_runtime.mlx), beside the card of
+// tests 504 to 506 (./mec_card.mlx, which carries out the packets and asks
+// this file for every word a buffer in an address space reads or writes).
+// What the memory controller does with an access in address space n, as
+// Linux's code counts on it (the study's 2.3 to 2.6, gmc_v8_0.c):
+// - the space's directory is where its base register named it when the
+//   space was last flushed (VM_INVALIDATE_REQUEST's bit n, written by the
+//   driver or by a ring): a base register written and not flushed is not
+//   seen; translations once made are kept until the next flush;
+// - two levels: VM_CONTEXT1_CNTL's block size gives the entries of a page
+//   table (2^(9 + size)); a directory entry names a table by its card
+//   address, valid in bit 0; a page table entry names a page of the
+//   system's memory (its bus address, the system bit set) or of the card's
+//   own (its offset in VRAM, as amdgpu_vm_update_range writes it), with
+//   the valid, readable and writeable bits;
+// - an access that finds no valid entry, or one that does not allow it,
+//   is a fault: the first is kept in VM_CONTEXT1_PROTECTION_FAULT_ADDR,
+//   _STATUS (the protection's bits, the client, read or write, the address
+//   space) and _MCCLIENT until VM_CONTEXT1_CNTL2's bit 0 clears them, and
+//   when the fault's interrupt is on in VM_CONTEXT1_CNTL an entry of source
+//   146 (no valid entry) or 147 (not allowed) goes into the interrupt ring
+//   with the address space and the number IH_VMID_n_LUT holds; the access
+//   itself goes to the default page (here: nowhere) and the buffer goes on.
+// The bits of a fault's status that the headers do not give meaning to
+// (which of PROTECTIONS' bits 2:0, the client's number and its four
+// characters) are this table's own choice, said where they are.
+//
+// What the card can be made to do wrong is a variable each, below.
+const engines = @import("../../projects/brix/kernel/gpu_engines.mlx")
+const ring = @import("../../projects/brix/kernel/gpu_ring.mlx")
+const card = @import("./engine_card.mlx")
+const smc = @import("./smc_card.mlx")
+
+pub const NEVER: usize = card.NEVER
+pub const SPACES: usize = 16
+pub const TLB: usize = 8
+
+// The base each space was last flushed with (its base register's value
+// then, a page number; NEVER: never flushed), and the translations made
+// since: the page and its entry.
+pub var flushedBase: [SPACES]usize = undefined
+pub var tlbPage: [SPACES][TLB]usize = undefined
+pub var tlbEntry: [SPACES][TLB]usize = undefined
+pub var tlbCount: [SPACES]usize = undefined
+// What it did: flushes of each space, accesses translated, faults made
+// and their entries sent.
+pub var flushes: [SPACES]usize = undefined
+pub var translated: usize = 0
+pub var faults: usize = 0
+pub var faultEntries: usize = 0
+// The table's own choices for a fault's status (the headers name the
+// fields, not these values): bit 0 of PROTECTIONS for no valid entry,
+// Linux's 0x8 and 0x10 for a read or a write not allowed; the client's
+// number; its four characters.
+pub const NOT_VALID: usize = 0x1
+pub const NOT_READABLE: usize = 0x8
+pub const NOT_WRITEABLE: usize = 0x10
+pub const CLIENT_ID: usize = 0x42
+pub const CLIENT: usize = 0x43504320
+
+// What the card does wrong: a fault kept in the registers with no entry
+// sent; the processor that made a fault stops there (its ring reads no
+// further); translations kept across a flush; the base register taken as
+// it is written, without a flush; a flush asked for that does nothing (the
+// space keeps the base it had, NEVER at first); a fault's status that
+// names another address space than the one that faulted (NEVER: the right
+// one).
+pub var noFaultEntry = false
+pub var faultHangs = false
+pub var hung = false
+pub var staleTlb = false
+pub var baseUnflushed = false
+pub var flushIgnored = false
+pub var statusSpace: usize = NEVER
+// A fault's entry sent this many microseconds after the fault (0: at once),
+// carrying what it carried then; the one held back and when it is due
+// (sent at the card's next pause from then on, `tick`).
+pub var entryLate: usize = 0
+// The system's memory beyond the dma piece that a program's pages are
+// (the native calls' frames, tests 517 and 518): its "physical" addresses
+// from `systemFrom`, `systemBytes` of them, kept at `systemMemory` (0:
+// none).
+pub var systemFrom: usize = 0
+pub var systemBytes: usize = 0
+pub var systemMemory: usize = 0
+var lateSource: usize = NEVER
+var lateWord: usize = 0
+var lateAt: usize = 0
+
+fn mem64(at: usize) -> *usize { return unsafe { @ptrFromInt(*usize, at) } }
+
+pub fn reset() -> void {
+    var n: usize = 0
+    while n < SPACES {
+        flushedBase[n] = NEVER
+        tlbCount[n] = 0
+        flushes[n] = 0
+        n += 1
+    }
+    translated = 0
+    faults = 0
+    faultEntries = 0
+    noFaultEntry = false
+    faultHangs = false
+    hung = false
+    staleTlb = false
+    baseUnflushed = false
+    flushIgnored = false
+    statusSpace = NEVER
+    entryLate = 0
+    lateSource = NEVER
+}
+
+// The fault's entry held back, sent once it is due.
+pub fn tick() -> void {
+    if lateSource != NEVER && card.clock >= lateAt {
+        smc.deliver(lateSource, 0, lateWord)
+        lateSource = NEVER
+    }
+}
+
+// A flush asked for the spaces whose bits `value` has: each takes its base
+// register as it is now and forgets its translations.
+pub fn flush(value: usize) -> void {
+    if flushIgnored { return }
+    var n: usize = 1
+    while n < SPACES {
+        if (value >> @intCast(u6, n)) & 1 != 0 {
+            flushedBase[n] = card.registers[ring.baseRegister(n)]
+            if !staleTlb { tlbCount[n] = 0 }
+            flushes[n] += 1
+        }
+        n += 1
+    }
+}
+
+// A register written, by the driver or by a ring: a flush asked, a fault's
+// words cleared.
+pub fn written(number: usize, value: usize) -> void {
+    if number == engines.VM_INVALIDATE_REQUEST { flush(value) }
+    if number == engines.VM_CONTEXT1_CNTL2 && value & ring.VM_CONTEXT1_CNTL2__CLEAR_PROTECTION_FAULT_STATUS_ADDR != 0 {
+        card.registers[engines.VM_CONTEXT1_PROTECTION_FAULT_ADDR] = 0
+        card.registers[engines.VM_CONTEXT1_PROTECTION_FAULT_STATUS] = 0
+        card.registers[engines.VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT] = 0
+    }
+}
+
+// A fault of address space `space` at `page`: kept when none is, its entry
+// sent when its interrupt is on; nothing reached.
+fn fault(space: usize, page: usize, protections: usize, write: bool, enable: usize) -> usize {
+    faults += 1
+    if faultHangs { hung = true }
+    if card.registers[engines.VM_CONTEXT1_PROTECTION_FAULT_STATUS] == 0 {
+        card.registers[engines.VM_CONTEXT1_PROTECTION_FAULT_ADDR] = page & 0xFFFFFFF
+        card.registers[engines.VM_CONTEXT1_PROTECTION_FAULT_STATUS] = protections | (CLIENT_ID << 12) | (if write { @intCast(usize, 1) << 24 } else { 0 }) | ((if statusSpace != NEVER { statusSpace } else { space }) << 25)
+        card.registers[engines.VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT] = CLIENT
+    }
+    if card.registers[engines.VM_CONTEXT1_CNTL] & enable != 0 && !noFaultEntry {
+        faultEntries += 1
+        const source = if protections == NOT_VALID { ring.VISLANDS30_IV_SRCID_GFX_PAGE_INV_FAULT } else { ring.VISLANDS30_IV_SRCID_GFX_MEM_PROT_FAULT }
+        const word = ((card.registers[ring.IH_VMID_0_LUT + space] & 0xFFFF) << 16) | (space << 8)
+        if entryLate != 0 {
+            if lateSource == NEVER {
+                lateSource = source
+                lateWord = word
+                lateAt = card.clock + entryLate * 1000
+            }
+        } else {
+            smc.deliver(source, 0, word)
+        }
+    }
+    return 0
+}
+
+// The entry of the page table that maps `page` in address space `space`
+// (NEVER: none valid, with the fault made).
+fn entryOf(space: usize, page: usize, write: bool) -> usize {
+    var k: usize = 0
+    while k < tlbCount[space] {
+        if tlbPage[space][k] == page { return tlbEntry[space][k] }
+        k += 1
+    }
+    const control = card.registers[engines.VM_CONTEXT1_CNTL]
+    const notValid = 0x1000
+    const pde0 = 0x200
+    if control & engines.VM_CONTEXT1_CNTL__ENABLE_CONTEXT == 0 || page < card.registers[engines.VM_CONTEXT1_PAGE_TABLE_START_ADDR] || page > card.registers[engines.VM_CONTEXT1_PAGE_TABLE_END_ADDR] {
+        _ = fault(space, page, NOT_VALID, write, 0x8)
+        return NEVER
+    }
+    const base = if baseUnflushed { card.registers[ring.baseRegister(space)] } else { flushedBase[space] }
+    if base == NEVER {
+        _ = fault(space, page, NOT_VALID, write, pde0)
+        return NEVER
+    }
+    const bits = 9 + ((control & engines.VM_CONTEXT1_CNTL__PAGE_TABLE_BLOCK_SIZE) >> 24)
+    const directory = (base << 12) -% smc.VRAM_START
+    const index = page >> @intCast(u6, bits)
+    if directory + (index + 1) * 8 > card.VIEW {
+        _ = fault(space, page, NOT_VALID, write, pde0)
+        return NEVER
+    }
+    const pde = mem64(card.vram + directory + index * 8).*
+    const table = (pde & engines.PTE_ADDRESS) -% smc.VRAM_START
+    const slot = page & ((@intCast(usize, 1) << @intCast(u6, bits)) - 1)
+    if pde & engines.AMDGPU_PTE_VALID == 0 || table + (slot + 1) * 8 > card.VIEW {
+        _ = fault(space, page, NOT_VALID, write, pde0)
+        return NEVER
+    }
+    const pte = mem64(card.vram + table + slot * 8).*
+    if pte & engines.AMDGPU_PTE_VALID == 0 {
+        _ = fault(space, page, NOT_VALID, write, notValid)
+        return NEVER
+    }
+    if tlbCount[space] < TLB {
+        tlbPage[space][tlbCount[space]] = page
+        tlbEntry[space][tlbCount[space]] = pte
+        tlbCount[space] += 1
+    }
+    return pte
+}
+
+// The host's memory behind card address `address` of address space
+// `space` for a read or a write; 0 for a fault (made, and its entry sent).
+pub fn reach(space: usize, address: usize, write: bool) -> usize {
+    if hung { return 0 }
+    const page = address >> 12
+    const pte = entryOf(space, page, write)
+    if pte == NEVER { return 0 }
+    if write && pte & engines.AMDGPU_PTE_WRITEABLE == 0 { return fault(space, page, NOT_WRITEABLE, write, 0x40000) }
+    if !write && pte & engines.AMDGPU_PTE_READABLE == 0 { return fault(space, page, NOT_READABLE, write, 0x8000) }
+    const physical = (pte & engines.PTE_ADDRESS) | (address & 0xFFF)
+    translated += 1
+    if pte & engines.AMDGPU_PTE_SYSTEM != 0 {
+        if physical >= card.dmaBase && physical + 4 <= card.dmaBase + card.DMA_BYTES { return card.dmaMemory + physical - card.dmaBase }
+        if systemMemory != 0 && physical >= systemFrom && physical + 4 <= systemFrom + systemBytes { return systemMemory + physical - systemFrom }
+        return fault(space, page, NOT_VALID, write, 0x1000)
+    }
+    // A page of the card's own memory: its offset in VRAM.
+    if physical + 4 <= card.VIEW { return card.vram + physical }
+    if physical >= card.VIEW && physical + 4 <= card.VIEW + card.BEYOND_VRAM { return card.beyondVram + physical - card.VIEW }
+    return fault(space, page, NOT_VALID, write, 0x1000)
+}
