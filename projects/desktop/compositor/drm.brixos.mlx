@@ -36,6 +36,21 @@
 //   usual keys, clients given no keymap and typing by their own US
 //   layout).
 // - No sessions, no VTs: switchTo does nothing.
+// - The display's mode can change while the compositor runs (the kernel's
+//   display_mode: std.displaymodes): whoever asked for it (the settings
+//   program through this compositor, mode_change.mlx; root's `display`
+//   tool), and when the kernel puts the mode before back by itself, the
+//   display's node says it has changed (its handle's CHANGED, looked at
+//   every turn of the loop: the loop wakes at least once a second, five
+//   times a second while a mode waits to be kept). Then the picture is
+//   mapped anew, the frame made for the new size and the whole desktop
+//   laid out for it (entries.outputResized: output_size.mlx), the
+//   further displays fitted anew, and the frame drawn whole. While the
+//   kernel waits for the mode to be kept, the question whether to keep it
+//   is on the screen (mode_question.mlx: its keys and clicks are taken
+//   here, before the windows get them), and its answer is carried out
+//   (displaymodes.confirm, takeBack). What the display offers goes into
+//   the .display file for the settings program (`describe`).
 const std = @import("std")
 const events = @import("std.events")
 const brix = std.os.brix
@@ -43,6 +58,7 @@ const evdev = std.linux.evdev
 const wl = @import("std.wayland")
 const ui = @import("std.ui")
 const displays = @import("std.displays")
+const displaymodes = @import("std.displaymodes")
 const state = @import("./state.mlx")
 const entries = @import("./entries.mlx")
 const scene = @import("./scene.mlx")
@@ -50,6 +66,10 @@ const framebuffer = @import("./framebuffer.mlx")
 const kms = @import("./kms.mlx")
 const xkb = @import("./xkb.mlx")
 const picture = @import("../splash/picture.mlx")
+const clock = @import("../shared/clock.mlx")
+const mode_question = @import("./mode_question.mlx")
+const mode_change = @import("./mode_change.mlx")
+const display_module = @import("./display.mlx")
 
 const Compositor = state.Compositor
 
@@ -88,6 +108,16 @@ pub const Backend = struct {
     packetLength: usize
     buttons: u32
     presented: usize
+    // The display as the kernel said it last (its size, its mode's
+    // state: what is pending, how often it changed), whether it says that
+    // much (a kernel from before modes changed at run time does not), its
+    // modes (MOST records, read when the file is written) and the askers
+    // (mode_change.mlx).
+    display: displaymodes.State
+    knowsModes: bool
+    modes: [*]displaymodes.Mode
+    modeCount: usize
+    asking: mode_change.Asking
 }
 
 fn word(bytes: [*]const u8, at: usize) -> usize {
@@ -113,13 +143,26 @@ fn openDisplay(backend: *Backend) -> bool {
     const opened = brix.open(0, "/devices/framebuffer", brix.Open.READ | brix.Open.WRITE, 0)
     if opened < 0 { return false }
     backend.*.framebuffer = @intCast(u32, opened)
-    var record: [32]u8 = undefined
-    if brix.read(backend.*.framebuffer, record[0..32], 0) != 32 { return false }
-    const words: [*]const u8 = &record
-    const width = word(words, 0)
-    const height = word(words, 8)
-    backend.*.pitch = word(words, 16)
-    backend.*.swap = word(words, 24) == 2
+    // The whole record (with the mode's state), else its first words.
+    var millihertz: usize = 0
+    var width: usize = 0
+    var height: usize = 0
+    backend.*.knowsModes = displaymodes.state(backend.*.framebuffer, &backend.*.display)
+    if backend.*.knowsModes {
+        width = backend.*.display.width
+        height = backend.*.display.height
+        backend.*.pitch = backend.*.display.pitch
+        backend.*.swap = backend.*.display.format == 2
+        millihertz = backend.*.display.millihertz
+    } else {
+        var record: [32]u8 = undefined
+        if brix.read(backend.*.framebuffer, record[0..32], 0) != 32 { return false }
+        const words: [*]const u8 = &record
+        width = word(words, 0)
+        height = word(words, 8)
+        backend.*.pitch = word(words, 16)
+        backend.*.swap = word(words, 24) == 2
+    }
     if width == 0 || height == 0 { return false }
     const mapped = brix.mapNode(backend.*.framebuffer, 0, backend.*.pitch * height)
     if mapped < 0 { return false }
@@ -127,8 +170,7 @@ fn openDisplay(backend: *Backend) -> bool {
     const output = outputOf(backend)
     output.*.width = width
     output.*.height = height
-    output.*.refresh = 60
-    output.*.millihertz = 60000
+    setRate(output, millihertz)
     output.*.connectorType = 0
     output.*.connectorTypeId = 1
     output.*.modeCount = 0
@@ -137,6 +179,14 @@ fn openDisplay(backend: *Backend) -> bool {
     output.*.flipPending = false
     output.*.needsModeset = false
     return true
+}
+
+// The rate the display runs at (the kernel's millihertz; 0, not known:
+// sixty a second).
+fn setRate(output: *kms.Output, millihertz: usize) -> void {
+    const rate = if millihertz >= 1000 && millihertz < 1000000 { millihertz } else { 60000 }
+    output.*.millihertz = @intCast(u32, rate)
+    output.*.refresh = @intCast(u32, (rate + 500) / 1000)
 }
 
 // Set by the terminate event (in the upcall): told to end, the loop ends
@@ -156,9 +206,23 @@ pub fn start(compositor: *Compositor) -> usize {
     backend.*.packetLength = 0
     backend.*.buttons = 0
     backend.*.presented = 0
+    backend.*.modeCount = 0
+    backend.*.asking.listener = -1
+    backend.*.asking.pathLength = 0
     if !openDisplay(backend) {
         state.say("brix: no display (/devices/framebuffer)\n")
         return 0
+    }
+    unsafe { backend.*.modes = @ptrCast([*]displaymodes.Mode, state.allocate(compositor, displaymodes.MOST * @sizeOf(displaymodes.Mode))) }
+    // The settings program asks here for another mode, when the kernel
+    // has a driver that changes this display's (the greeter's compositor
+    // takes no requests: nobody is logged in to ask).
+    if backend.*.knowsModes && backend.*.display.settable && !compositor.*.greeterMode {
+        if mode_change.begin(&backend.*.asking, compositor) && compositor.*.verbose {
+            state.say("display: another mode is asked for at ")
+            state.say(mode_change.pathOf(&backend.*.asking))
+            state.say("\n")
+        }
     }
     backend.*.frameMicros = 1000000000 / @intCast(usize, outputOf(backend).*.millihertz)
     backend.*.frameDue = 0
@@ -219,6 +283,9 @@ pub fn start(compositor: *Compositor) -> usize {
     // stop() runs, which leaves the picture; the event's default would end
     // the program where it stands.
     _ = events.handle(events.Event.TERMINATE, onTerminate)
+    // A mode that waits to be kept already (asked for before this
+    // compositor started): the question is on the first frame.
+    question(backend)
     return @intFromPtr(memory)
 }
 
@@ -230,6 +297,7 @@ pub fn backendAt(address: usize) -> *Backend {
 pub fn output(backend: *Backend) -> *kms.Output { return outputOf(backend) }
 
 pub fn stop(backend: *Backend) -> void {
+    mode_change.end(&backend.*.asking, backend.*.compositor)
     // Our last frame stays on the screen: it is handed to the program that
     // takes the screen next, from our own memory. Not before a frame of
     // ours was shown, nor while the opening fade runs (the screen is
@@ -258,9 +326,262 @@ pub fn stop(backend: *Backend) -> void {
         }
         displays.close(&backend.*.further)
     }
-    _ = brix.unmap(backend.*.address, backend.*.pitch * outputOf(backend).*.height)
+    if backend.*.address != 0 { _ = brix.unmap(backend.*.address, backend.*.pitch * outputOf(backend).*.height) }
     _ = brix.close(backend.*.framebuffer)
 }
+
+// ---------------------------------------------------------------------------
+// The display's mode while the compositor runs
+
+// The question whether to keep the mode, as the kernel's state says: on
+// the screen while a mode waits to be kept (whoever asked for it), gone
+// once it is kept or the mode before is back.
+fn question(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
+    const shown = backend.*.display
+    if !backend.*.knowsModes || !shown.pending {
+        mode_question.hide(compositor)
+        return
+    }
+    const asked = &compositor.*.question
+    if asked.*.shown && asked.*.width == shown.width && asked.*.height == shown.height && asked.*.millihertz == shown.millihertz { return }
+    mode_question.show(compositor, shown.width, shown.height, shown.millihertz, shown.left, clock.germanLocale(compositor.*.environment))
+    if compositor.*.verbose {
+        state.say("display: asks whether to keep ")
+        state.sayNumber(shown.width)
+        state.say("x")
+        state.sayNumber(shown.height)
+        state.say(" (")
+        state.sayNumber(shown.left / 1000000000)
+        state.say(" s left)\n")
+    }
+}
+
+// The display's picture is another one (another size, another place in
+// the adapter's memory): mapped anew, and when its size changed, the
+// frame made for the new size and the desktop laid out for it.
+fn remap(backend: *Backend, now: *const displaymodes.State) -> void {
+    const compositor = backend.*.compositor
+    const output = outputOf(backend)
+    const oldWidth = compositor.*.width
+    const oldHeight = compositor.*.height
+    // The old mapping is memory the display shows no more: it goes.
+    if backend.*.address != 0 { _ = brix.unmap(backend.*.address, backend.*.pitch * output.*.height) }
+    backend.*.address = 0
+    backend.*.pitch = now.*.pitch
+    backend.*.swap = now.*.format == 2
+    output.*.width = now.*.width
+    output.*.height = now.*.height
+    setRate(output, now.*.millihertz)
+    // (What wl_output tells the clients of the new mode.)
+    compositor.*.outputMillihertz = output.*.millihertz
+    backend.*.frameMicros = 1000000000 / @intCast(usize, output.*.millihertz)
+    const mapped = brix.mapNode(backend.*.framebuffer, 0, now.*.pitch * now.*.height)
+    if mapped >= 0 {
+        backend.*.address = @bitCast(usize, mapped)
+    } else {
+        // (Nothing is copied to the screen until a change maps it again.)
+        state.say("brix: the display's new picture cannot be mapped\n")
+    }
+    if now.*.width != oldWidth || now.*.height != oldHeight {
+        // The opening fade is over: its picture is of the old size.
+        if backend.*.fading {
+            backend.*.fading = false
+            state.release(compositor, backend.*.previous, oldWidth * oldHeight * 4)
+        }
+        state.release(compositor, backend.*.frame, oldWidth * oldHeight * 4)
+        compositor.*.width = now.*.width
+        compositor.*.height = now.*.height
+        backend.*.frame = state.allocate(compositor, now.*.width * now.*.height * 4)
+        compositor.*.lastFrame = backend.*.frame
+        compositor.*.lastFrameStride = now.*.width * 4
+        // The further displays show the frame fitted anew.
+        if backend.*.further.count != 0 { refitFurther(backend) }
+        entries.outputResized(compositor, oldWidth, oldHeight)
+    }
+    // The new picture is drawn whole, at once.
+    scene.damageAll(compositor)
+    backend.*.frameDue = 0
+    if compositor.*.verbose {
+        state.say("brix: the display is ")
+        state.sayNumber(now.*.width)
+        state.say("x")
+        state.sayNumber(now.*.height)
+        state.say(" at ")
+        state.sayNumber(@intCast(usize, output.*.millihertz))
+        state.say(" millihertz now (pitch ")
+        state.sayNumber(now.*.pitch)
+        state.say(")\n")
+    }
+}
+
+// The further displays let go and taken again (each fitted anew to the
+// frame's size and its own), the whole frame waiting for them.
+fn refitFurther(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
+    displays.close(&backend.*.further)
+    displays.begin(&backend.*.further, compositor.*.width, compositor.*.height, 0, 0)
+    _ = displays.open(&backend.*.further)
+}
+
+// Reads the display's state (which takes the handle's CHANGED away) and
+// follows it: the picture mapped anew when it is another, the question
+// shown or taken away, the .display file written again.
+fn follow(backend: *Backend) -> void {
+    var now: displaymodes.State = undefined
+    if !displaymodes.state(backend.*.framebuffer, &now) { return }
+    const before = backend.*.display
+    backend.*.display = now
+    if now.changes != before.changes || now.width != before.width || now.height != before.height || now.pitch != before.pitch {
+        remap(backend, &now)
+    }
+    question(backend)
+    display_module.write(backend.*.compositor)
+}
+
+// The display's handle says it changed (a cheap look: the handle's
+// state); followed.
+fn followChanges(backend: *Backend) -> void {
+    if !backend.*.knowsModes { return }
+    if displaymodes.changed(backend.*.framebuffer) {
+        follow(backend)
+    } else if backend.*.compositor.*.question.shown {
+        // A mode kept by another program (root's `display confirm`, the
+        // tool's own question) changes no picture, so the handle does not
+        // say it: while the question is up, the kernel is asked whether
+        // the mode still waits, and the question goes once it does not.
+        var now: displaymodes.State = undefined
+        if displaymodes.state(backend.*.framebuffer, &now) && !now.pending { follow(backend) }
+    }
+    // A further display's own mode changed (root's `display` tool): it
+    // shows the frame fitted to its new size.
+    var k: usize = 0
+    while k < backend.*.further.count {
+        const handle = backend.*.further.screens[k].handle
+        if handle != 0 && displaymodes.changed(handle) {
+            refitFurther(backend)
+            if backend.*.compositor.*.verbose { state.say("brix: a further display changed; it shows the frame fitted anew\n") }
+            return
+        }
+        k += 1
+    }
+}
+
+// The question's answer carried out: kept (the kernel remembers it for
+// the next boots) or taken back (the mode before runs again, followed
+// like any change).
+fn carryOut(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
+    const answer = compositor.*.question.answer
+    if answer == 0 { return }
+    compositor.*.question.answer = 0
+    const done = if answer == state.QUESTION_KEEP { displaymodes.confirm(backend.*.framebuffer) } else { displaymodes.takeBack(backend.*.framebuffer) }
+    if compositor.*.verbose {
+        state.say(if answer == state.QUESTION_KEEP { "display: kept" } else { "display: taken back" })
+        state.say(if done == 0 { "\n" } else { " (the kernel had nothing pending any more)\n" })
+    }
+    follow(backend)
+}
+
+// An Ask from the settings program: the kernel asked, the change
+// followed, the answer told.
+fn serveAskers(backend: *Backend) -> void {
+    const compositor = backend.*.compositor
+    var request: mode_change.Request = undefined
+    while mode_change.take(&backend.*.asking, compositor, &request) {
+        if compositor.*.verbose {
+            state.say("display: asked for ")
+            state.sayNumber(request.width)
+            state.say("x")
+            state.sayNumber(request.height)
+            state.say(" at ")
+            state.sayNumber(request.millihertz)
+            state.say(" millihertz\n")
+        }
+        const status = displaymodes.ask(backend.*.framebuffer, request.width, request.height, request.millihertz)
+        follow(backend)
+        if status != 0 && compositor.*.verbose {
+            state.say("display: not set: ")
+            state.say(mode_change.refusal(status, backend.*.display.last, backend.*.display.lastWhy))
+            state.say("\n")
+        }
+        mode_change.answer(&backend.*.asking, &request, status, &backend.*.display)
+    }
+}
+
+// What the display offers, for the .display file (display.mlx), from
+// `at`; the length after it (at most `capacity`):
+//
+//     driver = QEMU's adapter          (who sets the display's modes)
+//     ask = /temporary/wayland-mlx.modes
+//                                      (where to ask: mode_change.mlx;
+//                                       none: no change while it runs)
+//     pending = 12                     (seconds left to keep the mode)
+//     available = 1920x1080@60 60000 own
+//                                      (a mode that can be set: its rate
+//                                       in millihertz, `own` the
+//                                       monitor's, `runs`, `kept` the one
+//                                       the next boots set)
+//     unavailable = 3840x2160@60 60000 own: more than this output carries
+pub fn describe(backend: *Backend, out: [*]u8, at: usize, capacity: usize) -> usize {
+    if !backend.*.knowsModes { return at }
+    var length = at
+    const shown = &backend.*.display
+    length = putText(out, length, capacity, "\ndriver = ")
+    length = putText(out, length, capacity, driverName(shown.*.driver))
+    if mode_change.pathOf(&backend.*.asking).length > 0 {
+        length = putText(out, length, capacity, "\nask = ")
+        length = putText(out, length, capacity, mode_change.pathOf(&backend.*.asking))
+    }
+    if shown.*.pending {
+        length = putText(out, length, capacity, "\npending = ")
+        length = putNumber(out, length, capacity, (shown.*.left + 999999999) / 1000000000)
+    }
+    backend.*.modeCount = displaymodes.list(backend.*.framebuffer, backend.*.modes[0..displaymodes.MOST])
+    var index: usize = 0
+    while index < backend.*.modeCount {
+        const mode = backend.*.modes[index]
+        index += 1
+        // (Interlaced and doubled pictures are not offered: no driver
+        // here makes them.)
+        if mode.interlaced || mode.doubled { continue }
+        length = putText(out, length, capacity, if mode.can { "\navailable = " } else { "\nunavailable = " })
+        length = putNumber(out, length, capacity, @intCast(usize, mode.width))
+        length = putText(out, length, capacity, "x")
+        length = putNumber(out, length, capacity, @intCast(usize, mode.height))
+        length = putText(out, length, capacity, "@")
+        length = putNumber(out, length, capacity, (@intCast(usize, mode.millihertz) + 500) / 1000)
+        length = putText(out, length, capacity, " ")
+        length = putNumber(out, length, capacity, @intCast(usize, mode.millihertz))
+        if mode.own { length = putText(out, length, capacity, " own") }
+        if mode.runs { length = putText(out, length, capacity, " runs") }
+        if mode.kept { length = putText(out, length, capacity, " kept") }
+        if !mode.can {
+            length = putText(out, length, capacity, ": ")
+            length = putText(out, length, capacity, displaymodes.whyText(mode.why))
+        }
+    }
+    return length
+}
+
+fn putText(out: [*]u8, at: usize, capacity: usize, text: []const u8) -> usize {
+    if at + text.length > capacity { return at }
+    return std.text.append(out, at, capacity, text)
+}
+
+fn putNumber(out: [*]u8, at: usize, capacity: usize, value: usize) -> usize {
+    if at + 20 > capacity { return at }
+    return std.text.appendUnsigned(out, at, at + 20, value)
+}
+
+// The display's driver in words (the record's word 112).
+fn driverName(driver: usize) -> []const u8 {
+    if driver == displaymodes.Driver.QEMU { return "QEMU's adapter" }
+    if driver == displaymodes.Driver.RADEON_TMDS { return "Radeon, HDMI or DVI" }
+    if driver == displaymodes.Driver.RADEON_OTHER { return "Radeon" }
+    return "the firmware's picture"
+}
+
 
 // ---------------------------------------------------------------------------
 // The event loop
@@ -275,6 +596,15 @@ pub fn handles(backend: *Backend, list: [*]wl.Handle, capacity: usize) -> usize 
     if backend.*.mouse != 0 && count < capacity {
         list[count] = wl.Handle.fromDescriptor(@intCast(isize, backend.*.mouse))
         count += 1
+    }
+    // The settings program asking for another mode.
+    var asking: [3]isize = undefined
+    const askers = mode_change.descriptors(&backend.*.asking, &asking, 0, 3)
+    var index: usize = 0
+    while index < askers && count < capacity {
+        list[count] = wl.Handle.fromDescriptor(asking[index])
+        count += 1
+        index += 1
     }
     return count
 }
@@ -321,6 +651,9 @@ fn keyEvent(backend: *Backend, code: u32, pressed: bool) -> void {
     const compositor = backend.*.compositor
     const keyboard = keyboardOf(backend)
     const changed = xkb.key(keyboard, code, pressed)
+    // While the question about the display's mode is up, it has the keys
+    // pressed (and their releases: mode_question.key).
+    if mode_question.key(compositor, code, pressed) { return }
     entries.keyboardKey(compositor, code, pressed)
     if changed { entries.keyboardModifiers(compositor, keyboard.*.depressed, keyboard.*.latched, keyboard.*.locked, keyboard.*.group) }
 }
@@ -382,7 +715,9 @@ fn mousePacket(backend: *Backend) -> void {
             } else {
                 keyboard.*.pressedButtons = keyboard.*.pressedButtons & (4294967295 ^ (@intCast(u32, 1) << @intCast(u5, button - evdev.BTN_LEFT)))
             }
-            entries.pointerButton(compositor, button, is)
+            // (The question about the display's mode takes every click
+            // made while it is shown.)
+            if !mode_question.button(compositor, button, compositor.*.pointerX, compositor.*.pointerY, is) { entries.pointerButton(compositor, button, is) }
         }
         bit += 1
     }
@@ -390,6 +725,7 @@ fn mousePacket(backend: *Backend) -> void {
     if dx != 0 || dy != 0 {
         entries.pointerRelative(compositor, dx, dy, dx, dy)
         entries.pointerMotion(compositor, clamp(compositor.*.pointerX + dx, compositor.*.width), clamp(compositor.*.pointerY + dy, compositor.*.height))
+        mode_question.motion(compositor, compositor.*.pointerX, compositor.*.pointerY)
     }
 }
 
@@ -419,6 +755,12 @@ pub fn dispatch(backend: *Backend) -> void {
     xkb.reloadIfWanted(keyboardOf(backend), backend.*.compositor)
     if backend.*.keyboard != 0 && readable(backend.*.keyboard) { readKeyboard(backend) }
     if backend.*.mouse != 0 && readable(backend.*.mouse) { readMouse(backend) }
+    // The display's mode: asked for, changed by anyone, the question's
+    // answer and its seconds.
+    serveAskers(backend)
+    carryOut(backend)
+    followChanges(backend)
+    mode_question.tick(backend.*.compositor)
 }
 
 // How long the opening crossfade from the previous program's frame runs.
@@ -431,8 +773,12 @@ pub fn frameWait(backend: *Backend) -> isize {
     // (Something waits to be brought to a further display: the loop
     // comes back at once, and present brings a slice of it.)
     if displays.waiting(&backend.*.further) { return 0 }
-    if !backend.*.compositor.*.needsRedraw { return 1000 }
-    return @intCast(isize, (framebuffer.frameWait(backend.*.frameDue, state.microseconds()) + 999) / 1000)
+    // (While a mode waits to be kept: its seconds counted down on the
+    // screen, and the kernel taking it back followed at once.)
+    const most: isize = if backend.*.compositor.*.question.shown { 200 } else { 1000 }
+    if !backend.*.compositor.*.needsRedraw { return most }
+    const due = @intCast(isize, (framebuffer.frameWait(backend.*.frameDue, state.microseconds()) + 999) / 1000)
+    return if due < most { due } else { most }
 }
 
 // A slice of what waits for the further displays, while no frame goes
@@ -499,7 +845,9 @@ pub fn present(backend: *Backend) -> void {
     // picture.
     const composed = state.microseconds()
     const stride = compositor.*.width * 4
-    if weight < 256 {
+    if backend.*.address == 0 {
+        // (No picture mapped: the display's new one could not be.)
+    } else if weight < 256 {
         framebuffer.fadeRows(backend.*.address, backend.*.pitch, @intFromPtr(backend.*.frame), @intFromPtr(backend.*.previous), stride, scene.outputRect(compositor), weight, backend.*.swap)
     } else {
         framebuffer.copyRows(backend.*.address, backend.*.pitch, @intFromPtr(backend.*.frame), stride, region, backend.*.swap)

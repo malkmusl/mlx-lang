@@ -1457,9 +1457,11 @@ means no. Confirmed, it stays, and it is what the next boots set, in
 place of the monitor's own. Root may ask, and the program that draws on
 the display when the display's node is its user's: a session's
 compositor, once whoever starts the session has given the display's
-node to the session's person (node_own). The login does not do that
-yet, so today it is root, and the desktop where it is started as root.
-Nobody else.
+node to the session's person (node_own). The login does that: sentinel
+gives every display's node to the person whose session (or to the
+greeter's account, whose greeter) it starts, before that program takes
+its identity (projects/desktop/login/native.mlx, `giveDisplays`), so the
+person before keeps nothing of it. Nobody else.
 
 From a shell, as root, that is the image's tool `display`:
 
@@ -1472,6 +1474,61 @@ From a shell, as root, that is the image's tool `display`:
     display confirm         the pending mode stays
     display back            the pending mode is taken back
     display state           what runs, what is pending
+
+From the desktop, which is how it is meant to be done:
+
+1. Open Settings (the top bar's control centre, or `control display`)
+   and its Display page. It names who sets the display's modes ("Radeon,
+   HDMI or DVI" on the machine this was built for), the resolution and
+   rate that run, and lists every mode the display can run, the largest
+   first: the one that runs chosen, the monitor's own marked "(the
+   monitor's own)". Under "Not available" are the modes the monitor
+   names that cannot be set, each with the kernel's reason.
+2. Click a mode. The settings program asks the desktop's compositor
+   (kepler: MLXIPC's native format on a channel of its own,
+   projects/desktop/compositor/mode_change.mlx), the compositor asks the
+   kernel, and the screen takes the mode at once. The desktop is laid
+   out for it: the top bar across the new width, the dock in the middle
+   of the new bottom, maximized and tiled windows in the new work area,
+   fullscreen ones on the whole screen, every other window where it was
+   in proportion to the screen and inside it.
+3. On the new picture, in the middle, the desktop asks "Keep this
+   display mode?" and counts the seconds down ("It goes back in 12
+   s."). Enter or Keep keeps it: the kernel remembers it for this
+   monitor. A system that runs from a disk sets it at every boot from
+   then on; one that runs from its image alone (a stick, as the machine
+   this was built for runs it) keeps it until it restarts, and the
+   kernel's log says so. Escape or Go back brings the mode before back
+   at once.
+4. When the monitor does not show the mode chosen (it stays dark, or
+   says it cannot show it), do nothing: after fifteen seconds the kernel
+   itself brings the mode before back, and the desktop follows. The
+   question is drawn by the compositor and the time is counted by the
+   kernel, so this holds whatever program the settings were in.
+5. Kept a mode that later turns out bad (another monitor, a cable that
+   carries less)? Hold N while the machine starts: the kernel forgets the
+   remembered mode and sets the monitor's own again.
+
+Whatever changes the display's mode (the desktop, `display` from a
+shell, the kernel taking a mode back), the programs that draw on the
+screen follow it: the desktop's compositor and mlx-console map the new
+picture, take its size and draw all of it again (the console's program
+is told its new size in cells; the `display` tool's own question is
+then on the new picture). The boot animation (ignition) does not: it
+runs only the few seconds before the desktop or the console takes the
+screen, and a mode is changed then only by hand from the serial shell;
+it then goes on drawing into the memory of the old picture until it
+quits, and the picture it hands on (a file of the old size) is not one
+the next program fades in from. Under the desktop the desktop's
+question is the one to answer: it has the keys while it is up, so in a
+terminal there use `display ask` (or the Display page) rather than the
+tool's own question. tools/check_brix_modes_desktop.sh does
+all of the above on QEMU's adapter (the desktop as root and a person's
+session, a mode kept and the next boot in it, mlx-console), with
+screenshots. (A system installed on a disk keeps the kernel's file, but
+cannot run the desktop yet: the kernel makes no listener node, the
+Wayland socket, in a directory of a brixfs volume. The check makes the
+next boot's image with the file the kernel wrote instead.)
 
 What sets a mode is the display's driver, behind one seam
 (display_modes.mlx's `Driver`):
