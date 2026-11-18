@@ -1,0 +1,703 @@
+// The user's RX 580 as a table for stages 3 and 4 of the kernel's way to a
+// card that takes commands (tests/500_gpu_engines_firmware_runtime.mlx and
+// 501_gpu_engines_copy_runtime.mlx): the card of tests 493 and 494
+// (./engine_card.mlx: its registers, its SMC words, its memory, its log)
+// with what stages 3 and 4 need on top: the SMC's RAM behind the index and
+// data pair with its auto increment, the SMC's start as polaris10_start_smu
+// counts on it (in protected mode: held in reset, released, its ROM's
+// interrupts, the start's trigger, done and passed when the image is the
+// one its key takes, released again, the firmware's flag; without
+// protection: the jump word at 0), its messages and their answers,
+// LoadUcodes as the study (3.4) has the SMC do it (the list read from the
+// card's memory, each engine's image read through the GART and held
+// against its file, the load status word in the SMC's RAM, the RLC and
+// the compute processor unhalted), and the two copy engines: their rings
+// read through the GART from the read pointer to the write pointer told
+// by register or doorbell, the packets of tonga_sdma_pkt_open.h carried
+// out (NOP, write, copy, fill, fence, trap, indirect buffer, the host
+// path's wait and register write), the read pointer written back, a trap
+// an entry of the interrupt ring with its interrupt; an engine runs to the
+// write pointer it holds whenever it is unhalted with its ring on, as the
+// hardware's does, not only when it is told one. Every register write
+// but the SMC image's words is in the log of writes (engine_card.mlx's),
+// every doorbell in a log of its own.
+//
+// What the card can be made to do wrong is a variable each, below.
+const std = @import("std")
+const engines = @import("../../projects/brix/kernel/gpu_engines.mlx")
+const loaded = @import("../../projects/brix/kernel/gpu_smc_sdma.mlx")
+const card = @import("./engine_card.mlx")
+
+pub const NEVER: usize = card.NEVER
+pub const VRAM_START: usize = 0xF400000000
+pub const VRAM_BYTES: usize = 8192 * 1024 * 1024
+
+// The SMC's RAM, 0x20000 .. 0x3ffff, and how many words were uploaded
+// into it by the auto increment.
+pub const RAM_WORDS: usize = 0x8000
+pub var ram: [RAM_WORDS]u32 = undefined
+pub var ramWrites: usize = 0
+
+// The SMC's state: running its ROM, held in reset, released and waiting
+// for the start's trigger (protected mode), started (its image passed),
+// running its firmware.
+pub const Smc = enum(u8) { rom, held, released, passed, running }
+pub var smc: Smc = Smc.rom
+// The answer each message gets (1: done), by message (NEVER: all).
+pub var answerTo: usize = NEVER
+pub var answerWith: usize = 1
+// A message no answer comes to (NEVER: none).
+pub var silentTo: usize = NEVER
+// What the ROM answers to the start's trigger (the sources do not say).
+pub var triggerAnswer: usize = 1
+// What the SMC was asked: the messages in order, their parameters.
+pub const ASKED: usize = 16
+pub var asked: [ASKED]usize = undefined
+pub var askedWith: [ASKED]usize = undefined
+pub var askedCount: usize = 0
+// The working memory's and the list's addresses it was told.
+pub var smuHigh: usize = 0
+pub var smuLow: usize = 0
+pub var listHigh: usize = 0
+pub var listLow: usize = 0
+// What the SMC does wrong: its ROM never says its interrupts are on; its
+// start never ends; the image is refused; the firmware never sets its
+// flag; the version word in RAM is changed when it starts; the program
+// counter does not move once running; LoadUcodes loads only these bits
+// (NEVER: what the list allows); an engine's image is not as its file
+// (an index of gpu_engines.mlx's FILES; NEVER: none).
+pub var romSilent = false
+pub var neverDone = false
+pub var refuse = false
+pub var noFlags = false
+pub var otherVersion = false
+pub var stuckCounter = false
+pub var loadOnly: usize = NEVER
+// What the load found wrong (for the test's own look): the list's entries
+// read, the bits loaded, why one was not (text).
+pub var loadedBits: usize = 0
+pub var loadWhy: []const u8 = undefined
+pub var listEntries: usize = 0
+
+// The copy engines: their read pointers (bytes, as the engine keeps it),
+// the packets each carried out, the host path's flushes and invalidates.
+pub var readPointer: [2]usize = undefined
+pub var packets: [2]usize = undefined
+pub var flushes: usize = 0
+pub var invalidates: usize = 0
+// The doorbells rung: index and value, in order.
+pub const BELLS: usize = 64
+pub var bellIndex: [BELLS]usize = undefined
+pub var bellValue: [BELLS]usize = undefined
+pub var bells: usize = 0
+// The system's memory written by the processor (32-bit words).
+pub var memoryWrites: usize = 0
+// What the copy engines do wrong: an engine that never runs its ring (0
+// or 1; NEVER: none); doorbells not taken; no read pointer written back;
+// a write packet's word lands 4 bytes further; the fill writes its value's
+// low byte to every byte; the copy changes a byte; no fence written; no
+// trap; an indirect buffer not run.
+pub var dead: usize = NEVER
+pub var deafToBells = false
+pub var noReadBack = false
+pub var writeAside = false
+pub var fillBytes = false
+// (and a fill that stops 8 bytes short of its count)
+pub var fillShort = false
+pub var copyChanges = false
+pub var noFence = false
+pub var noTrap = false
+pub var noBuffer = false
+// An engine as the hardware has one: the write pointer it holds (bytes:
+// the last its register or a doorbell of its own told it), run from its
+// read pointer to that whenever it is unhalted with its ring on, not only
+// when it is told; how often each was unhalted (its halt bit cleared).
+pub var held: [2]usize = undefined
+pub var unhalts: [2]usize = undefined
+// A fence that comes late: written this many microseconds after its
+// packet ran (0: at once), not at all when its engine is halted first.
+pub var fenceLate: usize = 0
+const LATE: usize = 8
+var lateAt: [LATE]usize = undefined
+var lateValue: [LATE]usize = undefined
+var lateDue: [LATE]usize = undefined
+var lateEngine: [LATE]usize = undefined
+var lateCount: usize = 0
+
+fn mem32(at: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, at) } }
+
+fn mem64(at: usize) -> *usize { return unsafe { @ptrFromInt(*usize, at) } }
+
+fn inRam(address: usize) -> bool { return address >= loaded.SMU7_FIRMWARE_HEADER_LOCATION && address < loaded.SMC_RAM_END }
+
+pub fn ramWord(address: usize) -> usize { return @intCast(usize, ram[(address - loaded.SMU7_FIRMWARE_HEADER_LOCATION) / 4]) }
+
+fn stepIndex() -> void {
+    if card.registers[loaded.SMC_IND_ACCESS_CNTL] & loaded.SMC_IND_ACCESS_CNTL__AUTO_INCREMENT_IND_11 != 0 { card.registers[engines.SMC_IND_INDEX_11] += 4 }
+}
+
+// ---- A card address to the host's memory behind it: the card's memory
+// within the aperture, or a page of the system's memory through the GART;
+// anything else is a fault in address space 0 (0 back).
+
+pub fn reach(address: usize) -> usize {
+    if address >= VRAM_START && address < VRAM_START + VRAM_BYTES {
+        const at = address - VRAM_START
+        if at + 4 <= card.VIEW { return card.vram + at }
+    } else if card.registers[engines.VM_CONTEXT0_CNTL] & engines.VM_CONTEXT0_CNTL__ENABLE_CONTEXT != 0 {
+        const start = card.registers[engines.VM_CONTEXT0_PAGE_TABLE_START_ADDR] << 12
+        const end = (card.registers[engines.VM_CONTEXT0_PAGE_TABLE_END_ADDR] << 12) | 0xFFF
+        const table = (card.registers[engines.VM_CONTEXT0_PAGE_TABLE_BASE_ADDR] << 12) -% VRAM_START
+        if address >= start && address <= end && table + engines.GART_BYTES / 512 <= card.VIEW {
+            const entry = mem64(card.vram + table + ((address - start) >> 12) * 8).*
+            const physical = (entry & engines.PTE_ADDRESS) | (address & 0xFFF)
+            if entry & engines.AMDGPU_PTE_VALID != 0 && entry & engines.AMDGPU_PTE_SYSTEM != 0 && physical >= card.dmaBase && physical + 4 <= card.dmaBase + card.DMA_BYTES { return card.dmaMemory + physical - card.dmaBase }
+        }
+    }
+    card.registers[engines.VM_CONTEXT0_PROTECTION_FAULT_STATUS] = 0x1004
+    card.registers[engines.VM_CONTEXT0_PROTECTION_FAULT_ADDR] = (address >> 12) & 0xFFFFFFF
+    return 0
+}
+
+fn readCard(address: usize) -> usize {
+    const at = reach(address)
+    if at == 0 { return 0 }
+    return @intCast(usize, mem32(at).*)
+}
+
+fn writeCard(address: usize, value: usize) -> void {
+    const at = reach(address)
+    if at != 0 { mem32(at).* = @intCast(u32, value & 0xFFFFFFFF) }
+}
+
+// ---- The SMC.
+
+// What the SMC does when its reset or clock words are written.
+fn smcWritten(address: usize) -> void {
+    const reset = card.smcGet(engines.ixSMC_SYSCON_RESET_CNTL) & engines.SMC_SYSCON_RESET_CNTL__rst_reg
+    const clockOff = card.smcGet(engines.ixSMC_SYSCON_CLOCK_CNTL_0) & engines.SMC_SYSCON_CLOCK_CNTL_0__ck_disable
+    if address != engines.ixSMC_SYSCON_RESET_CNTL { return }
+    if reset != 0 {
+        smc = Smc.held
+        card.smcSet(engines.ixSMC_PC_C, 0)
+        return
+    }
+    if clockOff != 0 { return }
+    const protected = card.smcGet(engines.ixSMU_FIRMWARE) & engines.SMU_FIRMWARE__SMU_MODE != 0
+    if smc == Smc.held && protected {
+        if card.smcGet(engines.ixSMU_STATUS) & loaded.SMU_STATUS__SMU_PASS != 0 {
+            // Released a second time after its image passed: the firmware
+            // runs.
+            run()
+            return
+        }
+        smc = Smc.released
+        if !romSilent { card.smcSet(engines.ixRCU_UC_EVENTS, card.smcGet(engines.ixRCU_UC_EVENTS) | engines.RCU_UC_EVENTS__INTERRUPTS_ENABLED) }
+        return
+    }
+    if smc == Smc.held && !protected {
+        // Without protection the firmware runs from the jump word at 0.
+        if card.smcGet(0) == loaded.JUMP_ON_START && imageHolds() { run() }
+    }
+}
+
+fn run() -> void {
+    smc = Smc.running
+    // (The firmware's flags are a word of its RAM.)
+    if !noFlags { ram[(engines.ixFIRMWARE_FLAGS - loaded.SMU7_FIRMWARE_HEADER_LOCATION) / 4] = @intCast(u32, engines.FIRMWARE_FLAGS__INTERRUPTS_ENABLED) }
+    card.smcSet(engines.ixSMC_PC_C, 0x20A40)
+    card.counterStep = if stuckCounter { 0 } else { 0x14 }
+    if otherVersion { ram[5] = ram[5] ^ 0x100 }
+}
+
+// The image in RAM is the payload of the file the card's key takes.
+fn imageHolds() -> bool {
+    if refuse { return false }
+    const key = card.smcGet(engines.ixSMU_FIRMWARE) & engines.SMU_FIRMWARE__SMU_SEL != 0
+    const name = if key { "polaris10_k_smc.bin" } else { "polaris10_smc_sk.bin" }
+    const bytes = card.file(name)
+    if bytes.length < 32 { return false }
+    const size = le(bytes, 20)
+    const at = le(bytes, 24)
+    var k: usize = 0
+    while k < size / 4 {
+        if @intCast(usize, ram[k]) != le(bytes, at + 4 * k) { return false }
+        k += 1
+    }
+    return true
+}
+
+fn le(bytes: []const u8, at: usize) -> usize {
+    if at + 4 > bytes.length { return 0 }
+    return @intCast(usize, bytes[at]) | (@intCast(usize, bytes[at + 1]) << 8) | (@intCast(usize, bytes[at + 2]) << 16) | (@intCast(usize, bytes[at + 3]) << 24)
+}
+
+// A message: its answer in SMC_RESP_0 (none for one that is silent, none
+// from an SMC that does not run but for the start's trigger).
+fn messaged(number: usize) -> void {
+    const parameter = card.registers[loaded.SMC_MSG_ARG_0]
+    if askedCount < ASKED {
+        asked[askedCount] = number
+        askedWith[askedCount] = parameter
+    }
+    askedCount += 1
+    if number == silentTo { return }
+    if number == loaded.PPSMC_MSG_Test && parameter == loaded.TEST_TRIGGER && smc == Smc.released {
+        if !neverDone {
+            const pass = if imageHolds() { loaded.SMU_STATUS__SMU_PASS } else { 0 }
+            card.smcSet(engines.ixSMU_STATUS, loaded.SMU_STATUS__SMU_DONE | pass)
+        }
+        card.registers[loaded.SMC_RESP_0] = triggerAnswer
+        return
+    }
+    if smc != Smc.running { return }
+    card.registers[loaded.SMC_RESP_0] = if answerTo == NEVER || answerTo == number { answerWith } else { 1 }
+    if card.registers[loaded.SMC_RESP_0] != 1 { return }
+    if number == loaded.PPSMC_MSG_SMU_DRAM_ADDR_HI { smuHigh = parameter }
+    if number == loaded.PPSMC_MSG_SMU_DRAM_ADDR_LO { smuLow = parameter }
+    if number == loaded.PPSMC_MSG_DRV_DRAM_ADDR_HI { listHigh = parameter }
+    if number == loaded.PPSMC_MSG_DRV_DRAM_ADDR_LO { listLow = parameter }
+    if number == loaded.PPSMC_MSG_LoadUcodes { load(parameter) }
+}
+
+// LoadUcodes: for each engine the mask names, its entry of the list, its
+// image read through the GART and held against its file's payload (MEC
+// without its jump table, the jump table twice), its version and flag; the
+// bits of the engines that hold set in the load status word; the RLC and
+// the compute processor unhalted (their entries' flag).
+fn load(mask: usize) -> void {
+    loadedBits = 0
+    loadWhy = ""
+    const smuBuffer = reach((smuHigh << 32) | smuLow)
+    const list = reach((listHigh << 32) | listLow)
+    if smuBuffer == 0 || list == 0 {
+        loadWhy = "the working memory or the list is not in the card's memory"
+        finishLoad(mask)
+        return
+    }
+    if @intCast(usize, mem32(list).*) != loaded.SMU_DRAMData_TOC_VERSION {
+        loadWhy = "the list's version"
+        finishLoad(mask)
+        return
+    }
+    listEntries = @intCast(usize, mem32(list + 4).*)
+    const kinds = [_]usize{ loaded.UCODE_ID_RLC_G, loaded.UCODE_ID_CP_CE, loaded.UCODE_ID_CP_PFP, loaded.UCODE_ID_CP_ME, loaded.UCODE_ID_CP_MEC, loaded.UCODE_ID_SDMA0, loaded.UCODE_ID_SDMA1 }
+    const files = [_][]const u8{ "polaris10_rlc.bin", "polaris10_ce_2.bin", "polaris10_pfp_2.bin", "polaris10_me_2.bin", "polaris10_mec_2.bin", "polaris10_sdma.bin", "polaris10_sdma1.bin" }
+    var k: usize = 0
+    while k < kinds.length {
+        const bit = @intCast(usize, 1) << @intCast(u6, kinds[k])
+        if mask & bit != 0 && entryHolds(list, kinds[k], files[k], 0) && (kinds[k] != loaded.UCODE_ID_CP_MEC || (entryHolds(list, loaded.UCODE_ID_CP_MEC_JT1, files[k], 1) && entryHolds(list, loaded.UCODE_ID_CP_MEC_JT2, files[k], 1))) {
+            loadedBits |= bit
+        }
+        k += 1
+    }
+    if loadedBits & loaded.UCODE_ID_RLC_G_MASK != 0 { card.registers[engines.RLC_CNTL] |= engines.RLC_CNTL__RLC_ENABLE_F32 }
+    if loadedBits & loaded.UCODE_ID_CP_MEC_MASK != 0 { card.registers[engines.CP_MEC_CNTL] = 0 }
+    finishLoad(mask)
+}
+
+fn finishLoad(mask: usize) -> void {
+    var bits = loadedBits
+    if loadOnly != NEVER { bits = loadOnly }
+    const soft = ramWord(loaded.SMU7_FIRMWARE_HEADER_LOCATION + loaded.SMU74_Firmware_Header__SoftRegisters)
+    const status = soft + loaded.SMU74_SoftRegisters__UcodeLoadStatus
+    if inRam(status) { ram[(status - loaded.SMU7_FIRMWARE_HEADER_LOCATION) / 4] = @intCast(u32, bits & mask) }
+}
+
+// An entry of the list for `kind`: the image it names read through the
+// GART, the payload of `name` (`jumpTable`: its jump table) the same.
+fn entryHolds(list: usize, kind: usize, name: []const u8, jumpTable: usize) -> bool {
+    const bytes = card.file(name)
+    const payload = le(bytes, 24)
+    var n: usize = 0
+    while n < listEntries && n < loaded.SMU_MAX_ENTRIES {
+        const entry = list + 8 + n * loaded.SMU_Entry__size
+        const first = @intCast(usize, mem32(entry).*)
+        if first & 0xFFFF == kind {
+            if first >> 16 != le(bytes, 16) & 0xFFFF {
+                loadWhy = "an entry's version"
+                return false
+            }
+            const address = (@intCast(usize, mem32(entry + 4).*) << 32) | @intCast(usize, mem32(entry + 8).*)
+            const size = @intCast(usize, mem32(entry + 20).*)
+            const flags = @intCast(usize, mem32(entry + 24).*) & 0xFFFF
+            const unhalt = kind == loaded.UCODE_ID_RLC_G || kind == loaded.UCODE_ID_CP_MEC
+            if (flags == 1) != unhalt {
+                loadWhy = "an entry's flag"
+                return false
+            }
+            var from = payload
+            var wanted = le(bytes, 20)
+            if kind == loaded.UCODE_ID_CP_MEC { wanted = le(bytes, 36) * 4 }
+            if jumpTable != 0 {
+                from = payload + le(bytes, 36) * 4
+                wanted = le(bytes, 40) * 4
+            }
+            if size != wanted {
+                loadWhy = "an entry's size"
+                return false
+            }
+            var k: usize = 0
+            while k < size {
+                if readCard(address + k) != le(bytes, from + k) {
+                    loadWhy = "an image read through the GART is not its file's"
+                    return false
+                }
+                k += 4
+            }
+            return true
+        }
+        n += 1
+    }
+    loadWhy = "an engine is not in the list"
+    return false
+}
+
+// ---- The copy engines.
+
+fn engineOf(number: usize) -> usize { return if number >= engines.SDMA0_CNTL + loaded.SDMA1_REGISTER_OFFSET { 1 } else { 0 } }
+
+// The interrupt ring gets an entry (its three words), the write pointer
+// moved and written back, the interrupt raised as the card of tests 493
+// and 494 raises it.
+pub fn deliver(source: usize, data: usize, ring: usize) -> void {
+    const control = card.registers[engines.IH_RB_CNTL]
+    if control & engines.IH_RB_CNTL__RB_ENABLE == 0 { return }
+    const base = card.registers[engines.IH_RB_BASE] << 8
+    const pointer = card.registers[engines.IH_RB_WPTR] & (engines.IH_RING_BYTES - 1) & ~engines.IH_RB_WPTR__RB_OVERFLOW
+    if base >= card.dmaBase && base + engines.IH_RING_BYTES <= card.dmaBase + card.DMA_BYTES {
+        const at = card.dmaMemory + base - card.dmaBase + pointer
+        mem32(at).* = @intCast(u32, source)
+        mem32(at + 4).* = @intCast(u32, data)
+        mem32(at + 8).* = @intCast(u32, ring)
+        mem32(at + 12).* = 0
+    }
+    const next = (pointer + engines.IH_ENTRY_BYTES) & (engines.IH_RING_BYTES - 1)
+    card.registers[engines.IH_RB_WPTR] = next
+    const back = (card.registers[engines.IH_RB_WPTR_ADDR_HI] << 32) | (card.registers[engines.IH_RB_WPTR_ADDR_LO] & engines.IH_RB_WPTR_ADDR_LO__ADDR)
+    if control & engines.IH_RB_CNTL__WPTR_WRITEBACK_ENABLE != 0 && back >= card.dmaBase && back + 4 <= card.dmaBase + card.DMA_BYTES { mem32(card.dmaMemory + back - card.dmaBase).* = @intCast(u32, next) }
+    if card.routed && !card.noMessage && control & engines.IH_RB_CNTL__ENABLE_INTR != 0 {
+        if card.interruptsOn {
+            card.messages += 1
+        } else {
+            card.waitingMessage = true
+        }
+    }
+}
+
+// An engine runs its ring from its read pointer to `wptr` (bytes), when it
+// is not halted and its ring is on.
+fn runRing(engine: usize, wptr: usize) -> void {
+    const at = engine * loaded.SDMA1_REGISTER_OFFSET
+    if engine == dead { return }
+    if card.registers[engines.SDMA0_F32_CNTL + at] & engines.SDMA0_F32_CNTL__HALT != 0 { return }
+    const control = card.registers[engines.SDMA0_GFX_RB_CNTL + at]
+    if control & engines.SDMA0_GFX_RB_CNTL__RB_ENABLE == 0 { return }
+    const ring = ((card.registers[loaded.SDMA0_GFX_RB_BASE_HI + at] << 32) | card.registers[loaded.SDMA0_GFX_RB_BASE + at]) << 8
+    const words = (@intCast(usize, 1) << @intCast(u6, (control & loaded.SDMA0_GFX_RB_CNTL__RB_SIZE) >> 1))
+    var rounds: usize = 0
+    while readPointer[engine] != wptr && rounds < 4096 {
+        const used = carry(engine, ring, words, readPointer[engine] / 4)
+        readPointer[engine] = ((readPointer[engine] / 4 + used) & (words - 1)) * 4
+        rounds += 1
+    }
+    card.registers[loaded.SDMA0_GFX_RB_RPTR + at] = readPointer[engine]
+    if control & loaded.SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_ENABLE != 0 && !noReadBack {
+        writeCard((card.registers[loaded.SDMA0_GFX_RB_RPTR_ADDR_HI + at] << 32) | card.registers[loaded.SDMA0_GFX_RB_RPTR_ADDR_LO + at], readPointer[engine])
+    }
+}
+
+// One packet at word `k` of a ring of `words` words at card address
+// `base` (or of an indirect buffer: `words` 0, no wrapping) carried out;
+// how many words it took.
+fn carry(engine: usize, base: usize, words: usize, k: usize) -> usize {
+    const first = take(base, words, k, 0)
+    const op = first & 0xFF
+    packets[engine] += 1
+    if op == loaded.SDMA_OP_NOP { return 1 + ((first >> 16) & loaded.SDMA_PKT_NOP_HEADER_count_mask) }
+    if op == loaded.SDMA_OP_WRITE {
+        const address = take(base, words, k, 1) | (take(base, words, k, 2) << 32)
+        const count = take(base, words, k, 3) & 0x3FFFFF
+        var n: usize = 0
+        while n < count {
+            writeCard(address + n * 4 + (if writeAside { 4 } else { 0 }), take(base, words, k, 4 + n))
+            n += 1
+        }
+        return 4 + count
+    }
+    if op == loaded.SDMA_OP_COPY {
+        const count = take(base, words, k, 1) & 0x3FFFFF
+        const from = take(base, words, k, 3) | (take(base, words, k, 4) << 32)
+        const to = take(base, words, k, 5) | (take(base, words, k, 6) << 32)
+        var n: usize = 0
+        while n < count {
+            var value = readCard(from + n)
+            if copyChanges && n == 64 { value = value ^ 0x10 }
+            writeCard(to + n, value)
+            n += 4
+        }
+        return 7
+    }
+    if op == loaded.SDMA_OP_CONST_FILL {
+        const to = take(base, words, k, 1) | (take(base, words, k, 2) << 32)
+        var value = take(base, words, k, 3)
+        if fillBytes { value = (value & 0xFF) * 0x01010101 }
+        const count = (take(base, words, k, 4) & 0x3FFFFF) - (if fillShort { 8 } else { 0 })
+        var n: usize = 0
+        while n < count {
+            writeCard(to + n, value)
+            n += 4
+        }
+        return 5
+    }
+    if op == loaded.SDMA_OP_FENCE {
+        const at = take(base, words, k, 1) | (take(base, words, k, 2) << 32)
+        if !noFence && fenceLate != 0 && lateCount < LATE {
+            lateAt[lateCount] = at
+            lateValue[lateCount] = take(base, words, k, 3)
+            lateDue[lateCount] = card.clock + fenceLate * 1000
+            lateEngine[lateCount] = engine
+            lateCount += 1
+        } else if !noFence {
+            writeCard(at, take(base, words, k, 3))
+        }
+        return 4
+    }
+    if op == loaded.SDMA_OP_TRAP {
+        if !noTrap && card.registers[engines.SDMA0_CNTL + engine * loaded.SDMA1_REGISTER_OFFSET] & loaded.SDMA0_CNTL__TRAP_ENABLE != 0 { deliver(loaded.VISLANDS30_IV_SRCID_SDMA_TRAP, take(base, words, k, 1), engine) }
+        return 2
+    }
+    if op == loaded.SDMA_OP_POLL_REGMEM {
+        if first == loaded.hdpFlushHeader() { flushes += 1 }
+        return 6
+    }
+    if op == loaded.SDMA_OP_SRBM_WRITE {
+        if take(base, words, k, 1) == loaded.HDP_DEBUG0 { invalidates += 1 }
+        return 3
+    }
+    if op == loaded.SDMA_OP_INDIRECT {
+        const buffer = take(base, words, k, 1) | (take(base, words, k, 2) << 32)
+        const length = take(base, words, k, 3)
+        if !noBuffer {
+            var n: usize = 0
+            while n < length { n += carry(engine, buffer, 0, n) }
+        }
+        return 6
+    }
+    // An operation no packet of these steps has: the engine stops there.
+    return words
+}
+
+// Word `n` of the packet at word `k` of a ring (wrapping) or a buffer.
+fn take(base: usize, words: usize, k: usize, n: usize) -> usize {
+    const index = if words == 0 { k + n } else { (k + n) & (words - 1) }
+    return readCard(base + index * 4)
+}
+
+// ---- The hands.
+
+pub fn read(number: usize) -> u32 {
+    if number == engines.SMC_IND_DATA_11 && !card.gone {
+        const address = card.registers[engines.SMC_IND_INDEX_11]
+        if inRam(address) {
+            const value = ram[(address - loaded.SMU7_FIRMWARE_HEADER_LOCATION) / 4]
+            stepIndex()
+            return value
+        }
+    }
+    return card.read(number)
+}
+
+pub fn write(number: usize, value32: u32) -> void {
+    const value = @intCast(usize, value32)
+    if number == engines.SMC_IND_DATA_11 && !card.gone {
+        const address = card.registers[engines.SMC_IND_INDEX_11]
+        if inRam(address) {
+            ram[(address - loaded.SMU7_FIRMWARE_HEADER_LOCATION) / 4] = value32
+            if card.registers[loaded.SMC_IND_ACCESS_CNTL] & loaded.SMC_IND_ACCESS_CNTL__AUTO_INCREMENT_IND_11 != 0 {
+                ramWrites += 1
+                stepIndex()
+                return
+            }
+            card.write(number, value32)
+            return
+        }
+        card.write(number, value32)
+        smcWritten(address)
+        return
+    }
+    const halt = number == engines.SDMA0_F32_CNTL || number == engines.SDMA1_F32_CNTL
+    const wasHalted = halt && card.registers[number] & engines.SDMA0_F32_CNTL__HALT != 0
+    card.write(number, value32)
+    if card.gone { return }
+    if number == loaded.SMC_MESSAGE_0 { messaged(value) }
+    if number == loaded.SDMA0_GFX_RB_RPTR || number == loaded.SDMA0_GFX_RB_RPTR + loaded.SDMA1_REGISTER_OFFSET { readPointer[engineOf(number)] = value }
+    if number == loaded.SDMA0_GFX_RB_WPTR || number == loaded.SDMA0_GFX_RB_WPTR + loaded.SDMA1_REGISTER_OFFSET {
+        const engine = engineOf(number)
+        if card.registers[loaded.SDMA0_GFX_DOORBELL + engine * loaded.SDMA1_REGISTER_OFFSET] & loaded.SDMA0_GFX_DOORBELL__ENABLE == 0 {
+            held[engine] = value
+            runRing(engine, value)
+        }
+    }
+    if halt {
+        const engine = engineOf(number)
+        if value & engines.SDMA0_F32_CNTL__HALT != 0 {
+            dropLate(engine)
+        } else if wasHalted {
+            unhalts[engine] += 1
+            wake(engine)
+        }
+    }
+    if (number == engines.SDMA0_GFX_RB_CNTL || number == engines.SDMA1_GFX_RB_CNTL) && value & engines.SDMA0_GFX_RB_CNTL__RB_ENABLE != 0 { wake(engineOf(number)) }
+}
+
+// An engine unhalted or its ring turned on runs to the write pointer it
+// holds, as the hardware does (runRing: not when halted or off).
+fn wake(engine: usize) -> void {
+    if readPointer[engine] != held[engine] { runRing(engine, held[engine]) }
+}
+
+// The late fences of an engine that is halted are never written.
+fn dropLate(engine: usize) -> void {
+    var k: usize = 0
+    while k < lateCount {
+        if lateEngine[k] == engine {
+            lateCount -= 1
+            lateAt[k] = lateAt[lateCount]
+            lateValue[k] = lateValue[lateCount]
+            lateDue[k] = lateDue[lateCount]
+            lateEngine[k] = lateEngine[lateCount]
+        } else {
+            k += 1
+        }
+    }
+}
+
+// The card's pause, and the late fences whose time has come written.
+pub fn pause(microseconds: usize) -> void {
+    card.pause(microseconds)
+    var k: usize = 0
+    while k < lateCount {
+        if card.clock >= lateDue[k] {
+            writeCard(lateAt[k], lateValue[k])
+            lateCount -= 1
+            lateAt[k] = lateAt[lateCount]
+            lateValue[k] = lateValue[lateCount]
+            lateDue[k] = lateDue[lateCount]
+            lateEngine[k] = lateEngine[lateCount]
+        } else {
+            k += 1
+        }
+    }
+}
+
+pub fn memoryWrite(physical: usize, value: u32) -> void {
+    memoryWrites += 1
+    if physical < card.dmaBase || physical + 4 > card.dmaBase + card.DMA_BYTES { return }
+    mem32(card.dmaMemory + physical - card.dmaBase).* = value
+}
+
+pub fn doorbell(index: usize, value: u32) -> void {
+    if bells < BELLS {
+        bellIndex[bells] = index
+        bellValue[bells] = @intCast(usize, value)
+    }
+    bells += 1
+    if deafToBells || card.registers[engines.BIF_DOORBELL_APER_EN] & engines.BIF_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN == 0 { return }
+    var engine: usize = 0
+    while engine < 2 {
+        const word = card.registers[loaded.SDMA0_GFX_DOORBELL + engine * loaded.SDMA1_REGISTER_OFFSET]
+        if word & loaded.SDMA0_GFX_DOORBELL__ENABLE != 0 && word & loaded.SDMA0_GFX_DOORBELL__OFFSET == index {
+            held[engine] = @intCast(usize, value)
+            runRing(engine, @intCast(usize, value))
+        }
+        engine += 1
+    }
+}
+
+pub fn hands() -> engines.Hands {
+    var h = card.hands()
+    h.read = read
+    h.write = write
+    h.pause = pause
+    return h
+}
+
+pub fn more() -> loaded.More { return loaded.More.{ .memoryWrite = memoryWrite, .doorbell = doorbell, .doorbells = 0x80000 } }
+
+// The card anew (engine_card.mlx's reset) with the SMC running its ROM,
+// nothing of this file's wrong, the SMC's answer register 0 (nothing was
+// ever asked of it since the card's start).
+pub fn reset() -> void {
+    card.reset()
+    var k: usize = 0
+    while k < RAM_WORDS {
+        ram[k] = 0
+        k += 1
+    }
+    ramWrites = 0
+    smc = Smc.rom
+    answerTo = NEVER
+    answerWith = 1
+    silentTo = NEVER
+    triggerAnswer = 1
+    askedCount = 0
+    smuHigh = 0
+    smuLow = 0
+    listHigh = 0
+    listLow = 0
+    romSilent = false
+    neverDone = false
+    refuse = false
+    noFlags = false
+    otherVersion = false
+    stuckCounter = false
+    loadOnly = NEVER
+    loadedBits = 0
+    loadWhy = ""
+    listEntries = 0
+    readPointer[0] = 0
+    readPointer[1] = 0
+    packets[0] = 0
+    packets[1] = 0
+    flushes = 0
+    invalidates = 0
+    bells = 0
+    memoryWrites = 0
+    dead = NEVER
+    deafToBells = false
+    noReadBack = false
+    writeAside = false
+    fillBytes = false
+    fillShort = false
+    copyChanges = false
+    noFence = false
+    noTrap = false
+    noBuffer = false
+    held[0] = 0
+    held[1] = 0
+    unhalts[0] = 0
+    unhalts[1] = 0
+    fenceLate = 0
+    lateCount = 0
+}
+
+// The SMC found running its firmware (a start of brixOS before this one):
+// the image in its RAM, its flag, its program counter in RAM.
+pub fn smcRunning() -> void {
+    const bytes = card.file("polaris10_k_smc.bin")
+    const size = le(bytes, 20)
+    const at = le(bytes, 24)
+    var k: usize = 0
+    while k < size / 4 {
+        ram[k] = @intCast(u32, le(bytes, at + 4 * k))
+        k += 1
+    }
+    runningAsIs()
+}
+
+// The SMC found running whatever image its RAM holds.
+pub fn runningAsIs() -> void {
+    run()
+    card.registers[loaded.SMC_RESP_0] = 1
+}

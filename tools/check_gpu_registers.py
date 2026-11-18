@@ -102,6 +102,12 @@
 # and header versions), the display's runs of tests/support/
 # engine_card.mlx made again from dce_11_2_d.h, and that no register a
 # step writes is the display's (the files are named at that section).
+# Of stages 3 and 4 (gpu_smc_sdma.mlx: the SMC's firmware, the engines'
+# firmware through it, the copy engines): every register, field, SMC
+# address, message, kind and bit of the engines' list, packet word and
+# Linux's value against the SMC's, the list's, the packets' and the
+# copy engines' files, the list's order and the copies', the golden
+# table, and that no register those steps write is the display's.
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -1098,4 +1104,196 @@ for name in sorted(written_names):
     in_display = any(runs[k] <= number <= runs[k + 1] for k in range(0, len(runs), 2))
     hold("%s (%#x) written by a step is no register of the display's" % (name, number), int(in_display), 0)
 print("the card's engines: %d numbers of gpu_engines.mlx (and engine_card.mlx's display runs) held against Linux's files, %d wrong" % (held - engines_before, bad - engines_bad_before))
+# ---- Stages 3 and 4: gpu_smc_sdma.mlx (the SMC's firmware, the engines'
+# firmware loaded through it, the two copy engines). Beside the files
+# above, of Linux 6.6's drivers/gpu/drm/amd:
+#   pm/powerplay/inc/smu7_ppsmc.h       the SMC's messages and answers
+#   pm/powerplay/inc/smu7.h, smu74.h    the firmware's place in the SMC's
+#                                       RAM, its header, its soft registers
+#   pm/powerplay/inc/smu_ucode_xfer_vi.h  the engines' kinds, their bits,
+#                                       the list (struct SMU_DRAMData_TOC)
+#   pm/powerplay/smumgr/smu7_smumgr.h   the SMC's RAM's end
+#   pm/powerplay/hwmgr/hwmgr.c          how long the SMC's waits are
+#   include/amd_shared.h                AMD_MAX_USEC_TIMEOUT
+#   include/ivsrcid/ivsrcid_vislands30.h  the copy engines' trap
+#   amdgpu/tonga_sdma_pkt_open.h        the copy engines' packets
+#   amdgpu/amdgpu_doorbell.h            their doorbells
+#   amdgpu/amdgpu_ib.c amdgpu/amdgpu_drv.c  the indirect buffer test's
+#                                       time, the ring's submissions, the
+#                                       phase quantum
+# and that no register these steps write is the display's.
+smc_sdma_needed = ("smu7_ppsmc.h", "smu7.h", "smu74.h", "smu_ucode_xfer_vi.h", "smu7_smumgr.h", "hwmgr.c", "amd_shared.h",
+                   "ivsrcid_vislands30.h", "tonga_sdma_pkt_open.h", "amdgpu_doorbell.h", "amdgpu_ib.c", "amdgpu_drv.c", "vid.h")
+smc_sdma_missing = [name for name in smc_sdma_needed if not os.path.exists(os.path.join(hdr, name))]
+if smc_sdma_missing:
+    sys.exit("stages 3 and 4 are not held: not in %s: %s" % (hdr, " ".join(smc_sdma_missing)))
+loaded_before = held
+loaded_bad_before = bad
+loaded_text = open(os.path.join(here, "gpu_smc_sdma.mlx")).read()
+ppsmc = {m.group(1): int(m.group(2), 0) for m in re.finditer(r"#define\s+(PPSMC_\w+)\s+\(\(uint16_t\)\s*(0x[0-9a-fA-F]+)\)", text_of("smu7_ppsmc.h"))}
+xfer = defines(os.path.join(hdr, "smu_ucode_xfer_vi.h"))
+pkt = defines(os.path.join(hdr, "tonga_sdma_pkt_open.h"))
+vid = defines(os.path.join(hdr, "vid.h"))
+smu7_h = defines(os.path.join(hdr, "smu7.h"))
+smu7_smumgr_h = defines(os.path.join(hdr, "smu7_smumgr.h"))
+amd_shared = defines(os.path.join(hdr, "amd_shared.h"))
+ivsrc = defines(os.path.join(hdr, "ivsrcid_vislands30.h"))
+doorbell_h = text_of("amdgpu_doorbell.h")
+ib_c = text_of("amdgpu_ib.c")
+drv_c = text_of("amdgpu_drv.c")
+def c_function(text, name):
+    # A function's body in a C file (from its name to the next line that
+    # is a lone closing brace).
+    at = text.index(name + "(")
+    return text[at:text.index("\n}\n", at)]
+
+hdp_flush_c = c_function(sdma_c, "static void sdma_v3_0_ring_emit_hdp_flush")
+smu74_h = re.sub(r"/\*.*?\*/", "", text_of("smu74.h"), flags=re.S)
+xfer_text = re.sub(r"/\*.*?\*/", "", text_of("smu_ucode_xfer_vi.h"), flags=re.S)
+
+def c_struct_offset(text, struct, field):
+    # A field's offset in a structure of uint8_t, uint16_t and uint32_t
+    # fields and arrays of them, each aligned to its size (as the host's
+    # compiler lays them out); `size` the whole, rounded to the largest.
+    m = re.search(r"struct\s+%s\s*\{(.*?)\};" % struct, text, re.S)
+    body = m.group(1)
+    body = re.sub(r"#else.*?#endif", "", body, flags=re.S)
+    body = re.sub(r"#\w+[^\n]*", "", body)
+    at = 0
+    widest = 1
+    for kind, name, count in re.findall(r"(uint8_t|uint16_t|uint32_t)\s+(\w+)\s*(?:\[(\w+)\])?\s*;", body):
+        size = {"uint8_t": 1, "uint16_t": 2, "uint32_t": 4}[kind]
+        widest = max(widest, size)
+        at = (at + size - 1) // size * size
+        if name == field:
+            return at
+        n = 1 if not count else (int(count, 0) if count[0].isdigit() else xfer[count])
+        at += size * n
+    if field == "size":
+        return (at + widest - 1) // widest * widest
+    return None
+
+entry_size = c_struct_offset(xfer_text, "SMU_Entry", "size")
+toc_m = re.search(r"struct\s+SMU_DRAMData_TOC\s*\{(.*?)\};", xfer_text, re.S)
+toc_size = 8 + entry_size * xfer["SMU_MAX_ENTRIES"] if toc_m and "struct SMU_Entry entry[SMU_MAX_ENTRIES]" in toc_m.group(1) else None
+golden_rows = golden(sdma_c, "golden_settings_polaris10_a11")
+LOADED_LINUX = {
+    "SMU7_FIRMWARE_HEADER_LOCATION": smu7_h.get("SMU7_FIRMWARE_HEADER_LOCATION"),
+    "SMU74_Firmware_Header__Version": c_struct_offset(smu74_h, "SMU74_Firmware_Header", "Version"),
+    "SMU74_Firmware_Header__SoftRegisters": c_struct_offset(smu74_h, "SMU74_Firmware_Header", "SoftRegisters"),
+    "SMU74_SoftRegisters__UcodeLoadStatus": c_struct_offset(smu74_h, "SMU74_SoftRegisters", "UcodeLoadStatus"),
+    "SMC_RAM_END": smu7_smumgr_h.get("SMC_RAM_END"),
+    "AMD_MAX_USEC_TIMEOUT": amd_shared.get("AMD_MAX_USEC_TIMEOUT") if "hwmgr->usec_timeout = AMD_MAX_USEC_TIMEOUT;" in text_of("hwmgr.c") else None,
+    "TEST_TRIGGER": int(re.search(r"PPSMC_MSG_Test, (0x[0-9a-fA-F]+), NULL", smu7_c).group(1), 0),
+    "JUMP_ON_START": int.from_bytes(bytes(int(x, 0) for x in re.search(r"static const unsigned char data\[4\] = \{([^}]*)\}", smu7_c).group(1).split(",")), "big"),
+    "SMC_HEADER__ucode_start_addr": ucode_offset("smc_firmware_header_v1_0", "ucode_start_addr"),
+    "SMU_Entry__size": entry_size,
+    "SMU_DRAMData_TOC__size": toc_size,
+    "HEADER_BUFFER_BYTES": ((toc_size or 0) // 4096 + 1) * 4096 if "((sizeof(struct SMU_DRAMData_TOC) / 4096) + 1) * 4096" in smu7_c else None,
+    "HEADER__ucode_feature_version": ucode_offset("sdma_firmware_header_v1_0", "ucode_feature_version") if ucode_offset("sdma_firmware_header_v1_0", "ucode_feature_version") == ucode_offset("gfx_firmware_header_v1_0", "ucode_feature_version") else None,
+    "BURST_NOP_FEATURE": int(re.search(r"feature_version >= (\d+)\)\s*\n\s*adev->sdma.instance\[i\].burst_nop = true", sdma_c).group(1)),
+    "POLL_HDP_FLUSH": int(re.search(r"SDMA_PKT_POLL_REGMEM_HEADER_HDP_FLUSH\((\d+)\)", hdp_flush_c).group(1)),
+    "POLL_FUNC_EQUAL": int(re.search(r"SDMA_PKT_POLL_REGMEM_HEADER_FUNC\((\d+)\)", hdp_flush_c).group(1)),
+    "POLL_RETRY_COUNT": int(re.search(r"SDMA_PKT_POLL_REGMEM_DW5_RETRY_COUNT\((0x[0-9a-fA-F]+)\)", hdp_flush_c).group(1), 0),
+    "POLL_INTERVAL": int(re.search(r"SDMA_PKT_POLL_REGMEM_DW5_INTERVAL\((\d+)\)", hdp_flush_c).group(1)),
+    "SRBM_WRITE_BYTES": int(re.search(r"SDMA_PKT_SRBM_WRITE_HEADER_BYTE_EN\((0x[0-9a-fA-F]+)\)", sdma_c).group(1), 0),
+    "IB_BASE_ALIGN": int(re.search(r"lower_32_bits\(ib->gpu_addr\) & (0x[0-9a-fA-F]+)\);", sdma_c).group(1), 0),
+    "TILING_FROM_ADDRESS": int(re.search(r"gb_addr_config & (0x[0-9a-fA-F]+)\);", sdma_c).group(1), 0),
+    "PHASE_QUANTUM": int(re.search(r"uint amdgpu_sdma_phase_quantum = (\d+);", drv_c).group(1)),
+    "RING_ALIGN": int(re.search(r"static const struct amdgpu_ring_funcs sdma_v3_0_ring_funcs = \{.*?\.align_mask = (0x[0-9a-fA-F]+),", sdma_c, re.S).group(1), 0) + 1,
+    "IB_END_ALIGN": int(re.search(r"\(2 - lower_32_bits\(ring->wptr\)\) & (\d+)\);", sdma_c).group(1)) + 1,
+    "AMDGPU_DOORBELL_sDMA_ENGINE0": int(re.search(r"AMDGPU_DOORBELL_sDMA_ENGINE0\s*=\s*(0x[0-9A-Fa-f]+)", doorbell_h).group(1), 0),
+    "AMDGPU_DOORBELL_sDMA_ENGINE1": int(re.search(r"AMDGPU_DOORBELL_sDMA_ENGINE1\s*=\s*(0x[0-9A-Fa-f]+)", doorbell_h).group(1), 0),
+    "VISLANDS30_IV_SRCID_SDMA_TRAP": ivsrc.get("VISLANDS30_IV_SRCID_SDMA_TRAP"),
+    "TEST_BEFORE": int(re.search(r"tmp = (0x[0-9A-Fa-f]+);\s*\n\s*adev->wb.wb\[index\] = cpu_to_le32\(tmp\);\s*\n\s*\n?\s*r = amdgpu_ring_alloc", sdma_c).group(1), 0),
+    "TEST_WRITTEN": int(re.search(r"amdgpu_ring_write\(ring, (0x[0-9A-Fa-f]+)\);\s*\n\s*amdgpu_ring_commit\(ring\);", sdma_c).group(1), 0),
+    "IB_TEST_TIMEOUT_MS": int(re.search(r"#define AMDGPU_IB_TEST_TIMEOUT\s+msecs_to_jiffies\((\d+)\)", ib_c).group(1)),
+    "IB_BYTES": int(re.search(r"amdgpu_ib_get\(adev, NULL, (\d+),\s*AMDGPU_IB_POOL_DIRECT, &ib\);", sdma_c).group(1)),
+    "SDMA1_REGISTER_OFFSET": vid.get("SDMA1_REGISTER_OFFSET"),
+}
+for name in list(pkt):
+    if name.startswith("SDMA_OP_") or name.startswith("SDMA_SUBOP_") or name.startswith("SDMA_PKT_"):
+        LOADED_LINUX.setdefault(name, pkt[name])
+for name, value in ppsmc.items():
+    LOADED_LINUX.setdefault(name, value)
+for name, value in xfer.items():
+    if name.startswith("UCODE_") or name.startswith("SMU_"):
+        LOADED_LINUX.setdefault(name, value)
+# (Written as products, held below.)
+LOADED_PRODUCTS = {"SMU_BUFFER_BYTES", "SDMA_RING_BYTES"}
+LOADED_OWN = {"MARK", "LIST_AT", "SMU_BUFFER_AT", "TRIAL_BYTES", "FILL_VALUE", "RECORD", "RPTR_SLOT", "WPTR_SLOT", "FENCE_SLOT",
+              "RING_TEST_AT", "IB_TEST_AT", "IB_TEST", "IB_FILL", "IB_COPY", "KEPT", "TRAPS", "NONE", "IB_VMID"}
+loaded_names = {}
+for name, value, inside in constants(loaded_text):
+    loaded_names[name] = value
+    if name in LOADED_OWN or name in LOADED_PRODUCTS:
+        continue
+    if name in LOADED_LINUX:
+        hold(name, value, LOADED_LINUX[name])
+    elif "__" in name:
+        hold(name, value, masks.get(name + "_MASK"))
+    else:
+        hold(name, value, regs.get("mm" + name))
+# The constants written as sums: the SMC's working memory (smu7_init), the
+# ring's bytes (the 1024 words sdma_v3_0_sw_init asks, 4 bytes each, times
+# amdgpu_sched_hw_submission), the load mask (smu7_request_smu_load_fw's
+# fw_to_load past Topaz), the places in the driver's part of the aperture.
+smu_buffer = re.search(r"smu_data->smu_buffer.data_size = (\d+)\*(\d+);", smu7_c)
+hold("SMU_BUFFER_BYTES is smu7_init's", int(re.search(r"pub const SMU_BUFFER_BYTES: usize = (\d+) \* (\d+)", loaded_text).group(1)) * 4096, int(smu_buffer.group(1)) * int(smu_buffer.group(2)))
+ring_words = int(re.search(r"r = amdgpu_ring_init\(adev, ring, (\d+), &adev->sdma.trap_irq,", sdma_c).group(1))
+submissions = int(re.search(r"int amdgpu_sched_hw_submission = (\d+);", drv_c).group(1))
+mine = re.search(r"pub const SDMA_RING_BYTES: usize = (\d+) \* (\d+) \* (\d+)", loaded_text)
+hold("SDMA_RING_BYTES is amdgpu_ring_init's for 1024 words", int(mine.group(1)) * int(mine.group(2)) * int(mine.group(3)), 1 << (ring_words * 4 * submissions - 1).bit_length())
+fw_to_load = re.search(r"if \(hwmgr->chip_id > CHIP_TOPAZ\) \{.*?fw_to_load = (.*?);", smu7_c, re.S).group(1)
+linux_mask = sum(xfer[name] for name in re.findall(r"UCODE_ID_\w+_MASK", fw_to_load))
+code_mask = sum(loaded_names.get(name, 0) for name in re.findall(r"UCODE_ID_\w+_MASK", re.search(r"pub const LOAD_MASK: usize = ([^\n]*)", loaded_text).group(1)))
+hold("LOAD_MASK is smu7_request_smu_load_fw's", code_mask, linux_mask)
+fill_at = loaded_names["LIST_AT"] + loaded_names["HEADER_BUFFER_BYTES"] + int(smu_buffer.group(1)) * int(smu_buffer.group(2))
+proved = 1
+for factor in re.search(r"pub const PROVED: usize = ([\d *]+)", engines_text).group(1).split("*"):
+    proved *= int(factor)
+hold("the SMC's list after the GART's table and the default page", int(loaded_names["LIST_AT"] >= LINUX["GART_BYTES"] // LINUX["AMDGPU_GPU_PAGE_SIZE"] * LINUX["ENTRY_BYTES"] + LINUX["AMDGPU_GPU_PAGE_SIZE"]), 1)
+hold("the SMC's working memory after its list", int(loaded_names["SMU_BUFFER_AT"] >= loaded_names["LIST_AT"] + loaded_names["HEADER_BUFFER_BYTES"]), 1)
+hold("the fill's and the copy's pages within what M1 proved", int(fill_at + 3 * 4096 <= proved and re.search(r"pub const FILL_AT: usize = LIST_AT \+ HEADER_BUFFER_BYTES \+ SMU_BUFFER_BYTES", loaded_text) is not None), 1)
+# The copy engines' golden table, row for row in Linux's order.
+code_golden = [int(x, 0) for x in re.search(r"pub const GOLDEN_COPY_WORDS = \[_\]usize\{([^}]*)\}", loaded_text).group(1).replace(" ", "").split(",")]
+hold("the copy engines' golden rows, as many", len(code_golden), len(golden_rows))
+for k in range(min(len(code_golden), len(golden_rows))):
+    hold("the copy engines' golden word %d" % k, code_golden[k], resolve(golden_rows[k]))
+# The list's order (smu7_request_smu_load_fw) and each kind's file
+# (gpu_engines.mlx's FILES: pfp, me, ce, mec, rlc, sdma, sdma1).
+order = re.findall(r"smu7_populate_single_firmware_entry\(hwmgr,\s*(UCODE_ID_\w+), &toc->entry", smu7_c)
+if "UCODE_ID_MEC_STORAGE" in order:
+    order.remove("UCODE_ID_MEC_STORAGE")  # (a guest's virtual function only)
+code_kinds = re.search(r"pub const LIST_KINDS = \[_\]usize\{([^}]*)\}", loaded_text).group(1).replace(" ", "").split(",")
+hold("the list's kinds, as many", len(code_kinds), len(order))
+for k in range(min(len(code_kinds), len(order))):
+    hold("the list's entry %d is %s" % (k, order[k]), loaded_names.get(code_kinds[k], -1), xfer[order[k]])
+kind_file = {"UCODE_ID_RLC_G": "rlc", "UCODE_ID_CP_CE": "ce", "UCODE_ID_CP_PFP": "pfp", "UCODE_ID_CP_ME": "me", "UCODE_ID_CP_MEC": "mec",
+             "UCODE_ID_CP_MEC_JT1": "mec", "UCODE_ID_CP_MEC_JT2": "mec", "UCODE_ID_SDMA0": "sdma", "UCODE_ID_SDMA1": "sdma1"}
+files_of = [re.sub(r"polaris10_(\w+?)(_2)?\.bin", r"\1", n) for n in names]
+code_files = [int(x) for x in re.search(r"pub const LIST_FILES = \[_\]usize\{([^}]*)\}", loaded_text).group(1).replace(" ", "").split(",")]
+for k in range(min(len(code_files), len(order))):
+    hold("the list's entry %d's file is polaris10_%s" % (k, kind_file[order[k]]), int(files_of[code_files[k]] == kind_file[order[k]]), 1)
+# The copies' order: enum AMDGPU_UCODE_ID's.
+enum_body = re.search(r"enum AMDGPU_UCODE_ID \{(.*?)\};", ucode_h, re.S).group(1)
+enum_order = re.findall(r"AMDGPU_UCODE_ID_(\w+)", enum_body)
+file_enum = {"sdma": "SDMA0", "sdma1": "SDMA1", "ce": "CP_CE", "pfp": "CP_PFP", "me": "CP_ME", "mec": "CP_MEC1", "rlc": "RLC_G"}
+code_copies = [int(x) for x in re.search(r"pub const COPY_ORDER = \[_\]usize\{([^}]*)\}", loaded_text).group(1).replace(" ", "").split(",")]
+positions = [enum_order.index(file_enum[files_of[k]]) for k in code_copies]
+hold("the copies in the order of enum AMDGPU_UCODE_ID", int(positions == sorted(positions) and len(code_copies) == 7), 1)
+hold("MEC2's room between MEC's jump table and RLC (enum AMDGPU_UCODE_ID)", int(enum_order.index("CP_MEC1") < enum_order.index("CP_MEC2") < enum_order.index("RLC_G")), 1)
+# The unhalt flag on RLC's and MEC's entries alone (smu7_populate_single_firmware_entry).
+hold("the unhalt flag's engines", int(re.search(r"if \(\(fw_type == UCODE_ID_RLC_G\)\s*\|\| \(fw_type == UCODE_ID_CP_MEC\)\)\s*entry->flags = 1;", smu7_c) is not None and "kind == UCODE_ID_RLC_G || kind == UCODE_ID_CP_MEC { UCODE_FLAG_UNHALT_MASK }" in loaded_text), 1)
+# No register these steps write is the display's (engine 1's as engine
+# 0's + 0x200 as well).
+written = set(re.findall(r"\b(?:put\(e, l,|wr\(e,|regField\(e,) (?:engines\.)?(\w+)", loaded_text))
+for name in sorted(written):
+    number = loaded_names.get(name, engine_names.get(name))
+    if number is None:
+        continue
+    for at in (number, number + 0x200 if name.startswith("SDMA0") else number):
+        in_display = any(runs[k] <= at <= runs[k + 1] for k in range(0, len(runs), 2))
+        hold("%s (%#x) written by stage 3 or 4 is no register of the display's" % (name, at), int(in_display), 0)
+print("stages 3 and 4: %d numbers of gpu_smc_sdma.mlx held against Linux's files, %d wrong" % (held - loaded_before, bad - loaded_bad_before))
 sys.exit(1 if bad or rom_bad or wrong or display_bad else 0)
