@@ -1,0 +1,577 @@
+// The host card's memory as the card's engines reach it: a context's
+// mappings (its card addresses to the process's bytes, with their rights)
+// and a model of the card's caches, strict enough that a missing
+// invalidation or a missing wait shows (the study's 4.2 (3), 4.3 B, 7.6
+// and the second reading's silent need 2).
+//
+// THE CACHES, as the sources name them (CP_COHER_CNTL's actions, Mesa's
+// si_cmd_buffer.c radv_cs_emit_cache_flush for GFX8):
+//   I   the shaders' instruction cache (SH_ICACHE_ACTION_ENA invalidates it)
+//   K   the scalar data cache, which scalar loads go through: descriptors
+//       and push constants (SH_KCACHE_ACTION_ENA)
+//   V   the vector L1, which buffer loads go through (TCL1_ACTION_ENA)
+//   L2  under them all (TC_ACTION_ENA invalidates it, TC_WB_ACTION_ENA
+//       writes back what the shaders' stores left in it)
+// A read through I, K or V takes the line from L2, and L2 from memory, as
+// a cache that never lets a line go would (the model holds every line it
+// was given until it is invalidated: the strictest a cache can be). A
+// store of a shader goes into L2 and is memory's only once written back.
+// V stands for the vector L1 of every compute unit at once, and a store
+// reaches only the L1 of the unit that made it: so V's line, when V holds
+// one, keeps its old word, marked with the dispatch that stored; that
+// dispatch reads its own word, and any later one (its waves may run on
+// another unit) reads the old word, stale, until TCL1_ACTION_ENA lets V
+// go. A line V did not hold is in no unit's L1 either. What the processor
+// writes, and what the copy engine (CP DMA: memory to memory, not through
+// L2 on this generation, the study's 7.6) writes, is in memory at once and
+// in no cache.
+// A READ IS STALE when what the cache gives differs from what is true: L2's
+// own newer word when it holds one, else memory's. That is exactly the
+// case a missing invalidation leaves (a descriptor set the processor wrote
+// again at an address the scalar cache still holds: std.gpu's pool hands
+// out the same addresses every frame), and the model stops there and says
+// which cache and which address, instead of giving the old word.
+//
+// THE WAITS. A word a dispatch wrote is in flight until a CS_PARTIAL_FLUSH
+// (or the kernel's end-of-pipe fence) waited for the shaders: another
+// dispatch or the copy engine that touches it first races it, also when
+// L2 was let go in between (the shaders still write). What the
+// copy engine writes is in flight until a packet with CP_SYNC, or one
+// with RAW_WAIT, waited for it: a dispatch or a copy that reads or writes
+// it first races it, and so does the kernel's fence ("the kernel doesn't
+// wait for it": si_cmd_buffer.c radv_cp_dma_wait_for_idle). A race stops
+// the model as a stale read does.
+//
+// Lines are 64 bytes here: a choice of the model, not a number of the
+// card's (none of the sources read gives it); a larger line holds more
+// words that were never asked for, which only makes the model stricter.
+const std = @import("std")
+
+pub const LINE_WORDS: usize = 16
+const LINE_SHIFT: u6 = 6
+
+// A mapping's rights (std.gpucard's Access).
+pub const READ: usize = 1
+pub const WRITE: usize = 2
+pub const EXECUTE: usize = 4
+
+// A range of the context's card addresses and where its bytes are in the
+// process (the memory object's, at the mapping's offset).
+pub const Mapping = struct {
+    address: u64
+    size: u64
+    bytes: usize
+    flags: usize
+}
+
+// Why the model stopped.
+pub const Failure = enum(u8) {
+    none,
+    // No mapping at the address, or not with the right asked.
+    unmapped,
+    // A cache gave a word older than what is true.
+    stale,
+    // A word a dispatch wrote, touched before a CS_PARTIAL_FLUSH by
+    // another dispatch or by the copy engine.
+    shaderRace,
+    // A word the copy engine wrote, touched before a CP_SYNC or RAW_WAIT.
+    copyRace,
+    // The copy engine read memory whose newer words are still in L2.
+    unwritten,
+    // L2 invalidated (TC_ACTION_ENA) without its write-back while it held
+    // stores: what happens to them is not in the sources.
+    dropped,
+    // More copies in flight than the model keeps.
+    tooMany,
+}
+
+// The caches, for the failure's report.
+pub const Where = enum(u8) { memory, instruction, scalar, vector, l2 }
+
+pub var failure: Failure = Failure.none // (per run)
+pub var failureWhere: Where = Where.memory // (per run)
+pub var failureAddress: u64 = 0 // (per run)
+// What the cache gave and what is true, for a stale read.
+pub var failureGot: u32 = 0 // (per run)
+pub var failureTrue: u32 = 0 // (per run)
+
+fn fail(kind: Failure, where: Where, address: u64) -> bool {
+    if failure == Failure.none {
+        failure = kind
+        failureWhere = where
+        failureAddress = address
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// The mappings of the context that runs
+
+var mappings: [*]const Mapping = undefined // (per run)
+var mappingCount: usize = 0 // (per run)
+var lastFound: usize = 0 // (per run)
+
+// The context's mappings, sorted by address, for the submit about to run.
+pub fn useMappings(list: [*]const Mapping, count: usize) -> void {
+    mappings = list
+    mappingCount = count
+    lastFound = 0
+}
+
+// The mapping that holds `address` with every right of `rights`, or
+// mappingCount.
+fn mappingOf(address: u64, rights: usize) -> usize {
+    var found = mappingCount
+    if lastFound < mappingCount && address >= mappings[lastFound].address && address - mappings[lastFound].address < mappings[lastFound].size {
+        found = lastFound
+    } else {
+        var low: usize = 0
+        var high = mappingCount
+        while low < high {
+            const middle = (low + high) / 2
+            const m = &mappings[middle]
+            if address < m.*.address {
+                high = middle
+            } else if address - m.*.address >= m.*.size {
+                low = middle + 1
+            } else {
+                found = middle
+                break
+            }
+        }
+    }
+    if found == mappingCount { return mappingCount }
+    lastFound = found
+    if mappings[found].flags & rights != rights { return mappingCount }
+    return found
+}
+
+// Whether `address` is mapped with `rights`.
+pub fn mapped(address: u64, rights: usize) -> bool { return mappingOf(address, rights) != mappingCount }
+
+// The process's address of the byte at card address `address`, or 0.
+pub fn bytesAt(address: u64, rights: usize) -> usize {
+    const m = mappingOf(address, rights)
+    if m == mappingCount { return 0 }
+    return mappings[m].bytes + @intCast(usize, address - mappings[m].address)
+}
+
+fn memoryWord(address: u64) -> u32 {
+    const at = bytesAt(address, 0)
+    const word: *const u32 = unsafe { @ptrFromInt(*const u32, at) }
+    return word.*
+}
+
+fn setMemoryWord(address: u64, value: u32) -> void {
+    const at = bytesAt(address, 0)
+    const word: *u32 = unsafe { @ptrFromInt(*u32, at) }
+    word.* = value
+}
+
+// ---------------------------------------------------------------------------
+// A cache: lines by their address, in a table of open addressing
+
+const Line = struct {
+    // The line's address >> 6, plus 1 (0: an empty slot).
+    key: u64
+    words: [16]u32
+    // (L2) the words newer than memory, the words a dispatch wrote that no
+    // wait has waited for, and which dispatch wrote each of those. (V) the
+    // words a dispatch stored since V took the line, and which.
+    dirty: u32
+    flight: u32
+    writer: [16]u32
+}
+
+const Cache = struct {
+    lines: [*]Line
+    capacity: usize
+    used: usize
+}
+
+const FIRST_CAPACITY: usize = 256
+
+var instruction: Cache = undefined // (per run)
+var scalar: Cache = undefined // (per run)
+var vector: Cache = undefined // (per run)
+var level2: Cache = undefined // (per run)
+var made = false // (per run)
+
+fn makeCache(cache: *Cache, capacity: usize) -> void {
+    const memory = std.heap.allocator().alloc(capacity * @sizeOf(Line), 16)
+    cache.*.lines = unsafe { @ptrCast([*]Line, memory.?) }
+    cache.*.capacity = capacity
+    cache.*.used = 0
+}
+
+fn dropCache(cache: *Cache) -> void {
+    std.heap.allocator().free(unsafe { @ptrCast([*]u8, cache.*.lines) }, cache.*.capacity * @sizeOf(Line), 16)
+}
+
+// Every line let go.
+fn clear(cache: *Cache) -> void {
+    if cache.*.used == 0 { return }
+    if cache.*.capacity > FIRST_CAPACITY {
+        dropCache(cache)
+        makeCache(cache, FIRST_CAPACITY)
+        return
+    }
+    var k: usize = 0
+    while k < cache.*.capacity {
+        cache.*.lines[k].key = 0
+        k += 1
+    }
+    cache.*.used = 0
+}
+
+fn slotOf(cache: *Cache, key: u64) -> usize {
+    var at = @intCast(usize, (key *% 0x9E3779B97F4A7C15) >> 20) & (cache.*.capacity - 1)
+    while cache.*.lines[at].key != 0 && cache.*.lines[at].key != key { at = (at + 1) & (cache.*.capacity - 1) }
+    return at
+}
+
+// The line of `key`, or null.
+fn find(cache: *Cache, key: u64) -> ?*Line {
+    const at = slotOf(cache, key)
+    if cache.*.lines[at].key == 0 { return null }
+    return &cache.*.lines[at]
+}
+
+fn grow(cache: *Cache) -> void {
+    const old = cache.*.lines
+    const capacity = cache.*.capacity
+    makeCache(cache, capacity * 2)
+    var k: usize = 0
+    while k < capacity {
+        if old[k].key != 0 {
+            const at = slotOf(cache, old[k].key)
+            cache.*.lines[at] = old[k]
+            cache.*.used += 1
+        }
+        k += 1
+    }
+    std.heap.allocator().free(unsafe { @ptrCast([*]u8, old) }, capacity * @sizeOf(Line), 16)
+}
+
+// A new line for `key` (not in the cache yet), its words to be filled.
+fn insert(cache: *Cache, key: u64) -> *Line {
+    if (cache.*.used + 1) * 2 > cache.*.capacity { grow(cache) }
+    const at = slotOf(cache, key)
+    cache.*.lines[at].key = key
+    cache.*.lines[at].dirty = 0
+    cache.*.lines[at].flight = 0
+    cache.*.used += 1
+    return &cache.*.lines[at]
+}
+
+fn keyOf(address: u64) -> u64 { return (address >> LINE_SHIFT) + 1 }
+
+fn wordOf(address: u64) -> usize { return @intCast(usize, (address >> 2) & 15) }
+
+// No line in any cache, nothing in flight: a card that has run nothing.
+pub fn reset() -> void {
+    if !made {
+        makeCache(&instruction, FIRST_CAPACITY)
+        makeCache(&scalar, FIRST_CAPACITY)
+        makeCache(&vector, FIRST_CAPACITY)
+        makeCache(&level2, FIRST_CAPACITY)
+        made = true
+    }
+    clear(&instruction)
+    clear(&scalar)
+    clear(&vector)
+    clear(&level2)
+    copies = 0
+    failure = Failure.none
+    dispatch = 0
+}
+
+// ---------------------------------------------------------------------------
+// The paths
+
+// The dispatch whose shaders run now (0: none), for the waits.
+pub var dispatch: u32 = 0 // (per run)
+
+// L2's line of `address`, filled from memory when it had none.
+fn level2Line(address: u64) -> *Line {
+    const key = keyOf(address)
+    const found = find(&level2, key)
+    if found != null { return found.? }
+    const line = insert(&level2, key)
+    const first = address & ~@intCast(u64, 63)
+    var k: usize = 0
+    while k < LINE_WORDS {
+        line.*.words[k] = memoryWord(first + 4 * @intCast(u64, k))
+        k += 1
+    }
+    return line
+}
+
+// What is true of the word at `address`: L2's newer word, else memory's.
+fn truth(address: u64) -> u32 {
+    const found = find(&level2, keyOf(address))
+    if found != null && (found.?.*.dirty >> @intCast(u5, wordOf(address))) & 1 != 0 { return found.?.*.words[wordOf(address)] }
+    return memoryWord(address)
+}
+
+// Whether a shader of this dispatch may touch the word: not one another
+// dispatch's shaders may still be writing, not one a copy may still be
+// writing.
+fn shaderMay(address: u64, where: Where) -> bool {
+    const found = find(&level2, keyOf(address))
+    if found != null {
+        const w = wordOf(address)
+        if (found.?.*.flight >> @intCast(u5, w)) & 1 != 0 && found.?.*.writer[w] != dispatch { return fail(Failure.shaderRace, where, address) }
+    }
+    if copies != 0 && copyTouches(address, 4) { return fail(Failure.copyRace, where, address) }
+    return true
+}
+
+// A read through an upper cache (I, K or V): its line, else L2's copied
+// into it; the word, held against what is true.
+fn readThrough(cache: *Cache, where: Where, address: u64, value: *u32) -> bool {
+    var line = find(cache, keyOf(address))
+    if line == null {
+        const below = level2Line(address)
+        const made_line = insert(cache, keyOf(address))
+        made_line.*.words = below.*.words
+        line = made_line
+    }
+    const w = wordOf(address)
+    const real = truth(address)
+    if where == Where.vector && (line.?.*.flight >> @intCast(u5, w)) & 1 != 0 && line.?.*.writer[w] == dispatch {
+        // The dispatch's own store, which its unit's L1 has.
+        value.* = real
+        return true
+    }
+    const got = line.?.*.words[w]
+    if got != real {
+        failureGot = got
+        failureTrue = real
+        return fail(Failure.stale, where, address)
+    }
+    value.* = got
+    return true
+}
+
+// The instruction cache's word at `address` (the code must be mapped to
+// be executed).
+pub fn fetch(address: u64, value: *u32) -> bool {
+    if !mapped(address, EXECUTE) { return fail(Failure.unmapped, Where.instruction, address) }
+    return readThrough(&instruction, Where.instruction, address, value)
+}
+
+// A scalar load's word.
+pub fn scalarRead(address: u64, value: *u32) -> bool {
+    if !mapped(address, READ) { return fail(Failure.unmapped, Where.scalar, address) }
+    if !shaderMay(address, Where.scalar) { return false }
+    return readThrough(&scalar, Where.scalar, address, value)
+}
+
+// A buffer load's word.
+pub fn vectorRead(address: u64, value: *u32) -> bool {
+    if !mapped(address, READ) { return fail(Failure.unmapped, Where.vector, address) }
+    if !shaderMay(address, Where.vector) { return false }
+    return readThrough(&vector, Where.vector, address, value)
+}
+
+// A buffer store's word: into L2, newer than memory and in flight; V's
+// line, when V holds it, keeps its old word marked with the dispatch.
+pub fn vectorWrite(address: u64, value: u32) -> bool {
+    if !mapped(address, WRITE) { return fail(Failure.unmapped, Where.vector, address) }
+    if !shaderMay(address, Where.vector) { return false }
+    const line = level2Line(address)
+    const w = wordOf(address)
+    const bit = @intCast(u32, 1) << @intCast(u5, w)
+    line.*.words[w] = value
+    line.*.dirty |= bit
+    line.*.flight |= bit
+    line.*.writer[w] = dispatch
+    const above = find(&vector, keyOf(address))
+    if above != null {
+        above.?.*.flight |= bit
+        above.?.*.writer[w] = dispatch
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The actions (ACQUIRE_MEM's CP_COHER_CNTL, the events, the fence)
+
+pub fn invalidateInstruction() -> void { clear(&instruction) }
+
+pub fn invalidateScalar() -> void { clear(&scalar) }
+
+pub fn invalidateVector() -> void { clear(&vector) }
+
+// L2's newer words written to memory (TC_WB_ACTION_ENA).
+pub fn writeBack() -> void {
+    var k: usize = 0
+    while k < level2.capacity {
+        const line = &level2.lines[k]
+        if line.*.key != 0 && line.*.dirty != 0 {
+            const first = (line.*.key - 1) << LINE_SHIFT
+            var w: usize = 0
+            while w < LINE_WORDS {
+                if (line.*.dirty >> @intCast(u5, w)) & 1 != 0 { setMemoryWord(first + 4 * @intCast(u64, w), line.*.words[w]) }
+                w += 1
+            }
+            line.*.dirty = 0
+        }
+        k += 1
+    }
+}
+
+// L2 let go (TC_ACTION_ENA): false when it still held stores not written
+// back. Words a dispatch may still be writing (no CS_PARTIAL_FLUSH waited
+// for it) stay in flight: their lines are kept, read anew from memory, so
+// that the next dispatch or copy that touches them is a race.
+pub fn invalidateLevel2() -> bool {
+    var flying: usize = 0
+    var k: usize = 0
+    while k < level2.capacity {
+        const line = &level2.lines[k]
+        if line.*.key != 0 && line.*.dirty != 0 { return fail(Failure.dropped, Where.l2, (line.*.key - 1) << LINE_SHIFT) }
+        if line.*.key != 0 && line.*.flight != 0 { flying += 1 }
+        k += 1
+    }
+    if flying == 0 {
+        clear(&level2)
+        return true
+    }
+    const room = std.heap.allocator().alloc(flying * @sizeOf(Line), 16)
+    const kept: [*]Line = unsafe { @ptrCast([*]Line, room.?) }
+    var n: usize = 0
+    k = 0
+    while k < level2.capacity {
+        if level2.lines[k].key != 0 && level2.lines[k].flight != 0 {
+            kept[n] = level2.lines[k]
+            n += 1
+        }
+        k += 1
+    }
+    clear(&level2)
+    k = 0
+    while k < n {
+        const line = insert(&level2, kept[k].key)
+        const first = (kept[k].key - 1) << LINE_SHIFT
+        var w: usize = 0
+        while w < LINE_WORDS {
+            line.*.words[w] = memoryWord(first + 4 * @intCast(u64, w))
+            line.*.writer[w] = kept[k].writer[w]
+            w += 1
+        }
+        line.*.flight = kept[k].flight
+        k += 1
+    }
+    std.heap.allocator().free(room.?, flying * @sizeOf(Line), 16)
+    return true
+}
+
+// CS_PARTIAL_FLUSH: the shaders waited for; nothing of theirs in flight.
+pub fn shadersDone() -> void {
+    var k: usize = 0
+    while k < level2.capacity {
+        level2.lines[k].flight = 0
+        k += 1
+    }
+}
+
+// The kernel's fence after a submit's streams (Linux gfx_v8_0.c
+// gfx_v8_0_ring_emit_fence_compute: RELEASE_MEM with EOP_TCL1_ACTION_EN,
+// EOP_TC_ACTION_EN and EOP_TC_WB_ACTION_EN, an end-of-pipe event: every
+// shader done, L2 written back and let go, V let go; I and K kept).
+// False when a copy is still in flight then.
+pub fn fence() -> bool {
+    shadersDone()
+    writeBack()
+    clear(&level2)
+    clear(&vector)
+    if copies != 0 { return fail(Failure.copyRace, Where.memory, copyStart[0]) }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The copy engine (DMA_DATA: memory to memory)
+
+const MOST_COPIES: usize = 4096
+
+// The bytes copies wrote that no wait has waited for: [start, end).
+var copyStart: [MOST_COPIES]u64 = undefined // (per run)
+var copyEnd: [MOST_COPIES]u64 = undefined // (per run)
+var copies: usize = 0 // (per run)
+
+// Whether a copy in flight wrote any of `size` bytes at `address`.
+fn copyTouches(address: u64, size: u64) -> bool {
+    var k: usize = 0
+    while k < copies {
+        if address < copyEnd[k] && copyStart[k] < address + size { return true }
+        k += 1
+    }
+    return false
+}
+
+// Every copy waited for (CP_SYNC, RAW_WAIT).
+pub fn copiesDone() -> void { copies = 0 }
+
+// Whether a copy is still in flight.
+pub fn copying() -> bool { return copies != 0 }
+
+// Whether a copy may touch the byte at `address`: mapped with `rights`,
+// no word of a dispatch in flight there, and (reading) no newer word of
+// it in L2.
+fn copyMay(address: u64, rights: usize, reading: bool) -> bool {
+    if !mapped(address, rights) { return fail(Failure.unmapped, Where.memory, address) }
+    const word = address & ~@intCast(u64, 3)
+    const found = find(&level2, keyOf(word))
+    if found != null {
+        const w = wordOf(word)
+        if (found.?.*.flight >> @intCast(u5, w)) & 1 != 0 { return fail(Failure.shaderRace, Where.memory, address) }
+        if reading && (found.?.*.dirty >> @intCast(u5, w)) & 1 != 0 { return fail(Failure.unwritten, Where.l2, address) }
+    }
+    return true
+}
+
+// `size` bytes copied from `source` to `target` in memory (overlapping
+// ranges as a forward copy), or filled with `data` when `filling`;
+// `waitFirst` (RAW_WAIT) waits for the copies before it. What is written
+// is in flight afterwards.
+pub fn copy(target: u64, source: u64, data: u32, filling: bool, size: u64, waitFirst: bool) -> bool {
+    if waitFirst { copies = 0 }
+    if size == 0 { return true }
+    if !filling && copies != 0 && copyTouches(source, size) { return fail(Failure.copyRace, Where.memory, source) }
+    if copies != 0 && copyTouches(target, size) { return fail(Failure.copyRace, Where.memory, target) }
+    var k: u64 = 0
+    while k < size {
+        if !copyMay(target + k, WRITE, false) { return false }
+        var byte: u8 = 0
+        if filling {
+            byte = @intCast(u8, (data >> @intCast(u5, 8 * @intCast(u32, (target + k) & 3))) & 0xFF)
+        } else {
+            if !copyMay(source + k, READ, true) { return false }
+            const from: *const u8 = unsafe { @ptrFromInt(*const u8, bytesAt(source + k, 0)) }
+            byte = from.*
+        }
+        const to: *u8 = unsafe { @ptrFromInt(*u8, bytesAt(target + k, 0)) }
+        to.* = byte
+        k += 1
+    }
+    if copies == MOST_COPIES { return fail(Failure.tooMany, Where.memory, target) }
+    copyStart[copies] = target
+    copyEnd[copies] = target + size
+    copies += 1
+    return true
+}
+
+// The words a test reads back as the caches have them: the word V gives,
+// K gives, and whether L2 holds a newer one (tests/508).
+pub fn holds(address: u64, where: Where, value: *u32) -> bool {
+    var cache = &level2
+    if where == Where.instruction { cache = &instruction }
+    if where == Where.scalar { cache = &scalar }
+    if where == Where.vector { cache = &vector }
+    const line = find(cache, keyOf(address))
+    if line == null { return false }
+    value.* = line.?.*.words[wordOf(address)]
+    return true
+}

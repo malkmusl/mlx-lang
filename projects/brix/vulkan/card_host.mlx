@@ -6,22 +6,51 @@
 // brixOS). A host program or a test sets the cards up (`add`, with the
 // user's RX 580 as `rx580` has it) and offers the driver over them.
 //
-// At this stage it answers what the kernel answers: the cards, their
-// records, contexts made and ended; every call that would make the card do
-// something is refused with unsupported. The later stages give it the
-// rest: memory as the test's, the streams' packets executed, the shaders
-// run in wave.mlx.
+// WHAT IT ANSWERS: the cards, their records, contexts made and ended; and
+// on a card whose record lists a ring of the compute engine, what the
+// calls 80 to 85 do (on a card that lists none, each is refused with
+// unsupported, as brixOS's kernel refuses them until it starts the
+// engines):
+//   gpu_memory     memory of the card or of the system: the process's own
+//                  bytes here, zeroed when asked, else filled with POISON
+//                  (memory nobody wrote is not 0 on a card)
+//   gpu_memory_of  the process's own pages, in place
+//   gpu_map        at the card address the driver chose, whole pages, at
+//                  or above 2 MiB (Linux's AMDGPU_VA_RESERVED_SIZE) and
+//                  below 2^40, never over another mapping, with the rights
+//                  read, write, execute
+//   gpu_unmap      a mapping taken out, as it was made
+//   gpu_submit     every stream checked to lie in an executable mapping of
+//                  the context (else bad_address, nothing run), then
+//                  EXECUTED (card_run.mlx: the packets, the registers, the
+//                  dispatches in the interpreter, the copies, the caches of
+//                  card_cache.mlx) and the kernel's fence after them; a
+//                  stream the card would choke on loses the context, as a
+//                  hang does on the card (its fence peer_gone, its later
+//                  submits refused with peer_gone), and `report` says what
+//                  and at which word
+//   gpu_fence      a handle that is readable once the submit it was last
+//                  given to is done
+// and the native calls the driver needs beside them: memory_map_object of
+// a memory handle (its bytes), handle_close, and wait on fences (a submit
+// here is done when the call returns, so a wait never waits: a fence not
+// given to a submit since it was made is never readable, and the wait
+// answers timed_out at once).
 //
-// A handle is as the kernel makes one: (generation << 8) | (slot + 1),
+// A handle is as the kernel makes one: (generation << 12) | (slot + 1),
 // never 0, invalid once closed even when its slot is used again. Slots
-// below MOST_CONTEXTS are contexts; the others are the node opened to read
-// (`openToRead`), which is no context.
+// below MOST_CONTEXTS are contexts; then the node opened to read
+// (`openToRead`), which is no context; then memory; then fences.
 const std = @import("std")
 const gpucard = @import("std.gpucard")
 const record = @import("../kernel/gpu_record.mlx")
 const card = @import("./card.mlx")
+const cache = @import("./card_cache.mlx")
+const run = @import("./card_run.mlx")
 
 const Status = std.os.brix.Status
+const State = std.os.brix.State
+const WaitItem = std.os.brix.WaitItem
 // (Not among std.os.brix's: the spec's too_many, a table is full.)
 const TOO_MANY: isize = 21
 
@@ -29,29 +58,83 @@ pub const MOST_CARDS: usize = 4
 pub const MOST_CONTEXTS: usize = 64
 // The nodes opened to read, beside the contexts.
 const MOST_NODES: usize = 16
-const SLOTS: usize = MOST_CONTEXTS + MOST_NODES
+pub const MOST_MEMORY: usize = 2048
+pub const MOST_FENCES: usize = 512
+const FIRST_NODE: usize = MOST_CONTEXTS
+const FIRST_MEMORY: usize = FIRST_NODE + MOST_NODES
+const FIRST_FENCE: usize = FIRST_MEMORY + MOST_MEMORY
+const SLOTS: usize = FIRST_FENCE + MOST_FENCES
+const SLOT_BITS: u6 = 12
+
+// What memory nobody wrote holds here.
+pub const POISON: u32 = 0xDEADBEEF
+
+// A context's card addresses (Linux: AMDGPU_VA_RESERVED_SIZE, the first
+// 2 MiB, is reserved; 40 bits the most, the study's 3.3) and its page.
+pub const FIRST_ADDRESS: u64 = 0x200000
+pub const ADDRESS_END: u64 = 0x10000000000
+pub const PAGE: usize = 4096
 
 const Slot = struct {
     used: bool
     card: usize
     generation: usize
+    // A memory object: its bytes in the process, how many, its flags,
+    // whether they are this card's to free (not gpu_memory_of's), and
+    // whether its handle is closed while a mapping still holds it.
+    bytes: usize
+    size: usize
+    flags: usize
+    own: bool
+    closed: bool
+    // A fence: its state (State's READABLE, PEER_GONE), its context.
+    state: u32
+    context: usize
+    // A context: lost (a stream choked the card), its submits.
+    lost: bool
+    sequence: u64
+}
+
+pub const MOST_MAPPINGS: usize = 8192
+
+const Mapped = struct {
+    used: bool
+    context: usize
+    memory: usize
+    address: u64
+    size: u64
+    offset: usize
+    flags: usize
 }
 
 var cards: [MOST_CARDS]record.Facts = undefined // (per run)
 var names: [MOST_CARDS][32]u8 = undefined // (per run)
 var cardCount: usize = 0 // (per run)
 var slots: [SLOTS]Slot = undefined // (per run)
+var maps: [MOST_MAPPINGS]Mapped = undefined // (per run)
+// The context whose lines the caches hold (SLOTS: none).
+var cachedContext: usize = 0 // (per run)
+var rcpError: i32 = 0 // (per run)
 
 // No card, no handle.
 pub fn reset() -> void {
     cardCount = 0
     var k: usize = 0
     while k < SLOTS {
+        if slots[k].used && k >= FIRST_MEMORY && k < FIRST_FENCE && slots[k].own { freeBytes(k) }
         slots[k].used = false
         slots[k].card = 0
         slots[k].generation = 1
         k += 1
     }
+    k = 0
+    while k < MOST_MAPPINGS {
+        maps[k].used = false
+        k += 1
+    }
+    cachedContext = SLOTS
+    rcpError = 0
+    cache.reset()
 }
 
 // A card with `facts` (its name copied); its index, or MOST_CARDS when
@@ -75,6 +158,11 @@ pub fn add(facts: *const record.Facts) -> usize {
 
 // Card `index`'s facts, to be changed by a test (its rings, its flags).
 pub fn factsOf(index: usize) -> *record.Facts { return &cards[index] }
+
+// The units in the last place the card's v_rcp_f32 is off (wave.mlx's
+// rcpError), for a test that holds the division against a card whose
+// reciprocal is not the host's (the study's 11.14).
+pub fn setReciprocalError(units: i32) -> void { rcpError = units }
 
 // The user's card as the machine's logs and its ROM say it (/tmp/brix-
 // next/machine: PCI 21:00.0 1002:67df revision 0xe7, 8192 MiB, an
@@ -118,34 +206,56 @@ pub fn read(index: usize, offset: usize, into: []u8) -> usize {
 }
 
 // How many contexts there are.
-pub fn living() -> usize {
+pub fn living() -> usize { return countUsed(0, MOST_CONTEXTS) }
+
+// How many memory objects and fences there are, and mappings (a test's
+// look at what a driver left behind).
+pub fn memoryObjects() -> usize { return countUsed(FIRST_MEMORY, FIRST_FENCE) }
+
+pub fn fences() -> usize { return countUsed(FIRST_FENCE, SLOTS) }
+
+pub fn mappings() -> usize {
     var alive: usize = 0
     var k: usize = 0
-    while k < MOST_CONTEXTS {
+    while k < MOST_MAPPINGS {
+        if maps[k].used { alive += 1 }
+        k += 1
+    }
+    return alive
+}
+
+fn countUsed(first: usize, end: usize) -> usize {
+    var alive: usize = 0
+    var k = first
+    while k < end {
         if slots[k].used { alive += 1 }
         k += 1
     }
     return alive
 }
 
-fn handleOf(slot: usize) -> isize { return @intCast(isize, (slots[slot].generation << 8) | (slot + 1)) }
+fn handleOf(slot: usize) -> isize { return @intCast(isize, (slots[slot].generation << SLOT_BITS) | (slot + 1)) }
 
 // The slot `handle` names, or a status.
 fn slotOf(handle: u32) -> isize {
     const value = @intCast(usize, handle)
-    const slot = value & 0xFF
+    const slot = value & ((@intCast(usize, 1) << SLOT_BITS) - 1)
     if slot == 0 || slot > SLOTS { return -Status.invalid_handle }
-    if !slots[slot - 1].used || slots[slot - 1].generation != value >> 8 { return -Status.invalid_handle }
+    if !slots[slot - 1].used || slots[slot - 1].generation != value >> SLOT_BITS { return -Status.invalid_handle }
     return @intCast(isize, slot - 1)
 }
 
-// The context `handle` names, or a status.
-fn contextOf(handle: u32) -> isize {
+// The slot of `handle` if it is of the kind [first, end), or a status.
+fn kindOf(handle: u32, first: usize, end: usize) -> isize {
     const slot = slotOf(handle)
     if slot < 0 { return slot }
-    if @bitCast(usize, slot) >= MOST_CONTEXTS { return -Status.wrong_kind }
+    const at = @bitCast(usize, slot)
+    if at < first || at >= end { return -Status.wrong_kind }
     return slot
 }
+
+// The context `handle` names, or a status.
+fn contextOf(handle: u32) -> isize { return kindOf(handle, 0, MOST_CONTEXTS) }
 
 fn take(first: usize, end: usize, index: usize) -> isize {
     var k = first
@@ -153,11 +263,21 @@ fn take(first: usize, end: usize, index: usize) -> isize {
         if !slots[k].used {
             slots[k].used = true
             slots[k].card = index
+            slots[k].lost = false
+            slots[k].sequence = 0
+            slots[k].closed = false
+            slots[k].own = false
+            slots[k].state = 0
             return handleOf(k)
         }
         k += 1
     }
     return -TOO_MANY
+}
+
+fn letGo(slot: usize) -> void {
+    slots[slot].used = false
+    slots[slot].generation = if slots[slot].generation >= 0xFFFFF { 1 } else { slots[slot].generation + 1 }
 }
 
 fn count() -> usize { return cardCount }
@@ -178,12 +298,13 @@ fn open(index: usize) -> isize {
 // Card `index`'s node opened to read alone: a handle that is no context.
 pub fn openToRead(index: usize) -> isize {
     if index >= cardCount { return -Status.not_found }
-    return take(MOST_CONTEXTS, SLOTS, index)
+    return take(FIRST_NODE, FIRST_MEMORY, index)
 }
 
 fn describeContext(context: u32, into: *gpucard.Device) -> isize {
     const slot = slotOf(context)
     if slot < 0 { return slot }
+    if @bitCast(usize, slot) >= FIRST_MEMORY { return -Status.wrong_kind }
     return describe(slots[@bitCast(usize, slot)].card, into)
 }
 
@@ -191,31 +312,289 @@ fn close(handle: u32) -> isize {
     const slot = slotOf(handle)
     if slot < 0 { return slot }
     const at = @bitCast(usize, slot)
-    slots[at].used = false
-    slots[at].generation = if slots[at].generation >= 0xFFFFFF { 1 } else { slots[at].generation + 1 }
+    if at < MOST_CONTEXTS {
+        // Everything made through it: its mappings, its fences.
+        var k: usize = 0
+        while k < MOST_MAPPINGS {
+            if maps[k].used && maps[k].context == at { unmapAt(k) }
+            k += 1
+        }
+        k = FIRST_FENCE
+        while k < SLOTS {
+            if slots[k].used && slots[k].context == at { letGo(k) }
+            k += 1
+        }
+        if cachedContext == at { cachedContext = SLOTS }
+    } else if at >= FIRST_MEMORY && at < FIRST_FENCE {
+        if mappingsOf(at) != 0 {
+            // (A mapping holds the bytes until it is taken out.)
+            slots[at].closed = true
+            slots[at].generation += 1
+            return 0
+        }
+        if slots[at].own { freeBytes(at) }
+    }
+    letGo(at)
     return 0
 }
 
-// A call on a context: refused, as the kernel refuses it at this stage.
-fn refused(context: u32) -> isize {
-    const slot = contextOf(context)
+// ---------------------------------------------------------------------------
+// The calls on a context
+
+// The context of `handle` on a card that takes commands, or a status
+// (unsupported on a card whose record lists no compute ring).
+fn working(handle: u32) -> isize {
+    const slot = contextOf(handle)
     if slot < 0 { return slot }
-    return -Status.unsupported
+    if cards[slots[@bitCast(usize, slot)].card].computeRings == 0 { return -Status.unsupported }
+    return slot
 }
 
-fn memory(context: u32, size: usize, flags: usize) -> isize { return refused(context) }
+fn freeBytes(slot: usize) -> void {
+    std.heap.allocator().free(unsafe { @ptrFromInt([*]u8, slots[slot].bytes) }, slots[slot].size, PAGE)
+    slots[slot].own = false
+}
 
-fn memoryOf(context: u32, address: usize, size: usize) -> isize { return refused(context) }
+fn memory(context: u32, size: usize, flags: usize) -> isize {
+    const at = working(context)
+    if at < 0 { return at }
+    const known = gpucard.Memory.EITHER | gpucard.Memory.PROCESSOR | gpucard.Memory.WRITE_COMBINED | gpucard.Memory.ZEROED | gpucard.Memory.LOW | gpucard.Memory.SHAREABLE
+    if size == 0 || (flags & ~known) != 0 || (flags & gpucard.Memory.EITHER) == 0 { return -Status.invalid }
+    const pages = (size + PAGE - 1) / PAGE * PAGE
+    const taken = take(FIRST_MEMORY, FIRST_FENCE, slots[@bitCast(usize, at)].card)
+    if taken < 0 { return taken }
+    const slot = @bitCast(usize, slotOf(@intCast(u32, taken)))
+    const bytes = std.heap.allocator().alloc(pages, PAGE)
+    if bytes == null {
+        letGo(slot)
+        return -Status.no_memory
+    }
+    slots[slot].bytes = @intFromPtr(bytes.?)
+    slots[slot].size = pages
+    slots[slot].flags = flags
+    slots[slot].own = true
+    slots[slot].context = @bitCast(usize, at)
+    if (flags & gpucard.Memory.ZEROED) == 0 {
+        const words: [*]u32 = unsafe { @ptrFromInt([*]u32, slots[slot].bytes) }
+        var k: usize = 0
+        while k < pages / 4 {
+            words[k] = POISON
+            k += 1
+        }
+    }
+    return taken
+}
 
-fn map(context: u32, memory_handle: u32, offset: usize, size: usize, address: usize, flags: usize) -> isize { return refused(context) }
+fn memoryOf(context: u32, address: usize, size: usize) -> isize {
+    const at = working(context)
+    if at < 0 { return at }
+    if size == 0 || address % PAGE != 0 || size % PAGE != 0 { return -Status.invalid }
+    const taken = take(FIRST_MEMORY, FIRST_FENCE, slots[@bitCast(usize, at)].card)
+    if taken < 0 { return taken }
+    const slot = @bitCast(usize, slotOf(@intCast(u32, taken)))
+    slots[slot].bytes = address
+    slots[slot].size = size
+    slots[slot].flags = gpucard.Memory.SYSTEM | gpucard.Memory.PROCESSOR
+    slots[slot].own = false
+    slots[slot].context = @bitCast(usize, at)
+    return taken
+}
 
-fn unmap(context: u32, address: usize, size: usize) -> isize { return refused(context) }
+fn mappingsOf(memorySlot: usize) -> usize {
+    var held: usize = 0
+    var k: usize = 0
+    while k < MOST_MAPPINGS {
+        if maps[k].used && maps[k].memory == memorySlot { held += 1 }
+        k += 1
+    }
+    return held
+}
 
-fn submit(context: u32, streams: usize, count_of_streams: usize, fence_handle: u32) -> isize { return refused(context) }
+fn map(context: u32, memory_handle: u32, offset: usize, size: usize, address: usize, flags: usize) -> isize {
+    const at = working(context)
+    if at < 0 { return at }
+    const object = kindOf(memory_handle, FIRST_MEMORY, FIRST_FENCE)
+    if object < 0 { return object }
+    const known = gpucard.Access.READ | gpucard.Access.WRITE | gpucard.Access.EXECUTE
+    if flags == 0 || (flags & ~known) != 0 { return -Status.invalid }
+    if size == 0 || offset % PAGE != 0 || size % PAGE != 0 || address % PAGE != 0 { return -Status.invalid }
+    const m = @bitCast(usize, object)
+    if offset > slots[m].size || size > slots[m].size - offset { return -Status.invalid }
+    const first = @intCast(u64, address)
+    if first < FIRST_ADDRESS || first > ADDRESS_END || @intCast(u64, size) > ADDRESS_END - first { return -Status.bad_address }
+    var free = MOST_MAPPINGS
+    var k: usize = 0
+    while k < MOST_MAPPINGS {
+        if maps[k].used {
+            if maps[k].context == @bitCast(usize, at) && first < maps[k].address + maps[k].size && maps[k].address < first + @intCast(u64, size) { return -Status.exists }
+        } else if free == MOST_MAPPINGS {
+            free = k
+        }
+        k += 1
+    }
+    if free == MOST_MAPPINGS { return -TOO_MANY }
+    maps[free] = Mapped.{ .used = true, .context = @bitCast(usize, at), .memory = m, .address = first, .size = @intCast(u64, size), .offset = offset, .flags = flags }
+    return 0
+}
 
-fn fence(context: u32) -> isize { return refused(context) }
+fn unmapAt(k: usize) -> void {
+    maps[k].used = false
+    const m = maps[k].memory
+    if slots[m].closed && mappingsOf(m) == 0 {
+        if slots[m].own { freeBytes(m) }
+        slots[m].closed = false
+        letGo(m)
+    }
+}
+
+fn unmap(context: u32, address: usize, size: usize) -> isize {
+    const at = working(context)
+    if at < 0 { return at }
+    var k: usize = 0
+    while k < MOST_MAPPINGS {
+        if maps[k].used && maps[k].context == @bitCast(usize, at) && maps[k].address == @intCast(u64, address) && maps[k].size == @intCast(u64, size) {
+            unmapAt(k)
+            return 0
+        }
+        k += 1
+    }
+    return -Status.not_found
+}
+
+fn fence(context: u32) -> isize {
+    const at = working(context)
+    if at < 0 { return at }
+    const taken = take(FIRST_FENCE, SLOTS, slots[@bitCast(usize, at)].card)
+    if taken < 0 { return taken }
+    slots[@bitCast(usize, slotOf(@intCast(u32, taken)))].context = @bitCast(usize, at)
+    return taken
+}
+
+// The context's mappings for card_cache.mlx, sorted by address.
+var sorted: [MOST_MAPPINGS]cache.Mapping = undefined // (per run)
+
+fn mappingsFor(context: usize) -> usize {
+    var n: usize = 0
+    var k: usize = 0
+    while k < MOST_MAPPINGS {
+        if maps[k].used && maps[k].context == context {
+            const entry = cache.Mapping.{ .address = maps[k].address, .size = maps[k].size, .bytes = slots[maps[k].memory].bytes + maps[k].offset, .flags = maps[k].flags }
+            var at = n
+            while at > 0 && sorted[at - 1].address > entry.address {
+                sorted[at] = sorted[at - 1]
+                at -= 1
+            }
+            sorted[at] = entry
+            n += 1
+        }
+        k += 1
+    }
+    return n
+}
+
+const MOST_STREAMS: usize = 64
+
+var views: [MOST_STREAMS]run.Stream = undefined // (per run)
+
+fn submit(context: u32, streams: usize, count_of_streams: usize, fence_handle: u32) -> isize {
+    const at = working(context)
+    if at < 0 { return at }
+    const c = @bitCast(usize, at)
+    if slots[c].lost { return -Status.peer_gone }
+    var fenceSlot = SLOTS
+    if fence_handle != 0 {
+        const f = kindOf(fence_handle, FIRST_FENCE, SLOTS)
+        if f < 0 { return f }
+        if slots[@bitCast(usize, f)].context != c { return -Status.invalid }
+        fenceSlot = @bitCast(usize, f)
+    }
+    if count_of_streams == 0 || count_of_streams > MOST_STREAMS || streams == 0 { return -Status.invalid }
+    const records: [*]const gpucard.Stream = unsafe { @ptrFromInt([*]const gpucard.Stream, streams) }
+    const n = mappingsFor(c)
+    cache.useMappings(&sorted, n)
+    const facts = &cards[slots[c].card]
+    var k: usize = 0
+    while k < count_of_streams {
+        const s = &records[k]
+        // A ring of that engine, no flags (the spec's 0).
+        if s.*.engine != gpucard.Engine.COMPUTE || s.*.flags != 0 || s.*.words == 0 { return -Status.invalid }
+        const first = s.*.address
+        const last = first + 4 * s.*.words - 4
+        if (first & 3) != 0 || !cache.mapped(first, cache.EXECUTE) || !cache.mapped(last, cache.EXECUTE) || cache.bytesAt(last, 0) - cache.bytesAt(first, 0) != @intCast(usize, last - first) { return -Status.bad_address }
+        views[k] = run.Stream.{ .words = unsafe { @ptrFromInt([*]const u32, cache.bytesAt(first, 0)) }, .count = @intCast(usize, s.*.words) }
+        k += 1
+    }
+    // The caches hold one address space's lines: another context's are
+    // let go (the model's choice; the sources read do not say how the
+    // card's caches tell address spaces apart).
+    if cachedContext != c {
+        cache.reset()
+        cachedContext = c
+    }
+    if fenceSlot != SLOTS { slots[fenceSlot].state = 0 }
+    slots[c].sequence += 1
+    const card_facts = run.Card.{ .computeUnits = facts.*.shaderEngines * facts.*.arraysPerEngine * facts.*.computeUnitsPerArray, .shaderEngines = facts.*.shaderEngines, .rcpError = rcpError }
+    if !run.run(views[0..count_of_streams], card_facts) {
+        // The card would hang: the context is lost, its fence says so.
+        slots[c].lost = true
+        cache.reset()
+        if fenceSlot != SLOTS { slots[fenceSlot].state = State.PEER_GONE }
+        return @intCast(isize, slots[c].sequence)
+    }
+    if fenceSlot != SLOTS { slots[fenceSlot].state = State.READABLE }
+    return @intCast(isize, slots[c].sequence)
+}
+
+// What the last submit that failed ran into (card_run.mlx's report).
+pub fn report() -> *const run.Report { return &run.report }
+
+// Whether the context of `handle` is lost.
+pub fn lost(handle: u32) -> bool {
+    const slot = contextOf(handle)
+    if slot < 0 { return false }
+    return slots[@bitCast(usize, slot)].lost
+}
+
+// ---------------------------------------------------------------------------
+// The native calls beside them
+
+fn mapMemory(memory_handle: u32, size: usize) -> isize {
+    const object = kindOf(memory_handle, FIRST_MEMORY, FIRST_FENCE)
+    if object < 0 { return object }
+    const m = @bitCast(usize, object)
+    if (slots[m].flags & gpucard.Memory.PROCESSOR) == 0 { return -Status.no_right }
+    if size == 0 || size > slots[m].size { return -Status.invalid }
+    return @bitCast(isize, slots[m].bytes)
+}
+
+fn unmapMemory(address: usize, size: usize) -> isize { return 0 }
+
+fn release(handle: u32) -> isize {
+    const slot = slotOf(handle)
+    if slot < 0 { return slot }
+    if @bitCast(usize, slot) < FIRST_MEMORY { return -Status.wrong_kind }
+    return close(handle)
+}
+
+fn wait(items: usize, count_of_items: usize, timeout: u64) -> isize {
+    if count_of_items == 0 { return -Status.timed_out }
+    const list: [*]WaitItem = unsafe { @ptrFromInt([*]WaitItem, items) }
+    var ready: isize = 0
+    var k: usize = 0
+    while k < count_of_items {
+        const slot = slotOf(list[k].handle)
+        if slot < 0 { return slot }
+        const at = @bitCast(usize, slot)
+        list[k].seen = if at >= FIRST_FENCE { slots[at].state } else { 0 }
+        if (list[k].seen & list[k].want) != 0 { ready += 1 }
+        k += 1
+    }
+    // Nothing changes while the program waits here.
+    if ready == 0 { return -Status.timed_out }
+    return ready
+}
 
 // The host card's implementation of the interface.
 pub fn interface() -> card.Card {
-    return card.Card.{ .count = count, .describe = describe, .open = open, .describeContext = describeContext, .close = close, .memory = memory, .memoryOf = memoryOf, .map = map, .unmap = unmap, .submit = submit, .fence = fence }
+    return card.Card.{ .count = count, .describe = describe, .open = open, .describeContext = describeContext, .close = close, .memory = memory, .memoryOf = memoryOf, .map = map, .unmap = unmap, .submit = submit, .fence = fence, .mapMemory = mapMemory, .unmapMemory = unmapMemory, .release = release, .wait = wait }
 }

@@ -1,0 +1,151 @@
+// The driver's memory and buffers (the study's 7.2 and 3.5): a
+// VkDeviceMemory is a memory handle of the card (gpu_memory), mapped at
+// a card address of the device's choosing for its whole life; a mapping
+// for the processor is made the first time vkMapMemory asks and kept
+// (7.2: "a mapping stays for the object's life"); a VkBuffer is a range
+// of it.
+//
+// The memory types are the physical device's (driver.mlx: the
+// reference's four on up to three heaps); a type's heap says where the
+// card's memory is (a device-local heap: the card's own, else the
+// system's), its host-visible flag that the processor may map it, and
+// device local with host visible the reachable part of the card's memory,
+// mapped write-combined. Every allocation is zeroed (a program sees no
+// other program's bytes). What a heap has given is counted: an
+// allocation that does not fit fails (no eviction, no over-commit: 7.2).
+const vk = @import("std.vulkan")
+const gpucard = @import("std.gpucard")
+const device = @import("./device.mlx")
+
+const DeviceObject = device.DeviceObject
+
+pub const MemoryObject = struct {
+    block: device.Block
+    typeIndex: u32
+    heapIndex: u32
+    // The size asked for (the block is whole pages).
+    size: u64
+    mapped: bool
+}
+
+pub const BufferObject = struct {
+    size: u64
+    usage: u32
+    // The memory it is bound to (0: none yet), where in it, and the card
+    // address of its first byte.
+    memory: usize
+    offset: u64
+    address: u64
+}
+
+pub fn memoryOf(handle: vk.DeviceMemory) -> *MemoryObject { return unsafe { @ptrFromInt(*MemoryObject, handle) } }
+
+pub fn bufferOf(handle: vk.Buffer) -> *BufferObject { return unsafe { @ptrFromInt(*BufferObject, handle) } }
+
+// A buffer's alignment and size granule (ours: 16, the descriptors' and
+// the copy engine's needs; minStorageBufferOffsetAlignment is 4).
+pub const BUFFER_ALIGNMENT: u64 = 16
+
+// gpu_memory's flags for memory type `index`.
+pub fn flagsOf(owner: *const DeviceObject, index: u32) -> usize {
+    const properties = owner.*.memory.memoryTypes[index].propertyFlags
+    const heap = owner.*.memory.memoryTypes[index].heapIndex
+    const local = (owner.*.memory.memoryHeaps[heap].flags & vk.MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0
+    var flags = gpucard.Memory.ZEROED | (if local { gpucard.Memory.CARD } else { gpucard.Memory.SYSTEM })
+    if (properties & vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 {
+        flags |= gpucard.Memory.PROCESSOR
+        if local { flags |= gpucard.Memory.WRITE_COMBINED }
+    }
+    return flags
+}
+
+pub fn allocateMemory(handle: vk.Device, info: *const vk.MemoryAllocateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.DeviceMemory) -> vk.Result {
+    const owner = device.deviceOf(handle)
+    into.* = 0
+    if owner.*.lost { return vk.Result.errorDeviceLost }
+    if info.*.memoryTypeIndex >= owner.*.memory.memoryTypeCount || info.*.allocationSize == 0 { return vk.Result.errorOutOfDeviceMemory }
+    const heap = owner.*.memory.memoryTypes[info.*.memoryTypeIndex].heapIndex
+    const size = info.*.allocationSize
+    const pages = (size + @intCast(u64, device.PAGE) - 1) / @intCast(u64, device.PAGE) * @intCast(u64, device.PAGE)
+    if pages > owner.*.memory.memoryHeaps[heap].size - owner.*.heapUsed[heap] { return vk.Result.errorOutOfDeviceMemory }
+    const address = device.allocate(callbacks, @sizeOf(MemoryObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = memoryOf(address)
+    const rights = gpucard.Access.READ | gpucard.Access.WRITE
+    if !device.makeBlock(owner, @intCast(usize, size), flagsOf(owner, info.*.memoryTypeIndex), rights, false, false, &made.*.block) {
+        device.release(callbacks, address, @sizeOf(MemoryObject))
+        return vk.Result.errorOutOfDeviceMemory
+    }
+    made.*.typeIndex = info.*.memoryTypeIndex
+    made.*.heapIndex = heap
+    made.*.size = size
+    made.*.mapped = false
+    owner.*.heapUsed[heap] += pages
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn freeMemory(handle: vk.Device, memory: vk.DeviceMemory, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if memory == 0 { return }
+    const owner = device.deviceOf(handle)
+    const made = memoryOf(memory)
+    owner.*.heapUsed[made.*.heapIndex] -= @intCast(u64, made.*.block.size)
+    device.dropBlock(owner, &made.*.block)
+    device.release(callbacks, memory, @sizeOf(MemoryObject))
+}
+
+pub fn mapMemory(handle: vk.Device, memory: vk.DeviceMemory, offset: vk.DeviceSize, size: vk.DeviceSize, flags: vk.MemoryMapFlags, into: *?*anyopaque) -> vk.Result {
+    const owner = device.deviceOf(handle)
+    const made = memoryOf(memory)
+    into.* = null
+    const properties = owner.*.memory.memoryTypes[made.*.typeIndex].propertyFlags
+    if (properties & vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 || made.*.mapped || offset >= made.*.size { return vk.Result.errorMemoryMapFailed }
+    if size != vk.WHOLE_SIZE && (size == 0 || size > made.*.size - offset) { return vk.Result.errorMemoryMapFailed }
+    if !device.mapBlock(&made.*.block) { return vk.Result.errorMemoryMapFailed }
+    made.*.mapped = true
+    into.* = unsafe { @ptrFromInt(*anyopaque, made.*.block.bytes + @intCast(usize, offset)) }
+    return vk.Result.success
+}
+
+// (The processor's mapping is kept for the memory's life.)
+pub fn unmapMemory(handle: vk.Device, memory: vk.DeviceMemory) -> void { memoryOf(memory).*.mapped = false }
+
+pub fn createBuffer(handle: vk.Device, info: *const vk.BufferCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.Buffer) -> vk.Result {
+    into.* = 0
+    // No sparse buffer (the feature is false), no external memory.
+    if info.*.size == 0 || info.*.flags != 0 { return vk.Result.errorOutOfDeviceMemory }
+    const address = device.allocate(callbacks, @sizeOf(BufferObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = bufferOf(address)
+    made.*.size = info.*.size
+    made.*.usage = info.*.usage
+    made.*.memory = 0
+    made.*.offset = 0
+    made.*.address = 0
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn destroyBuffer(handle: vk.Device, buffer: vk.Buffer, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if buffer == 0 { return }
+    device.release(callbacks, buffer, @sizeOf(BufferObject))
+}
+
+pub fn getBufferMemoryRequirements(handle: vk.Device, buffer: vk.Buffer, into: *vk.MemoryRequirements) -> void {
+    const owner = device.deviceOf(handle)
+    const made = bufferOf(buffer)
+    into.*.size = (made.*.size + BUFFER_ALIGNMENT - 1) / BUFFER_ALIGNMENT * BUFFER_ALIGNMENT
+    into.*.alignment = BUFFER_ALIGNMENT
+    // Every type the device has.
+    into.*.memoryTypeBits = if owner.*.memory.memoryTypeCount >= 32 { 0xFFFFFFFF } else { (@intCast(u32, 1) << @intCast(u5, owner.*.memory.memoryTypeCount)) - 1 }
+}
+
+pub fn bindBufferMemory(handle: vk.Device, buffer: vk.Buffer, memory: vk.DeviceMemory, offset: vk.DeviceSize) -> vk.Result {
+    const made = bufferOf(buffer)
+    const backing = memoryOf(memory)
+    if offset % BUFFER_ALIGNMENT != 0 || offset >= backing.*.size || made.*.size > backing.*.size - offset { return vk.Result.errorOutOfDeviceMemory }
+    made.*.memory = memory
+    made.*.offset = offset
+    made.*.address = backing.*.block.address + offset
+    return vk.Result.success
+}

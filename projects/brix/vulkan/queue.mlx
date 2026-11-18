@@ -1,0 +1,287 @@
+// The driver's queue and fences (the study's 3.5, 4.2, 7.5).
+//
+// THE PREAMBLE (4.2): a stream the device makes once and gives the card
+// before the streams of every submit (radv_queue.c radv_update_preamble_
+// cs, the "initial" one with the first flush's CS_PARTIAL_FLUSH: our
+// submits carry no wait for earlier ones, the ring runs them in order):
+// radv_emit_compute's registers on GFX8 (COMPUTE_START_X .. _Z 0,
+// COMPUTE_PGM_HI the code's high part, 0: the device keeps code below
+// 4 GiB; the four shader engines' compute units, all enabled) and the
+// flush of INV_ICACHE, INV_SCACHE, INV_VCACHE, INV_L2,
+// START_PIPELINE_STATS, CS_PARTIAL_FLUSH (radv_cs_emit_cache_flush on a
+// compute ring: EVENT_WRITE CS_PARTIAL_FLUSH, ACQUIRE_MEM 0x28C40000,
+// COMPUTE_PIPELINESTAT_ENABLE 1). It is given at EVERY submit and never
+// marked as a stream that may be left out (the study's corrections 1 and
+// the silent need 2): its invalidation is what makes descriptors, push
+// constants and code the processor wrote since the last submit visible
+// to the shaders' caches. No scratch, no ring descriptors, no border
+// colours, no trap handler (nothing of this stage needs them).
+//
+// A SUBMIT is one gpu_submit of the preamble and every chunk of every
+// command buffer, in order, with a fence: the VkFence's own when there is
+// one, else the device's. A FENCE is a fence handle of the card (gpu_
+// fence), readable once the submit it was last given to is done; a
+// VkFence also keeps whether it is signalled by creation and whether it
+// has been given to a submit since it was reset, since the handle alone
+// cannot be made unsignalled again.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const gpucard = @import("std.gpucard")
+const device = @import("./device.mlx")
+const commands = @import("./commands.mlx")
+const packets = @import("./packets.mlx")
+
+const DeviceObject = device.DeviceObject
+const State = std.os.brix.State
+const WaitItem = std.os.brix.WaitItem
+
+pub const FenceObject = struct {
+    handle: u32
+    signalled: bool
+    submitted: bool
+}
+
+fn fenceOf(handle: vk.Fence) -> *FenceObject { return unsafe { @ptrFromInt(*FenceObject, handle) } }
+
+// ---------------------------------------------------------------------------
+// The preamble
+
+// The first preamble's invalidation: INV_ICACHE, INV_SCACHE and INV_L2
+// (TC, TCL1, TC_WB): 0x28C40000.
+pub const PREAMBLE_ACTIONS: u32 = packets.CP_COHER_CNTL__SH_ICACHE_ACTION_ENA | packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA | packets.CP_COHER_CNTL__TC_ACTION_ENA | packets.CP_COHER_CNTL__TCL1_ACTION_ENA | packets.CP_COHER_CNTL__TC_WB_ACTION_ENA
+
+pub fn buildPreamble(owner: *DeviceObject) -> bool {
+    if !device.ownBlock(owner, device.PAGE, gpucard.Access.READ | gpucard.Access.EXECUTE, false, &owner.*.preamble) { return false }
+    const words: [*]u32 = unsafe { @ptrFromInt([*]u32, owner.*.preamble.bytes) }
+    var at: usize = 0
+    // COMPUTE_START_X .. _Z.
+    words[at] = packets.header(packets.PKT3_SET_SH_REG, 3, false)
+    words[at + 1] = @intCast(u32, (packets.COMPUTE_START_X - packets.SH_START) / 4)
+    words[at + 2] = 0
+    words[at + 3] = 0
+    words[at + 4] = 0
+    at += 5
+    // COMPUTE_PGM_HI: the code's address >> 40, 0 below 4 GiB.
+    words[at] = packets.header(packets.PKT3_SET_SH_REG, 1, false)
+    words[at + 1] = @intCast(u32, (packets.COMPUTE_PGM_HI - packets.SH_START) / 4)
+    words[at + 2] = @intCast(u32, (device.LOW_END - 1) >> 40)
+    at += 3
+    // The compute units of shader engines 0 and 1, then 2 and 3 (GFX7 and
+    // later): all enabled (ac_gpu_info.c's spi_cu_en, no debug narrowing).
+    const all = packets.COMPUTE_STATIC_THREAD_MGMT_SE0__SH0_CU_EN | packets.COMPUTE_STATIC_THREAD_MGMT_SE0__SH1_CU_EN
+    words[at] = packets.header(packets.PKT3_SET_SH_REG, 2, false)
+    words[at + 1] = @intCast(u32, (packets.COMPUTE_STATIC_THREAD_MGMT_SE0 - packets.SH_START) / 4)
+    words[at + 2] = all
+    words[at + 3] = all
+    at += 4
+    words[at] = packets.header(packets.PKT3_SET_SH_REG, 2, false)
+    words[at + 1] = @intCast(u32, (packets.COMPUTE_STATIC_THREAD_MGMT_SE2 - packets.SH_START) / 4)
+    words[at + 2] = all
+    words[at + 3] = all
+    at += 4
+    // The flush.
+    words[at] = packets.header(packets.PKT3_EVENT_WRITE, 0, false)
+    words[at + 1] = packets.event(packets.CS_PARTIAL_FLUSH, packets.EVENT_INDEX_PARTIAL)
+    at += 2
+    words[at] = packets.header(packets.PKT3_ACQUIRE_MEM, 5, true)
+    words[at + 1] = if preambleActions == 0xFFFFFFFF { PREAMBLE_ACTIONS } else { preambleActions }
+    words[at + 2] = packets.COHER_SIZE_ALL
+    words[at + 3] = packets.COHER_SIZE_HI_ALL
+    words[at + 4] = 0
+    words[at + 5] = 0
+    words[at + 6] = packets.COHER_POLL
+    at += 7
+    words[at] = packets.header(packets.PKT3_SET_SH_REG, 1, false)
+    words[at + 1] = @intCast(u32, (packets.COMPUTE_PIPELINESTAT_ENABLE - packets.SH_START) / 4)
+    words[at + 2] = packets.COMPUTE_PIPELINESTAT_ENABLE__PIPELINESTAT_ENABLE
+    at += 3
+    while at % packets.PAD_WORDS != 0 {
+        words[at] = packets.NOP_PAD
+        at += 1
+    }
+    owner.*.preambleWords = at
+    return true
+}
+
+// A test may leave words of the preamble out (the proof that the
+// invalidation at every submit is needed): its ACQUIRE_MEM's actions
+// when not 0xFFFFFFFF, taken when a device is made. (Never written into
+// a device's preamble later: the card may be running it.)
+pub var preambleActions: u32 = 0xFFFFFFFF // (per run)
+
+// ---------------------------------------------------------------------------
+// Fences
+
+pub fn createFence(handle: vk.Device, info: *const vk.FenceCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.Fence) -> vk.Result {
+    const owner = device.deviceOf(handle)
+    into.* = 0
+    const made = device.cardFence(owner.*.context)
+    if made <= 0 { return if made == -device.PEER_GONE { vk.Result.errorDeviceLost } else { vk.Result.errorOutOfHostMemory } }
+    const address = device.allocate(callbacks, @sizeOf(FenceObject), vk.SystemAllocationScope.object)
+    if address == 0 {
+        _ = device.cardRelease(@intCast(u32, made))
+        return vk.Result.errorOutOfHostMemory
+    }
+    const fence = fenceOf(address)
+    fence.*.handle = @intCast(u32, made)
+    fence.*.signalled = (info.*.flags & vk.FENCE_CREATE_SIGNALED_BIT) != 0
+    fence.*.submitted = false
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn destroyFence(handle: vk.Device, given: vk.Fence, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if given == 0 { return }
+    const owner = device.deviceOf(handle)
+    const fence = fenceOf(given)
+    if owner.*.lastFence == fence.*.handle { owner.*.lastFence = 0 }
+    _ = device.cardRelease(fence.*.handle)
+    device.release(callbacks, given, @sizeOf(FenceObject))
+}
+
+pub fn resetFences(handle: vk.Device, count: u32, fences: ?[*]const vk.Fence) -> vk.Result {
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const fence = fenceOf(fences.?[k])
+        fence.*.signalled = false
+        fence.*.submitted = false
+        k += 1
+    }
+    return vk.Result.success
+}
+
+const MOST_WAITED: usize = 64
+
+// Whether the fence handles `items` are done, waiting at most `timeout`:
+// success, timeout, or device lost (a context lost: peer_gone).
+fn waitHandles(owner: *DeviceObject, items: [*]WaitItem, count: usize, all: bool, timeout: u64) -> vk.Result {
+    var remaining = count
+    var ready: usize = 0
+    while remaining > 0 {
+        const got = device.cardWait(@intFromPtr(items), remaining, timeout)
+        if got == -device.TIMED_OUT { return vk.Result.timeout }
+        if got < 0 { return vk.Result.errorDeviceLost }
+        // The ready ones out of the list.
+        var k: usize = 0
+        while k < remaining {
+            if (items[k].seen & State.PEER_GONE) != 0 {
+                owner.*.lost = true
+                return vk.Result.errorDeviceLost
+            }
+            if (items[k].seen & State.READABLE) != 0 {
+                ready += 1
+                items[k] = items[remaining - 1]
+                remaining -= 1
+            } else {
+                k += 1
+            }
+        }
+        if !all && ready > 0 { return vk.Result.success }
+    }
+    return vk.Result.success
+}
+
+pub fn waitForFences(handle: vk.Device, count: u32, fences: ?[*]const vk.Fence, waitAll: vk.Bool32, timeout: u64) -> vk.Result {
+    const owner = device.deviceOf(handle)
+    const all = waitAll != vk.FALSE
+    var items: [64]WaitItem = undefined
+    var waited: usize = 0
+    var done: usize = 0
+    var never = false
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const fence = fenceOf(fences.?[k])
+        if fence.*.signalled {
+            done += 1
+        } else if fence.*.submitted && waited < MOST_WAITED {
+            items[waited] = WaitItem.{ .handle = fence.*.handle, .want = State.READABLE | State.PEER_GONE, .seen = 0, .reserved = 0 }
+            waited += 1
+        } else {
+            never = true
+        }
+        k += 1
+    }
+    if !all && done > 0 { return vk.Result.success }
+    if waited > 0 {
+        const result = waitHandles(owner, &items, waited, all, timeout)
+        if result != vk.Result.success { return result }
+        if !all { return vk.Result.success }
+        // The fences waited for are signalled from now on.
+        k = 0
+        while k < @intCast(usize, count) {
+            const fence = fenceOf(fences.?[k])
+            if fence.*.submitted { fence.*.signalled = true }
+            k += 1
+        }
+    }
+    if never {
+        // A fence nothing will signal: the wait lasts its time.
+        if timeout != 0 { _ = device.cardWait(0, 0, timeout) }
+        return vk.Result.timeout
+    }
+    return vk.Result.success
+}
+
+pub fn getFenceStatus(handle: vk.Device, given: vk.Fence) -> vk.Result {
+    var one = given
+    const result = waitForFences(handle, 1, unsafe { @ptrCast([*]const vk.Fence, &one) }, vk.TRUE, 0)
+    return if result == vk.Result.timeout { vk.Result.notReady } else { result }
+}
+
+// ---------------------------------------------------------------------------
+// Submits
+
+const MOST_STREAMS: usize = 64
+
+pub fn queueSubmit(queue: vk.Queue, count: u32, submits: ?[*]const vk.SubmitInfo, given: vk.Fence) -> vk.Result {
+    const queueObject: *device.QueueObject = unsafe { @ptrFromInt(*device.QueueObject, queue) }
+    const owner = device.deviceOf(queueObject.*.device)
+    if owner.*.lost { return vk.Result.errorDeviceLost }
+    var streams: [64]gpucard.Stream = undefined
+    streams[0] = gpucard.Stream.{ .engine = gpucard.Engine.COMPUTE, .flags = 0, .address = owner.*.preamble.address, .words = @intCast(u64, owner.*.preambleWords) }
+    var n: usize = 1
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const submit = &submits.?[k]
+        var b: usize = 0
+        while b < @intCast(usize, submit.*.commandBufferCount) {
+            const cb = commands.bufferOf(submit.*.pCommandBuffers.?[b])
+            if n + cb.*.current + 1 > MOST_STREAMS { return vk.Result.errorOutOfHostMemory }
+            n += commands.streamsOf(submit.*.pCommandBuffers.?[b], &streams, n)
+            b += 1
+        }
+        k += 1
+    }
+    var fenceHandle = owner.*.ownFence
+    if given != 0 {
+        const fence = fenceOf(given)
+        fence.*.signalled = false
+        fence.*.submitted = true
+        fenceHandle = fence.*.handle
+    }
+    // (A submit without command buffers still signals its fence: the
+    // preamble alone is run.)
+    const sequence = device.cardSubmit(owner.*.context, @intFromPtr(&streams), n, fenceHandle)
+    if sequence < 0 {
+        if sequence == -device.PEER_GONE { owner.*.lost = true }
+        if given != 0 { fenceOf(given).*.submitted = false }
+        return if sequence == -device.PEER_GONE { vk.Result.errorDeviceLost } else { vk.Result.errorOutOfHostMemory }
+    }
+    owner.*.lastFence = fenceHandle
+    return vk.Result.success
+}
+
+// The last submit done (the ring runs them in order).
+fn idle(owner: *DeviceObject) -> vk.Result {
+    if owner.*.lost { return vk.Result.errorDeviceLost }
+    if owner.*.lastFence == 0 { return vk.Result.success }
+    var item = WaitItem.{ .handle = owner.*.lastFence, .want = State.READABLE | State.PEER_GONE, .seen = 0, .reserved = 0 }
+    return waitHandles(owner, unsafe { @ptrCast([*]WaitItem, &item) }, 1, true, device.FOREVER)
+}
+
+pub fn queueWaitIdle(queue: vk.Queue) -> vk.Result {
+    const queueObject: *device.QueueObject = unsafe { @ptrFromInt(*device.QueueObject, queue) }
+    return idle(device.deviceOf(queueObject.*.device))
+}
+
+pub fn deviceWaitIdle(handle: vk.Device) -> vk.Result { return idle(device.deviceOf(handle)) }

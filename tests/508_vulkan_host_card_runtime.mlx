@@ -1,0 +1,1007 @@
+// The host card of our Vulkan driver (projects/brix/vulkan/card_host.mlx,
+// card_run.mlx, card_cache.mlx; the study's 8.1), built for the host: what
+// the calls 80 to 85 do there, and a submit EXECUTED.
+// - memory (zeroed when asked, else the poison word), the process's own
+//   pages in place, the processor's mapping (only with its flag), mappings
+//   at the driver's addresses (whole pages, from 2 MiB, below 2^40, never
+//   over another, with their rights), unmapped, a handle closed while
+//   mapped keeping its bytes, fences (never readable before a submit, at
+//   once after one), a card without a compute ring refusing every call;
+// - the doubler (tests/support/spirv/doubler.mlx) compiled by our compiler
+//   and dispatched by streams built here by hand, word for word as the
+//   study's 4.2 (the compute preamble: the start registers, COMPUTE_PGM_HI,
+//   the four engines' compute units, CS_PARTIAL_FLUSH, ACQUIRE_MEM
+//   0x28C40000, COMPUTE_PIPELINESTAT_ENABLE) and 4.3 (the pipeline's 15
+//   words, the user data words of 5.2's even pairs, DISPATCH_DIRECT 0x45)
+//   give them, the descriptor set above 4 GiB: 256 words doubled;
+// - every refusal, each with its stream and word: a packet the card does
+//   not know, a header that is none, a packet past its stream, a compute
+//   bit RADV does not set, a register outside the four ranges, a register
+//   the dispatch reads that no stream set (the preamble's every one, the
+//   pipeline's, the user data), COMPUTE_RESOURCE_LIMITS other than the
+//   record's compute units and shader engines give (the silent need 4), a
+//   float mode or scratch the interpreter does not model, the shader not
+//   mapped executable, a stream not padded to 8 words, a stream not in an
+//   executable mapping (bad_address, nothing run), another engine; a lost
+//   context's fence peer_gone and its later submits refused;
+// - the caches: the descriptor set written again at the same address
+//   between two submits is seen afresh with the preamble's invalidation
+//   and as a stale read of the scalar cache without it (std.gpu's pool
+//   hands out the same addresses every frame); code written again at the
+//   same address the same with the instruction cache; a buffer the copy
+//   engine filled read by a dispatch: with the vector caches invalidated
+//   it is seen, without it the read is stale; a dispatch's stores read by
+//   the copy engine without the write-back (L2 holds them); L2 let go
+//   without its write-back; a copy racing a dispatch without
+//   CS_PARTIAL_FLUSH, a dispatch racing a copy without CP_SYNC, the copy
+//   engine still running at the kernel's fence;
+// - the copy engine's packets (7.6): a copy, a fill, more than one
+//   packet's 2 097 120 bytes in two packets, the byte count's 21 bits
+//   (a count past them moves what its field says), RAW_WAIT, CP_SYNC;
+// - what the review added: a word one dispatch stored, read by the next
+//   after CS_PARTIAL_FLUSH alone, is stale (the vector caches are every
+//   compute unit's: TCL1 must come between), with TCL1 it is doubled
+//   twice; a dispatch racing the one before it without a barrier and with
+//   an ACQUIRE_MEM that has no CS_PARTIAL_FLUSH before it (L2 let go does
+//   not end the race); ACQUIRE_MEM over a part of memory; of RSRC1's 16
+//   scalar registers s15 is VCC's (s13 the shader's); a group of 65535 x
+//   65535 x 2 refused, not a stop.
+// With an argument, each failing check is printed.
+// Exits 13.
+const std = @import("std")
+const gpucard = @import("std.gpucard")
+const builder = @import("std.spirv.builder")
+const spv = @import("std.spirv.core")
+const doubler = @import("./support/spirv/doubler.mlx")
+const host = @import("../projects/brix/vulkan/card_host.mlx")
+const run = @import("../projects/brix/vulkan/card_run.mlx")
+const cache = @import("../projects/brix/vulkan/card_cache.mlx")
+const packets = @import("../projects/brix/vulkan/packets.mlx")
+const shader = @import("../projects/brix/vulkan/shader.mlx")
+const wave = @import("../projects/brix/vulkan/wave.mlx")
+const cardInterface = @import("../projects/brix/vulkan/card.mlx")
+const encode = @import("../projects/brix/vulkan/encode.mlx")
+const isa = @import("../projects/brix/vulkan/isa.mlx")
+
+const Status = std.os.brix.Status
+const State = std.os.brix.State
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+fn sayNumber(value: u64) -> void { _ = std.io.writeUnsigned(std.io.stdout(), @intCast(usize, value)) }
+
+var failed: u8 = 0
+var show = false
+
+fn check(number: u8, holds: bool) -> void {
+    if holds { return }
+    if failed == 0 { failed = number }
+    if show {
+        say("check ")
+        sayNumber(@intCast(u64, number))
+        say(" fails")
+        const r = host.report()
+        if r.*.failure != run.Failure.none {
+            say(" (last report: ")
+            say(run.failureText(r.*.failure))
+            say(", stream ")
+            sayNumber(@intCast(u64, r.*.stream))
+            say(" word ")
+            sayNumber(@intCast(u64, r.*.word))
+            say(" detail ")
+            sayNumber(r.*.detail)
+            say(")")
+        }
+        say("\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The card and its memory
+
+var card: gpucard.Device = undefined
+var calls: cardInterface.Card = undefined
+
+const CODE_AT: u64 = 0x10000000
+const STREAM_AT: u64 = 0x20000000
+const PREAMBLE_AT: u64 = 0x20010000
+// Above 4 GiB: the pointers' high words are used.
+const SET_AT: u64 = 0x100000000
+const PUSH_AT: u64 = 0x100010000
+const DATA_AT: u64 = 0x200000000
+const OTHER_AT: u64 = 0x200800000
+
+const PAGE: usize = 4096
+
+var codeMemory: u32 = 0
+var streamMemory: u32 = 0
+var preambleMemory: u32 = 0
+var setMemory: u32 = 0
+var pushMemory: u32 = 0
+var dataMemory: u32 = 0
+var otherMemory: u32 = 0
+
+var codeWords: [*]u32 = undefined
+var streamWords: [*]u32 = undefined
+var preambleWords: [*]u32 = undefined
+var setWords: [*]u32 = undefined
+var pushWords: [*]u32 = undefined
+var dataWords: [*]u32 = undefined
+var otherWords: [*]u32 = undefined
+
+var context: u32 = 0
+
+fn made(handle: isize) -> u32 { return if handle > 0 { @intCast(u32, handle) } else { 0 } }
+
+fn words(memory: u32, size: usize) -> [*]u32 {
+    const function = calls.mapMemory
+    const address = function(memory, size)
+    return unsafe { @ptrFromInt([*]u32, @bitCast(usize, address)) }
+}
+
+fn memoryOf(size: usize, flags: usize) -> u32 {
+    const function = calls.memory
+    return made(function(context, size, flags))
+}
+
+fn mapIn(memory: u32, size: usize, address: u64, rights: usize) -> isize {
+    const function = calls.map
+    return function(context, memory, 0, size, @intCast(usize, address), rights)
+}
+
+// A card that takes commands, its memory made once.
+fn setUp() -> void {
+    host.reset()
+    const facts = host.rx580(1)
+    _ = host.add(&facts)
+    calls = host.interface()
+    const open = calls.open
+    context = made(open(0))
+    const visible = gpucard.Memory.SYSTEM | gpucard.Memory.PROCESSOR | gpucard.Memory.ZEROED
+    codeMemory = memoryOf(65536, visible)
+    streamMemory = memoryOf(65536, visible)
+    preambleMemory = memoryOf(PAGE, visible)
+    setMemory = memoryOf(PAGE, visible)
+    pushMemory = memoryOf(PAGE, visible)
+    dataMemory = memoryOf(4 * 1024 * 1024 + PAGE, visible)
+    otherMemory = memoryOf(4 * 1024 * 1024 + PAGE, visible)
+    codeWords = words(codeMemory, 65536)
+    streamWords = words(streamMemory, 65536)
+    preambleWords = words(preambleMemory, PAGE)
+    setWords = words(setMemory, PAGE)
+    pushWords = words(pushMemory, PAGE)
+    dataWords = words(dataMemory, 4 * 1024 * 1024 + PAGE)
+    otherWords = words(otherMemory, 4 * 1024 * 1024 + PAGE)
+    mapAll(true)
+}
+
+// The memory mapped into the current context (the code executable or not).
+fn mapAll(executableCode: bool) -> void {
+    const r = gpucard.Access.READ
+    const rw = gpucard.Access.READ | gpucard.Access.WRITE
+    const rx = gpucard.Access.READ | gpucard.Access.EXECUTE
+    _ = mapIn(codeMemory, 65536, CODE_AT, if executableCode { rx } else { r })
+    _ = mapIn(streamMemory, 65536, STREAM_AT, rx)
+    _ = mapIn(preambleMemory, PAGE, PREAMBLE_AT, rx)
+    _ = mapIn(setMemory, PAGE, SET_AT, r)
+    _ = mapIn(pushMemory, PAGE, PUSH_AT, r)
+    _ = mapIn(dataMemory, 4 * 1024 * 1024 + PAGE, DATA_AT, rw)
+    _ = mapIn(otherMemory, 4 * 1024 * 1024 + PAGE, OTHER_AT, rw)
+}
+
+// A new context (after one was lost), its mappings made again.
+fn freshContext(executableCode: bool) -> void {
+    const close = calls.close
+    _ = close(context)
+    const open = calls.open
+    context = made(open(0))
+    mapAll(executableCode)
+}
+
+// ---------------------------------------------------------------------------
+// The doubler, compiled
+
+var facts: shader.Facts = undefined
+var program: [4096]u32 = undefined
+
+fn compileDoubler() -> bool {
+    const allocator = std.page_allocator.init()
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    doubler.build(&b)
+    const count = builder.wordCount(&b)
+    const memory = allocator.alloc(count * 4, 4)
+    if memory == null { return false }
+    const spirv: [*]u32 = unsafe { @ptrCast([*]u32, memory.?) }
+    builder.writeWords(&b, spirv)
+    var failure: shader.Failure = undefined
+    if !shader.compile(spirv[0..count], allocator, program[0..], &facts, &failure) { return false }
+    var k: usize = 0
+    while k < facts.words {
+        codeWords[k] = program[k]
+        k += 1
+    }
+    return true
+}
+
+fn roundUp(value: u32, to: u32) -> u32 { return (value + to - 1) / to * to }
+
+fn largest(a: u32, b: u32) -> u32 { return if a > b { a } else { b } }
+
+// COMPUTE_PGM_RSRC1 by RADV's formula (radv_shader.c radv_postprocess_
+// binary_config: VGPRS (n - 1) / 4, SGPRS (n - 1) / 8 of ACO's counts
+// (aco_live_var_analysis.cpp get_sgpr_alloc: VCC's 2 added, 16 at a time
+// on GFX8) and at least the entry's arguments + 5, FLOAT_MODE 0xC0, DX10
+// clamp).
+fn rsrc1() -> u32 {
+    const vgprs = roundUp(largest(largest(facts.vgprs, facts.localIdComponents + 1), 4), 4)
+    const entry = facts.userSgprs + (if facts.groupIdX { @intCast(u32, 1) } else { 0 }) + (if facts.groupIdY { @intCast(u32, 1) } else { 0 }) + (if facts.groupIdZ { @intCast(u32, 1) } else { 0 })
+    const sgprs = largest(roundUp(largest(facts.sgprs + 2, 16), 16), entry + 5)
+    return packets.put(packets.COMPUTE_PGM_RSRC1__VGPRS, (vgprs - 1) / 4) | packets.put(packets.COMPUTE_PGM_RSRC1__SGPRS, (sgprs - 1) / 8) | packets.put(packets.COMPUTE_PGM_RSRC1__FLOAT_MODE, 192) | packets.COMPUTE_PGM_RSRC1__DX10_CLAMP
+}
+
+fn rsrc2() -> u32 {
+    var word = packets.put(packets.COMPUTE_PGM_RSRC2__USER_SGPR, facts.userSgprs) | packets.put(packets.COMPUTE_PGM_RSRC2__TIDIG_COMP_CNT, facts.localIdComponents)
+    if facts.groupIdX { word |= packets.COMPUTE_PGM_RSRC2__TGID_X_EN }
+    if facts.groupIdY { word |= packets.COMPUTE_PGM_RSRC2__TGID_Y_EN }
+    if facts.groupIdZ { word |= packets.COMPUTE_PGM_RSRC2__TGID_Z_EN }
+    return word
+}
+
+// ---------------------------------------------------------------------------
+// Streams, by hand
+
+var built: [512]u32 = undefined
+var length: usize = 0
+
+fn emit(word: u32) -> void {
+    built[length] = word
+    length += 1
+}
+
+fn pad() -> void {
+    while length % 8 != 0 { emit(packets.NOP_PAD) }
+}
+
+// The compute preamble, the study's 4.2 word for word (with
+// `actions` as ACQUIRE_MEM's CP_COHER_CNTL).
+fn preamble(actions: u32) -> void {
+    length = 0
+    emit(0xC0037600)
+    emit(0x204)
+    emit(0)
+    emit(0)
+    emit(0)
+    emit(0xC0017600)
+    emit(0x20D)
+    emit(0)
+    emit(0xC0027600)
+    emit(0x216)
+    emit(0xFFFFFFFF)
+    emit(0xFFFFFFFF)
+    emit(0xC0027600)
+    emit(0x219)
+    emit(0xFFFFFFFF)
+    emit(0xFFFFFFFF)
+    emit(0xC0004600)
+    emit(0x00000407)
+    emit(0xC0055802)
+    emit(actions)
+    emit(0xFFFFFFFF)
+    emit(0x000000FF)
+    emit(0)
+    emit(0)
+    emit(0x0000000A)
+    emit(0xC0017600)
+    emit(0x20A)
+    emit(0x00000001)
+    pad()
+    var k: usize = 0
+    while k < length {
+        preambleWords[k] = built[k]
+        k += 1
+    }
+    preambleLength = length
+}
+
+var preambleLength: usize = 0
+
+// What the dispatch stream leaves out, or puts in wrong.
+var leaveOut: usize = 0
+var limitsWord: u32 = 0x00800000
+var rsrc1Word: u32 = 0
+
+// The doubler's dispatch, the study's 4.3 word for word: the pipeline's 15
+// words, set 0's address into user data 2 and 3, the push block's into 4
+// and 5, DISPATCH_DIRECT for `groups` groups of 64.
+fn dispatchWords(groups: u32) -> void {
+    if leaveOut != packets.COMPUTE_PGM_LO {
+        emit(0xC0017600)
+        emit(0x20C)
+        emit(@intCast(u32, CODE_AT >> 8))
+    }
+    emit(0xC0027600)
+    emit(0x212)
+    emit(rsrc1Word)
+    emit(rsrc2())
+    if leaveOut != packets.COMPUTE_RESOURCE_LIMITS {
+        emit(0xC0017600)
+        emit(0x215)
+        emit(limitsWord)
+    }
+    emit(0xC0037600)
+    emit(0x207)
+    emit(facts.groupSizeX)
+    emit(facts.groupSizeY)
+    emit(facts.groupSizeZ)
+    if leaveOut != packets.COMPUTE_USER_DATA_0 + 8 {
+        emit(0xC0027600)
+        emit(0x242)
+        emit(@intCast(u32, SET_AT & 0xFFFFFFFF))
+        emit(@intCast(u32, SET_AT >> 32))
+    }
+    emit(0xC0027600)
+    emit(0x244)
+    emit(@intCast(u32, PUSH_AT & 0xFFFFFFFF))
+    emit(@intCast(u32, PUSH_AT >> 32))
+    emit(0xC0031502)
+    emit(groups)
+    emit(1)
+    emit(1)
+    emit(0x45)
+}
+
+// Binding 0's descriptor: `at`, `bytes` long (the study's 4.5).
+fn descriptor(at: u64, bytes: u32) -> void {
+    setWords[0] = @intCast(u32, at & 0xFFFFFFFF)
+    setWords[1] = @intCast(u32, at >> 32)
+    setWords[2] = bytes
+    setWords[3] = 0x27FAC
+}
+
+// The stream built so far (padded) submitted after the preamble, with a
+// fence: the fence's state afterwards.
+fn submitBuilt(withPreamble: bool) -> u32 {
+    pad()
+    var k: usize = 0
+    while k < length {
+        streamWords[k] = built[k]
+        k += 1
+    }
+    var streams: [2]gpucard.Stream = undefined
+    var n: usize = 0
+    if withPreamble {
+        streams[0] = gpucard.Stream.{ .engine = gpucard.Engine.COMPUTE, .flags = 0, .address = PREAMBLE_AT, .words = @intCast(u64, preambleLength) }
+        n = 1
+    }
+    streams[n] = gpucard.Stream.{ .engine = gpucard.Engine.COMPUTE, .flags = 0, .address = STREAM_AT, .words = @intCast(u64, length) }
+    n += 1
+    const fence = calls.fence
+    const handle = made(fence(context))
+    const submit = calls.submit
+    if submit(context, @intFromPtr(&streams), n, handle) < 0 { return 0xFFFFFFFF }
+    var item = std.os.brix.WaitItem.{ .handle = handle, .want = State.READABLE | State.PEER_GONE, .seen = 0, .reserved = 0 }
+    const wait = calls.wait
+    _ = wait(@intFromPtr(&item), 1, 0)
+    const release = calls.release
+    _ = release(handle)
+    return item.seen
+}
+
+fn fillData(count: usize) -> void {
+    var k: usize = 0
+    while k < count {
+        dataWords[k] = @intCast(u32, k) * 3 + 1
+        k += 1
+    }
+}
+
+fn doubled(count: usize) -> bool {
+    var k: usize = 0
+    while k < count {
+        if dataWords[k] != (@intCast(u32, k) * 3 + 1) * 2 + @intCast(u32, k) { return false }
+        k += 1
+    }
+    return true
+}
+
+// The last failure's kind, stream and word.
+fn failedAt(failure: run.Failure, stream: usize, word: usize) -> bool {
+    const r = host.report()
+    return r.*.failure == failure && r.*.stream == stream && r.*.word == word
+}
+
+// ---------------------------------------------------------------------------
+// The calls
+
+fn testCalls() -> void {
+    // A card without a compute ring refuses them all, as brixOS's kernel.
+    host.reset()
+    const none = host.rx580(0)
+    _ = host.add(&none)
+    calls = host.interface()
+    const open = calls.open
+    context = made(open(0))
+    check(1, memoryOf(PAGE, gpucard.Memory.SYSTEM) == 0)
+    const fence = calls.fence
+    check(2, fence(context) == -Status.unsupported)
+    setUp()
+    check(3, context != 0 && codeMemory != 0 && dataMemory != 0 && host.memoryObjects() == 7 && host.mappings() == 7)
+    // Zeroed when asked, else the poison word.
+    const poisoned = memoryOf(PAGE, gpucard.Memory.CARD | gpucard.Memory.PROCESSOR)
+    const p = words(poisoned, PAGE)
+    check(4, poisoned != 0 && p[0] == host.POISON && p[1023] == host.POISON && dataWords[5] == 0)
+    // The processor maps only memory with its flag.
+    const hidden = memoryOf(PAGE, gpucard.Memory.CARD)
+    const mapMemory = calls.mapMemory
+    check(5, hidden != 0 && mapMemory(hidden, PAGE) == -Status.no_right && mapMemory(poisoned, 2 * PAGE) == -Status.invalid)
+    // Mappings: whole pages, from 2 MiB, below 2^40, not over another.
+    check(6, mapIn(hidden, PAGE, 0x100000, gpucard.Access.READ) == -Status.bad_address)
+    check(7, mapIn(hidden, PAGE, 0x10000000000, gpucard.Access.READ) == -Status.bad_address)
+    check(8, mapIn(hidden, PAGE, 0x300001000 + 8, gpucard.Access.READ) == -Status.invalid && mapIn(hidden, 100, 0x300001000, gpucard.Access.READ) == -Status.invalid)
+    check(9, mapIn(hidden, PAGE, DATA_AT + PAGE, gpucard.Access.READ) == -Status.exists && mapIn(hidden, PAGE, 0x300001000, 0) == -Status.invalid && mapIn(hidden, 2 * PAGE, 0x300001000, gpucard.Access.READ) == -Status.invalid)
+    check(10, mapIn(hidden, PAGE, 0x300001000, gpucard.Access.READ) == 0 && host.mappings() == 8)
+    const unmap = calls.unmap
+    check(11, unmap(context, 0x300001000, 2 * PAGE) == -Status.not_found && unmap(context, 0x300001000, PAGE) == 0 && host.mappings() == 7)
+    // A memory handle closed while mapped keeps its bytes until unmapped.
+    check(12, mapIn(poisoned, PAGE, 0x300002000, gpucard.Access.READ) == 0)
+    const release = calls.release
+    check(13, release(poisoned) == 0 && mapMemory(poisoned, PAGE) == -Status.invalid_handle && host.memoryObjects() == 9)
+    check(14, unmap(context, 0x300002000, PAGE) == 0 && host.memoryObjects() == 8 && release(hidden) == 0 && host.memoryObjects() == 7)
+    // The process's own pages, in place.
+    const own = std.heap.allocator().alloc(2 * PAGE, PAGE)
+    const memoryOfCall = calls.memoryOf
+    const wrapped = made(memoryOfCall(context, @intFromPtr(own.?), 2 * PAGE))
+    check(15, wrapped != 0 && @bitCast(usize, mapMemory(wrapped, 2 * PAGE)) == @intFromPtr(own.?) && memoryOfCall(context, @intFromPtr(own.?) + 8, PAGE) == -Status.invalid)
+    _ = release(wrapped)
+    // A fence not given to a submit is never readable: the wait times out.
+    const f = made(fence(context))
+    var item = std.os.brix.WaitItem.{ .handle = f, .want = State.READABLE, .seen = 0, .reserved = 0 }
+    const wait = calls.wait
+    check(16, f != 0 && wait(@intFromPtr(&item), 1, 1000) == -Status.timed_out && item.seen == 0)
+    check(17, wait(@intFromPtr(&item), 0, 0) == -Status.timed_out && release(f) == 0 && host.fences() == 0)
+    // A fence or memory handle is no context.
+    check(18, made(fence(context)) != 0 && memoryOfCall(codeMemory, 0, PAGE) == -Status.wrong_kind)
+}
+
+// ---------------------------------------------------------------------------
+// The doubler, by hand
+
+fn testDoubler() -> void {
+    setUp()
+    check(20, compileDoubler())
+    check(21, facts.groupSizeX == doubler.LOCAL_SIZE && facts.userSgprs == 6)
+    rsrc1Word = rsrc1()
+    limitsWord = 0x00800000
+    leaveOut = 0
+    preamble(0x28C40000)
+    // The words of 4.2 as the study computed them.
+    check(22, preambleLength == 32 && preambleWords[16] == 0xC0004600 && preambleWords[17] == 0x407 && preambleWords[18] == 0xC0055802 && preambleWords[19] == 0x28C40000 && preambleWords[25] == 0xC0017600 && preambleWords[26] == 0x20A && preambleWords[28] == packets.NOP_PAD)
+    descriptor(DATA_AT, 1024)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    // 15 words of the pipeline, 8 of the user data, 5 of the dispatch.
+    check(23, length == 28 && built[0] == 0xC0017600 && built[1] == 0x20C && built[23] == 0xC0031502 && built[27] == 0x45)
+    check(24, submitBuilt(true) == State.READABLE && doubled(256))
+    check(25, host.report().*.failure == run.Failure.none && host.report().*.dispatches == 1)
+    // The registers the streams set.
+    var value: u32 = 0
+    check(26, run.register(packets.COMPUTE_PGM_LO, &value) && value == @intCast(u32, CODE_AT >> 8) && run.register(packets.COMPUTE_USER_DATA_0 + 12, &value) && value == 1 && !run.register(packets.COMPUTE_USER_DATA_0, &value))
+    // The preamble sets the registers at every submit: without it the
+    // dispatch reads COMPUTE_PGM_HI that nothing of this submit set.
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    check(27, submitBuilt(false) == State.PEER_GONE && failedAt(run.Failure.unset, 0, 23) && host.report().*.detail == packets.COMPUTE_PGM_HI)
+    // The lost context refuses its later submits.
+    const submit = calls.submit
+    var one = gpucard.Stream.{ .engine = gpucard.Engine.COMPUTE, .flags = 0, .address = STREAM_AT, .words = 32 }
+    check(28, host.lost(context) && submit(context, @intFromPtr(&one), 1, 0) == -Status.peer_gone)
+}
+
+// Each register the dispatch reads, left out: unset, at the dispatch's
+// word.
+fn testUnset() -> void {
+    const wanted = [_]usize{ packets.COMPUTE_PGM_LO, packets.COMPUTE_RESOURCE_LIMITS, packets.COMPUTE_USER_DATA_0 + 8 }
+    var k: usize = 0
+    while k < wanted.length {
+        freshContext(true)
+        leaveOut = wanted[k]
+        length = 0
+        dispatchWords(4)
+        const at = length - 5
+        check(30, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.unset, 1, at) && host.report().*.detail == @intCast(u64, wanted[k]))
+        k += 1
+    }
+    leaveOut = 0
+    // A preamble without the engines' compute units: SE0 is not set.
+    freshContext(true)
+    preamble(0x28C40000)
+    preambleWords[8] = packets.NOP_PAD
+    preambleWords[9] = packets.NOP_PAD
+    preambleWords[10] = packets.NOP_PAD
+    preambleWords[11] = packets.NOP_PAD
+    length = 0
+    dispatchWords(4)
+    check(31, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.unset, 1, 23) && host.report().*.detail == packets.COMPUTE_STATIC_THREAD_MGMT_SE0)
+    // An engine with no compute unit enabled.
+    preamble(0x28C40000)
+    preambleWords[14] = 0
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    check(32, submitBuilt(true) == State.PEER_GONE && host.report().*.failure == run.Failure.value && host.report().*.detail == packets.COMPUTE_STATIC_THREAD_MGMT_SE2)
+    preamble(0x28C40000)
+}
+
+// Values the card's record or the interpreter refuse.
+fn testValues() -> void {
+    // COMPUTE_RESOURCE_LIMITS: the user's card has 36 compute units in 4
+    // engines, 9 an engine, not a multiple of 4, and a group of 64 is one
+    // wave: FORCE_SIMD_DIST, 0x00800000, nothing else.
+    check(40, packets.resourceLimits(1, 36, 4) == 0x00800000 && packets.resourceLimits(1, 32, 4) == 0 && packets.resourceLimits(4, 36, 4) == 0x00400000 && packets.resourceLimits(2, 36, 4) == 0)
+    freshContext(true)
+    limitsWord = 0
+    length = 0
+    dispatchWords(4)
+    check(41, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.value, 1, 23) && host.report().*.detail == packets.COMPUTE_RESOURCE_LIMITS)
+    limitsWord = 0x00800000
+    // Another card: 32 compute units, 8 an engine: 0 is right there.
+    host.factsOf(0).*.computeUnitsPerArray = 8
+    freshContext(true)
+    limitsWord = 0
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    check(42, submitBuilt(true) == State.READABLE && doubled(256))
+    host.factsOf(0).*.computeUnitsPerArray = 9
+    limitsWord = 0x00800000
+    // 32-bit denormals kept: the interpreter flushes them.
+    freshContext(true)
+    rsrc1Word = (rsrc1() & ~packets.COMPUTE_PGM_RSRC1__FLOAT_MODE) | packets.put(packets.COMPUTE_PGM_RSRC1__FLOAT_MODE, 48 | 192)
+    length = 0
+    dispatchWords(4)
+    check(43, submitBuilt(true) == State.PEER_GONE && host.report().*.failure == run.Failure.value && host.report().*.detail == packets.COMPUTE_PGM_RSRC1)
+    rsrc1Word = rsrc1()
+    // Scratch: not modelled (nothing spills).
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    built[6] |= packets.COMPUTE_PGM_RSRC2__SCRATCH_EN
+    check(44, submitBuilt(true) == State.PEER_GONE && host.report().*.failure == run.Failure.value && host.report().*.detail == packets.COMPUTE_PGM_RSRC2)
+    // An initiator with offsets.
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    built[27] = 0x41
+    check(45, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.value, 1, 23))
+    // The code not mapped executable.
+    freshContext(false)
+    length = 0
+    dispatchWords(4)
+    check(46, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.shader, 1, 23) && host.report().*.detail == CODE_AT)
+    // The shader stops in the interpreter: a range of 4 words for 256.
+    freshContext(true)
+    descriptor(DATA_AT, 16)
+    length = 0
+    dispatchWords(4)
+    check(47, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.wave, 1, 23) && host.report().*.stop == wave.Stop.range)
+    descriptor(DATA_AT, 1024)
+}
+
+// The forms of the stream.
+fn testForms() -> void {
+    // A packet the host card does not know: WRITE_DATA (0x37).
+    freshContext(true)
+    length = 0
+    emit(0xC0003700)
+    emit(0)
+    dispatchWords(4)
+    check(50, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.packet, 1, 0) && host.report().*.detail == 0x37)
+    // A word that is no header (a type-0 packet).
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    emit(0x00001234)
+    check(51, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.header, 1, 28))
+    // A packet past its stream.
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    emit(0xC0057600)
+    emit(0x20C)
+    pad()
+    check(52, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.overrun, 1, 28))
+    // The compute bit on SET_SH_REG; DISPATCH_DIRECT without it.
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    built[0] = 0xC0017602
+    check(53, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.form, 1, 0))
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    built[23] = 0xC0031500
+    check(54, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.form, 1, 23))
+    // A register outside the four ranges: SET_SH_REG past 0xC000.
+    freshContext(true)
+    length = 0
+    emit(0xC0027600)
+    emit(0x3FF)
+    emit(1)
+    emit(2)
+    dispatchWords(4)
+    check(55, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.range, 1, 0) && host.report().*.detail == 0xC000)
+    // A stream of 30 words.
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    var k: usize = 0
+    while k < length {
+        streamWords[k] = built[k]
+        k += 1
+    }
+    var streams: [2]gpucard.Stream = undefined
+    streams[0] = gpucard.Stream.{ .engine = gpucard.Engine.COMPUTE, .flags = 0, .address = PREAMBLE_AT, .words = @intCast(u64, preambleLength) }
+    streams[1] = gpucard.Stream.{ .engine = gpucard.Engine.COMPUTE, .flags = 0, .address = STREAM_AT, .words = 30 }
+    const submit = calls.submit
+    check(56, submit(context, @intFromPtr(&streams), 2, 0) > 0 && failedAt(run.Failure.padding, 1, 0) && host.report().*.detail == 30)
+    // A stream not in an executable mapping, another engine, flags: refused,
+    // nothing run, the context not lost.
+    freshContext(true)
+    streams[1].address = DATA_AT
+    check(57, submit(context, @intFromPtr(&streams), 2, 0) == -Status.bad_address && !host.lost(context))
+    streams[1].address = STREAM_AT
+    streams[1].engine = gpucard.Engine.COPY
+    check(58, submit(context, @intFromPtr(&streams), 2, 0) == -Status.invalid)
+    streams[1].engine = gpucard.Engine.COMPUTE
+    streams[1].flags = 1
+    check(59, submit(context, @intFromPtr(&streams), 2, 0) == -Status.invalid && !host.lost(context))
+}
+
+// ---------------------------------------------------------------------------
+// The caches
+
+fn testCaches() -> void {
+    // Frame 1: binding 0 at DATA_AT.
+    freshContext(true)
+    preamble(0x28C40000)
+    descriptor(DATA_AT, 1024)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    check(60, submitBuilt(true) == State.READABLE && doubled(256))
+    // Frame 2: the set at the same address names OTHER_AT now; with the
+    // preamble's invalidation the shader sees it.
+    descriptor(OTHER_AT, 1024)
+    var k: usize = 0
+    while k < 256 {
+        otherWords[k] = 7
+        k += 1
+    }
+    length = 0
+    dispatchWords(4)
+    check(61, submitBuilt(true) == State.READABLE && otherWords[0] == 14 && otherWords[255] == 14 + 255)
+    // Frame 3: back to DATA_AT, the preamble without SH_KCACHE: the scalar
+    // cache still holds frame 2's descriptor: a stale read, at its address.
+    descriptor(DATA_AT, 1024)
+    preamble(0x28C40000 & ~packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA)
+    length = 0
+    dispatchWords(4)
+    check(62, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.memory, 1, 23) && host.report().*.cacheFailure == cache.Failure.stale && host.report().*.where == cache.Where.scalar && host.report().*.detail == SET_AT)
+    // The code rewritten at the same address (an s_endpgm at its start)
+    // without SH_ICACHE: the instruction cache's old word is stale.
+    freshContext(true)
+    preamble(0x28C40000)
+    descriptor(DATA_AT, 1024)
+    length = 0
+    dispatchWords(4)
+    check(63, submitBuilt(true) == State.READABLE)
+    const first = codeWords[0]
+    codeWords[0] = 0xBF810000
+    preamble(0x28C40000 & ~packets.CP_COHER_CNTL__SH_ICACHE_ACTION_ENA)
+    length = 0
+    dispatchWords(4)
+    check(64, submitBuilt(true) == State.PEER_GONE && host.report().*.cacheFailure == cache.Failure.stale && host.report().*.where == cache.Where.instruction && host.report().*.detail == CODE_AT)
+    codeWords[0] = first
+    preamble(0x28C40000)
+}
+
+// A fill by the copy engine, then the dispatch reads it: the flush between
+// them as RADV's barrier gives it (CS_PARTIAL_FLUSH, ACQUIRE_MEM
+// 0x08C40000) and the copy engine waited for (a zero-byte DMA with
+// CP_SYNC); then each part left out.
+fn fillWords(at: u64, bytes: u32, value: u32, sync: bool) -> void {
+    emit(0xC0055000)
+    emit(packets.put(packets.DMA_DATA__SRC_SEL, packets.SRC_SEL_DATA) | (if sync { packets.DMA_DATA__CP_SYNC } else { 0 }))
+    emit(value)
+    emit(0)
+    emit(@intCast(u32, at & 0xFFFFFFFF))
+    emit(@intCast(u32, at >> 32))
+    emit(bytes)
+}
+
+fn copyWords(target: u64, source: u64, bytes: u32, rawWait: bool) -> void {
+    emit(0xC0055000)
+    emit(0)
+    emit(@intCast(u32, source & 0xFFFFFFFF))
+    emit(@intCast(u32, source >> 32))
+    emit(@intCast(u32, target & 0xFFFFFFFF))
+    emit(@intCast(u32, target >> 32))
+    emit(bytes | (if rawWait { packets.DMA_DATA__RAW_WAIT } else { 0 }))
+}
+
+fn syncWords() -> void {
+    emit(0xC0055000)
+    emit(packets.DMA_DATA__CP_SYNC)
+    emit(0)
+    emit(0)
+    emit(0)
+    emit(0)
+    emit(0)
+}
+
+fn barrierWords(actions: u32) -> void {
+    emit(0xC0004600)
+    emit(0x407)
+    emit(0xC0055802)
+    emit(actions)
+    emit(0xFFFFFFFF)
+    emit(0xFF)
+    emit(0)
+    emit(0)
+    emit(0xA)
+}
+
+fn testCopies() -> void {
+    // A dispatch reads and writes DATA_AT (its lines into the vector
+    // caches), its stores written back but the lines kept (TC_WB alone);
+    // the copy engine fills it with 5s; with the barrier's invalidation
+    // the second dispatch sees the 5s.
+    freshContext(true)
+    descriptor(DATA_AT, 1024)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    barrierWords(packets.CP_COHER_CNTL__TC_WB_ACTION_ENA)
+    fillWords(DATA_AT, 1024, 5, true)
+    barrierWords(0x08C40000)
+    dispatchWords(4)
+    check(70, submitBuilt(true) == State.READABLE && dataWords[0] == 10 && dataWords[255] == 10 + 255 && host.report().*.dispatches == 2)
+    // Without the vector invalidation after the fill: the vector cache's
+    // line of the first dispatch's stores is stale.
+    freshContext(true)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    barrierWords(packets.CP_COHER_CNTL__TC_WB_ACTION_ENA)
+    fillWords(DATA_AT, 1024, 5, true)
+    barrierWords(packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA)
+    dispatchWords(4)
+    check(71, submitBuilt(true) == State.PEER_GONE && host.report().*.cacheFailure == cache.Failure.stale && host.report().*.where == cache.Where.vector && host.report().*.detail == DATA_AT)
+    // Without the write-back: the copy reads memory whose newer words are
+    // in L2 (the first dispatch's stores), at the copy's word.
+    freshContext(true)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    emit(0xC0004600)
+    emit(0x407)
+    copyWords(OTHER_AT, DATA_AT, 1024, false)
+    syncWords()
+    check(72, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.memory, 1, 30) && host.report().*.cacheFailure == cache.Failure.unwritten)
+    // Without CS_PARTIAL_FLUSH: the copy races the shaders.
+    freshContext(true)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    copyWords(OTHER_AT, DATA_AT, 1024, false)
+    syncWords()
+    check(73, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.memory, 1, 28) && host.report().*.cacheFailure == cache.Failure.shaderRace)
+    // With both: the copy has the doubled words.
+    freshContext(true)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    barrierWords(0x00C40000)
+    copyWords(OTHER_AT, DATA_AT, 1024, true)
+    syncWords()
+    check(74, submitBuilt(true) == State.READABLE && otherWords[3] == (3 * 3 + 1) * 2 + 3 && otherWords[255] == dataWords[255])
+    // A dispatch after a copy without CP_SYNC races the copy.
+    freshContext(true)
+    length = 0
+    fillWords(DATA_AT, 1024, 9, false)
+    barrierWords(0x08C40000)
+    dispatchWords(4)
+    check(75, submitBuilt(true) == State.PEER_GONE && host.report().*.cacheFailure == cache.Failure.copyRace)
+    // The copy engine running at the kernel's fence.
+    freshContext(true)
+    length = 0
+    fillWords(DATA_AT, 1024, 9, false)
+    check(76, submitBuilt(true) == State.PEER_GONE && host.report().*.cacheFailure == cache.Failure.copyRace)
+    // L2 let go without its write-back while it holds stores.
+    freshContext(true)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    barrierWords(packets.CP_COHER_CNTL__TC_ACTION_ENA)
+    check(77, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.memory, 1, 30) && host.report().*.cacheFailure == cache.Failure.dropped)
+    // A copy reading what an earlier copy writes, without RAW_WAIT: a race;
+    // with it: in order.
+    freshContext(true)
+    length = 0
+    fillWords(DATA_AT, 64, 3, false)
+    copyWords(OTHER_AT, DATA_AT, 64, false)
+    syncWords()
+    check(78, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.memory, 1, 7) && host.report().*.cacheFailure == cache.Failure.copyRace)
+    freshContext(true)
+    length = 0
+    fillWords(DATA_AT, 64, 3, false)
+    copyWords(OTHER_AT, DATA_AT, 64, true)
+    syncWords()
+    check(79, submitBuilt(true) == State.READABLE && otherWords[15] == 3 && otherWords[16] != 3)
+    // More than one packet's bytes: 4 MiB in two packets of 2 097 120 and
+    // one of the rest; a count past the field's 21 bits moves what the field says.
+    freshContext(true)
+    var k: usize = 0
+    while k < 1024 * 1024 {
+        dataWords[k] = @intCast(u32, k)
+        otherWords[k] = 0
+        k += 1
+    }
+    length = 0
+    copyWords(OTHER_AT, DATA_AT, 2097120, false)
+    copyWords(OTHER_AT + 2097120, DATA_AT + 2097120, 2097120, false)
+    copyWords(OTHER_AT + 2 * 2097120, DATA_AT + 2 * 2097120, 4 * 1024 * 1024 - 2 * 2097120, false)
+    syncWords()
+    check(80, submitBuilt(true) == State.READABLE && otherWords[0] == 0 && otherWords[524279] == 524279 && otherWords[524280] == 524280 && otherWords[1048575] == 1048575)
+    freshContext(true)
+    k = 0
+    while k < 1024 * 1024 {
+        otherWords[k] = 0
+        k += 1
+    }
+    length = 0
+    copyWords(OTHER_AT, DATA_AT, 0, false)
+    built[length - 1] = (4 * 1024 * 1024) & packets.DMA_DATA__BYTE_COUNT
+    syncWords()
+    check(81, submitBuilt(true) == State.READABLE && otherWords[1048575] == 0 && packets.DMA_MOST_BYTES == 2097120)
+    // An unaligned fill, a fill's high data word: refused.
+    freshContext(true)
+    length = 0
+    fillWords(DATA_AT + 2, 64, 3, true)
+    check(82, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.action, 1, 0))
+    // A copy into memory mapped to read alone.
+    freshContext(true)
+    length = 0
+    copyWords(SET_AT, DATA_AT, 16, false)
+    syncWords()
+    check(83, submitBuilt(true) == State.PEER_GONE && host.report().*.cacheFailure == cache.Failure.unmapped && host.report().*.detail == SET_AT)
+}
+
+// ---------------------------------------------------------------------------
+// The review's: what the card's compute units, VCC and ACQUIRE_MEM's
+// range demand
+
+fn twice(count: usize) -> bool {
+    var k: usize = 0
+    while k < count {
+        const i = @intCast(u32, k)
+        if dataWords[k] != ((i * 3 + 1) * 2 + i) * 2 + i { return false }
+        k += 1
+    }
+    return true
+}
+
+fn acquireWords(actions: u32, size: u32) -> void {
+    emit(0xC0055802)
+    emit(actions)
+    emit(size)
+    emit(0xFF)
+    emit(0)
+    emit(0)
+    emit(0xA)
+}
+
+// `s_mov_b32 sN, 0` and s_endpgm as the code.
+fn moveProgram(register: u16) -> void {
+    var i = encode.blank(isa.S_MOV_B32)
+    i.dst = register
+    i.src0 = encode.constant(0)
+    const first = encode.encode(&i, codeWords[0..16])
+    const end = encode.blank(isa.S_ENDPGM)
+    _ = encode.encode(&end, codeWords[first..16])
+}
+
+fn testReview() -> void {
+    setUp()
+    _ = compileDoubler()
+    rsrc1Word = rsrc1()
+    limitsWord = 0x00800000
+    leaveOut = 0
+    preamble(0x28C40000)
+    descriptor(DATA_AT, 1024)
+    // A second dispatch reads the first's stores after CS_PARTIAL_FLUSH
+    // alone: its waves may run on compute units whose L1 holds the old
+    // lines (the first dispatch's loads filled them): stale, at the word.
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    emit(0xC0004600)
+    emit(0x407)
+    dispatchWords(4)
+    check(84, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.memory, 1, 53) && host.report().*.cacheFailure == cache.Failure.stale && host.report().*.where == cache.Where.vector && host.report().*.detail == DATA_AT)
+    // With TCL1 (and L2's write-back and invalidation): doubled twice.
+    freshContext(true)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    barrierWords(0x00C40000)
+    dispatchWords(4)
+    check(85, submitBuilt(true) == State.READABLE && twice(256))
+    // ACQUIRE_MEM without the CS_PARTIAL_FLUSH before it: L2 let go while
+    // the first dispatch's shaders may still write: the second races them.
+    freshContext(true)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    acquireWords(0x00C40000, 0xFFFFFFFF)
+    dispatchWords(4)
+    check(86, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.memory, 1, 58) && host.report().*.cacheFailure == cache.Failure.shaderRace && host.report().*.detail == DATA_AT)
+    // No barrier at all: the same race.
+    freshContext(true)
+    fillData(256)
+    length = 0
+    dispatchWords(4)
+    dispatchWords(4)
+    check(87, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.memory, 1, 51) && host.report().*.cacheFailure == cache.Failure.shaderRace)
+    // ACQUIRE_MEM over a part of memory: not a form RADV writes.
+    freshContext(true)
+    length = 0
+    acquireWords(0x00C40000, 0x1000)
+    dispatchWords(4)
+    check(88, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.action, 1, 0))
+    // RSRC1's 16 scalar registers: the last two are VCC's, s15 is not the
+    // shader's to write; s13 is.
+    freshContext(true)
+    moveProgram(15)
+    rsrc1Word = (rsrc1() & ~packets.COMPUTE_PGM_RSRC1__SGPRS) | packets.put(packets.COMPUTE_PGM_RSRC1__SGPRS, 1)
+    length = 0
+    dispatchWords(4)
+    check(89, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.wave, 1, 23))
+    freshContext(true)
+    moveProgram(13)
+    length = 0
+    dispatchWords(4)
+    check(90, submitBuilt(true) == State.READABLE)
+    rsrc1Word = rsrc1()
+    // A group of 65535 x 65535 x 2 (each NUM_THREAD_FULL in its 16 bits,
+    // their product past 32): refused with the register, as any group of
+    // more than 1024 (a stream of garbage must not stop the host card).
+    freshContext(true)
+    length = 0
+    dispatchWords(4)
+    built[12] = 0xFFFF
+    built[13] = 0xFFFF
+    built[14] = 2
+    check(91, submitBuilt(true) == State.PEER_GONE && failedAt(run.Failure.value, 1, 23) && host.report().*.detail == packets.COMPUTE_NUM_THREAD_X)
+    var k: usize = 0
+    while k < facts.words {
+        codeWords[k] = program[k]
+        k += 1
+    }
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    show = arguments.length > 1
+    testCalls()
+    testDoubler()
+    testUnset()
+    testValues()
+    testForms()
+    testCaches()
+    testCopies()
+    testReview()
+    if failed != 0 { return failed }
+    return 13
+}

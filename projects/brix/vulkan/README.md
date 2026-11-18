@@ -9,8 +9,8 @@ kept in the repository, its section numbers are given here where it is
 followed). This directory holds the first part, the one that needs no
 card: the card's instruction set, a compiler from SPIR-V to it, and an
 interpreter that runs the compiler's output on the host; and the driver's
-stage (a), the device found and listed (below), which programs on brixOS
-link in.
+stages (a), the device found and listed, and (b), compute (below), which
+programs on brixOS link in.
 
 ## What stands
 
@@ -79,9 +79,10 @@ negotiated as for any driver. `vkinfo` (projects/brix/tools/vkinfo, in the
 image) and the compositor (its `card.brixos.mlx`) do so.
 
 What it answers: the instance is Vulkan 1.1 and answers every
-instance-level command of 1.0 and 1.1 (all of them queries); the device
-is 1.0 and has `vkDestroyDevice` and `vkGetDeviceQueue`; every other
-command is not exported (the loader gets 0, never a wrong function).
+instance-level command of 1.0 and 1.1 (all of them queries); at stage
+(a) the device had `vkDestroyDevice` and `vkGetDeviceQueue` alone (stage
+(b), below, adds its commands); every other command is not exported
+(the loader gets 0, never a wrong function).
 What the device says is only what works: every feature false (also
 robustBufferAccess, 1.0's one required feature, until the card shows it
 checks a buffer's range: the study's 11.5), no format feature and no
@@ -108,6 +109,98 @@ driver's numbers (the limits, the Polaris 10 device numbers) are held
 against Mesa's radv_physical_device.c and radv_constants.h and Linux's
 amdgpu_drv.c by `tools/check_vulkan_driver.py MESA LINUX`, a development
 check that needs those files fetched.
+
+## The driver, stage (b): compute
+
+std.gpu's commands (the study's 8.2 (b)): its kernels run through our
+driver, proven on the host card, whose submits are executed.
+
+| File | What it is |
+| --- | --- |
+| `device.mlx` | What the parts share: the card interface, the device and queue objects, host memory, the card's memory the driver makes for itself and the card addresses it chooses (code below 4 GiB, everything else above) |
+| `memory.mlx` | vkAllocateMemory (a memory handle of the card, mapped at the device's address, zeroed), vkMapMemory (the processor's mapping, kept), vkFreeMemory; buffers and their binding |
+| `pipeline.mlx` | Shader modules, descriptor set layouts, pools and sets (16-byte buffer descriptors in the card's memory, binding b at 16 * b), pipeline layouts, compute pipelines (our compiler; the code below 4 GiB at 256 bytes; the 15 register words of the study's 4.3 A) |
+| `commands.mlx` | Command pools and buffers as growing streams of packets; bind, push, dispatch, barrier, copy and fill as RADV writes them on a compute ring of GFX8 |
+| `queue.mlx` | The preamble (the study's 4.2, its cache invalidation at every submit), submits, fences, the queue and device idle |
+| `selftest.mlx`, `doubler.mlx`, `divider.mlx` | The doubler and then the division by a variable (64 quotients and remainders) at every vkCreateDevice, held against the processor's; a mismatch refuses the device and says the first wrong word |
+| `packets.mlx` | The packets and registers of a compute stream |
+| `card_run.mlx`, `card_cache.mlx` | The host card's engine: a submit's streams executed and their shaders run in `wave.mlx`; the card's caches modelled |
+
+The device is Vulkan 1.1 (as the study has it from stage (b)) and exports
+the stage's 46 device commands; every other command answers 0. Its own
+1.1 commands (vkGetDeviceQueue2 and the others) are not among them yet.
+
+WHAT A DISPATCH WRITES (the study's 4.3): the pipeline's 15 words when it
+changed, the flush a barrier left owing, set 0's address into user data 2
+and 3 and the push constants' block into 4 and 5 (64-bit pointers in even
+pairs: 5.2's second way out, which the compiler expects), and
+DISPATCH_DIRECT with the initiator 0x45. COMPUTE_RESOURCE_LIMITS is the
+card's record's: the user's card has 36 compute units in 4 engines, 9 an
+engine, so FORCE_SIMD_DIST for a group of one wave (0x00800000); a record
+that does not count them refuses the device. A barrier writes nothing
+where it stands but the copy engine's wait; its flush (RADV's stage and
+access rules, the graphics ones dropped on a compute queue) is owed to the
+next dispatch, copy or the end: std.gpu's barrier becomes CS_PARTIAL_FLUSH
+and ACQUIRE_MEM 0x08C40000. Copies and fills are the processor's copy
+engine of the compute queue (DMA_DATA, 7.6) in packets of at most
+2 097 120 bytes, RAW_WAIT on the first after a flush, CP_SYNC on a fill's
+last packet and at the end of a command buffer that copied.
+
+THE HOST CARD (card_host.mlx) answers calls 80 to 85 when its record lists
+a compute ring, and executes a submit: card_run.mlx walks the packets,
+keeps the registers (for one submit: the preamble sets them every time),
+does the preamble's and the barriers' cache actions, runs each dispatch's
+shader in the interpreter wave by wave with the entry state of 4.3 and
+5.2, and the copy packets; anything it does not know (a packet, a register
+outside the four ranges, a register the dispatch reads that no stream set,
+a value it does not model, code not mapped executable, a stream not padded
+to 8 words) loses the context with the stream and word where it stands.
+card_cache.mlx models the instruction, scalar and vector caches and L2: a
+read whose cached word is older than memory's is refused as stale, a word
+a dispatch wrote is in flight until a CS_PARTIAL_FLUSH, a word the copy
+engine wrote until a CP_SYNC or RAW_WAIT, and the kernel's fence writes L2
+back. So a missing invalidation or wait shows on the host. V stands for
+every compute unit's L1 at once: a word one dispatch stored and a later
+one reads before TCL1 lets the L1s go is stale (its waves may run on
+another unit); a word a dispatch may still be writing stays in flight
+when L2 is let go (ACQUIRE_MEM without CS_PARTIAL_FLUSH before it is a
+race); and of the scalar registers RSRC1 gives, the last two are VCC's
+(ACO's get_addr_sgpr_from_waves).
+
+The self-test divides too (divider.mlx): the desktop's kernels divide by
+variables on their first frame, our compiler does it with Mesa's
+reciprocal sequence, and the card's v_rcp_f32 is not the host's (the
+study's 11.14): a reciprocal one unit high gives wrong quotients, and the
+device is refused with the first one.
+
+What the tests found against the study: std.gpu's own frames do not need
+the preamble's scalar cache invalidation, because each of its dispatches
+is followed by a barrier with a shader read, whose flush (RADV's
+radv_dst_access_flush: ACO loads storage buffers by SMEM) invalidates the
+scalar cache at the frame's end, before the processor writes the next
+frame's sets; a frame without such a barrier at its end does need it
+(tests/509). The preamble keeps it at every submit, as RADV does.
+
+On brixOS the kernel's record lists no compute ring until its calls 80 to
+85 are served, so vkCreateDevice is refused there as before: vkinfo says
+"not yet: no engine of the card takes commands" and the compositor
+composes on the processor. Where a device opens (its self-test passed),
+the compositor says so and still composes on the processor: the brixOS
+backend offers the Vulkan renderer no output yet.
+
+The proof: `tests/508_vulkan_host_card_runtime.mlx` (the host card: the
+calls, streams built by hand word for word as the study's 4.2 and 4.3
+give them, every refusal with its stream and word, the caches, the copy
+packets) and `tests/509_vulkan_compute_driver_runtime.mlx` (the driver
+through the loader: each command against the registry's codes, the words
+a dispatch and a barrier write, the six silent needs of the second
+reading, std.gpu's nine kernels through std.gpu word for word against the
+processor with tests/497's cases, tests 253, 254 and 263 over our driver,
+the self-test passing and failing on a wrong compiler output and on a
+reciprocal a unit high). The
+numbers of `packets.mlx` and the address spaces are held against Mesa's
+and Linux's files by `tools/check_vulkan_driver.py MESA LINUX` (its
+head names the files).
 
 ## Where the numbers come from
 
@@ -236,17 +329,15 @@ The study's section 8 has the stages; this directory is the compiler and
 the interpreter of stage (b), built ahead of it.
 
 - (a) The driver is found and its device listed: built (above).
-- (b) Compute: std.gpu's kernels on the card, the desktop composing with
-  it. From the kernel: memory, mapping, submit and fences on a compute
-  ring. From the driver: devices, queues, memory, buffers, descriptor
-  sets, compute pipelines (`shader.compile`), command buffers as streams
-  with the preamble (its cache invalidation at every submit), dispatches.
-  And the study's host card (its 8.1): a decoder of the command stream
-  that keeps the registers the packets set and, at a dispatch, runs the
-  shader in `wave.dispatch` with the entry state built from them. Then
-  tests 254, 257, 263, 276 and the compositor's frame comparison run
-  against our driver on the host. The self-tests at device creation (the
-  doubler, the division) go to the card with it.
+- (b) Compute: the driver's side built (above), proven on the host card.
+  What remains: the kernel's calls 80 to 85 on a compute ring (after its
+  stages 5 to 7), then the card's own answers to the study's section 11
+  (the entry state, the division's reciprocal, the buffer range check)
+  with a log line each, and the brixOS backend offering the Vulkan
+  renderer its output. Test 257 needs memory shared as dma-bufs and host
+  memory imported, stage (d)'s; 256 is the manifest's path, which a
+  driver linked in does not take; 276 builds a module and runs no
+  driver.
 - (c) The first triangle into a buffer: vertex and fragment shaders
   (floats, vectors, exports, interpolation), a model of the fixed stages
   for the host card.

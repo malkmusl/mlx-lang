@@ -1,0 +1,556 @@
+// The driver's command pools and command buffers (the study's 3.2, 4.3,
+// 4.5, 7.5, 7.6): a command buffer is a growing stream of the card's
+// packets in the card's memory. When a piece of it (a chunk) is full it is
+// padded to 8 words (the compute engine's padding: packets.PAD_WORDS) and
+// the next one begins; at a submit each chunk is one stream of the
+// gpu_submit (RADV chains its pieces by INDIRECT_BUFFER packets instead;
+// a submit of several streams is the same to the card, and needs no
+// packet a process's stream would otherwise not have). Small data the
+// stream points at (the push constants' block) goes into upload pieces
+// beside it.
+//
+// WHAT EACH COMMAND WRITES, on a compute ring of GFX8 as RADV writes it:
+// - vkCmdBindPipeline, vkCmdBindDescriptorSets, vkCmdPushConstants:
+//   nothing; they are kept until a dispatch.
+// - vkCmdDispatch (4.3): the pipeline's 15 words when it changed, the
+//   flush a barrier left owing (4.3 B: after the pipeline's words), set
+//   0's address into COMPUTE_USER_DATA_2 and _3, the push constants'
+//   block (copied into an upload piece) into _4 and _5 (5.2: 64-bit
+//   pointers in even pairs), DISPATCH_DIRECT with the initiator 0x45.
+// - vkCmdPipelineBarrier (4.3 B, 7.5): nothing where it stands but the
+//   copy engine's wait when the source stages include the transfers
+//   (radv_cp_dma_wait_for_stages); its flush is owed to the next dispatch,
+//   copy or the end: radv_stage_flush (CS_PARTIAL_FLUSH for a compute,
+//   transfer, bottom-of-pipe or all-commands source unless the
+//   destination is bottom-of-pipe alone), radv_src_access_flush (a shader,
+//   transfer or memory write: INV_L2) and radv_dst_access_flush (a shader
+//   read: INV_SCACHE, INV_VCACHE, INV_L2; a uniform read: INV_VCACHE and
+//   INV_SCACHE; a transfer read or write: INV_VCACHE, INV_L2; a memory
+//   read or write: all three; an indirect command read: INV_SCACHE), the
+//   graphics ones dropped as radv_emit_cache_flush drops them on a compute
+//   queue. The flush's words (radv_cs_emit_cache_flush, is_mec):
+//   EVENT_WRITE CS_PARTIAL_FLUSH, then ACQUIRE_MEM with SH_ICACHE and
+//   SH_KCACHE as asked and, for INV_L2, TC, TCL1 and TC_WB, else for
+//   INV_VCACHE TCL1.
+// - vkCmdCopyBuffer, vkCmdFillBuffer (7.6, the copy engine of the compute
+//   queue, at any size): packets of at most 2 097 120 bytes; the first
+//   after an owed flush gets the flush before it and RAW_WAIT; a fill's
+//   last packet has CP_SYNC, a copy's none (radv_cp_dma_buffer_copy,
+//   radv_cp_dma_clear_buffer).
+// - vkEndCommandBuffer: the owed flush, and when a copy has not been
+//   waited for the zero-byte DMA_DATA with CP_SYNC ("the kernel doesn't
+//   wait for it": radv_cp_dma_wait_for_idle), then the padding.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const icd = @import("std.vulkan.icd")
+const gpucard = @import("std.gpucard")
+const device = @import("./device.mlx")
+const memory = @import("./memory.mlx")
+const pipeline = @import("./pipeline.mlx")
+const packets = @import("./packets.mlx")
+
+const DeviceObject = device.DeviceObject
+
+pub const MOST_CHUNKS: usize = 32
+pub const CHUNK_BYTES: usize = 65536
+const CHUNK_WORDS: usize = CHUNK_BYTES / 4
+pub const MOST_UPLOADS: usize = 32
+pub const UPLOAD_BYTES: usize = 65536
+const UPLOAD_ALIGNMENT: usize = 16
+const MOST_PUSH_BYTES: usize = 256
+
+pub const Recording = struct {
+    pub const INITIAL: u32 = 0
+    pub const RECORDING: u32 = 1
+    pub const EXECUTABLE: u32 = 2
+}
+
+// The flush a barrier leaves owing (RADV's RADV_CMD_FLAG_ names).
+pub const Flush = struct {
+    pub const CS_PARTIAL_FLUSH: u32 = 0x1
+    pub const INV_ICACHE: u32 = 0x2
+    pub const INV_SCACHE: u32 = 0x4
+    pub const INV_VCACHE: u32 = 0x8
+    pub const INV_L2: u32 = 0x10
+}
+
+pub const CommandPoolObject = struct {
+    flags: u32
+    family: u32
+    // Its command buffers, linked.
+    first: usize
+}
+
+pub const CommandBufferObject = struct {
+    header: icd.DispatchableHeader
+    device: usize
+    pool: usize
+    next: usize
+    state: u32
+    // The stream's chunks: made, written (its words once finished), the
+    // one written now and its words so far.
+    chunks: [32]device.Block
+    lengths: [32]usize
+    chunkCount: usize
+    current: usize
+    at: usize
+    uploads: [32]device.Block
+    uploadCount: usize
+    uploadCurrent: usize
+    uploadAt: usize
+    // What is bound, and what the stream has.
+    pipeline: usize
+    emitted: usize
+    sets: [4]u64
+    push: [64]u32
+    flush: u32
+    copying: bool
+    // Out of the card's memory while recording: vkEndCommandBuffer says so.
+    failed: bool
+}
+
+pub fn poolOf(handle: vk.CommandPool) -> *CommandPoolObject { return unsafe { @ptrFromInt(*CommandPoolObject, handle) } }
+pub fn bufferOf(handle: vk.CommandBuffer) -> *CommandBufferObject { return unsafe { @ptrFromInt(*CommandBufferObject, handle) } }
+fn ownerOf(cb: *CommandBufferObject) -> *DeviceObject { return device.deviceOf(cb.*.device) }
+
+// ---------------------------------------------------------------------------
+// Pools and buffers
+
+pub fn createCommandPool(handle: vk.Device, info: *const vk.CommandPoolCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.CommandPool) -> vk.Result {
+    into.* = 0
+    const address = device.allocate(callbacks, @sizeOf(CommandPoolObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = poolOf(address)
+    made.*.flags = info.*.flags
+    made.*.family = info.*.queueFamilyIndex
+    made.*.first = 0
+    into.* = address
+    return vk.Result.success
+}
+
+fn dropBuffer(owner: *DeviceObject, cb: *CommandBufferObject) -> void {
+    var k: usize = 0
+    while k < cb.*.chunkCount {
+        device.dropBlock(owner, &cb.*.chunks[k])
+        k += 1
+    }
+    k = 0
+    while k < cb.*.uploadCount {
+        device.dropBlock(owner, &cb.*.uploads[k])
+        k += 1
+    }
+    device.release(null, @intFromPtr(cb), @sizeOf(CommandBufferObject))
+}
+
+pub fn destroyCommandPool(handle: vk.Device, pool: vk.CommandPool, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if pool == 0 { return }
+    const owner = device.deviceOf(handle)
+    const made = poolOf(pool)
+    var at = made.*.first
+    while at != 0 {
+        const cb = bufferOf(at)
+        at = cb.*.next
+        dropBuffer(owner, cb)
+    }
+    device.release(callbacks, pool, @sizeOf(CommandPoolObject))
+}
+
+pub fn allocateCommandBuffers(handle: vk.Device, info: *const vk.CommandBufferAllocateInfo, into: ?[*]vk.CommandBuffer) -> vk.Result {
+    const pool = poolOf(info.*.commandPool)
+    var k: usize = 0
+    while k < @intCast(usize, info.*.commandBufferCount) {
+        // (The driver's own heap: a command buffer's memory is the pool's,
+        // not the application's callbacks' at vkCreateCommandPool.)
+        const address = device.allocate(null, @sizeOf(CommandBufferObject), vk.SystemAllocationScope.object)
+        if address == 0 {
+            var n: usize = 0
+            while n < k {
+                freeOne(handle, info.*.commandPool, into.?[n])
+                into.?[n] = 0
+                n += 1
+            }
+            return vk.Result.errorOutOfHostMemory
+        }
+        const made = bufferOf(address)
+        icd.initDispatchable(&made.*.header)
+        made.*.device = handle
+        made.*.pool = info.*.commandPool
+        made.*.next = pool.*.first
+        pool.*.first = address
+        made.*.state = Recording.INITIAL
+        into.?[k] = address
+        k += 1
+    }
+    return vk.Result.success
+}
+
+fn freeOne(handle: vk.Device, pool: vk.CommandPool, buffer: vk.CommandBuffer) -> void {
+    if buffer == 0 { return }
+    const made = poolOf(pool)
+    if made.*.first == buffer {
+        made.*.first = bufferOf(buffer).*.next
+    } else {
+        var at = made.*.first
+        while at != 0 && bufferOf(at).*.next != buffer { at = bufferOf(at).*.next }
+        if at != 0 { bufferOf(at).*.next = bufferOf(buffer).*.next }
+    }
+    dropBuffer(device.deviceOf(handle), bufferOf(buffer))
+}
+
+pub fn freeCommandBuffers(handle: vk.Device, pool: vk.CommandPool, count: u32, buffers: ?[*]const vk.CommandBuffer) -> void {
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        freeOne(handle, pool, buffers.?[k])
+        k += 1
+    }
+}
+
+fn restart(cb: *CommandBufferObject) -> void {
+    cb.*.current = 0
+    cb.*.at = 0
+    cb.*.uploadCurrent = 0
+    cb.*.uploadAt = 0
+    cb.*.pipeline = 0
+    cb.*.emitted = 0
+    cb.*.sets[0] = 0
+    cb.*.sets[1] = 0
+    cb.*.sets[2] = 0
+    cb.*.sets[3] = 0
+    cb.*.flush = 0
+    cb.*.copying = false
+    cb.*.failed = false
+    var k: usize = 0
+    while k < 64 {
+        cb.*.push[k] = 0
+        k += 1
+    }
+}
+
+pub fn resetCommandBuffer(buffer: vk.CommandBuffer, flags: vk.CommandBufferResetFlags) -> vk.Result {
+    const cb = bufferOf(buffer)
+    restart(cb)
+    cb.*.state = Recording.INITIAL
+    return vk.Result.success
+}
+
+pub fn beginCommandBuffer(buffer: vk.CommandBuffer, info: *const vk.CommandBufferBeginInfo) -> vk.Result {
+    const cb = bufferOf(buffer)
+    restart(cb)
+    cb.*.state = Recording.RECORDING
+    return vk.Result.success
+}
+
+// ---------------------------------------------------------------------------
+// The stream
+
+// The chunk `index`, made when it is not there yet.
+fn chunk(cb: *CommandBufferObject, index: usize) -> bool {
+    if index < cb.*.chunkCount { return true }
+    if index >= MOST_CHUNKS || !device.ownBlock(ownerOf(cb), CHUNK_BYTES, gpucard.Access.READ | gpucard.Access.EXECUTE, false, &cb.*.chunks[index]) { return false }
+    cb.*.chunkCount = index + 1
+    return true
+}
+
+fn put(cb: *CommandBufferObject, word: u32) -> void {
+    const words: [*]u32 = unsafe { @ptrFromInt([*]u32, cb.*.chunks[cb.*.current].bytes) }
+    words[cb.*.at] = word
+    cb.*.at += 1
+}
+
+// The chunk padded to 8 words (at least 8).
+fn pad(cb: *CommandBufferObject) -> void {
+    if cb.*.at == 0 { put(cb, packets.NOP_PAD) }
+    while cb.*.at % packets.PAD_WORDS != 0 { put(cb, packets.NOP_PAD) }
+    cb.*.lengths[cb.*.current] = cb.*.at
+}
+
+// Room for `words` words in the chunk written now, else the next chunk:
+// false when there is none to be had (the command buffer then records
+// nothing more and its end says so).
+fn reserve(cb: *CommandBufferObject, words: usize) -> bool {
+    if cb.*.failed { return false }
+    if cb.*.at == 0 && !chunk(cb, cb.*.current) {
+        cb.*.failed = true
+        return false
+    }
+    if cb.*.at + words + packets.PAD_WORDS <= CHUNK_WORDS { return true }
+    pad(cb)
+    if !chunk(cb, cb.*.current + 1) {
+        cb.*.failed = true
+        return false
+    }
+    cb.*.current += 1
+    cb.*.at = 0
+    return true
+}
+
+// `bytes` bytes of an upload piece: their processor's address, and their
+// card address in `address`; 0 when there is no room.
+fn upload(cb: *CommandBufferObject, bytes: usize, address: *u64) -> usize {
+    var at = (cb.*.uploadAt + UPLOAD_ALIGNMENT - 1) / UPLOAD_ALIGNMENT * UPLOAD_ALIGNMENT
+    if cb.*.uploadCurrent < cb.*.uploadCount && at + bytes > UPLOAD_BYTES {
+        cb.*.uploadCurrent += 1
+        at = 0
+    }
+    if cb.*.uploadCurrent >= cb.*.uploadCount {
+        if cb.*.uploadCurrent >= MOST_UPLOADS || !device.ownBlock(ownerOf(cb), UPLOAD_BYTES, gpucard.Access.READ, false, &cb.*.uploads[cb.*.uploadCurrent]) {
+            cb.*.failed = true
+            return 0
+        }
+        cb.*.uploadCount = cb.*.uploadCurrent + 1
+        at = 0
+    }
+    cb.*.uploadAt = at + bytes
+    address.* = cb.*.uploads[cb.*.uploadCurrent].address + @intCast(u64, at)
+    return cb.*.uploads[cb.*.uploadCurrent].bytes + at
+}
+
+// The SET_SH_REG of `count` registers from `offset`.
+fn setRegisters(cb: *CommandBufferObject, offset: usize, count: u32) -> void {
+    put(cb, packets.header(packets.PKT3_SET_SH_REG, count, false))
+    put(cb, @intCast(u32, (offset - packets.SH_START) / 4))
+}
+
+fn acquire(cb: *CommandBufferObject, actions: u32) -> void {
+    put(cb, packets.header(packets.PKT3_ACQUIRE_MEM, 5, true))
+    put(cb, actions)
+    put(cb, packets.COHER_SIZE_ALL)
+    put(cb, packets.COHER_SIZE_HI_ALL)
+    put(cb, 0)
+    put(cb, 0)
+    put(cb, packets.COHER_POLL)
+}
+
+// The flush owed (radv_cs_emit_cache_flush on a compute ring of GFX8).
+fn emitFlush(cb: *CommandBufferObject) -> void {
+    const flush = cb.*.flush
+    if flush == 0 || !reserve(cb, 2 + 7 + 7) { return }
+    var actions: u32 = 0
+    if (flush & Flush.INV_ICACHE) != 0 { actions |= packets.CP_COHER_CNTL__SH_ICACHE_ACTION_ENA }
+    if (flush & Flush.INV_SCACHE) != 0 { actions |= packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA }
+    if (flush & Flush.CS_PARTIAL_FLUSH) != 0 {
+        put(cb, packets.header(packets.PKT3_EVENT_WRITE, 0, false))
+        put(cb, packets.event(packets.CS_PARTIAL_FLUSH, packets.EVENT_INDEX_PARTIAL))
+    }
+    if (flush & Flush.INV_L2) != 0 {
+        acquire(cb, actions | packets.CP_COHER_CNTL__TC_ACTION_ENA | packets.CP_COHER_CNTL__TCL1_ACTION_ENA | packets.CP_COHER_CNTL__TC_WB_ACTION_ENA)
+        actions = 0
+    } else if (flush & Flush.INV_VCACHE) != 0 {
+        acquire(cb, actions | packets.CP_COHER_CNTL__TCL1_ACTION_ENA)
+        actions = 0
+    }
+    if actions != 0 { acquire(cb, actions) }
+    cb.*.flush = 0
+}
+
+// One DMA_DATA packet.
+fn dmaPacket(cb: *CommandBufferObject, control: u32, source: u64, target: u64, command: u32) -> void {
+    put(cb, packets.header(packets.PKT3_DMA_DATA, 5, false))
+    put(cb, control)
+    put(cb, @intCast(u32, source & 0xFFFFFFFF))
+    put(cb, @intCast(u32, source >> 32))
+    put(cb, @intCast(u32, target & 0xFFFFFFFF))
+    put(cb, @intCast(u32, target >> 32))
+    put(cb, command)
+}
+
+// The copy engine waited for (radv_cp_dma_wait_for_idle).
+fn waitForCopies(cb: *CommandBufferObject) -> void {
+    if !cb.*.copying || !reserve(cb, 7) { return }
+    dmaPacket(cb, packets.DMA_DATA__CP_SYNC, 0, 0, 0)
+    cb.*.copying = false
+}
+
+// Before a copy packet: the owed flush, and RAW_WAIT on the packet when
+// there was one (radv_cp_dma_prepare).
+fn beforeCopy(cb: *CommandBufferObject) -> u32 {
+    if cb.*.flush == 0 { return 0 }
+    emitFlush(cb)
+    return packets.DMA_DATA__RAW_WAIT
+}
+
+pub fn endCommandBuffer(buffer: vk.CommandBuffer) -> vk.Result {
+    const cb = bufferOf(buffer)
+    emitFlush(cb)
+    waitForCopies(cb)
+    if !cb.*.failed && reserve(cb, 0) { pad(cb) }
+    cb.*.state = Recording.EXECUTABLE
+    if cb.*.failed { return vk.Result.errorOutOfDeviceMemory }
+    return vk.Result.success
+}
+
+// The streams a submit gives the card for `buffer`: into `streams` from
+// `at`; how many.
+pub fn streamsOf(buffer: vk.CommandBuffer, streams: [*]gpucard.Stream, at: usize) -> usize {
+    const cb = bufferOf(buffer)
+    var k: usize = 0
+    while k <= cb.*.current && k < cb.*.chunkCount {
+        streams[at + k] = gpucard.Stream.{ .engine = gpucard.Engine.COMPUTE, .flags = 0, .address = cb.*.chunks[k].address, .words = @intCast(u64, cb.*.lengths[k]) }
+        k += 1
+    }
+    return k
+}
+
+// ---------------------------------------------------------------------------
+// The commands
+
+pub fn cmdBindPipeline(buffer: vk.CommandBuffer, point: vk.PipelineBindPoint, given: vk.Pipeline) -> void {
+    if point != vk.PipelineBindPoint.compute { return }
+    bufferOf(buffer).*.pipeline = given
+}
+
+pub fn cmdBindDescriptorSets(buffer: vk.CommandBuffer, point: vk.PipelineBindPoint, layout: vk.PipelineLayout, first: u32, count: u32, sets: ?[*]const vk.DescriptorSet, dynamicCount: u32, offsets: ?[*]const u32) -> void {
+    const cb = bufferOf(buffer)
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const index = @intCast(usize, first) + k
+        if index < pipeline.MOST_SETS { cb.*.sets[index] = if sets.?[k] != 0 { pipeline.setOf(sets.?[k]).*.address } else { 0 } }
+        k += 1
+    }
+}
+
+pub fn cmdPushConstants(buffer: vk.CommandBuffer, layout: vk.PipelineLayout, stages: vk.ShaderStageFlags, offset: u32, size: u32, values: ?*const anyopaque) -> void {
+    const cb = bufferOf(buffer)
+    if @intCast(usize, offset) + @intCast(usize, size) > MOST_PUSH_BYTES || values == null { return }
+    device.copyBytes(@intFromPtr(&cb.*.push) + @intCast(usize, offset), @intFromPtr(values.?), @intCast(usize, size))
+}
+
+pub fn cmdDispatch(buffer: vk.CommandBuffer, x: u32, y: u32, z: u32) -> void {
+    const cb = bufferOf(buffer)
+    if cb.*.pipeline == 0 || x == 0 || y == 0 || z == 0 { return }
+    const bound = pipeline.pipelineOf(cb.*.pipeline)
+    if !reserve(cb, pipeline.PIPELINE_WORDS + 2 + 7 + 7 + 8 + 5) { return }
+    if cb.*.emitted != cb.*.pipeline {
+        var k: usize = 0
+        while k < pipeline.PIPELINE_WORDS {
+            put(cb, bound.*.words[k])
+            k += 1
+        }
+        cb.*.emitted = cb.*.pipeline
+    }
+    emitFlush(cb)
+    // The push constants' block, whole (the layout's range), as the
+    // shader's s[4:5] points at it; set 0's address in s[2:3].
+    const layout = pipeline.pipelineLayoutOf(bound.*.layout)
+    const pushBytes = if layout.*.pushBytes == 0 { UPLOAD_ALIGNMENT } else { @intCast(usize, layout.*.pushBytes) }
+    var pushAddress: u64 = 0
+    const block = upload(cb, pushBytes, &pushAddress)
+    if block == 0 { return }
+    device.copyBytes(block, @intFromPtr(&cb.*.push), if pushBytes > MOST_PUSH_BYTES { MOST_PUSH_BYTES } else { pushBytes })
+    const user = bound.*.facts.userSgprs
+    if user >= 4 {
+        setRegisters(cb, packets.COMPUTE_USER_DATA_0 + 8, 2)
+        put(cb, @intCast(u32, cb.*.sets[0] & 0xFFFFFFFF))
+        put(cb, @intCast(u32, cb.*.sets[0] >> 32))
+    }
+    if user >= 6 {
+        setRegisters(cb, packets.COMPUTE_USER_DATA_0 + 16, 2)
+        put(cb, @intCast(u32, pushAddress & 0xFFFFFFFF))
+        put(cb, @intCast(u32, pushAddress >> 32))
+    }
+    put(cb, packets.header(packets.PKT3_DISPATCH_DIRECT, 3, true))
+    put(cb, x)
+    put(cb, y)
+    put(cb, z)
+    put(cb, packets.COMPUTE_DISPATCH_INITIATOR__COMPUTE_SHADER_EN | packets.COMPUTE_DISPATCH_INITIATOR__FORCE_START_AT_000 | packets.COMPUTE_DISPATCH_INITIATOR__ORDER_MODE)
+}
+
+// The Vulkan 1.0 stage and access bits the flush depends on.
+const STAGE_COMPUTE: u32 = 0x800
+const STAGE_TRANSFER: u32 = 0x1000
+const STAGE_BOTTOM: u32 = 0x2000
+const STAGE_ALL_COMMANDS: u32 = 0x10000
+const ACCESS_INDIRECT_COMMAND_READ: u32 = 0x1
+const ACCESS_VERTEX_ATTRIBUTE_READ: u32 = 0x4
+const ACCESS_UNIFORM_READ: u32 = 0x8
+const ACCESS_INPUT_ATTACHMENT_READ: u32 = 0x10
+const ACCESS_SHADER_READ: u32 = 0x20
+const ACCESS_SHADER_WRITE: u32 = 0x40
+const ACCESS_TRANSFER_READ: u32 = 0x800
+const ACCESS_TRANSFER_WRITE: u32 = 0x1000
+const ACCESS_MEMORY_READ: u32 = 0x8000
+const ACCESS_MEMORY_WRITE: u32 = 0x10000
+
+// radv_src_access_flush for buffers on a compute queue.
+fn sourceFlush(access: u32) -> u32 {
+    if (access & (ACCESS_SHADER_WRITE | ACCESS_TRANSFER_WRITE | ACCESS_MEMORY_WRITE)) != 0 { return Flush.INV_L2 }
+    return 0
+}
+
+// radv_dst_access_flush for buffers on a compute queue (ACO's SMEM loads
+// of storage buffers: a shader read invalidates the scalar cache too).
+fn targetFlush(access: u32) -> u32 {
+    var flush: u32 = 0
+    if (access & ACCESS_INDIRECT_COMMAND_READ) != 0 { flush |= Flush.INV_SCACHE }
+    if (access & ACCESS_UNIFORM_READ) != 0 { flush |= Flush.INV_VCACHE | Flush.INV_SCACHE }
+    if (access & (ACCESS_VERTEX_ATTRIBUTE_READ | ACCESS_INPUT_ATTACHMENT_READ | ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE)) != 0 { flush |= Flush.INV_VCACHE | Flush.INV_L2 }
+    if (access & ACCESS_SHADER_READ) != 0 { flush |= Flush.INV_SCACHE | Flush.INV_VCACHE | Flush.INV_L2 }
+    if (access & (ACCESS_MEMORY_READ | ACCESS_MEMORY_WRITE)) != 0 { flush |= Flush.INV_VCACHE | Flush.INV_SCACHE | Flush.INV_L2 }
+    return flush
+}
+
+pub fn cmdPipelineBarrier(buffer: vk.CommandBuffer, sourceStages: vk.PipelineStageFlags, targetStages: vk.PipelineStageFlags, dependency: vk.DependencyFlags, memoryCount: u32, memoryBarriers: ?[*]const vk.MemoryBarrier, bufferCount: u32, bufferBarriers: ?[*]const vk.BufferMemoryBarrier, imageCount: u32, imageBarriers: ?[*]const vk.ImageMemoryBarrier) -> void {
+    const cb = bufferOf(buffer)
+    var source: u32 = 0
+    var target: u32 = 0
+    var k: usize = 0
+    while k < @intCast(usize, memoryCount) {
+        source |= sourceFlush(memoryBarriers.?[k].srcAccessMask)
+        target |= targetFlush(memoryBarriers.?[k].dstAccessMask)
+        k += 1
+    }
+    k = 0
+    while k < @intCast(usize, bufferCount) {
+        source |= sourceFlush(bufferBarriers.?[k].srcAccessMask)
+        target |= targetFlush(bufferBarriers.?[k].dstAccessMask)
+        k += 1
+    }
+    // (There are no images at this stage.)
+    if targetStages != STAGE_BOTTOM && (sourceStages & (STAGE_COMPUTE | STAGE_TRANSFER | STAGE_BOTTOM | STAGE_ALL_COMMANDS)) != 0 { cb.*.flush |= Flush.CS_PARTIAL_FLUSH }
+    cb.*.flush |= source
+    if (sourceStages & (STAGE_TRANSFER | STAGE_BOTTOM | STAGE_ALL_COMMANDS)) != 0 { waitForCopies(cb) }
+    cb.*.flush |= target
+}
+
+pub fn cmdCopyBuffer(buffer: vk.CommandBuffer, sourceBuffer: vk.Buffer, targetBuffer: vk.Buffer, count: u32, regions: ?[*]const vk.BufferCopy) -> void {
+    const cb = bufferOf(buffer)
+    const from = memory.bufferOf(sourceBuffer)
+    const to = memory.bufferOf(targetBuffer)
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const region = &regions.?[k]
+        var source = from.*.address + region.*.srcOffset
+        var target = to.*.address + region.*.dstOffset
+        var rest = region.*.size
+        while rest != 0 {
+            const bytes = if rest > @intCast(u64, packets.DMA_MOST_BYTES) { @intCast(u64, packets.DMA_MOST_BYTES) } else { rest }
+            if !reserve(cb, 2 + 7 + 7 + 7) { return }
+            const raw = beforeCopy(cb)
+            dmaPacket(cb, 0, source, target, @intCast(u32, bytes) | raw)
+            cb.*.copying = true
+            source += bytes
+            target += bytes
+            rest -= bytes
+        }
+        k += 1
+    }
+}
+
+pub fn cmdFillBuffer(buffer: vk.CommandBuffer, targetBuffer: vk.Buffer, offset: vk.DeviceSize, size: vk.DeviceSize, data: u32) -> void {
+    const cb = bufferOf(buffer)
+    const to = memory.bufferOf(targetBuffer)
+    var rest = size
+    if rest == vk.WHOLE_SIZE { rest = (to.*.size - offset) / 4 * 4 }
+    var target = to.*.address + offset
+    while rest != 0 {
+        const bytes = if rest > @intCast(u64, packets.DMA_MOST_BYTES) { @intCast(u64, packets.DMA_MOST_BYTES) } else { rest }
+        if !reserve(cb, 2 + 7 + 7 + 7) { return }
+        const raw = beforeCopy(cb)
+        const last = bytes == rest
+        const control = packets.put(packets.DMA_DATA__SRC_SEL, packets.SRC_SEL_DATA) | (if last { packets.DMA_DATA__CP_SYNC } else { 0 })
+        dmaPacket(cb, control, @intCast(u64, data), target, @intCast(u32, bytes) | raw)
+        cb.*.copying = !last
+        target += bytes
+        rest -= bytes
+    }
+}
