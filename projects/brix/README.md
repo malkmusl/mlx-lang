@@ -1468,7 +1468,8 @@ when the screen stays dark).
 ### The card's engines: how far a boot goes (the digits)
 
 The first steps toward a Radeon that takes commands (kernel/
-gpu_engines.mlx, gpu_smc_sdma.mlx and gpu_compute.mlx, after the study of the kernel's part of that, its
+gpu_engines.mlx, gpu_smc_sdma.mlx, gpu_compute.mlx, gpu_graphics.mlx and
+gpu_first_space.mlx, after the study of the kernel's part of that, its
 section 8, worked out from Linux 6.6's amdgpu). A digit held while the machine starts says how far they go
 at this boot; it is read by the same loader as F, N, R and A, holds for
 that boot only and is never remembered (projects/brix/engine_choice.mlx;
@@ -1488,14 +1489,37 @@ the word Info.STAGE):
 - 4: stage 4, the two copy engines run: one by itself first ("gpu: step
   D1"), then both, with a fill and a copy of the card's memory checked
   by the processor ("gpu: step D2").
-- 5 (or more: this kernel has stages up to 5): stage 5, the graphics
+- 5: stage 5, the graphics
   block's settings ("gpu: step G1"), its RLC ("gpu: step G2"), the compute
   processor with its KIQ and compute ring 0 ("gpu: step G3"), and a small
   program of the card's run on that ring, its end and its interrupt
   checked ("gpu: step G4"). When copy engine 0 does not read its ring at
   such a boot, G1 and G2 come first and D1 is tried once more; the log
   says which order worked.
+- 6: stage 6, the graphics ring ("gpu: step G5"): started with its clear
+  state, tested, and a small program run on it. Before that, two words
+  the picture's way goes through (HDP_ADDR_CONFIG and the display's
+  DMIF_ADDR_CALC) are given the card's address layout, each only when it
+  does not hold it already, with the picture watched around those two
+  writes alone; the line says what each held and how many were written.
+  These are the only display-side words any step writes.
+- 7: stage 7, a program's address space ("gpu: step V1"): the kernel makes
+  one, maps a page of the system's memory and a page of the card's memory
+  in it, and runs small programs in it on compute ring 0: one writes a
+  word to each page, one writes where nothing is mapped (the card must
+  report that as a fault, and the line says the page and the decoded
+  fault), and a third shows the ring went on. The address space is given
+  back afterwards; if a program in it did not end, it is emptied and kept
+  until the machine stops instead. This is what the Vulkan driver's
+  programs will run in (kernel/gpu_space.mlx).
 The rings are stopped again when the machine restarts or powers off.
+
+On the machine: hold 6 while it starts and look for the line "gpu: step
+G5: the graphics ring: started, its clear state taken (916 words) ...";
+then hold 7 and look for "gpu: step V1: address space 1 (directory at
+...) ... an unmapped write faulted as it should (page 0x12345, a write,
+...); the ring went on". If a step fails, its line says why, and the
+log shows the card's state; the steps before it stay up.
 
 F keeps every stage at 0. One line says which stage a boot goes to and
 why ("gpu: this boot: the card's engines up to stage 2, the interrupt
@@ -1505,14 +1529,16 @@ its registers back as the firmware had them and no later step runs (a
 failed F1 leaves the SMC held in reset and the kernel watching the
 card's temperature, a failed F2, D1, D2 or G step leaves the engines
 halted). No
-step writes a register of the display's, and the picture is watched
+step writes a register of the display's but G5 its one word
+(DMIF_ADDR_CALC, only where it differs), and the picture is watched
 around each one. From stage 3 on each step says the card's temperature
 before and after, and none begins at 85 C or more; nothing sets a clock,
 a voltage or the fan; while a ring runs the kernel reads the temperature
 once a second, takes no new work at 85 C and stops every ring at 95 C.
-Try 1 first, then 2, 3, 4 and 5. tests/493, 494, 500, 501, 504 and 505
-hold the steps on a card that is a table;
-tools/check_gpu_registers.py holds their numbers against Linux's.
+Try 1 first, then 2, 3, 4, 5, 6 and 7. tests/493, 494, 500, 501, 504,
+505, 506 and 507 hold the steps on a card that is a table;
+tools/check_gpu_registers.py holds their numbers against Linux's, and
+tools/check_gpu_clear_state.py the graphics ring's first words.
 
 ### A display's mode while the system runs
 

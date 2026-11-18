@@ -269,9 +269,9 @@ said "$none_here (2 was pressed at this start and holds for this boot only)" || 
 said "this boot: the monitor's own mode (N was pressed at an earlier start and is remembered; F while the machine starts keeps the firmware's picture)" || fail "a digit changed the display's choice"
 said "brixOS: display: " && fail "the loader says a display's choice for a digit"
 digit 7
-said "$none_here (7 was pressed at this start; this kernel has the stages up to 5)" || fail "the kernel does not say that 7 goes as far as the stages it has"
+said "$none_here (7 was pressed at this start and holds for this boot only)" || fail "the kernel does not say the digit 7 (the last stage it has)"
 boot
-said "$none_here (no digit was pressed; 1 to 5 held while the machine starts goes further)" || fail "a digit is remembered, or the start without one is not said"
+said "$none_here (no digit was pressed; 1 to 7 held while the machine starts goes further)" || fail "a digit is remembered, or the start without one is not said"
 echo "ok   a digit: it reaches the kernel beside the display's choice and holds for its one boot; without a card of ours nothing of a card's engines is read or written"
 
 # ---- 6. something remembered that is no choice ----

@@ -127,6 +127,19 @@
 # vi_structs.h, the KIQ's queue by amdgpu_gfx_kiq_acquire's rule, Linux's
 # values where its files have them, the clear state value for value, and
 # that no register stage 5 writes is the display's.
+# Of stages 6 and 7 (gpu_graphics.mlx, gpu_space.mlx, gpu_first_space.mlx
+# and gpu_ring.mlx's frame for a program's buffer: the graphics ring, the
+# programs' address spaces as an interface, V1): every register, field,
+# event and Linux's value (the first submission's size, the polls, the
+# context control's words, the reserved bottom, the DMA's bits, the
+# address spaces handed out), gpu_map's flags against the spec, the order
+# of a job's frame in amdgpu_ib_schedule and amdgpu_vm_flush and the same
+# in submitIn, the entries' bits and addresses as amdgpu_vm.c,
+# amdgpu_ttm.c, amdgpu_vram_mgr.c and amdgpu_gmc.c make them, the fault
+# taken as gmc_v8_0_process_interrupt takes it, and that no register
+# these stages write is the display's but DMIF_ADDR_CALC, written only
+# where it differs. (tools/check_gpu_clear_state.py holds the graphics
+# ring's first submission, as tests/506 prints it, word for word.)
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -1541,11 +1554,14 @@ STAGE5_OWN = {"STOP_MARK", "WATCH_EVERY", "KEPT", "KIQ_RECORD", "RING0_RECORD", 
               # (the packet's length field, bits 19:0: the study's 5.7; no header of Linux's names it)
               "IB_LENGTH_MOST"}
 STAGE5_PRODUCTS = {"RING_BYTES"}
+# (gpu_ring.mlx's numbers of stages 6 and 7: held in their section below.)
+STAGE67_RING = {"VS_PARTIAL_FLUSH", "VGT_FLUSH", "VISLANDS30_IV_SRCID_GFX_PAGE_INV_FAULT", "VISLANDS30_IV_SRCID_GFX_MEM_PROT_FAULT", "PIPELINE_SYNC_POLL",
+                "VM_FLUSH_POLL", "CONTEXT_LOAD_ENABLE", "CONTEXT_LOAD_GLOBAL", "CONTEXT_LOAD_CS_SH", "CONTEXT_LOAD_PER_CONTEXT", "SPACE_FRAME_WORDS"}
 stage5_names = {}
 for text in (compute_text, ring_text):
     for name, value, inside in constants(text):
         stage5_names[name] = value
-        if name in STAGE5_OWN or name in STAGE5_PRODUCTS:
+        if name in STAGE5_OWN or name in STAGE5_PRODUCTS or name in STAGE67_RING:
             continue
         if name in STAGE5_LINUX:
             hold(name, value, STAGE5_LINUX[name])
@@ -1622,4 +1638,174 @@ for k in range(0, len(code_tiles)):
     number = regs["mmGB_TILE_MODE0"] + k
     hold("GB_TILE_MODE%d written by stage 5 is no register of the display's" % k, int(any(runs[j] <= number <= runs[j + 1] for j in range(0, len(runs), 2))), 0)
 print("stage 5: %d numbers of gpu_compute.mlx, gpu_ring.mlx and gpu_clear_state.mlx held against Linux's files, %d wrong" % (held - stage5_before, bad - stage5_bad_before))
+# ---- Stages 6 and 7: gpu_graphics.mlx (the graphics ring), gpu_space.mlx
+# (the programs' address spaces as an interface), gpu_first_space.mlx
+# (V1), gpu_ring.mlx's frame for a program's buffer and the memory
+# controller's faults. Beside the files above, of Linux 6.6's
+# drivers/gpu/drm/amd:
+#   amdgpu/amdgpu_vm.h, amdgpu_vm.c, amdgpu_vm_pt.c, amdgpu_vm_cpu.c  the
+#                  reserved bottom, the entries' bits, the flush's order
+#   amdgpu/amdgpu_ib.c                 a job's frame, in its order
+#   amdgpu/amdgpu_ids.c                the flush at every job of an address
+#                                      space the processor writes
+#   amdgpu/amdgpu_ttm.c, amdgpu_vram_mgr.c  the entries' flags
+#   amdgpu/amdgpu_gmc.c                a directory entry's address
+#   include/asic_reg/oss/oss_3_0_sh_mask.h  the interrupt ring's number
+# (the spec's gpu_map flags from spec/04-stdlib/os/brix.xml), and that no
+# register these steps write is the display's but DMIF_ADDR_CALC, written
+# only where it differs.
+stage67_needed = ("amdgpu_vm.h", "amdgpu_vm.c", "amdgpu_vm_pt.c", "amdgpu_vm_cpu.c", "amdgpu_ib.c", "amdgpu_ids.c", "amdgpu_ttm.c",
+                  "amdgpu_vram_mgr.c", "amdgpu_gmc.c", "oss_3_0_sh_mask.h")
+stage67_missing = [name for name in stage67_needed if not os.path.exists(os.path.join(hdr, name))]
+if stage67_missing:
+    sys.exit("stages 6 and 7 are not held: not in %s: %s" % (hdr, " ".join(stage67_missing)))
+stage67_before = held
+stage67_bad_before = bad
+graphics_text = open(os.path.join(here, "gpu_graphics.mlx")).read()
+space_text = open(os.path.join(here, "gpu_space.mlx")).read()
+first_text = open(os.path.join(here, "gpu_first_space.mlx")).read()
+spec_text = open(os.path.join(here, "..", "..", "..", "spec", "04-stdlib", "os", "brix.xml")).read()
+vm_h = text_of("amdgpu_vm.h")
+vm_c = re.sub(r"/\*.*?\*/", "", text_of("amdgpu_vm.c"), flags=re.S)
+ib_c = re.sub(r"/\*.*?\*/", "", text_of("amdgpu_ib.c"), flags=re.S)
+ids_c = text_of("amdgpu_ids.c")
+ttm_c = text_of("amdgpu_ttm.c")
+vram_mgr_c = text_of("amdgpu_vram_mgr.c")
+gmc_common_c = text_of("amdgpu_gmc.c")
+oss_masks = defines(os.path.join(hdr, "oss_3_0_sh_mask.h"))
+csb_at = gfx_c.index("static u32 gfx_v8_0_get_csb_size(struct amdgpu_device *adev)\n{")
+csb_size = gfx_c[csb_at:gfx_c.index("\n}\n", csb_at)]
+pipeline_sync = function_body(gfx_c, "static void gfx_v8_0_ring_emit_pipeline_sync")
+vm_flush = function_body(gfx_c, "static void gfx_v8_0_ring_emit_vm_flush")
+cntxcntl = function_body(gfx_c, "static void gfx_v8_ring_emit_cntxcntl")
+vgt_flush = function_body(gfx_c, "static void gfx_v8_0_ring_emit_vgt_flush")
+eop_irq = function_body(gfx_c_plain, "static int gfx_v8_0_eop_irq")
+gfx_eop_state = function_body(gfx_c_plain, "static void gfx_v8_0_set_gfx_eop_interrupt_state")
+fault_state = function_body(gmc8_c, "static int gmc_v8_0_vm_fault_interrupt_state")
+fault_process = function_body(gmc8_c, "static int gmc_v8_0_process_interrupt")
+flush_tlb = function_body(gmc8_c, "static uint64_t gmc_v8_0_emit_flush_gpu_tlb")
+ib_schedule = function_body(ib_c, "int amdgpu_ib_schedule")
+vm_flush_common = function_body(vm_c, "int amdgpu_vm_flush")
+csb_counts = [int(x) for x in re.findall(r"count \+= (\d+);", csb_size)]
+STAGE67_LINUX = {
+    # gfx_v8_0_get_csb_size's words that are no clear state's run's, and the
+    # four cp_gfx_start asks for beyond it (SET_BASE).
+    "CSB_FRAME_WORDS": sum(csb_counts) if "count += 2 + ext->reg_count;" in csb_size else None,
+    "SET_BASE_WORDS": int(re.search(r"amdgpu_ring_alloc\(ring, gfx_v8_0_get_csb_size\(adev\) \+ (\d+)\);", gfx_start).group(1)),
+    # gfx_v8_0_eop_irq: the graphics ring is micro engine 0, pipe 0, queue 0.
+    "GRAPHICS_ID": 0 if "case 0:\n\t\tamdgpu_fence_process(&adev->gfx.gfx_ring[0]);" in eop_irq else None,
+    "VS_PARTIAL_FLUSH": enum8.get("VS_PARTIAL_FLUSH"),
+    "VGT_FLUSH": enum8.get("VGT_FLUSH"),
+    "VISLANDS30_IV_SRCID_GFX_PAGE_INV_FAULT": ivsrc8.get("VISLANDS30_IV_SRCID_GFX_PAGE_INV_FAULT"),
+    "VISLANDS30_IV_SRCID_GFX_MEM_PROT_FAULT": ivsrc8.get("VISLANDS30_IV_SRCID_GFX_MEM_PROT_FAULT"),
+    "PIPELINE_SYNC_POLL": int(re.search(r"amdgpu_ring_write\(ring, (\d+)\); /\* poll interval \*/", pipeline_sync).group(1)),
+    "VM_FLUSH_POLL": int(re.search(r"amdgpu_ring_write\(ring, (0x[0-9a-fA-F]+)\); /\* poll interval \*/", vm_flush).group(1), 0),
+    "CONTEXT_LOAD_ENABLE": int(re.search(r"dw2 \|= (0x[0-9a-fA-F]+); /\* set load_enable", cntxcntl).group(1), 0),
+    "CONTEXT_LOAD_GLOBAL": int(re.search(r"/\* set load_global_config & load_global_uconfig \*/\s*dw2 \|= (0x[0-9a-fA-F]+);", cntxcntl).group(1), 0),
+    "CONTEXT_LOAD_CS_SH": int(re.search(r"/\* set load_cs_sh_regs \*/\s*dw2 \|= (0x[0-9a-fA-F]+);", cntxcntl).group(1), 0),
+    "CONTEXT_LOAD_PER_CONTEXT": int(re.search(r"/\* set load_per_context_state & load_gfx_sh_regs for GFX \*/\s*dw2 \|= (0x[0-9a-fA-F]+);", cntxcntl).group(1), 0),
+    "IH_VMID_0_LUT__PASID": oss_masks.get("IH_VMID_0_LUT__PASID_MASK"),
+    "AMDGPU_VA_RESERVED_SIZE": (lambda m: int(m.group(1)) << int(m.group(2)))(re.search(r"#define AMDGPU_VA_RESERVED_SIZE\s+\((\d+)ULL << (\d+)\)", vm_h)),
+    "DMA_BITS": int(re.search(r"dma_set_mask_and_coherent\(adev->dev, DMA_BIT_MASK\((\d+)\)\)", gmc8_c).group(1)),
+    # gpu_map's flags as the spec names them.
+    "READ": int(re.search(r"flags read (\d+), write \d+, execute \d+", spec_text).group(1)),
+    "WRITE": int(re.search(r"flags read \d+, write (\d+), execute \d+", spec_text).group(1)),
+    "EXECUTE": int(re.search(r"flags read \d+, write \d+, execute (\d+)", spec_text).group(1)),
+    # Linux's own clients' address spaces: 1 to first_kfd_vmid less one.
+    "HANDED": int(re.search(r"adev->vm_manager.first_kfd_vmid = (\d+);", gmc8_c).group(1)) - 1,
+}
+for name in ("PROTECTIONS", "MEMORY_CLIENT_ID", "MEMORY_CLIENT_RW", "VMID"):
+    STAGE67_LINUX["VM_CONTEXT1_PROTECTION_FAULT_STATUS__" + name] = masks.get("VM_CONTEXT1_PROTECTION_FAULT_STATUS__%s_MASK" % name)
+for name in ("RANGE", "DUMMY_PAGE", "PDE0", "VALID", "READ", "WRITE", "EXECUTE"):
+    whole = "VM_CONTEXT1_CNTL__%s_PROTECTION_FAULT_ENABLE_INTERRUPT" % name
+    STAGE67_LINUX[whole] = masks.get(whole + "_MASK")
+    hold("gmc_v8_0_vm_fault_interrupt_state sets %s in both address spaces' words" % whole, int(whole + "_MASK" in fault_state and "tmp = RREG32(mmVM_CONTEXT0_CNTL);\n\t\ttmp |= bits;" in fault_state and "tmp = RREG32(mmVM_CONTEXT1_CNTL);\n\t\ttmp |= bits;" in fault_state), 1)
+    hold("%s is the same bit in VM_CONTEXT0_CNTL" % whole, masks.get(whole + "_MASK"), masks.get(whole.replace("CONTEXT1", "CONTEXT0") + "_MASK"))
+STAGE67_OWN = {"BUFFER_AT", "TEST_AT", "NONE", "UNHELD", "POOL_AT", "KERNEL", "KERNEL_PASID", "KEPT_FAULTS", "RINGS", "SYSTEM_AT", "CARD_AT",
+               "UNMAPPED_AT", "FIRST_AT", "SECOND_AT", "THIRD_AT", "WORD_AT", "FIRST_WORD", "CARD_WORD", "STRAY_WORD", "THIRD_WORD",
+               "FAULT_LATER_MS", "SPACE_FRAME_WORDS"}
+STAGE67_PRODUCTS = {"POOL_PAGES", "POOL_WORDS", "DIRECTORY_ENTRIES", "DIRECTORY_BYTES", "TABLE_ENTRIES", "TABLE_BYTES"}
+stage67_names = {}
+ring67 = [(name, value, inside) for name, value, inside in constants(ring_text) if name in STAGE67_RING]
+for name, value, inside in constants(graphics_text) + constants(space_text) + constants(first_text) + ring67:
+    stage67_names[name] = value
+    if name in STAGE67_OWN or name in STAGE67_PRODUCTS:
+        continue
+    if name in STAGE67_LINUX:
+        hold(name, value, STAGE67_LINUX[name])
+    elif "__" in name:
+        hold(name, value, masks.get(name + "_MASK"))
+    else:
+        hold(name, value, regs.get("mm" + name))
+# The products and the frame's room.
+hold("a directory's entries: MAX_PFN >> BLOCK_SIZE", int("DIRECTORY_ENTRIES: usize = engines.MAX_PFN >> @intCast(u6, engines.BLOCK_SIZE)" in space_text), 1)
+hold("a table's entries: 2^BLOCK_SIZE (amdgpu_vm_pt_entries_mask)", int("TABLE_ENTRIES: usize = @intCast(usize, 1) << @intCast(u6, engines.BLOCK_SIZE)" in space_text), 1)
+frame_words = 5 + 5 + 7 + 5 + 5 + 7 + 2 + 5 + 12 + 4 + 5 + 7 + 4 + 3 + 4 + 5 + 12 + 2
+hold("the most a program's frame takes on the graphics ring (99 words) fits SPACE_FRAME_WORDS", int(frame_words <= stage67_names["SPACE_FRAME_WORDS"]), 1)
+hold("the first submission: 916 words (gfx_v8_0_get_csb_size and SET_BASE)", STAGE67_LINUX["CSB_FRAME_WORDS"] + 2 * len(cs_runs) + len(linux_values) + STAGE67_LINUX["SET_BASE_WORDS"], 916)
+# V1's addresses: above the kernel's bottom, inside the 64 GiB; its two
+# pages in one table, the unmapped page in another.
+for name in ("SYSTEM_AT", "CARD_AT", "UNMAPPED_AT"):
+    hold("%s lies above the reserved bottom and inside the address space" % name, int(stage67_names[name] >= STAGE67_LINUX["AMDGPU_VA_RESERVED_SIZE"] and stage67_names[name] >> 12 < engine_names["MAX_PFN"]), 1)
+hold("V1's two pages share a table", stage67_names["SYSTEM_AT"] >> (12 + engine_names["BLOCK_SIZE"]), stage67_names["CARD_AT"] >> (12 + engine_names["BLOCK_SIZE"]))
+hold("V1's unmapped page is in no table it makes", int(stage67_names["UNMAPPED_AT"] >> (12 + engine_names["BLOCK_SIZE"]) != stage67_names["SYSTEM_AT"] >> (12 + engine_names["BLOCK_SIZE"])), 1)
+# The order of the two words (gfx_v8_0_constants_init) and the graphics
+# ring's end-of-pipe interrupt (gfx_v8_0_set_gfx_eop_interrupt_state).
+hold("HDP_ADDR_CONFIG before DMIF_ADDR_CALC, as gfx_v8_0_constants_init writes them", int(constants_init.index("WREG32(mmHDP_ADDR_CONFIG") < constants_init.index("WREG32(mmDMIF_ADDR_CALC") and graphics_text.index("compute.put(e, c, engines.HDP_ADDR_CONFIG, config)") < graphics_text.index("compute.put(e, c, engines.DMIF_ADDR_CALC, config)")), 1)
+hold("the graphics ring's end of pipe is CP_INT_CNTL_RING0's TIME_STAMP_INT_ENABLE", int("WREG32_FIELD(CP_INT_CNTL_RING0, TIME_STAMP_INT_ENABLE" in gfx_eop_state and "CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE" in graphics_text), 1)
+hold("the vertex grouper's flush: VS_PARTIAL_FLUSH index 4, VGT_FLUSH index 0", int("EVENT_TYPE(VS_PARTIAL_FLUSH) |\n\t\tEVENT_INDEX(4)" in vgt_flush and "EVENT_TYPE(VGT_FLUSH) |\n\t\tEVENT_INDEX(0)" in vgt_flush and "event(l, r, VS_PARTIAL_FLUSH, 4)" in ring_text and "event(l, r, VGT_FLUSH, 0)" in ring_text), 1)
+# A job's frame in amdgpu_ib_schedule's and amdgpu_vm_flush's order, and
+# submitIn's in the same.
+def in_order(text, marks):
+    places = [text.find(mark) for mark in marks]
+    return int(all(p >= 0 for p in places) and places == sorted(places))
+submit_in = ring_text[ring_text.index("pub fn submitIn"):]
+hold("amdgpu_ib_schedule's order: memory sync, the address space's flush, the conditional execution, the host path's flush, the context control, the buffer, the invalidate, the fence, the count patched, the buffer switch",
+     in_order(ib_schedule, ["ring->funcs->emit_mem_sync(ring);", "r = amdgpu_vm_flush(ring, job, need_pipe_sync);", "patch_offset = amdgpu_ring_init_cond_exec(ring);", "amdgpu_device_flush_hdp(adev, ring);", "amdgpu_ring_emit_cntxcntl(ring, status);", "amdgpu_ring_emit_ib(ring, job, ib, status);", "amdgpu_device_invalidate_hdp(adev, ring);", "r = amdgpu_fence_emit(ring, f, job, fence_flags);", "amdgpu_ring_patch_cond_exec(ring, patch_offset);", "amdgpu_ring_emit_switch_buffer(ring);"]), 1)
+hold("submitIn's order is the same", in_order(submit_in, ["if s.*.sync { memSync(l, r) }", "pipelineSync(l, r)", "const second = if graphics { condExec(l, r) }", "hdpFlush(l, r)", "emit(l, r, packet3(PACKET3_CONTEXT_CONTROL, 1))", "indirect(l, r, address, length, s.*.space)", "writeRegister(l, r, loaded.HDP_DEBUG0, 1)", "fence(l, r, r.*.sent, true)\n    if graphics {\n        patchCondExec(l, r, second)", "        switchBuffer(l, r)\n    }\n    r.*.context"]), 1)
+hold("amdgpu_vm_flush's order: the conditional execution, the wait for the last fence, the flush, the number, a fence, the count patched, two buffer switches",
+     in_order(vm_flush_common, ["patch_offset = amdgpu_ring_init_cond_exec(ring);", "amdgpu_ring_emit_pipeline_sync(ring);", "amdgpu_ring_emit_vm_flush(ring, job->vmid, job->vm_pd_addr);", "amdgpu_gmc_emit_pasid_mapping(ring, job->vmid, job->pasid);", "r = amdgpu_fence_emit(ring, &fence, NULL, 0);", "amdgpu_ring_patch_cond_exec(ring, patch_offset);", "amdgpu_ring_emit_switch_buffer(ring);\n\t\tamdgpu_ring_emit_switch_buffer(ring);"]), 1)
+hold("submitIn's flush part is in the same order", in_order(submit_in, ["const first = if graphics { condExec(l, r) }", "pipelineSync(l, r)", "writeRegister(l, r, baseRegister(s.*.space), s.*.directory >> 12)", "writeRegister(l, r, engines.VM_INVALIDATE_REQUEST,", "emit(l, r, packet3(PACKET3_PFP_SYNC_ME, 0))", "if s.*.lut { writeRegister(l, r, IH_VMID_0_LUT + s.*.space, s.*.pasid) }", "fence(l, r, r.*.sent, true)", "patchCondExec(l, r, first)", "switchBuffer(l, r)\n            switchBuffer(l, r)"]), 1)
+hold("gmc_v8_0_emit_flush_gpu_tlb: the base register (0 to 7 from VM_CONTEXT0's, 8 to 15 from VM_CONTEXT8's) = the directory >> 12, then VM_INVALIDATE_REQUEST = 1 << n",
+     int("reg = mmVM_CONTEXT0_PAGE_TABLE_BASE_ADDR + vmid;" in flush_tlb and "reg = mmVM_CONTEXT8_PAGE_TABLE_BASE_ADDR + vmid - 8;" in flush_tlb and "amdgpu_ring_emit_wreg(ring, reg, pd_addr >> 12);" in flush_tlb and "amdgpu_ring_emit_wreg(ring, mmVM_INVALIDATE_REQUEST, 1 << vmid);" in flush_tlb), 1)
+hold("the wait for the flush: always, on VM_INVALIDATE_REQUEST; the pre-fetch parser's sync on the graphics ring", int("WAIT_REG_MEM_FUNCTION(0) |  /* always */" in vm_flush and "amdgpu_ring_write(ring, mmVM_INVALIDATE_REQUEST);" in vm_flush and "PACKET3(PACKET3_PFP_SYNC_ME, 0)" in vm_flush), 1)
+hold("the wait for the last fence: memory, equal, the pre-fetch parser's on the graphics ring", int("WAIT_REG_MEM_MEM_SPACE(1) | /* memory */" in pipeline_sync and "WAIT_REG_MEM_FUNCTION(3) | /* equal */" in pipeline_sync and "WAIT_REG_MEM_ENGINE(usepfp)" in pipeline_sync), 1)
+hold("Linux flushes at every job of an address space whose tables the processor writes", int("bool needs_flush = vm->use_cpu_for_update;" in ids_c and "job->vm_needs_flush = vm->use_cpu_for_update;" in ids_c and ".flush = true," in space_text), 1)
+hold("a flush brings the wait for the last fence", int("if (job->vm_needs_flush || ring->has_compute_vm_bug)" in vm_c), 1)
+# The entries (the study's 2.3, the source where it differs).
+hold("a page of the card's memory: its offset in it (vram_base_offset 0 on a card that is no APU)", int("adev->vm_manager.vram_base_offset = 0;" in gmc8_c and "addr = vram_base + cursor.start;" in vm_c), 1)
+hold("the card's memory is write-combined for a card not on XGMI: no snooped bit", int("vres->base.bus.caching = ttm_write_combined;" in vram_mgr_c and "mem->bus.caching == ttm_cached)\n\t\tflags |= AMDGPU_PTE_SNOOPED;" in ttm_c), 1)
+hold("a system page: valid, system, snooped when cached (amdgpu_ttm_tt_pde_flags)", int("flags |= AMDGPU_PTE_SYSTEM;\n\n\t\tif (ttm->caching == ttm_cached)\n\t\t\tflags |= AMDGPU_PTE_SNOOPED;" in ttm_c), 1)
+hold("readable, writeable as the mapping asks; executable from the mapping (amdgpu_vm_bo_update, gmc_v8_0_get_vm_pte)", int("update_flags &= ~AMDGPU_PTE_READABLE;" in vm_c and "update_flags &= ~AMDGPU_PTE_WRITEABLE;" in vm_c and "*flags |= mapping->flags & AMDGPU_PTE_EXECUTABLE;" in gmc8_c), 1)
+hold("a directory entry: the table's card address (amdgpu_bo_gpu_offset) | valid", int("*addr = amdgpu_bo_gpu_offset(bo);" in gmc_common_c and "flags |= AMDGPU_PTE_VALID;" in ttm_c and "(s.*.vramStart + table) & engines.PTE_ADDRESS) | engines.AMDGPU_PTE_VALID" in space_text), 1)
+hold("an entry written whole, its address & 0x0000FFFFFFFFF000 (amdgpu_gmc_set_pte_pde)", int("value = addr & 0x0000FFFFFFFFF000ULL;" in gmc_common_c and engine_names["PTE_ADDRESS"] == 0x0000FFFFFFFFF000), 1)
+hold("the processor's writes then the host path flushed (amdgpu_vm_cpu_commit)", int("amdgpu_device_flush_hdp(p->adev, NULL);" in text_of("amdgpu_vm_cpu.c")), 1)
+# Both kinds of fault interrupt in V1 (the study's 1.2, row 13): the
+# memory's and the graphics block's (gfx_v8_0_late_init's priv_reg_irq and
+# priv_inst_irq, a field each of CP_INT_CNTL_RING0).
+hold("late_init's two graphics fault interrupts, each a field of CP_INT_CNTL_RING0, turned on by V1",
+     int("r = amdgpu_irq_get(adev, &adev->gfx.priv_reg_irq, 0);" in gfx_c and "r = amdgpu_irq_get(adev, &adev->gfx.priv_inst_irq, 0);" in gfx_c and "WREG32_FIELD(CP_INT_CNTL_RING0, PRIV_REG_INT_ENABLE," in gfx_c and "WREG32_FIELD(CP_INT_CNTL_RING0, PRIV_INSTR_INT_ENABLE," in gfx_c and "compute.put(e, c, loaded.CP_INT_CNTL_RING0, rd(e, loaded.CP_INT_CNTL_RING0) | privateFaults())" in first_text), 1)
+# A space runs on one ring at a time: this card flushes no address space
+# another engine still uses (concurrent flushes only from Vega10 on; a space
+# that needs a flush is taken idle on every other ring).
+hold("no concurrent flush before Vega10 (amdgpu_vm_manager_init), a used space that needs a flush not taken (amdgpu_vmid_grab_used)",
+     int("adev->vm_manager.concurrent_flush = !(adev->asic_type < CHIP_VEGA10 ||" in vm_c and "if (needs_flush && !adev->vm_manager.concurrent_flush)\n\t\t\tcontinue;" in ids_c and "if !idleBut(e, s, space, k) { return NONE }" in space_text), 1)
+# A fault is the context's whose number its entry carries (Linux names the
+# process by entry->pasid, the entry's bits 31:16 of its third word).
+hold("a fault's process by the entry's number (gmc_v8_0_process_interrupt, tonga_ih_decode_iv)",
+     int("amdgpu_vm_get_task_info(adev, entry->pasid, &task_info);" in gmc8_c and "entry->pasid = (dw[2] >> 16) & 0xffff;" in ih_c and "const number = (r.*.spaceWord[k] >> 16) & IH_VMID_0_LUT__PASID" in space_text and "pasidOf(s.*.owner[space]) != number" in space_text), 1)
+# The fault taken as gmc_v8_0_process_interrupt takes it.
+hold("a fault: page, status, client read, then VM_CONTEXT1_CNTL2 bit 0 set; nothing more when page and status are 0",
+     int(in_order(fault_process, ["RREG32(mmVM_CONTEXT1_PROTECTION_FAULT_ADDR)", "RREG32(mmVM_CONTEXT1_PROTECTION_FAULT_STATUS)", "RREG32(mmVM_CONTEXT1_PROTECTION_FAULT_MCCLIENT)", "WREG32_P(mmVM_CONTEXT1_CNTL2, 1, ~1);", "if (!addr && !status)"]) == 1 and in_order(ring_text, ["rd(e, engines.VM_CONTEXT1_PROTECTION_FAULT_ADDR)", "rd(e, engines.VM_CONTEXT1_PROTECTION_FAULT_STATUS)", "rd(e, engines.VM_CONTEXT1_PROTECTION_FAULT_MCCLIENT)", "VM_CONTEXT1_CNTL2__CLEAR_PROTECTION_FAULT_STATUS_ADDR)", "if page == 0 && status == 0"]) == 1), 1)
+hold("the client's four characters, byte 3 first", int("char block[5] = { mc_client >> 24," in gmc8_c), 1)
+# No register these steps write is the display's but DMIF_ADDR_CALC.
+written67 = set(re.findall(r"\b(?:put|putField)\(e, c, (?:engines\.|loaded\.|ring\.|compute\.)?(\w+)", graphics_text + first_text)) | set(re.findall(r"\bwr\(e, (?:engines\.|loaded\.|ring\.|compute\.)?(\w+)", graphics_text + space_text + first_text))
+for name in sorted(written67):
+    number = stage67_names.get(name, stage5_names.get(name, loaded_names.get(name, engine_names.get(name))))
+    if number is None:
+        continue
+    in_display = any(runs[k] <= number <= runs[k + 1] for k in range(0, len(runs), 2))
+    hold("%s (%#x) written by stage 6 or 7 is %s register of the display's" % (name, number, "the one" if name == "DMIF_ADDR_CALC" else "no"), int(in_display), int(name == "DMIF_ADDR_CALC"))
+hold("DMIF_ADDR_CALC is written only where it differs", int("if g.*.dmifWas != config {\n            compute.put(e, c, engines.DMIF_ADDR_CALC, config)" in graphics_text), 1)
+print("stages 6 and 7: %d numbers of gpu_graphics.mlx, gpu_space.mlx, gpu_first_space.mlx and gpu_ring.mlx held against Linux's files, %d wrong" % (held - stage67_before, bad - stage67_bad_before))
 sys.exit(1 if bad or rom_bad or wrong or display_bad else 0)

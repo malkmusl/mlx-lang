@@ -20,6 +20,11 @@
 // unhalted (the clear state's packets counted, EVENT_WRITE_EOP). Packets
 // the processors carry out write the card's registers and memory directly:
 // the log of writes (engine_card.mlx's) holds the driver's writes alone.
+// For stages 6 and 7 (tests 506 and 507): the graphics ring's packets of a
+// program's frame (PFP_SYNC_ME, SWITCH_BUFFER, EVENT_WRITE taken), and a
+// buffer in a program's address space read and writing through it
+// (./vm_card.mlx, which every register write, the driver's and a ring's,
+// is shown to: the flushes, a fault's words cleared).
 //
 // What the card can be made to do wrong is a variable each, below.
 const std = @import("std")
@@ -29,6 +34,14 @@ const compute = @import("../../projects/brix/kernel/gpu_compute.mlx")
 const ring = @import("../../projects/brix/kernel/gpu_ring.mlx")
 const card = @import("./engine_card.mlx")
 const smc = @import("./smc_card.mlx")
+const vm = @import("./vm_card.mlx")
+
+// The address space the packets being carried out run in (0: the
+// kernel's, through the GART).
+var inSpace: usize = 0
+// The address spaces the buffers ran in, the last ones (stages 6 and 7).
+pub var spacesRun: [8]usize = undefined
+pub var spacesCount: usize = 0
 
 pub const NEVER: usize = card.NEVER
 
@@ -96,8 +109,15 @@ pub var ringDeaf = false
 pub var noEntry = false
 pub var noFenceWrite = false
 pub var privFault = false
+// The privileged fault's entry sent only when CP_INT_CNTL_RING0's
+// PRIV_REG_INT_ENABLE is on, as the card does (false: always, as stage 5's
+// tests have it).
+pub var privNeedsEnable = false
 pub var kiqMute = false
 pub var graphicsDeaf = false
+// The graphics ring reads no word at or beyond this one (NEVER: none): a
+// ring that took what came before and stops there.
+pub var graphicsStallAt: usize = NEVER
 pub var noReadBack = false
 pub var sdmaNeedsRlc = false
 // More of what the processors do wrong: the end-of-pipe entry carries
@@ -119,14 +139,17 @@ var lateDue: usize = NEVER
 
 fn mem32(at: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, at) } }
 
+// A word the processors read or write: in the address space their buffer
+// runs in (a program's through ./vm_card.mlx; a fault reads 0 and writes
+// nothing).
 fn readCard(address: usize) -> usize {
-    const at = smc.reach(address)
+    const at = if inSpace != 0 { vm.reach(inSpace, address, false) } else { smc.reach(address) }
     if at == 0 { return 0 }
     return @intCast(usize, mem32(at).*)
 }
 
 fn writeCard(address: usize, value: usize) -> void {
-    const at = smc.reach(address)
+    const at = if inSpace != 0 { vm.reach(inSpace, address, true) } else { smc.reach(address) }
     if at != 0 { mem32(at).* = @intCast(u32, value & 0xFFFFFFFF) }
 }
 
@@ -203,6 +226,7 @@ pub fn write(number: usize, value32: u32) -> void {
         if resetSticks && rlcResets != 0 { card.registers[number] |= compute.GRBM_SOFT_RESET__SOFT_RESET_RLC }
     }
     if number == engines.RLC_CNTL && value & engines.RLC_CNTL__RLC_ENABLE_F32 != 0 && sdmaNeedsRlc { smc.dead = NEVER }
+    vm.written(number, value)
     if number == engines.CP_MEC_CNTL && wasMec != value { runAll() }
     if number == engines.CP_ME_CNTL && wasMe != value { runGraphics() }
     if number == compute.CP_RB0_CNTL && value & compute.CP_RB0_CNTL__RB_RPTR_WR_ENA != 0 { graphicsRead = 0 }
@@ -263,7 +287,7 @@ fn runQueue(q: usize) -> void {
     const base = ((queueRegs[q][word(compute.vi_mqd__cp_hqd_pq_base_hi)] << 32) | queueRegs[q][word(compute.vi_mqd__cp_hqd_pq_base_lo)]) << 8
     const words = @intCast(usize, 2) << @intCast(u6, queueRegs[q][compute.CP_HQD_PQ_CONTROL - FIRST] & 0x3F)
     var rounds: usize = 0
-    while card.queueRead[q] != card.queueWrite[q] % words && rounds < 4096 {
+    while card.queueRead[q] != card.queueWrite[q] % words && rounds < 4096 && !vm.hung {
         const used = carry(q, base, words, card.queueRead[q])
         card.queueRead[q] = (card.queueRead[q] + used) & (words - 1)
         rounds += 1
@@ -355,6 +379,7 @@ fn carry(q: usize, base: usize, words: usize, k: usize) -> usize {
             if (control >> 8) & 0xF == 0 {
                 card.registers[(target + n) % card.ROOM] = value
                 if target == loaded.HDP_DEBUG0 { invalidates += 1 }
+                vm.written((target + n) % card.ROOM, value)
             } else {
                 writeCard(target + 4 * n, value)
             }
@@ -395,15 +420,21 @@ fn carry(q: usize, base: usize, words: usize, k: usize) -> usize {
         const control = take(base, words, k, 3)
         bufferSpace = (control >> 24) & 0xF
         buffers += 1
-        if privFault && q != NEVER {
+        if privFault && q != NEVER && (!privNeedsEnable || card.registers[loaded.CP_INT_CNTL_RING0] & 0x800000 != 0) {
             smc.deliver(ring.VISLANDS30_IV_SRCID_CP_PRIV_REG_FAULT, 0x1234, ring.ringId(q / 32, (q / 8) % 4, q % 8))
             return count + 1
         }
         if q != NEVER && control & ring.INDIRECT_BUFFER_VALID == 0 { return count + 1 }
         if bufferSkipped { return count + 1 }
         const length = control & 0xFFFFF
+        // The buffer read, and its words carried out, in its address space.
+        if spacesCount < 8 { spacesRun[spacesCount] = bufferSpace }
+        spacesCount += 1
+        const was = inSpace
+        inSpace = bufferSpace
         var n: usize = 0
-        while n < length { n += carry(q, address, 0, n) }
+        while n < length && !vm.hung { n += carry(q, address, 0, n) }
+        inSpace = was
         return count + 1
     }
     if op == ring.PACKET3_RELEASE_MEM {
@@ -439,6 +470,7 @@ fn carry(q: usize, base: usize, words: usize, k: usize) -> usize {
         return count + 1
     }
     if op == ring.PACKET3_PREAMBLE_CNTL || op == ring.PACKET3_CONTEXT_CONTROL || op == ring.PACKET3_SET_BASE || op == ring.PACKET3_COND_EXEC { return count + 1 }
+    if op == ring.PACKET3_PFP_SYNC_ME || op == ring.PACKET3_SWITCH_BUFFER || op == ring.PACKET3_EVENT_WRITE { return count + 1 }
     // An operation no packet of these steps has: the processor stops there.
     return if words == 0 { 0x100000 } else { words }
 }
@@ -453,7 +485,7 @@ fn runGraphics() -> void {
     const base = ((card.registers[compute.CP_RB0_BASE_HI] << 32) | card.registers[compute.CP_RB0_BASE]) << 8
     if base == 0 { return }
     var rounds: usize = 0
-    while graphicsRead != graphicsHeld % words && rounds < 4096 {
+    while graphicsRead != graphicsHeld % words && rounds < 4096 && graphicsRead != graphicsStallAt {
         const used = carry(NEVER, base, words, graphicsRead)
         graphicsRead = (graphicsRead + used) & (words - 1)
         rounds += 1
@@ -467,6 +499,7 @@ fn runGraphics() -> void {
 // The card's pause, and the KIQ's late scratch write once its time came.
 pub fn pause(microseconds: usize) -> void {
     smc.pause(microseconds)
+    vm.tick()
     if lateDue != NEVER && card.clock >= lateDue {
         card.registers[engines.SCRATCH_REG0] = lateScratch
         lateDue = NEVER
@@ -493,6 +526,9 @@ pub fn queueDefault(q: usize, w: usize) -> usize { return ((w + 1) * 0x01000193 
 // block idle, no queue active, nothing of this file's wrong.
 pub fn reset() -> void {
     smc.reset()
+    vm.reset()
+    inSpace = 0
+    spacesCount = 0
     var q: usize = 0
     while q < QUEUES {
         var w: usize = 0
@@ -547,8 +583,10 @@ pub fn reset() -> void {
     noEntry = false
     noFenceWrite = false
     privFault = false
+    privNeedsEnable = false
     kiqMute = false
     graphicsDeaf = false
+    graphicsStallAt = NEVER
     noReadBack = false
     sdmaNeedsRlc = false
     entryRing = NEVER
