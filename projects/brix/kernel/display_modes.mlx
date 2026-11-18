@@ -582,7 +582,11 @@ pub const Set = enum(u8) {
     // It failed on the way, and the mode before is back.
     back,
     // It failed, and the mode before is not known to be back.
-    lost
+    lost,
+    // Not carried out, nothing written: the driver is changing the
+    // display already (a Radeon's picture brought to the output its
+    // monitor was moved to: gpu_together.mlx). Asked again later.
+    busy
 }
 
 // A display's picture: where its memory is (a physical address), its size
@@ -850,6 +854,7 @@ pub const State = struct {
             self.*.deadline = now + CONFIRM_TIME
             return self.answer(Answer.changed, Why.NONE)
         }
+        if result == Set.busy { return self.answer(Answer.busy, Why.NONE) }
         if result == Set.refused { return self.answer(Answer.refused, if mode.why != Why.NONE { mode.why } else { Why.CARD }) }
         return self.answer(if result == Set.back { Answer.failed_back } else { Answer.failed_lost }, Why.NONE)
     }
@@ -872,6 +877,12 @@ pub const State = struct {
         var picture = self.*.picture
         const back = self.*.driver.back
         const result = back(self.*.driver.which, &self.*.before, &picture)
+        if result == Set.busy {
+            // (Nothing was written: the change stays pending, and is
+            // taken back once the driver is done.)
+            self.*.pending = true
+            return self.answer(Answer.busy, Why.NONE)
+        }
         if result == Set.done {
             self.*.runs = self.*.before
             self.*.picture = picture
@@ -887,6 +898,40 @@ pub const State = struct {
     pub fn takeBack(self: *Self) -> Answer {
         if !self.*.pending { return self.answer(Answer.nothing_pending, Why.NONE) }
         return self.goBack(false)
+    }
+
+    // The pending mode confirmed at the time `now`: as `confirm` before
+    // the time to confirm is over. After it the mode goes back now, as
+    // the timer's tick would have taken it back (the tick comes a moment
+    // later, or the clock's turn was had elsewhere): whether a late
+    // confirmation counts does not depend on when the next tick comes.
+    // The answer is then the kernel's own taking back (timed_out).
+    pub fn confirmAt(self: *Self, now: usize) -> Answer {
+        if self.*.pending && now >= self.*.deadline { return self.goBack(true) }
+        return self.confirm()
+    }
+
+    // A pending mode taken back by the kernel before its time: the
+    // display's driver is to bring the picture to another output, or to
+    // set another monitor's timing (gpu_together.mlx), and a mode nobody
+    // has confirmed is not carried there. Answered as the kernel's own
+    // taking back (timed_out); the kernel's log says why.
+    pub fn withdraw(self: *Self) -> Answer {
+        if !self.*.pending { return self.answer(Answer.nothing_pending, Why.NONE) }
+        return self.goBack(true)
+    }
+
+    // The display's driver brought the picture to another output, or set
+    // its mode again there (gpu_together.mlx; the picture's memory, size
+    // and pitch are as they were): the modes listed anew from what that
+    // output's monitor's EDID says (`bytes`), and what runs is the
+    // picture's size at `millihertz` (the rate counted; 0: as it was),
+    // the list's nearest or one added for it. What is kept stays.
+    pub fn moved(self: *Self, bytes: []const u8, millihertz: usize) -> void {
+        const rate = if millihertz != 0 { millihertz } else { self.*.runs.millihertz }
+        read(bytes, &self.*.list)
+        self.running(self.*.picture.width, self.*.picture.height, rate, null)
+        self.judge()
     }
 
     // The clock says `now`: a pending mode nobody confirmed in time is
@@ -909,7 +954,7 @@ pub const State = struct {
         if self.*.runs.same(&mode) || (mode.source == Source.ASKED && mode.millihertz == 0 && self.*.runs.width == width && self.*.runs.height == height) { return self.answer(Answer.already, Why.NONE) }
         const result = self.carry(&mode)
         if result == Set.done { return self.answer(Answer.confirmed, Why.NONE) }
-        if result == Set.refused { return self.answer(Answer.refused, if mode.why != Why.NONE { mode.why } else { Why.CARD }) }
+        if result == Set.refused || result == Set.busy { return self.answer(Answer.refused, if mode.why != Why.NONE { mode.why } else { Why.CARD }) }
         return self.answer(if result == Set.back { Answer.failed_back } else { Answer.failed_lost }, Why.NONE)
     }
 
@@ -1184,12 +1229,42 @@ pub fn atBoot(ownAsked: bool, sets: bool) -> AtBoot {
     return if sets { AtBoot.set } else { AtBoot.leave }
 }
 
+// Whether a remembered mode that a boot tried to set is forgotten after
+// what came of it: when the display was written and the mode did not
+// come (tried at every boot, it would darken every start); not when it
+// was set, ran already, or could not be set with nothing written (the
+// monitor does not name it at this boot, or the card is not in a state
+// to set it: another boot may).
+pub fn forgottenAfter(answer: Answer) -> bool { return answer == Answer.failed_back || answer == Answer.failed_lost }
+
 // The file's text anew, into `into`: `text` without that display's lines,
 // and a line for `mode` at its end (null: none, the mode is forgotten).
-// How many bytes it is; more than `into.length` when it does not fit
-// (then `into` holds its beginning and is not to be written).
+// How many bytes it is. When that is more than `into` holds, the lines at
+// the file's beginning are left out, one after the other, until it fits:
+// the modes confirmed longest ago, of other monitors (each confirmation
+// puts its line at the end). More than `into.length` only when the new
+// line alone does not fit (then `into` holds its beginning and is not to
+// be written).
 pub fn remember(text: []const u8, vendor: usize, device: usize, monitor: usize, mode: ?*const Kept, into: []u8) -> usize {
+    var lines: usize = 0
+    var k: usize = 0
+    while k < text.length {
+        if text[k] == 10 || k + 1 == text.length { lines += 1 }
+        k += 1
+    }
+    var dropped: usize = 0
+    var length = rewrite(text, vendor, device, monitor, mode, into, 0)
+    while length > into.length && dropped < lines {
+        dropped += 1
+        length = rewrite(text, vendor, device, monitor, mode, into, dropped)
+    }
+    return length
+}
+
+// `remember`'s text with the first `drop` lines of `text` left out.
+fn rewrite(text: []const u8, vendor: usize, device: usize, monitor: usize, mode: ?*const Kept, into: []u8, drop: usize) -> usize {
     var length: usize = 0
+    var line: usize = 0
     var at: usize = 0
     while at < text.length {
         var end = at
@@ -1199,10 +1274,11 @@ pub fn remember(text: []const u8, vendor: usize, device: usize, monitor: usize, 
         var m: usize = 0
         var kept: Kept = undefined
         const theirs = readLine(text[at..end], &v, &d, &m, &kept) && v == vendor && d == device && m == monitor
-        if !theirs && end > at {
+        if !theirs && end > at && line >= drop {
             putText(into, &length, text[at..end])
             putText(into, &length, "\n")
         }
+        line += 1
         at = end + 1
     }
     if mode != null {

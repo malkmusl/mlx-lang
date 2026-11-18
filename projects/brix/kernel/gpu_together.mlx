@@ -1,0 +1,351 @@
+// A Radeon's display while brixOS runs, as one driver: the mode a program
+// asks for (gpu_change.mlx, behind display_modes.mlx's seam), the hot plug
+// lines and the EDIDs read over DDC (gpu_plug.mlx, gpu_ddc.mlx) and the
+// monitor followed to another output (gpu_switch.mlx). Each was built on
+// its own; this file is where they meet: who has the card's display, what
+// runs where, and the records each keeps of the others' changes.
+//
+// ONE USER OF THE CARD'S DISPLAY AT A TIME (`User`: nobody, a mode change,
+// a move). How each exclusion is ensured:
+// - The kernel's lock. The tick (the timer's interrupt), a program's
+//   request (a native call), the kernel's own taking back and the move
+//   (both on the trap's way back, below) all run holding it, and none
+//   lets it go before it is over: so none of them meets another half
+//   done. While a change or a move writes the card the processor that
+//   holds the lock has its interrupts off, and the timer's tick on any
+//   other processor waits for the lock.
+// - The processors held still. Every write of the display goes through
+//   gpu_change.mlx's `held`: every other processor is stopped where it is
+//   (smp.mlx's `holdOthers`) before the first write and let go after the
+//   last, a program's change and the switch's move alike.
+// - `watching` cleared and `user` set around every write (the plug
+//   review's rule for anything that writes the card): a tick that came in
+//   between all the same would look at nothing and read nothing.
+// - A reading under way is let end. An EDID is read a piece at a tick,
+//   over several ticks, so a request can come between two pieces. No tick
+//   can come while the request holds the lock, so waiting for the reading
+//   to end by the ticks would never end: it is taken to its end at once,
+//   with its own waits (gpu_plug.mlx's `finish`, at most ddc.BUDGET and a
+//   transfer's bound), before the first write. No transfer is cut in the
+//   middle.
+// - A move under way makes a request busy (`dm.Set.busy`: the program
+//   hears "busy" and asks again), and a change under way makes a move
+//   wait: it is decided again at the next tick.
+//
+// THE MOVE IS NOT MADE IN THE TIMER'S INTERRUPT. The tick decides
+// (gpu_switch.mlx's `tick`: a few reads of the record) and keeps what is
+// to be done (`due`); the trap's way back makes it (`carryDue`, from
+// modes.mlx's `due`, which trap.mlx calls once the interrupt's own work is
+// done: the timer acknowledged, the network, USB and the lines looked
+// at), as a program's request is made: the card read out again only when
+// something wrote it since the last read-out (`Seen.fresh`), the plan,
+// then every other processor held while the card is written. How long the
+// system stands still: the processors are held for the writing alone.
+// By the parts the card's log of 17 Nov gives (the autoswitch study's
+// 6.3) a TMDS move is about a second, nearly all of it the two frame
+// counts and the tenth of a second the monitor is given to see the signal
+// gone; on the card that is a table it is 0.54 s (tests/498); the plan's
+// bounds, 23 s there and 22 s back, are what a broken card could take,
+// and a held processor goes on by itself after smp.mlx's HOLD_MOST. The
+// read-out after it, 0.15 s, has the kernel but holds nobody. Before, the
+// move kept the kernel in the timer's interrupt for the read-out, the plan
+// and the writing, about 1.5 s, while every other processor that came to
+// the kernel waited for it, without a bound and without a word.
+//
+// THE RECORDS:
+// - After a mode change the switch's record of the picture (its size, the
+//   timing it is sent, the clock) is the new mode's (gpu_switch.mlx's
+//   `modeChanged`): the same-size rule and the monitor's return are
+//   judged by what runs. The monitor the picture was last set for is
+//   followed to another output with that timing (gpu_switch.mlx's `fits`
+//   and `planned`), not refused for its own size.
+// - After a move the mode change's record is the new output's: the card
+//   read out again (what is judged next is judged by what runs), what the
+//   new monitor's EDID says of HDMI, and the list of modes from that EDID
+//   (`monitors` moves on, modes.mlx lists the modes anew and finds what
+//   runs in the list).
+// - The list of modes is made from the EDID read over DDC from the output
+//   that shows the picture (`modeEdid`), every block of it, and made anew
+//   whenever another monitor's EDID is read there; a monitor that leaves
+//   leaves the list as it was.
+// - A MONITOR ELSEWHERE WHILE A MODE WAITS TO BE CONFIRMED: whatever the
+//   switch would write (the picture brought to another output, its mode
+//   set again, another monitor's timing set) is not done on top of a mode
+//   nobody has confirmed. The mode before is taken back first, by the
+//   kernel, as at the end of the time to confirm (`withdraw`: the program
+//   hears "taken back by the kernel"), and said; the switch decides anew
+//   at the next tick, by the record of the mode before. A mode that
+//   cannot be seen cannot be confirmed, and the monitor that would show
+//   the question is the one that left. When the mode before cannot be
+//   set for the monitor that is there now (another monitor, with another
+//   link: a DVI one for an HDMI mode), nothing is written for it, and the
+//   mode asked for waits no more: the monitor it was asked on is gone;
+//   the switch then decides by the mode that runs. Whatever writes
+//   nothing (a second monitor, the monitor gone with none elsewhere, the
+//   same monitor back, another size) leaves the pending mode waiting.
+//
+// Built for the host too, on cards that are tables
+// (tests/498_gpu_together_runtime.mlx).
+const scanout = @import("./gpu_display.mlx")
+const modeset = @import("./gpu_set.mlx")
+const edid = @import("./edid.mlx")
+const ddc = @import("./gpu_ddc.mlx")
+const plug = @import("./gpu_plug.mlx")
+const rule = @import("./gpu_switch.mlx")
+const changing = @import("./gpu_change.mlx")
+const dm = @import("./display_modes.mlx")
+
+pub const NONE: usize = plug.NONE
+
+// Who has the card's display.
+pub const User = enum(u8) {
+    // Nobody: the tick looks at the lines and reads an EDID a piece at a
+    // time.
+    nobody,
+    // A mode a program asked for, or the mode before it, is being set.
+    changing,
+    // The switch brings the picture to another output, or sets its mode
+    // again.
+    moving
+}
+
+// What became of a change the tick found due.
+pub const Due = enum(u8) {
+    // Nothing was due.
+    none,
+    // It was made.
+    made,
+    // It was tried and did not come about (the switch's record says
+    // whether it is tried again).
+    failed,
+    // A mode a program asked for waited to be confirmed: it was taken back
+    // first (the display's state says how that went); the switch decides
+    // anew at the next tick.
+    withdrawn,
+    // Another change had the card: decided anew at the next tick.
+    waits
+}
+
+pub const Driver = struct {
+    // The card as the read-out reaches it (reads, the clock, the log).
+    card: scanout.Card
+    // The parts, the kernel's (gpu.mlx) or a test's: the lines and the
+    // readings, the switch's record and what a move is carried out with,
+    // the mode change's machinery and its record; the DDC's hands (null:
+    // nobody is asked at this boot) and how it waits; whether the tick
+    // looks at the lines at all.
+    watch: *plug.Watch
+    follow: *rule.Follow
+    lent: *const rule.Lent
+    change: *const changing.Lent
+    seen: *changing.Seen
+    hands: ?*const ddc.Hands
+    pause: fn(usize) -> void
+    watching: *bool
+    user: User
+    // The change the switch decided at the last tick, made once the
+    // interrupt is over (stay: none).
+    due: rule.Decision
+    // The EDID the list of modes is made from (the last one read over DDC
+    // from the output that shows the picture and that holds; none yet:
+    // the loader's counts), and how often it became another.
+    listed: [ddc.ROOM]u8
+    listedCount: usize
+    monitors: usize
+    // How often a reading was let end before a write, a request met a
+    // move, a tick found the card taken.
+    finished: usize
+    busy: usize
+    skipped: usize
+}
+
+fn stay(d: *const Driver) -> rule.Decision { return rule.Decision.{ .act = rule.Act.stay, .to = NONE, .from = d.*.follow.*.showing } }
+
+// The driver begun once the boot's own mode set is over and the mode
+// change's record holds what the card runs (gpu.mlx's `take`).
+pub fn begin(d: *Driver) -> void {
+    d.*.user = User.nobody
+    d.*.due = stay(d)
+    d.*.listedCount = 0
+    d.*.monitors = 0
+    d.*.finished = 0
+    d.*.busy = 0
+    d.*.skipped = 0
+    note(d)
+}
+
+// The connector that shows the picture (NONE: none of the ROM's).
+fn showing(d: *const Driver) -> usize {
+    const s = d.*.follow.*.showing
+    return if s < d.*.watch.*.ports.count { s } else { NONE }
+}
+
+// The EDID of the monitor on the output that shows the picture, when one
+// that holds was read there and is another than the one listed: kept,
+// counted, and what it says of HDMI is what the mode change plans with.
+fn note(d: *Driver) -> void {
+    const s = showing(d)
+    if s == NONE { return }
+    const port = &d.*.watch.*.ports.ports[s]
+    if port.*.heard.outcome != ddc.Outcome.read || port.*.monitor.state != edid.State.found { return }
+    const bytes = port.*.heard.data()
+    d.*.seen.*.offer = port.*.offer
+    var same = bytes.length == d.*.listedCount
+    var k: usize = 0
+    while same && k < bytes.length {
+        if bytes[k] != d.*.listed[k] { same = false }
+        k += 1
+    }
+    if same { return }
+    k = 0
+    while k < bytes.length && k < ddc.ROOM {
+        d.*.listed[k] = bytes[k]
+        k += 1
+    }
+    d.*.listedCount = k
+    d.*.monitors += 1
+}
+
+// The EDID the display's modes are listed from: the one read over DDC
+// from the output that shows the picture (`note`); nothing while none
+// was (the loader's then).
+pub fn modeEdid(d: *const Driver) -> []const u8 { return d.*.listed[0..d.*.listedCount] }
+
+// The timer's tick (in its interrupt): the lines looked at, a piece of a
+// reading, the switch's rule; a change it decides is kept for after the
+// interrupt. Nothing while a change or a move has the card.
+pub fn tick(d: *Driver) -> void {
+    if d.*.user != User.nobody || !d.*.watching.* {
+        d.*.skipped += 1
+        return
+    }
+    plug.tick(&d.*.card, d.*.hands, d.*.watch)
+    const due = rule.tick(&d.*.card, d.*.follow, d.*.watch)
+    if due.act != rule.Act.stay { d.*.due = due }
+    note(d)
+}
+
+// Whether a change is due (modes.mlx looks, on the trap's way back).
+pub fn isDue(d: *const Driver) -> bool { return d.*.due.act != rule.Act.stay }
+
+// The card taken for a write: the tick kept off it (`watching`), the
+// user said, a reading under way let end. What `watching` was.
+fn take(d: *Driver, user: User) -> bool {
+    const was = d.*.watching.*
+    d.*.watching.* = false
+    d.*.user = user
+    if d.*.watch.*.reading == NONE || d.*.hands == null { return was }
+    const port = &d.*.watch.*.ports.ports[d.*.watch.*.reading]
+    const began = d.*.card.time()
+    d.*.card.say("gpu: ")
+    plug.sayName(&d.*.card, port)
+    d.*.card.say(": the reading of its EDID that is under way is let end before the card is written\n")
+    _ = plug.finish(&d.*.card, d.*.hands.?, d.*.pause, d.*.watch)
+    d.*.finished += 1
+    d.*.card.field("gpu: it ended after ", (d.*.card.time() - began) / 1000000)
+    d.*.card.say(" ms\n")
+    return was
+}
+
+fn give(d: *Driver, was: bool) -> void {
+    d.*.user = User.nobody
+    d.*.watching.* = was
+}
+
+// The change the tick found due, made (from modes.mlx's `due`, on the
+// trap's way back from the timer's interrupt). `state`: the display's
+// state of the modes (null: none), whose pending mode is taken back
+// first.
+pub fn carryDue(d: *Driver, state: ?*dm.State) -> Due {
+    if d.*.due.act == rule.Act.stay { return Due.none }
+    const due = d.*.due
+    d.*.due = stay(d)
+    if d.*.user != User.nobody { return Due.waits }
+    if state != null && state.?.*.pending {
+        const card = &d.*.card
+        card.say("gpu: ")
+        if due.act == rule.Act.move {
+            card.say("the picture is to be brought to ")
+            plug.sayName(card, &d.*.watch.*.ports.ports[due.to])
+        } else {
+            plug.sayName(card, &d.*.watch.*.ports.ports[due.to])
+            card.say(": its mode is to be set")
+        }
+        card.say(" while a mode asked for waits to be confirmed: the mode before is put back first\n")
+        _ = state.?.withdraw()
+        return Due.withdrawn
+    }
+    const was = take(d, User.moving)
+    const done = rule.carry(&d.*.card, d.*.lent, d.*.follow, d.*.watch, due)
+    // (The card was written: what it runs now is read for what is judged
+    // next. Nothing written: the read-out stands.)
+    if d.*.lent.*.result.*.outcome != modeset.Outcome.untouched { readAgain(d) }
+    note(d)
+    give(d, was)
+    if !done { return Due.failed }
+    // The display's modes are the new output's monitor's, and what runs
+    // is found among them (its rate is another after another monitor's
+    // own timing was set).
+    if state != null && d.*.listedCount != 0 { state.?.moved(modeEdid(d), changing.rate(d.*.seen)) }
+    return Due.made
+}
+
+// The card read out again for the mode change's record, the read-out's
+// lines for the log alone.
+fn readAgain(d: *Driver) -> void {
+    const aside = d.*.change.*.aside
+    aside(true)
+    changing.look(d.*.change, d.*.seen)
+    aside(false)
+}
+
+// What a change of the mode leaves for the others: the outputs' records
+// read anew (a mode set may change what an output sends: DVI or HDMI
+// signalling) and the switch's record of the picture. A change the tick
+// decided before it is not made: it was judged by the picture of before
+// (the time to confirm ends at the tick that decides a move, and
+// modes.mlx's `due` takes the mode back first); the switch decides anew
+// at the next tick.
+fn changed(d: *Driver, result: dm.Set) -> void {
+    if result == dm.Set.refused || result == dm.Set.busy { return }
+    plug.serveAll(&d.*.card, &d.*.watch.*.ports)
+    rule.modeChanged(&d.*.card, d.*.follow, &d.*.watch.*.ports, &d.*.seen.*.plan, &d.*.seen.*.result)
+    d.*.due = stay(d)
+}
+
+// A mode a program asked for (`t`, its timing) set: the driver's `set`
+// behind display_modes.mlx's seam (gpu.mlx's `modeSetTo`).
+pub fn set(d: *Driver, t: *const edid.Timing) -> dm.Set {
+    if d.*.user != User.nobody {
+        d.*.busy += 1
+        return dm.Set.busy
+    }
+    const was = take(d, User.changing)
+    const result = changing.change(d.*.change, d.*.seen, t)
+    changed(d, result)
+    give(d, was)
+    return result
+}
+
+// The mode before the last change put back (by the program, or by the
+// kernel at the end of the time to confirm or before a move): the
+// driver's `back` (gpu.mlx's `modeBack`).
+pub fn back(d: *Driver, before: *const dm.Mode) -> dm.Set {
+    if d.*.user != User.nobody {
+        d.*.busy += 1
+        return dm.Set.busy
+    }
+    const was = take(d, User.changing)
+    const result = changing.back(d.*.change, d.*.seen, before)
+    changed(d, result)
+    give(d, was)
+    return result
+}
+
+// Whether a mode can be set (the driver's `judge`): by the card as it
+// runs now, read again first when something wrote it since the last
+// read-out.
+pub fn judge(d: *Driver, asked: *dm.Mode) -> void {
+    if !d.*.seen.*.fresh && d.*.user == User.nobody { readAgain(d) }
+    changing.judge(d.*.change, d.*.seen, asked)
+}

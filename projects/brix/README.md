@@ -1343,10 +1343,14 @@ shown") and it is tried again in 5 and 30 seconds, three times in all,
 or when a line or an EDID changes. When the way back itself does not
 end in the state of before, nothing is tried again at that boot ("gpu:
 the monitor is not followed any more at this boot: ..."), and a restart
-starts from the firmware's picture. The change is made from the timer's
-tick on the first processor, in one go: no other processor enters the
-kernel meanwhile, programs go on drawing into the picture, which is not
-moved.
+starts from the firmware's picture. The timer's tick decides; the
+change is made right after that interrupt, on the trap's way back, by
+the same machinery as a mode a program asks for: every other processor
+stands still while the card is written, and only then. The picture's
+memory is not moved, and programs draw on as before. (Before, the whole
+change ran inside the timer's interrupt, about 1.5 seconds with the
+card read out first, while every other processor that came to the
+kernel waited for it.)
 
 A monitor switched off and on, or to another input and back, on the
 same output: its EDID is read again; the same monitor, an output that
@@ -1571,8 +1575,15 @@ pitch; node_map gives its memory, which on the Radeon is another part of
 the card's memory), the kernel's console is on it where it was on the
 old one, and every handle of the node has the state "changed" until its
 holder has read the node again. A program that still has the old picture
-mapped keeps memory of the adapter there, which the display shows no
-more: it never faults; it reads the node and maps it anew.
+mapped keeps that mapping: the kernel does not take it away (a fault
+would end the program, and the one that draws is the desktop). On the
+Radeon a new picture is never put where the picture just before it lay
+(two places in the card's memory, used in turn), so what a program one
+change late draws there is not seen; one that is two changes late (it
+did not look again across a change and its taking back) may draw onto
+the picture shown. QEMU's adapter shows its picture from the start of
+its memory whatever its size, so there a late program's drawing lands
+on the new picture, sheared, until it reads the node and maps it anew.
 
 What is remembered is a file, /system/settings/display-modes, written by
 the kernel when a mode is confirmed (a line a display: its adapter, its
@@ -1583,6 +1594,15 @@ monitor gets its own mode. A system that runs from its image alone has
 no disk to keep it on, and says so when a mode is confirmed. On the
 Radeon the boot sets the monitor's own mode first, as ever, and then the
 remembered one by the same change a request makes.
+
+When 2 KiB do not hold every monitor's line, the lines confirmed longest
+ago are left out. A remembered mode that a boot tries and that fails
+(the display was written and the mode did not come) is forgotten, and
+the log says so: tried at every boot it would darken every start. One
+that cannot be set at a boot, with nothing written, stays remembered.
+A confirmation that comes after the fifteen seconds finds the mode
+before back, even when the timer's tick has not come yet to take it
+back.
 
 The boot's choice goes before what is remembered:
 
@@ -1598,8 +1618,31 @@ The boot's choice goes before what is remembered:
   while the machine starts sets the monitor's own mode again and forgets
   this one)").
 
+On the Radeon the mode a program asks for, the hot plug lines with the
+EDIDs read over DDC, and the monitor followed to another output are one
+driver (kernel/gpu_together.mlx), with one user of the card's display
+at a time:
+
+- While a mode is set, nothing looks at the lines and no EDID is read;
+  a reading that is under way is let end first ("gpu: connector 3
+  (HDMI): the reading of its EDID that is under way is let end before
+  the card is written"), never cut in the middle. While the picture is
+  brought to another output a program's request is answered "busy".
+- After a mode change, the monitor moved to another output gets the
+  picture with the mode that runs. After a move, the display's modes
+  are those of the monitor it is on now, read from its EDID, and the
+  next change is made for that output.
+- A monitor moved while a mode waits to be confirmed: the mode before
+  is put back first ("gpu: the picture is to be brought to connector 3
+  (HDMI) while a mode asked for waits to be confirmed: the mode before
+  is put back first"), then the picture is brought over. A second
+  monitor, or the monitor switched off and on, leaves the question as
+  it is.
+
 tests/489_display_modes_runtime.mlx holds the lists, every request and
-the remembered file on the host; tests/490_gpu_mode_change_runtime.mlx
+the remembered file on the host; tests/498_gpu_together_runtime.mlx the
+mode change, the hot plug lines and the move together, each in the
+middle of the others; tests/490_gpu_mode_change_runtime.mlx
 the Radeon's change against a card that is a table (the same writes and
 table runs as a boot's mode set for that timing, the picture's two
 places in turn, a failure at every table); tools/check_brix_modes.sh the
