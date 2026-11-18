@@ -108,6 +108,14 @@
 # Linux's value against the SMC's, the list's, the packets' and the
 # copy engines' files, the list's order and the copies', the golden
 # table, and that no register those steps write is the display's.
+# Of stage 5 (gpu_compute.mlx, gpu_ring.mlx, gpu_clear_state.mlx: the
+# graphics block, the RLC, the KIQ and compute ring 0, the ring as an
+# interface): every register, field, packet and macro's shift, the golden
+# tables row for row, the tiling words and the raster configuration worked
+# out from gfx_v8_0.c's macros, the queue descriptor's words from
+# vi_structs.h, the KIQ's queue by amdgpu_gfx_kiq_acquire's rule, Linux's
+# values where its files have them, the clear state value for value, and
+# that no register stage 5 writes is the display's.
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -1296,4 +1304,289 @@ for name in sorted(written):
         in_display = any(runs[k] <= at <= runs[k + 1] for k in range(0, len(runs), 2))
         hold("%s (%#x) written by stage 3 or 4 is no register of the display's" % (name, at), int(in_display), 0)
 print("stages 3 and 4: %d numbers of gpu_smc_sdma.mlx held against Linux's files, %d wrong" % (held - loaded_before, bad - loaded_bad_before))
+# ---- Stage 5: gpu_compute.mlx, gpu_ring.mlx, gpu_clear_state.mlx (the
+# graphics block's settings, the RLC, the KIQ and compute ring 0, the ring
+# as an interface, the clear state). Beside the files above, of Linux
+# 6.6's drivers/gpu/drm/amd:
+#   include/asic_reg/gca/gfx_8_0_enum.h  the tiling words' names, the
+#                                       memory types, the shader memory
+#                                       modes, the end of pipe's event
+#   include/vi_structs.h                the queue descriptor (struct vi_mqd,
+#                                       struct vi_mqd_allocation)
+#   amdgpu/clearstate_vi.h              the clear state
+#   amdgpu/amdgpu_gfx.c, amdgpu_ids.h   the KIQ's queue, the address spaces
+#   amdgpu/amdgpu_ring.c                a ring's size and record
+# and that no register these steps write is the display's.
+stage5_needed = ("gfx_8_0_enum.h", "vi_structs.h", "clearstate_vi.h", "amdgpu_gfx.c", "amdgpu_ids.h", "amdgpu_ring.c", "vid.h",
+                 "gfx_v8_0.c", "gmc_v8_0.c", "amdgpu_doorbell.h", "ivsrcid_vislands30.h", "amdgpu_drv.c")
+stage5_missing = [name for name in stage5_needed if not os.path.exists(os.path.join(hdr, name))]
+if stage5_missing:
+    sys.exit("stage 5 is not held: not in %s: %s" % (hdr, " ".join(stage5_missing)))
+stage5_before = held
+stage5_bad_before = bad
+compute_text = open(os.path.join(here, "gpu_compute.mlx")).read()
+ring_text = open(os.path.join(here, "gpu_ring.mlx")).read()
+clear_text = open(os.path.join(here, "gpu_clear_state.mlx")).read()
+enum8 = {m.group(1): int(m.group(2), 0) for m in re.finditer(r"^\s*(\w+)\s*=\s*(0x[0-9a-fA-F]+|\d+)\s*,", text_of("gfx_8_0_enum.h"), re.M)}
+vid_text = re.sub(r"/\*.*?\*/", "", text_of("vid.h"), flags=re.S)
+gfx_shifts = {m.group(1): int(m.group(2), 0) for m in re.finditer(r"#define\s+(\w+)__SHIFT\s+(0x[0-9a-fA-F]+|\d+)", text_of("gfx_8_0_sh_mask.h"))}
+amdgpu_gfx_c = text_of("amdgpu_gfx.c")
+ring_c = text_of("amdgpu_ring.c")
+gmc8_c = text_of("gmc_v8_0.c")
+
+def vid_value(name):
+    # A define of vid.h: a number, (1 << n), (x << n) for a macro that takes
+    # a value (its shift), PACKET3's opcodes.
+    m = re.search(r"#\s*define\s+%s\(x\)\s+\(\(x\)\s*<<\s*(\d+)\)" % name, vid_text)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"#\s*define\s+%s\s+\((\d+)\s*<<\s*(\d+)\)" % name, vid_text)
+    if m:
+        return int(m.group(1)) << int(m.group(2))
+    m = re.search(r"#\s*define\s+%s\s+(0x[0-9a-fA-F]+|\d+)\b" % name, vid_text)
+    if m:
+        return int(m.group(1), 0)
+    return None
+
+def function_body(text, name):
+    at = text.index(name + "(")
+    at = text.index("{", at)
+    return text[at:text.index("\n}\n", at)]
+
+# The descriptor's words (every field 32 bits) and the allocation's bytes.
+structs_text = re.sub(r"/\*.*?\*/", "", text_of("vi_structs.h"), flags=re.S)
+mqd_body = re.search(r"struct vi_mqd \{(.*?)\};", structs_text, re.S).group(1)
+mqd_words = {}
+at = 0
+for name, count in re.findall(r"uint32_t\s+(\w+)\s*(?:\[(\d+)\])?\s*;", mqd_body):
+    mqd_words[name] = at
+    at += int(count) if count else 1
+mqd_size = at * 4
+allocation = {"size": mqd_size}
+alloc_body = re.search(r"struct vi_mqd_allocation \{(.*?)\};", structs_text, re.S).group(1)
+at = mqd_size
+for name in re.findall(r"uint32_t\s+(\w+)\s*;", alloc_body):
+    allocation[name] = at
+    at += 4
+allocation["size"] = at
+
+gfx_c_plain = re.sub(r"/\*.*?\*/", "", gfx_c, flags=re.S)
+mqd_init = function_body(gfx_c_plain, "static int gfx_v8_0_mqd_init")
+early = re.search(r"case CHIP_POLARIS10:\n\tcase CHIP_VEGAM:\n(.*?)break;", function_body(gfx_c_plain, "static int gfx_v8_0_gpu_early_init"), re.S).group(1)
+def config(name):
+    return int(re.search(r"adev->gfx.config.%s = (0x[0-9a-fA-F]+|\d+);" % name, early).group(1), 0)
+constants_init = function_body(gfx_c_plain, "static void gfx_v8_0_constants_init")
+compute_funcs = re.search(r"static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_compute = \{(.*?)\};", gfx_c_plain, re.S).group(1)
+kiq_funcs = re.search(r"static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_kiq = \{(.*?)\};", gfx_c_plain, re.S).group(1)
+gfx_funcs = re.search(r"static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_gfx = \{(.*?)\};", gfx_c_plain, re.S).group(1)
+aligns = {int(re.search(r"\.align_mask = (0x[0-9a-fA-F]+)", f).group(1), 0) for f in (compute_funcs, kiq_funcs, gfx_funcs)}
+nops = {re.search(r"\.nop = PACKET3\(PACKET3_NOP, (0x[0-9a-fA-F]+)\)", f).group(1) for f in (compute_funcs, kiq_funcs, gfx_funcs)}
+hold("the three rings pad to one fetch size", len(aligns), 1)
+hold("the three rings' NOP covers 0x3FFF", int(nops == {"0x3FFF"}), 1)
+fence_kiq = function_body(gfx_c, "static void gfx_v8_0_ring_emit_fence_kiq")
+fence_compute = function_body(gfx_c_plain, "static void gfx_v8_0_ring_emit_fence_compute")
+hdp_flush = function_body(gfx_c, "static void gfx_v8_0_ring_emit_hdp_flush")
+mem_sync = function_body(gfx_c, "static void gfx_v8_0_emit_mem_sync_compute")
+cond_exec = function_body(gfx_c, "static unsigned gfx_v8_0_ring_emit_init_cond_exec")
+kiq_kcq = function_body(gfx_c_plain, "static int gfx_v8_0_kiq_kcq_enable")
+kcq_disable = function_body(gfx_c_plain, "static int gfx_v8_0_kcq_disable")
+test_ib = function_body(gfx_c_plain, "static int gfx_v8_0_ring_test_ib")
+gfx_start = function_body(gfx_c_plain, "static int gfx_v8_0_cp_gfx_start")
+compute_vmid = function_body(gfx_c_plain, "static void gfx_v8_0_init_compute_vmid")
+early_gmc = function_body(gmc8_c, "static int gmc_v8_0_early_init")
+doorbell_text = text_of("amdgpu_doorbell.h")
+ivsrc8 = defines(os.path.join(hdr, "ivsrcid_vislands30.h"))
+
+# The tiling words: the Polaris 10 case of gfx_v8_0_tiling_mode_table_init
+# with its macros, the headers' shifts and the enum's names.
+tiling_fn = function_body(gfx_c_plain, "static void gfx_v8_0_tiling_mode_table_init")
+tiling_case = re.search(r"case CHIP_POLARIS10:\n(.*?)\n\t\tbreak;", tiling_fn, re.S).group(1)
+tile_macros = {m.group(1): m.group(2) for m in re.finditer(r"#define\s+(ARRAY_MODE|PIPE_CONFIG|TILE_SPLIT|MICRO_TILE_MODE_NEW|SAMPLE_SPLIT|BANK_WIDTH|BANK_HEIGHT|MACRO_TILE_ASPECT|NUM_BANKS)\(x\)\s+\(\(x\) << (\w+)__SHIFT\)", gfx_c_plain)}
+def tiling_value(expression):
+    return eval(re.sub(r"(\w+)\((\w+)\)", lambda m: "((%d) << %d)" % (enum8[m.group(2)], gfx_shifts[tile_macros[m.group(1)]]), " ".join(expression.split())))
+linux_tiles = [0] * 32
+linux_macrotiles = [0] * 16
+for which, index, expression in re.findall(r"(modearray|mod2array)\[(\d+)\] = \((.*?)\);", tiling_case, re.S):
+    (linux_tiles if which == "modearray" else linux_macrotiles)[int(index)] = tiling_value(expression)
+skipped = int(re.search(r"if \(reg_offset != (\d+)\)\s*\n\s*WREG32\(mmGB_MACROTILE_MODE0", tiling_case).group(1))
+
+# The raster configuration of Polaris 10 (gfx_v8_0_raster_config) by
+# vid.h's macros.
+raster_fn = function_body(gfx_c_plain, "gfx_v8_0_raster_config")
+raster_case = re.search(r"case CHIP_TONGA:\n\tcase CHIP_POLARIS10:\n(.*?)break;", raster_fn, re.S).group(1)
+def raster_value(expression):
+    return eval(re.sub(r"(\w+)\((\d+)\)", lambda m: "(%d << %d)" % (int(m.group(2)), vid_value(m.group(1))), " ".join(expression.split())))
+raster0 = raster_value(re.search(r"\*rconf \|= (.*?);", raster_case, re.S).group(1))
+raster1 = raster_value(re.search(r"\*rconf1 \|= (.*?);", raster_case, re.S).group(1))
+
+# The KIQ's queue by amdgpu_gfx_kiq_acquire with compute ring 0 taken (its
+# bit 0): the highest free bit whose queue is 0 and not on pipe 2 or 3 of
+# the second processor, two processors of 4 pipes of 8 queues
+# (gfx_v8_0_sw_init).
+num_mec = 2 if re.search(r"case CHIP_POLARIS10:[^\n]*\n(?:[^\n]*\n)*?\s*adev->gfx.mec.num_mec = 2;", gfx_c_plain) else 1
+pipes = int(re.search(r"adev->gfx.mec.num_pipe_per_mec = (\d+);", gfx_c_plain).group(1))
+queues = int(re.search(r"adev->gfx.mec.num_queue_per_pipe = (\d+);", gfx_c_plain).group(1))
+kiq_place = None
+for bit in range(num_mec * pipes * queues - 1, -1, -1):
+    if bit == 0:
+        continue
+    mec, rest = divmod(bit, pipes * queues)
+    pipe, queue = divmod(rest, queues)
+    if (mec == 1 and pipe > 1) or queue != 0:
+        continue
+    kiq_place = (mec + 1, pipe, queue)
+    break
+hold("the KIQ's queue rule in amdgpu_gfx.c is the one followed", int("(mec == 1 && pipe > 1) || queue != 0" in amdgpu_gfx_c), 1)
+
+ring_words = int(re.search(r"r = amdgpu_ring_init\(adev, ring, (\d+), &adev->gfx.eop_irq, irq_type,", gfx_c_plain).group(1))
+submissions = int(re.search(r"int amdgpu_sched_hw_submission = (\d+);", drv_c).group(1))
+STAGE5_LINUX = {
+    "RING_ALIGN": aligns.pop() + 1,
+    "HDP_POLL_INTERVAL": int(re.search(r"amdgpu_ring_write\(ring, (0x[0-9a-fA-F]+)\); /\* poll interval \*/", hdp_flush).group(1), 0),
+    "MEM_SYNC_POLL": int(re.search(r"amdgpu_ring_write\(ring, (0x[0-9a-fA-F]+)\);\s*/\* poll interval \*/", mem_sync).group(1), 0),
+    "COND_EXEC_DUMMY": int(re.search(r"amdgpu_ring_write\(ring, (0x[0-9a-fA-F]+)\); /\* patch dummy value later \*/", cond_exec).group(1), 0),
+    "CPC_INT_RAISE": int(re.search(r"amdgpu_ring_write\(ring, (0x[0-9a-fA-F]+)\); /\* src_id is 178 \*/", fence_kiq).group(1), 0),
+    "DATA_32": int(re.search(r"DATA_SEL\(write64bit \? \d+ : (\d+)\)", fence_compute).group(1)),
+    "INTERRUPT_CONFIRMED": int(re.search(r"INT_SEL\(int_sel \? (\d+) : 0\)", fence_compute).group(1)),
+    "CACHE_FLUSH_AND_INV_TS_EVENT": enum8.get("CACHE_FLUSH_AND_INV_TS_EVENT"),
+    "MTYPE_NC": enum8.get("MTYPE_NC"),
+    "MTYPE_CC": enum8.get("MTYPE_CC"),
+    "MTYPE_UC": enum8.get("MTYPE_UC"),
+    "SH_MEM_ALIGNMENT_MODE_UNALIGNED": enum8.get("SH_MEM_ALIGNMENT_MODE_UNALIGNED"),
+    "SH_MEM_ADDRESS_MODE_HSA64": enum8.get("SH_MEM_ADDRESS_MODE_HSA64"),
+    "ACLK_DIVIDER": int(re.search(r"data \|= (0x[0-9a-fA-F]+) << CG_ACLK_CNTL__ACLK_DIVIDER__SHIFT;", gfx_c_plain).group(1), 0),
+    "MACROTILE_SKIPPED": skipped,
+    "RASTER_CONFIG": raster0,
+    "RASTER_CONFIG_1": raster1,
+    "SC_FRONTEND_PRIM_FIFO_SIZE": config("sc_prim_fifo_size_frontend"),
+    "SC_BACKEND_PRIM_FIFO_SIZE": config("sc_prim_fifo_size_backend"),
+    "SC_HIZ_TILE_FIFO_SIZE": config("sc_hiz_tile_fifo_size"),
+    "SC_EARLYZ_TILE_FIFO_SIZE": config("sc_earlyz_tile_fifo_size"),
+    "MAX_CONTEXT": config("max_hw_contexts") - 1 if "WREG32(mmCP_MAX_CONTEXT, adev->gfx.config.max_hw_contexts - 1);" in gfx_start else None,
+    "PIPE_ORDER": int(re.search(r"SPI_ARB_PRIORITY, PIPE_ORDER_TS0, (\d+)\);", constants_init).group(1)),
+    "SWIZZLE_ENABLE": int(re.search(r"SWIZZLE_ENABLE, (\d+)\);", constants_init).group(1)),
+    "ELEMENT_SIZE": int(re.search(r"ELEMENT_SIZE, (\d+)\);", constants_init).group(1)),
+    "INDEX_STRIDE": int(re.search(r"INDEX_STRIDE, (\d+)\);", constants_init).group(1)),
+    "SHARED_APERTURE_BASES": int(re.search(r"adev->gmc.shared_aperture_start = (0x[0-9a-fA-F]+)ULL;", early_gmc).group(1), 0) >> 48 if "adev->gmc.shared_aperture_start >> 48" in constants_init else None,
+    "DEFAULT_SH_MEM_BASES": int(re.search(r"#define DEFAULT_SH_MEM_BASES\s+\((0x[0-9a-fA-F]+)\)", gfx_c_plain).group(1), 0) if "DEFAULT_SH_MEM_BASES | (DEFAULT_SH_MEM_BASES << 16)" in compute_vmid else None,
+    "FIRST_KFD_VMID": int(re.search(r"adev->vm_manager.first_kfd_vmid = (\d+);", gmc8_c).group(1)),
+    "AMDGPU_NUM_VMID": defines(os.path.join(hdr, "amdgpu_ids.h")).get("AMDGPU_NUM_VMID"),
+    # (gpu_ring.mlx: the address spaces a buffer may name.)
+    "SPACES": defines(os.path.join(hdr, "amdgpu_ids.h")).get("AMDGPU_NUM_VMID"),
+    "SPM_VMID": int(re.search(r"update_spm_vmid\(adev, (0x[0-9a-fA-F]+)\);", gfx_c_plain).group(1), 0),
+    "KIQ_ME": kiq_place[0],
+    "KIQ_PIPE": kiq_place[1],
+    "KIQ_QUEUE": kiq_place[2],
+    # gfx_v8_0_sw_init: ring 0 is the first processor's (ME 1), its first
+    # pipe and queue.
+    "RING0_ME": 1 if "ring->me = mec + 1;" in gfx_c_plain else None,
+    "RING0_PIPE": 0,
+    "RING0_QUEUE": 0,
+    "GFX8_MEC_HPD_SIZE": int(re.search(r"#define GFX8_MEC_HPD_SIZE (\d+)", gfx_c_plain).group(1)),
+    "MQD_HEADER": int(re.search(r"mqd->header = (0x[0-9a-fA-F]+);", mqd_init).group(1), 0),
+    "PRELOAD_SIZE": int(re.search(r"PRELOAD_SIZE, (0x[0-9a-fA-F]+)\);", mqd_init).group(1), 0),
+    "DEVICE_ID": int(re.search(r"WREG32\(mmCP_DEVICE_ID, (\d+)\);", gfx_start).group(1)),
+    "CE_PARTITION": int(re.search(r"PACKET3_BASE_INDEX\(CE_PARTITION_BASE\)\);\s*\n\s*amdgpu_ring_write\(ring, (0x[0-9a-fA-F]+)\);", gfx_start).group(1), 0),
+    "CONTEXT_CONTROL_WORD": int(re.search(r"PACKET3_CONTEXT_CONTROL, 1\)\);\s*\n\s*amdgpu_ring_write\(ring, (0x[0-9a-fA-F]+)\);", gfx_start).group(1), 0),
+    "IDLE_STATUS2": int(re.search(r"RREG32\(mmGRBM_STATUS2\) != (0x[0-9a-fA-F]+)\)", gfx_c_plain).group(1), 0),
+    "RESET_QUEUES": int(re.search(r"PACKET3_UNMAP_QUEUES_ACTION\((\d+)\) \| /\* RESET_QUEUES \*/", gfx_c).group(1)),
+    "DST_MEMORY": int(re.search(r"ib.ptr\[1\] = WRITE_DATA_DST_SEL\((\d+)\) \| WR_CONFIRM;", test_ib).group(1)),
+    "RING0_ID": (1 << 2) | 0 | (0 << 4) if "me_id = (entry->ring_id & 0x0c) >> 2;" in gfx_c_plain and "queue_id = (entry->ring_id & 0x70) >> 4;" in gfx_c_plain else None,
+    "VISLANDS30_IV_SRCID_CP_END_OF_PIPE": ivsrc8.get("VISLANDS30_IV_SRCID_CP_END_OF_PIPE"),
+    "VISLANDS30_IV_SRCID_CP_PRIV_REG_FAULT": ivsrc8.get("VISLANDS30_IV_SRCID_CP_PRIV_REG_FAULT"),
+    "VISLANDS30_IV_SRCID_CP_PRIV_INSTR_FAULT": ivsrc8.get("VISLANDS30_IV_SRCID_CP_PRIV_INSTR_FAULT"),
+}
+for name in ("AMDGPU_DOORBELL_KIQ", "AMDGPU_DOORBELL_MEC_RING0", "AMDGPU_DOORBELL_MEC_RING7", "AMDGPU_DOORBELL_GFX_RING0"):
+    STAGE5_LINUX[name] = int(re.search(r"%s\s*=\s*(0x[0-9A-Fa-f]+)" % name, doorbell_text).group(1), 0)
+for name, word in mqd_words.items():
+    STAGE5_LINUX["vi_mqd__" + name] = word
+for name, offset in allocation.items():
+    STAGE5_LINUX["vi_mqd_allocation__" + name] = offset
+# (Their own: the records, the marks, the room.)
+STAGE5_OWN = {"STOP_MARK", "WATCH_EVERY", "KEPT", "KIQ_RECORD", "RING0_RECORD", "GRAPHICS_RECORD", "IB_TEST_AT", "MOST_ENGINES",
+              "MOST_ARRAYS", "MOST_UNITS", "NONE", "RECORD", "RPTR_SLOT", "WPTR_SLOT", "FENCE_SLOT", "COND_SLOT", "FRAME_WORDS", "FAULTS",
+              # (the packet's length field, bits 19:0: the study's 5.7; no header of Linux's names it)
+              "IB_LENGTH_MOST"}
+STAGE5_PRODUCTS = {"RING_BYTES"}
+stage5_names = {}
+for text in (compute_text, ring_text):
+    for name, value, inside in constants(text):
+        stage5_names[name] = value
+        if name in STAGE5_OWN or name in STAGE5_PRODUCTS:
+            continue
+        if name in STAGE5_LINUX:
+            hold(name, value, STAGE5_LINUX[name])
+        elif name.endswith("_SHIFT") or name.startswith("PACKET3_") or name.startswith("PACKET_") or name.startswith("EOP_") or name in ("WR_CONFIRM", "INDIRECT_BUFFER_VALID", "CE_PARTITION_BASE"):
+            hold(name, value, vid_value(name[:-len("_SHIFT")] if name.endswith("_SHIFT") else name))
+        elif name.startswith("GPU_HDP_FLUSH_DONE__"):
+            hold(name, value, masks.get(name + "_MASK"))
+        elif "__" in name:
+            hold(name, value, masks.get(name + "_MASK"))
+        else:
+            hold(name, value, regs.get("mm" + name))
+# The ring's bytes: amdgpu_ring_init's rule for the 1024 words the compute
+# and graphics rings ask (twice over, a power of two).
+mine = re.search(r"pub const RING_BYTES: usize = (\d+) \* (\d+) \* (\d+)", compute_text)
+hold("RING_BYTES is amdgpu_ring_init's for the rings' 1024 words", int(mine.group(1)) * int(mine.group(2)) * int(mine.group(3)), 1 << (ring_words * 4 * submissions - 1).bit_length())
+hold("the ring's record slots are 32 bytes apart as amdgpu_device_wb_get's", stage5_names["RECORD"], 32 if "*wb = offset << 3; /* convert to dw offset */" in text_of("amdgpu_device.c") else None)
+# The golden tables, row for row.
+for table_name, mine_name in (("golden_settings_polaris10_a11", "GOLDEN_GRAPHICS_WORDS"), ("polaris10_golden_common_all", "GOLDEN_COMMON_WORDS")):
+    rows = golden(gfx_c, table_name)
+    code = [int(x, 0) for x in re.search(r"pub const %s = \[_\]usize\{([^}]*)\}" % mine_name, compute_text).group(1).replace(" ", "").split(",")]
+    hold("%s's rows, as many" % mine_name, len(code), len(rows))
+    for k in range(min(len(code), len(rows))):
+        hold("%s word %d" % (mine_name, k), code[k], resolve(rows[k]))
+# The tiling words.
+code_tiles = [int(x, 0) for x in re.search(r"pub const TILE_MODES = \[_\]usize\{([^}]*)\}", compute_text).group(1).replace(" ", "").split(",")]
+code_macrotiles = [int(x, 0) for x in re.search(r"pub const MACROTILE_MODES = \[_\]usize\{([^}]*)\}", compute_text).group(1).replace(" ", "").split(",")]
+hold("TILE_MODES, as many", len(code_tiles), len(linux_tiles))
+hold("MACROTILE_MODES, as many", len(code_macrotiles), len(linux_macrotiles))
+for k in range(min(len(code_tiles), 32)):
+    hold("tile mode %d" % k, code_tiles[k], linux_tiles[k])
+for k in range(min(len(code_macrotiles), 16)):
+    hold("macrotile mode %d" % k, code_macrotiles[k], linux_macrotiles[k])
+# gfx_v8_0_mqd_commit's ranges: the registers from CP_MQD_BASE_ADDR are
+# the descriptor's words from cp_mqd_base_addr_lo, in the same order.
+for name in ("CP_HQD_VMID", "CP_HQD_PERSISTENT_STATE", "CP_HQD_QUANTUM", "CP_HQD_PQ_DOORBELL_CONTROL", "CP_HQD_PQ_CONTROL", "CP_HQD_IB_CONTROL",
+             "CP_HQD_IQ_TIMER", "CP_MQD_CONTROL", "CP_HQD_EOP_CONTROL", "CP_HQD_EOP_RPTR", "CP_HQD_EOP_WPTR", "CP_HQD_EOP_EVENTS",
+             "CP_HQD_CTX_SAVE_BASE_ADDR_LO", "CP_HQD_CTX_SAVE_BASE_ADDR_HI", "CP_HQD_CTX_SAVE_CONTROL", "CP_HQD_CNTL_STACK_OFFSET",
+             "CP_HQD_CNTL_STACK_SIZE", "CP_HQD_WG_STATE_OFFSET", "CP_HQD_CTX_SAVE_SIZE", "CP_HQD_ERROR", "CP_HQD_EOP_WPTR_MEM", "CP_HQD_EOP_DONES"):
+    field_name = {"CP_HQD_EOP_EVENTS": "cp_hqd_eop_done_events"}.get(name, name.lower())
+    hold("%s is the descriptor's %s" % (name, field_name), regs["mm" + name] - regs["mmCP_MQD_BASE_ADDR"] + mqd_words["cp_mqd_base_addr_lo"], mqd_words.get(field_name))
+hold("gfx_v8_0_mqd_commit's first range ends at CP_HQD_EOP_CONTROL, its second is CP_HQD_EOP_EVENTS to CP_HQD_ERROR", int("for (mqd_reg = mmCP_HQD_VMID; mqd_reg <= mmCP_HQD_EOP_CONTROL; mqd_reg++)" in gfx_c and "for (mqd_reg = mmCP_HQD_EOP_EVENTS; mqd_reg <= mmCP_HQD_ERROR; mqd_reg++)" in gfx_c and "for (mqd_reg = mmCP_MQD_BASE_ADDR; mqd_reg <= mmCP_HQD_ACTIVE; mqd_reg++)" in gfx_c), 1)
+# The KIQ's packets' words as gfx_v8_0_kiq_kcq_enable and _kcq_disable
+# write them.
+hold("SET_RESOURCES carries 6 words", int("PACKET3(PACKET3_SET_RESOURCES, 6)" in kiq_kcq and "6))" in ring_text + "PACKET3_SET_RESOURCES, 6))" ), 1)
+hold("MAP_QUEUES carries 5 words, the micro engine 1 as 0", int("PACKET3(PACKET3_MAP_QUEUES, 5)" in kiq_kcq and "PACKET3_MAP_QUEUES_ME(ring->me == 1 ? 0 : 1)" in kiq_kcq and "PACKET3_MAP_QUEUES, 5))" in compute_text), 1)
+hold("UNMAP_QUEUES carries 4 words", int("PACKET3(PACKET3_UNMAP_QUEUES, 4)" in kcq_disable and "PACKET3_UNMAP_QUEUES, 4))" in compute_text), 1)
+hold("the queue bit is micro engine x 32 + pipe x 8 + queue (two processors of 4 pipes of 8)", int(pipes * queues == 32 and queues == 8 and "(r.*.me - 1) * 32 + r.*.pipe * 8 + r.*.queue" in compute_text), 1)
+# The clear state, value for value.
+cs_text = re.sub(r"//[^\n]*", "", re.sub(r"/\*.*?\*/", "", text_of("clearstate_vi.h"), flags=re.S))
+cs_arrays = {m.group(1): [int(v, 0) for v in m.group(2).replace("\n", " ").split(",") if v.strip()]
+             for m in re.finditer(r"static const unsigned int (vi_SECT_CONTEXT_def_\d+)\[\] =\s*\{(.*?)\};", cs_text, re.S)}
+cs_runs = re.findall(r"\{\s*(vi_SECT_CONTEXT_def_\d+),\s*(0x[0-9a-fA-F]+),\s*(\d+)\s*\}", cs_text)
+code_first = [int(x, 0) for x in re.search(r"pub const RUN_FIRST = \[_\]usize\{([^}]*)\}", clear_text).group(1).replace(" ", "").split(",")]
+code_count = [int(x, 0) for x in re.search(r"pub const RUN_COUNT = \[_\]usize\{([^}]*)\}", clear_text).group(1).replace(" ", "").split(",")]
+code_values = [int(x, 0) for x in re.search(r"pub const VALUES = \[_\]u32\{([^}]*)\}", clear_text).group(1).replace("\n", " ").replace(" ", "").split(",") if x]
+linux_values = []
+for name, first, count in cs_runs:
+    linux_values += cs_arrays[name]
+hold("the clear state's runs, as many", len(code_first), len(cs_runs))
+for k in range(min(len(code_first), len(cs_runs))):
+    hold("clear state run %d's first register" % k, code_first[k], int(cs_runs[k][1], 0))
+    hold("clear state run %d's count" % k, code_count[k], int(cs_runs[k][2]))
+hold("the clear state's values, as many", len(code_values), len(linux_values))
+hold("the clear state's values, value for value", int(code_values == linux_values), 1)
+# No register these steps write is the display's.
+written5 = set(re.findall(r"\b(?:put|putField)\(e, c, (?:engines\.|loaded\.|ring\.)?(\w+)", compute_text)) | set(re.findall(r"\bwr\(e, (?:engines\.|loaded\.|ring\.)?(\w+)", compute_text + ring_text))
+for name in sorted(written5):
+    number = stage5_names.get(name, loaded_names.get(name, engine_names.get(name)))
+    if number is None:
+        continue
+    in_display = any(runs[k] <= number <= runs[k + 1] for k in range(0, len(runs), 2))
+    hold("%s (%#x) written by stage 5 is no register of the display's" % (name, number), int(in_display), 0)
+for k in range(0, len(code_tiles)):
+    number = regs["mmGB_TILE_MODE0"] + k
+    hold("GB_TILE_MODE%d written by stage 5 is no register of the display's" % k, int(any(runs[j] <= number <= runs[j + 1] for j in range(0, len(runs), 2))), 0)
+print("stage 5: %d numbers of gpu_compute.mlx, gpu_ring.mlx and gpu_clear_state.mlx held against Linux's files, %d wrong" % (held - stage5_before, bad - stage5_bad_before))
 sys.exit(1 if bad or rom_bad or wrong or display_bad else 0)

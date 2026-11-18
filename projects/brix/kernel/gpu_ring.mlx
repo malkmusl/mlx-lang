@@ -1,0 +1,724 @@
+// A command ring of the Radeon's command processors (a Polaris 10, the RX
+// 580) as one small interface: what the kernel does to give the card work
+// and to know when it is done, the same for every ring of the graphics
+// block. Stage 5 (gpu_compute.mlx) is its first user: the KIQ and compute
+// ring 0; the graphics ring (stage 6), a program's address space (stage 7)
+// and the native calls that submit and wait (kernel/native/gpucalls.mlx's
+// gpu_submit and gpu_fence, through gpu_offer.mlx) are built on it. The
+// study's 5.6 to 5.10 and 4.5 (/tmp/brix-next/gpu-accel-kernel.verified.md,
+// as its second reading corrected them), from Linux 6.6's gfx_v8_0.c,
+// amdgpu_ring.c, amdgpu_ib.c, amdgpu_fence.c and amdgpu_ih.c.
+//
+// WHAT A RING IS: a power of two of 32-bit words in the system's memory the
+// GART maps, filled with NOP words; the driver writes packets at its write
+// pointer, pads what it wrote to 256 words (Linux's fetch size) and tells
+// the card the new write pointer; the card reads up to it and writes its
+// read pointer back into the ring's record, a 32-byte piece of a write-back
+// page (Linux's write-back slot: read pointer, write pointer, fence, the
+// conditional word).
+//
+// THE INTERFACE:
+// - `begin` and `clear`: a ring of a kind (compute queue, KIQ, graphics
+//   ring) on its memory, record and doorbell;
+// - `emit`, `commit`: packets written, padded, the write pointer told:
+//   by the record's word and the ring's doorbell (compute queues, the KIQ,
+//   the graphics ring with a doorbell, as Linux's set_wptr does), or by
+//   the register CP_RB0_WPTR, read back (the graphics ring without one);
+// - `ringTest`: Linux's ring test (the scratch register through the ring);
+// - `submit`: an indirect buffer by its card address, its length and the
+//   address space it runs in, framed as amdgpu_ib_schedule frames one (the
+//   memory sync, the host path's flush, the buffer, the host path's
+//   invalidate, the fence at the end of the pipe with its interrupt);
+//   its fence number back, or NONE when the ring takes nothing now or the
+//   buffer cannot be named in the packet as it is given;
+// - `wait`: a fence number waited for, by the end-of-pipe entry in the
+//   interrupt ring (the handler's body run in the wait, as at boot the
+//   processor's interrupts are off) or by the fence word alone, each with
+//   a bound; done, late, hung (its read pointer stands short of its write
+//   pointer), faulted (a privileged register or instruction entry for this
+//   ring) or gone (the card no longer answers);
+// - `sayState`: the words that tell how a ring stands, for a line;
+// - `refused` (no new work: the temperature's first mark, gpu_compute.mlx's
+//   watch) and `hung` (a ring that did not come to its fence: no new work
+//   until the stages bring it up again).
+// The rings' registers and their start are the stages' (gpu_compute.mlx:
+// the KIQ's registers, the map, the graphics ring's registers); a ring here
+// knows only its memory, its pointers and its doorbell or register.
+//
+// The numbers are Linux 6.6's (vid.h, gfx_8_0_d.h, gfx_8_0_sh_mask.h,
+// gfx_8_0_enum.h, bif_5_0_d.h, bif_5_0_sh_mask.h, ivsrcid_vislands30.h,
+// gfx_v8_0.c): tools/check_gpu_registers.py holds every one of them against
+// those files.
+const engines = @import("./gpu_engines.mlx")
+const loaded = @import("./gpu_smc_sdma.mlx")
+
+// ---- The registers (gfx_8_0_d.h).
+pub const CP_STAT: usize = 0x21A0
+pub const CP_CPC_STATUS: usize = 0x2084
+pub const CP_RB0_RPTR: usize = 0x21C0
+pub const CP_RB0_WPTR: usize = 0x3045
+pub const CPC_INT_STATUS: usize = 0x30B5
+
+// ---- The packets (vid.h): a type 3 header, the operations, their fields.
+pub const PACKET_TYPE3: usize = 3
+pub const PACKET3_NOP: usize = 0x10
+pub const PACKET3_SET_BASE: usize = 0x11
+pub const PACKET3_CLEAR_STATE: usize = 0x12
+pub const PACKET3_COND_EXEC: usize = 0x22
+pub const PACKET3_CONTEXT_CONTROL: usize = 0x28
+pub const PACKET3_WRITE_DATA: usize = 0x37
+pub const PACKET3_WAIT_REG_MEM: usize = 0x3C
+pub const PACKET3_INDIRECT_BUFFER: usize = 0x3F
+pub const PACKET3_SURFACE_SYNC: usize = 0x43
+pub const PACKET3_EVENT_WRITE_EOP: usize = 0x47
+pub const PACKET3_RELEASE_MEM: usize = 0x49
+pub const PACKET3_PREAMBLE_CNTL: usize = 0x4A
+pub const PACKET3_ACQUIRE_MEM: usize = 0x58
+pub const PACKET3_SET_CONTEXT_REG: usize = 0x69
+pub const PACKET3_SET_UCONFIG_REG: usize = 0x79
+pub const PACKET3_SET_RESOURCES: usize = 0xA0
+pub const PACKET3_MAP_QUEUES: usize = 0xA2
+pub const PACKET3_UNMAP_QUEUES: usize = 0xA3
+pub const PACKET3_SET_CONTEXT_REG_START: usize = 0xA000
+pub const PACKET3_SET_UCONFIG_REG_START: usize = 0xC000
+// The fields, by their masks or by the shift of a macro of vid.h that takes
+// a value (NAME(x) is x << NAME_SHIFT).
+pub const WRITE_DATA_DST_SEL_SHIFT: usize = 8
+pub const WR_CONFIRM: usize = 0x100000
+pub const WRITE_DATA_ENGINE_SEL_SHIFT: usize = 30
+pub const WAIT_REG_MEM_FUNCTION_SHIFT: usize = 0
+pub const WAIT_REG_MEM_OPERATION_SHIFT: usize = 6
+pub const WAIT_REG_MEM_ENGINE_SHIFT: usize = 8
+pub const INDIRECT_BUFFER_VALID: usize = 0x800000
+pub const PACKET3_TC_WB_ACTION_ENA: usize = 0x40000
+pub const PACKET3_TCL1_ACTION_ENA: usize = 0x400000
+pub const PACKET3_TC_ACTION_ENA: usize = 0x800000
+pub const PACKET3_SH_KCACHE_ACTION_ENA: usize = 0x8000000
+pub const PACKET3_SH_ICACHE_ACTION_ENA: usize = 0x20000000
+pub const EOP_TC_WB_ACTION_EN: usize = 0x8000
+pub const EOP_TCL1_ACTION_EN: usize = 0x10000
+pub const EOP_TC_ACTION_EN: usize = 0x20000
+pub const EVENT_TYPE_SHIFT: usize = 0
+pub const EVENT_INDEX_SHIFT: usize = 8
+pub const DATA_SEL_SHIFT: usize = 29
+pub const INT_SEL_SHIFT: usize = 24
+pub const PACKET3_PREAMBLE_BEGIN_CLEAR_STATE: usize = 0x20000000
+pub const PACKET3_PREAMBLE_END_CLEAR_STATE: usize = 0x30000000
+pub const PACKET3_BASE_INDEX_SHIFT: usize = 0
+pub const CE_PARTITION_BASE: usize = 3
+pub const PACKET3_SET_RESOURCES_QUEUE_TYPE_SHIFT: usize = 29
+pub const PACKET3_MAP_QUEUES_NUM_QUEUES_SHIFT: usize = 29
+pub const PACKET3_MAP_QUEUES_DOORBELL_OFFSET_SHIFT: usize = 2
+pub const PACKET3_MAP_QUEUES_QUEUE_SHIFT: usize = 26
+pub const PACKET3_MAP_QUEUES_PIPE_SHIFT: usize = 29
+pub const PACKET3_MAP_QUEUES_ME_SHIFT: usize = 31
+pub const PACKET3_UNMAP_QUEUES_ACTION_SHIFT: usize = 0
+pub const PACKET3_UNMAP_QUEUES_NUM_QUEUES_SHIFT: usize = 29
+pub const PACKET3_UNMAP_QUEUES_DOORBELL_OFFSET0_SHIFT: usize = 2
+// The event an end of pipe waits for (gfx_8_0_enum.h).
+pub const CACHE_FLUSH_AND_INV_TS_EVENT: usize = 0x14
+// Which bit of the host path's flush is a ring's (bif_5_0_sh_mask.h): the
+// graphics ring's, then micro engine 1's and 2's pipe 0 (shifted by the
+// pipe).
+pub const GPU_HDP_FLUSH_DONE__CP0: usize = 0x1
+pub const GPU_HDP_FLUSH_DONE__CP2: usize = 0x4
+pub const GPU_HDP_FLUSH_DONE__CP6: usize = 0x40
+
+// ---- Linux's numbers that are no register.
+// The interrupt ring's sources of the command processors
+// (ivsrcid_vislands30.h): a fence reached, a privileged register or
+// instruction used by a ring.
+pub const VISLANDS30_IV_SRCID_CP_END_OF_PIPE: usize = 181
+pub const VISLANDS30_IV_SRCID_CP_PRIV_REG_FAULT: usize = 184
+pub const VISLANDS30_IV_SRCID_CP_PRIV_INSTR_FAULT: usize = 185
+// What these rings' words are padded to (align_mask + 1 of
+// gfx_v8_0_ring_funcs_compute, _kiq and _gfx), the host path's flush's poll
+// interval, the memory sync's (gfx_v8_0_emit_mem_sync_compute and
+// gfx_v8_0_emit_mem_sync), the word a conditional execution is patched
+// from (gfx_v8_0_ring_emit_init_cond_exec).
+pub const RING_ALIGN: usize = 256
+pub const HDP_POLL_INTERVAL: usize = 0x20
+pub const MEM_SYNC_POLL: usize = 0xA
+pub const COND_EXEC_DUMMY: usize = 0x55AA55AA
+// The KIQ's interrupt: this word written to CPC_INT_STATUS
+// (gfx_v8_0_ring_emit_fence_kiq: "src_id is 178").
+pub const CPC_INT_RAISE: usize = 0x20000000
+// The fence's 64-bit value (DATA_SEL 2) and 32 (1); the interrupt when the
+// write is confirmed (INT_SEL 2).
+pub const DATA_32: usize = 1
+pub const INTERRUPT_CONFIRMED: usize = 2
+
+// ---- This driver's own numbers.
+// A ring's record in a write-back page (Linux's write-back slot is 8
+// words): its read pointer, its write pointer, its fence, the conditional
+// word.
+pub const RECORD: usize = 32
+pub const RPTR_SLOT: usize = 0
+pub const WPTR_SLOT: usize = 4
+pub const FENCE_SLOT: usize = 8
+pub const COND_SLOT: usize = 16
+// The packets a frame takes at most (the memory sync, a conditional
+// execution, the host path's flush and invalidate, the buffer, two
+// fences): the room a submission asks for before it writes.
+pub const FRAME_WORDS: usize = 64
+// The faults kept per ring (their source and data).
+pub const FAULTS: usize = 4
+// The longest indirect buffer, in words: the packet's length field is bits
+// 19:0 of its control word (the study's 5.7); the bits above it are the
+// valid bit and the address space, which a length must never reach.
+pub const IB_LENGTH_MOST: usize = 0xFFFFF
+// The address spaces (bits 27:24 of the control word).
+pub const SPACES: usize = 16
+// (No such thing.)
+pub const NONE: usize = 0xFFFFFFFFFFFFFFFF
+
+// The ring's kind: a compute queue mapped by the KIQ, the KIQ itself, the
+// graphics ring.
+pub const Kind = enum(u8) { compute, kiq, graphics }
+
+// How a wait ended.
+pub const Waited = enum(u8) { done, late, hung, faulted, gone }
+
+pub const Ring = struct {
+    kind: Kind
+    // The queue: micro engine, pipe, queue (the graphics ring: 0 0 0).
+    me: usize
+    pipe: usize
+    queue: usize
+    // Its memory (physical), its card address, its words (a power of two),
+    // its write pointer (words, kept masked to the ring).
+    memory: usize
+    address: usize
+    words: usize
+    wptr: usize
+    // Its record (physical, and the card's address of it).
+    record: usize
+    recordAddress: usize
+    // Its doorbell's index (NONE: the write pointer by CP_RB0_WPTR).
+    doorbell: usize
+    // Fences: the last number sent, the last seen done.
+    sent: usize
+    done: usize
+    // The end-of-pipe entries the interrupt ring brought for it, and the
+    // faults (source, data) for it.
+    entries: usize
+    faults: usize
+    faultSource: [FAULTS]usize
+    faultData: [FAULTS]usize
+    // It runs; no new work (the temperature's mark); it did not come to a
+    // fence.
+    up: bool
+    refused: bool
+    hung: bool
+    // How long the last wait took (microseconds).
+    waited: usize
+}
+
+// ---- Reaching the card (gpu_engines.mlx's hands, stage 3's two more).
+
+fn rd(e: *engines.Engines, number: usize) -> usize {
+    const read = e.*.hands.read
+    return @intCast(usize, read(number))
+}
+
+fn wr(e: *engines.Engines, number: usize, value: usize) -> void {
+    const write = e.*.hands.write
+    write(number, @intCast(u32, value & 0xFFFFFFFF))
+}
+
+fn say(e: *engines.Engines, text: []const u8) -> void {
+    const write = e.*.hands.say
+    write(text)
+}
+
+fn now(e: *engines.Engines) -> usize {
+    const clock = e.*.hands.now
+    return clock()
+}
+
+fn pause(e: *engines.Engines, microseconds: usize) -> void {
+    const wait = e.*.hands.pause
+    wait(microseconds)
+}
+
+fn memoryRead(e: *engines.Engines, physical: usize) -> usize {
+    const read = e.*.hands.memoryRead
+    return @intCast(usize, read(physical))
+}
+
+fn memoryWrite(l: *loaded.Loaded, physical: usize, value: usize) -> void {
+    const write = l.*.more.memoryWrite
+    write(physical, @intCast(u32, value & 0xFFFFFFFF))
+}
+
+fn hex(e: *engines.Engines, value: usize) -> void {
+    var digits: usize = 1
+    while digits < 16 && (value >> @intCast(u6, digits * 4)) != 0 { digits += 1 }
+    var text: [18]u8 = undefined
+    text[0] = 48
+    text[1] = 120
+    var k: usize = 0
+    while k < digits {
+        const digit = (value >> @intCast(u6, (digits - 1 - k) * 4)) & 15
+        text[2 + k] = @intCast(u8, if digit < 10 { 48 + digit } else { 87 + digit })
+        k += 1
+    }
+    say(e, text[0..2 + digits])
+}
+
+fn decimal(e: *engines.Engines, value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var at: usize = 20
+    var rest = value
+    while true {
+        at -= 1
+        digits[at] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    say(e, digits[at..20])
+}
+
+fn word(e: *engines.Engines, label: []const u8, value: usize) -> void {
+    say(e, label)
+    hex(e, value)
+}
+
+// The card address of a piece of the dma memory: through the GART, whose
+// first entries map the piece page for page (gpu_engines.mlx's M2).
+pub fn gartAddress(e: *engines.Engines, physical: usize) -> usize { return e.*.found.gartStart + physical - e.*.card.dmaBase }
+
+// ---- The packets' words.
+
+// A type 3 header (vid.h's PACKET3): the operation, the count of words
+// that follow less one.
+pub fn packet3(op: usize, count: usize) -> usize { return (PACKET_TYPE3 << 30) | ((op & 0xFF) << 8) | ((count & 0x3FFF) << 16) }
+
+// The filler: a NOP that the processors take as one word (the rings'
+// `nop`, PACKET3(PACKET3_NOP, 0x3FFF)).
+pub fn nop() -> usize { return packet3(PACKET3_NOP, 0x3FFF) }
+
+// The ring id an end-of-pipe entry carries for a queue (gfx_v8_0_eop_irq:
+// micro engine in bits 3:2, pipe in 1:0, queue in 6:4).
+pub fn ringId(me: usize, pipe: usize, queue: usize) -> usize { return ((me & 3) << 2) | (pipe & 3) | ((queue & 7) << 4) }
+
+// ---- A ring.
+
+// A ring of `kind` for queue (me, pipe, queue) on `words` words of the dma
+// memory at `memory`, its record at `record`, its doorbell (NONE: by
+// register). Nothing is written to the card or its memory.
+pub fn begin(e: *engines.Engines, r: *Ring, kind: Kind, me: usize, pipe: usize, queue: usize, memory: usize, words: usize, record: usize, doorbell: usize) -> void {
+    r.*.kind = kind
+    r.*.me = me
+    r.*.pipe = pipe
+    r.*.queue = queue
+    r.*.memory = memory
+    r.*.address = gartAddress(e, memory)
+    r.*.words = words
+    r.*.wptr = 0
+    r.*.record = record
+    r.*.recordAddress = gartAddress(e, record)
+    r.*.doorbell = doorbell
+    r.*.sent = 0
+    r.*.done = 0
+    r.*.entries = 0
+    r.*.faults = 0
+    r.*.up = false
+    r.*.refused = false
+    r.*.hung = false
+    r.*.waited = 0
+}
+
+// The ring filled with the NOP word (amdgpu_ring_clear_ring), its write
+// pointer 0, its record cleared but the conditional word, which is 1
+// (amdgpu_ring_init: "always set cond_exec_polling to CONTINUE").
+pub fn clear(l: *loaded.Loaded, r: *Ring) -> void {
+    var k: usize = 0
+    while k < r.*.words {
+        memoryWrite(l, r.*.memory + k * 4, nop())
+        k += 1
+    }
+    k = 0
+    while k < RECORD {
+        memoryWrite(l, r.*.record + k, if k == COND_SLOT { 1 } else { 0 })
+        k += 4
+    }
+    r.*.wptr = 0
+    r.*.sent = 0
+    r.*.done = 0
+}
+
+// A word at the write pointer (amdgpu_ring_write).
+pub fn emit(l: *loaded.Loaded, r: *Ring, value: usize) -> void {
+    memoryWrite(l, r.*.memory + r.*.wptr * 4, value)
+    r.*.wptr = (r.*.wptr + 1) & (r.*.words - 1)
+}
+
+// The read pointer the card wrote back (gfx_v8_0_ring_get_rptr), in words.
+pub fn readPointer(e: *engines.Engines, r: *const Ring) -> usize { return memoryRead(e, r.*.record + RPTR_SLOT) & (r.*.words - 1) }
+
+// The words free between the write pointer and the read pointer.
+pub fn room(e: *engines.Engines, r: *const Ring) -> usize { return (readPointer(e, r) -% r.*.wptr -% 1) & (r.*.words - 1) }
+
+// The write pointer told (gfx_v8_0_ring_set_wptr_compute and _gfx): into
+// the record and the doorbell, or into CP_RB0_WPTR and read back.
+pub fn tell(e: *engines.Engines, l: *loaded.Loaded, r: *Ring) -> void {
+    if r.*.doorbell != NONE {
+        memoryWrite(l, r.*.record + WPTR_SLOT, r.*.wptr)
+        const ring = l.*.more.doorbell
+        ring(r.*.doorbell, @intCast(u32, r.*.wptr))
+    } else {
+        wr(e, CP_RB0_WPTR, r.*.wptr)
+        _ = rd(e, CP_RB0_WPTR)
+    }
+}
+
+// What was written padded with NOP words to 256 and told
+// (amdgpu_ring_commit: "We pad to match fetch size").
+pub fn commit(e: *engines.Engines, l: *loaded.Loaded, r: *Ring) -> void {
+    const count = (RING_ALIGN - (r.*.wptr & (RING_ALIGN - 1))) % RING_ALIGN
+    var k: usize = 0
+    while k < count {
+        emit(l, r, nop())
+        k += 1
+    }
+    @fence(seq_cst)
+    tell(e, l, r)
+}
+
+// Linux's ring test (gfx_v8_0_ring_test_ring): SCRATCH_REG0 set to
+// 0xcafedead, three words into the ring that set it to 0xdeadbeef, padded
+// and told; the register read every microsecond, 100000 times at most.
+// Whether it came (`r.waited`: after how many microseconds).
+pub fn ringTest(e: *engines.Engines, l: *loaded.Loaded, r: *Ring) -> bool {
+    wr(e, engines.SCRATCH_REG0, loaded.TEST_BEFORE)
+    emit(l, r, packet3(PACKET3_SET_UCONFIG_REG, 1))
+    emit(l, r, engines.SCRATCH_REG0 - PACKET3_SET_UCONFIG_REG_START)
+    emit(l, r, loaded.TEST_WRITTEN)
+    commit(e, l, r)
+    var k: usize = 0
+    while k < engines.AMDGPU_MAX_USEC_TIMEOUT {
+        if rd(e, engines.SCRATCH_REG0) == loaded.TEST_WRITTEN {
+            r.*.waited = k
+            return true
+        }
+        pause(e, 1)
+        k += 1
+    }
+    r.*.waited = k
+    return false
+}
+
+// ---- A submission's frame (amdgpu_ib_schedule without a job, as the
+// study's 5.9 and 5.10 give its words).
+
+// The memory sync the buffer's flag asks for (gfx_v8_0_emit_mem_sync_compute
+// on a compute queue, gfx_v8_0_emit_mem_sync on the graphics ring): every
+// cache over all of memory.
+fn memSync(l: *loaded.Loaded, r: *Ring) -> void {
+    const caches = PACKET3_TCL1_ACTION_ENA | PACKET3_TC_ACTION_ENA | PACKET3_SH_KCACHE_ACTION_ENA | PACKET3_SH_ICACHE_ACTION_ENA | PACKET3_TC_WB_ACTION_ENA
+    if r.*.kind == Kind.graphics {
+        emit(l, r, packet3(PACKET3_SURFACE_SYNC, 3))
+        emit(l, r, caches)
+        emit(l, r, 0xFFFFFFFF)
+        emit(l, r, 0)
+        emit(l, r, MEM_SYNC_POLL)
+        return
+    }
+    emit(l, r, packet3(PACKET3_ACQUIRE_MEM, 5))
+    emit(l, r, caches)
+    emit(l, r, 0xFFFFFFFF)
+    emit(l, r, 0xFF)
+    emit(l, r, 0)
+    emit(l, r, 0)
+    emit(l, r, MEM_SYNC_POLL)
+}
+
+// The ring's bit in the host path's flush (gfx_v8_0_ring_emit_hdp_flush).
+pub fn flushBit(r: *const Ring) -> usize {
+    if r.*.kind == Kind.graphics { return GPU_HDP_FLUSH_DONE__CP0 }
+    if r.*.me == 1 { return GPU_HDP_FLUSH_DONE__CP2 << @intCast(u6, r.*.pipe) }
+    return GPU_HDP_FLUSH_DONE__CP6 << @intCast(u6, r.*.pipe)
+}
+
+// The host path flushed by the ring (gfx_v8_0_ring_emit_hdp_flush: write,
+// wait, write; equal; the graphics ring's by its pre-fetch parser).
+fn hdpFlush(l: *loaded.Loaded, r: *Ring) -> void {
+    const engine: usize = if r.*.kind == Kind.graphics { 1 } else { 0 }
+    emit(l, r, packet3(PACKET3_WAIT_REG_MEM, 5))
+    emit(l, r, (@intCast(usize, 1) << @intCast(u6, WAIT_REG_MEM_OPERATION_SHIFT)) | (@intCast(usize, 3) << @intCast(u6, WAIT_REG_MEM_FUNCTION_SHIFT)) | (engine << @intCast(u6, WAIT_REG_MEM_ENGINE_SHIFT)))
+    emit(l, r, loaded.GPU_HDP_FLUSH_REQ)
+    emit(l, r, loaded.GPU_HDP_FLUSH_DONE)
+    emit(l, r, flushBit(r))
+    emit(l, r, flushBit(r))
+    emit(l, r, HDP_POLL_INTERVAL)
+}
+
+// A register written by the ring (gfx_v8_0_ring_emit_wreg: the graphics
+// ring by its pre-fetch parser, confirmed; a compute queue confirmed; the
+// KIQ's without incrementing).
+pub fn writeRegister(l: *loaded.Loaded, r: *Ring, number: usize, value: usize) -> void {
+    var control: usize = WR_CONFIRM
+    if r.*.kind == Kind.graphics { control = (@intCast(usize, 1) << @intCast(u6, WRITE_DATA_ENGINE_SEL_SHIFT)) | WR_CONFIRM }
+    if r.*.kind == Kind.kiq { control = 1 << 16 }
+    emit(l, r, packet3(PACKET3_WRITE_DATA, 3))
+    emit(l, r, control)
+    emit(l, r, number)
+    emit(l, r, 0)
+    emit(l, r, value)
+}
+
+// The indirect buffer (gfx_v8_0_ring_emit_ib_compute and _gfx): its address
+// on 4 bytes, its upper 16 bits, its length with the address space, on a
+// compute queue marked valid.
+fn indirect(l: *loaded.Loaded, r: *Ring, address: usize, length: usize, space: usize) -> void {
+    var control = length | (space << 24)
+    if r.*.kind != Kind.graphics { control |= INDIRECT_BUFFER_VALID }
+    emit(l, r, packet3(PACKET3_INDIRECT_BUFFER, 2))
+    emit(l, r, address & 0xFFFFFFFC)
+    emit(l, r, (address >> 32) & 0xFFFF)
+    emit(l, r, control)
+}
+
+// The fence at the end of the pipe: on a compute queue one RELEASE_MEM
+// (gfx_v8_0_ring_emit_fence_compute), on the graphics ring two
+// EVENT_WRITE_EOP, the first one below without an interrupt
+// (gfx_v8_0_ring_emit_fence_gfx: "Workaround for cache flush problems"),
+// on the KIQ a WRITE_DATA of the value and, for an interrupt, one of
+// CPC_INT_STATUS (gfx_v8_0_ring_emit_fence_kiq). 32-bit values.
+pub fn fence(l: *loaded.Loaded, r: *Ring, value: usize, interrupt: bool) -> void {
+    const address = r.*.recordAddress + FENCE_SLOT
+    const flush = EOP_TCL1_ACTION_EN | EOP_TC_ACTION_EN | EOP_TC_WB_ACTION_EN | (CACHE_FLUSH_AND_INV_TS_EVENT << @intCast(u6, EVENT_TYPE_SHIFT)) | (@intCast(usize, 5) << @intCast(u6, EVENT_INDEX_SHIFT))
+    const raise: usize = if interrupt { INTERRUPT_CONFIRMED } else { 0 }
+    if r.*.kind == Kind.compute {
+        emit(l, r, packet3(PACKET3_RELEASE_MEM, 5))
+        emit(l, r, flush)
+        emit(l, r, (DATA_32 << @intCast(u6, DATA_SEL_SHIFT)) | (raise << @intCast(u6, INT_SEL_SHIFT)))
+        emit(l, r, address & 0xFFFFFFFC)
+        emit(l, r, address >> 32)
+        emit(l, r, value & 0xFFFFFFFF)
+        emit(l, r, value >> 32)
+        return
+    }
+    if r.*.kind == Kind.graphics {
+        var pass: usize = 0
+        while pass < 2 {
+            const v = if pass == 0 { value -% 1 } else { value }
+            const raised: usize = if pass == 0 { 0 } else { raise }
+            emit(l, r, packet3(PACKET3_EVENT_WRITE_EOP, 4))
+            emit(l, r, flush)
+            emit(l, r, address & 0xFFFFFFFC)
+            emit(l, r, ((address >> 32) & 0xFFFF) | (DATA_32 << @intCast(u6, DATA_SEL_SHIFT)) | (raised << @intCast(u6, INT_SEL_SHIFT)))
+            emit(l, r, v & 0xFFFFFFFF)
+            emit(l, r, (v >> 32) & 0xFFFFFFFF)
+            pass += 1
+        }
+        return
+    }
+    emit(l, r, packet3(PACKET3_WRITE_DATA, 3))
+    emit(l, r, (@intCast(usize, 5) << @intCast(u6, WRITE_DATA_DST_SEL_SHIFT)) | WR_CONFIRM)
+    emit(l, r, address & 0xFFFFFFFF)
+    emit(l, r, address >> 32)
+    emit(l, r, value & 0xFFFFFFFF)
+    if interrupt {
+        emit(l, r, packet3(PACKET3_WRITE_DATA, 3))
+        emit(l, r, WR_CONFIRM)
+        emit(l, r, CPC_INT_STATUS)
+        emit(l, r, 0)
+        emit(l, r, CPC_INT_RAISE)
+    }
+}
+
+// An indirect buffer submitted, framed as amdgpu_ib_schedule frames
+// Linux's test (no job; every buffer carries the memory sync flag): on the
+// graphics ring the memory sync, the conditional execution (its count
+// patched at the end), the host path's flush, the buffer, the host path's
+// invalidate (HDP_DEBUG0 = 1), the two fences; on a compute queue the same
+// without the conditional execution and with one fence. The buffer runs in
+// address space `space` (0: the kernel's, through the GART); a program's
+// (1 to 15) needs its page directory set and flushed in front of it,
+// which stage 7 adds. The fence's number back, NONE when the ring takes
+// nothing now (not up, refused, hung, a program's address space, no room)
+// or the buffer cannot be named in the packet (no words, more than its
+// length field holds, an address not on 4 bytes or beyond 48 bits): what a
+// caller hands in never reaches the packet's other fields.
+pub fn submit(e: *engines.Engines, l: *loaded.Loaded, r: *Ring, address: usize, length: usize, space: usize) -> usize {
+    if length == 0 || length > IB_LENGTH_MOST || address & 3 != 0 || address >> 48 != 0 || space >= SPACES { return NONE }
+    if !r.*.up || r.*.refused || r.*.hung || r.*.kind == Kind.kiq || space != 0 { return NONE }
+    if room(e, r) < FRAME_WORDS + RING_ALIGN { return NONE }
+    memSync(l, r)
+    var patch = NONE
+    if r.*.kind == Kind.graphics {
+        emit(l, r, packet3(PACKET3_COND_EXEC, 3))
+        emit(l, r, (r.*.recordAddress + COND_SLOT) & 0xFFFFFFFF)
+        emit(l, r, (r.*.recordAddress + COND_SLOT) >> 32)
+        emit(l, r, 0)
+        patch = r.*.wptr
+        emit(l, r, COND_EXEC_DUMMY)
+    }
+    hdpFlush(l, r)
+    indirect(l, r, address, length, space)
+    writeRegister(l, r, loaded.HDP_DEBUG0, 1)
+    r.*.sent += 1
+    fence(l, r, r.*.sent, true)
+    if patch != NONE {
+        // gfx_v8_0_ring_emit_patch_cond_exec: the words from the patched
+        // one to the last written.
+        const last = (r.*.wptr -% 1) & (r.*.words - 1)
+        const count = if last > patch { last - patch } else { r.*.words - patch + last }
+        memoryWrite(l, r.*.memory + patch * 4, count)
+    }
+    commit(e, l, r)
+    return r.*.sent
+}
+
+// ---- Waiting.
+
+// The interrupt ring's entries taken (amdgpu_ih_process as stage 2 takes
+// them, the read pointer told by register): an end of pipe for `r` (its
+// ring id) counted, a fault of `r`'s kept, a copy engine's trap kept as
+// stage 4 keeps it, any other counted in the stages' record.
+pub fn entries(e: *engines.Engines, l: *loaded.Loaded, r: *Ring) -> void {
+    const mine = ringId(r.*.me, r.*.pipe, r.*.queue)
+    var rounds: usize = 0
+    while rounds < engines.IH_RING_BYTES / engines.IH_ENTRY_BYTES {
+        rounds += 1
+        if e.*.ring == 0 || !e.*.ringUp { return }
+        var pointer = memoryRead(e, e.*.pointers)
+        if pointer & engines.IH_RB_WPTR__RB_OVERFLOW != 0 {
+            pointer = rd(e, engines.IH_RB_WPTR)
+            if pointer & engines.IH_RB_WPTR__RB_OVERFLOW != 0 {
+                pointer = pointer & ~engines.IH_RB_WPTR__RB_OVERFLOW
+                e.*.readPointer = (pointer + engines.IH_ENTRY_BYTES) & (engines.IH_RING_BYTES - 1)
+                wr(e, engines.IH_RB_CNTL, rd(e, engines.IH_RB_CNTL) | engines.IH_RB_CNTL__WPTR_OVERFLOW_CLEAR)
+            }
+        }
+        pointer = pointer & (engines.IH_RING_BYTES - 1)
+        if pointer == e.*.readPointer { return }
+        var count = engines.AMDGPU_IH_MAX_NUM_IVS
+        while e.*.readPointer != pointer && count > 1 {
+            count -= 1
+            const entry = e.*.ring + e.*.readPointer
+            const source = memoryRead(e, entry) & 0xFF
+            const id = memoryRead(e, entry + 8) & 0xFF
+            if source == VISLANDS30_IV_SRCID_CP_END_OF_PIPE && id & 0x7F == mine {
+                r.*.entries += 1
+            } else if (source == VISLANDS30_IV_SRCID_CP_PRIV_REG_FAULT || source == VISLANDS30_IV_SRCID_CP_PRIV_INSTR_FAULT) && id & 0x7F == mine {
+                if r.*.faults < FAULTS {
+                    r.*.faultSource[r.*.faults] = source
+                    r.*.faultData[r.*.faults] = memoryRead(e, entry + 4) & 0xFFFFFFF
+                }
+                r.*.faults += 1
+            } else if source == loaded.VISLANDS30_IV_SRCID_SDMA_TRAP {
+                if l.*.trapCount < loaded.TRAPS { l.*.traps[l.*.trapCount] = id }
+                l.*.trapCount += 1
+            } else {
+                l.*.others += 1
+            }
+            e.*.entries += 1
+            e.*.readPointer = (e.*.readPointer + engines.IH_ENTRY_BYTES) & (engines.IH_RING_BYTES - 1)
+        }
+        wr(e, engines.IH_RB_RPTR, e.*.readPointer)
+    }
+}
+
+// Whether the fence word holds `value` or a later one (32-bit numbers that
+// wrap).
+fn reached(e: *engines.Engines, r: *const Ring, value: usize) -> bool { return (memoryRead(e, r.*.record + FENCE_SLOT) -% value) & 0x80000000 == 0 }
+
+// Fence `value` waited for, `bound` milliseconds at most: by its end-of-pipe
+// entry (`byEntry`: the interrupt ring's entries taken while waiting; done
+// when the fence word holds it and an entry for this ring came since the
+// wait began) or by the fence word alone. A ring whose read pointer stands
+// short of its write pointer for the whole bound is hung, and takes no new
+// work; a fault entry for it ends the wait at once.
+pub fn wait(e: *engines.Engines, l: *loaded.Loaded, r: *Ring, value: usize, byEntry: bool, bound: usize) -> Waited {
+    const started = now(e)
+    const before = r.*.entries
+    const faultsBefore = r.*.faults
+    var moved = false
+    var last = readPointer(e, r)
+    while true {
+        if byEntry { entries(e, l, r) }
+        if rd(e, engines.CONFIG_MEMSIZE) != e.*.found.memsize {
+            r.*.waited = (now(e) - started) / 1000
+            return Waited.gone
+        }
+        if r.*.faults != faultsBefore {
+            r.*.waited = (now(e) - started) / 1000
+            r.*.hung = true
+            return Waited.faulted
+        }
+        if reached(e, r, value) && (!byEntry || r.*.entries != before) {
+            r.*.waited = (now(e) - started) / 1000
+            r.*.done = value
+            return Waited.done
+        }
+        const pointer = readPointer(e, r)
+        if pointer != last { moved = true }
+        last = pointer
+        if now(e) - started > bound * 1000000 { break }
+        pause(e, 10)
+    }
+    r.*.waited = (now(e) - started) / 1000
+    if byEntry { entries(e, l, r) }
+    if reached(e, r, value) { return Waited.late }
+    if !moved && readPointer(e, r) != r.*.wptr {
+        r.*.hung = true
+        return Waited.hung
+    }
+    return Waited.late
+}
+
+// How a ring stands, for a line: its read pointer (the record's and the
+// card's own), its write pointer, its fence, and the processor's words.
+pub fn sayState(e: *engines.Engines, r: *const Ring) -> void {
+    word(e, "read pointer ", readPointer(e, r))
+    if r.*.kind == Kind.graphics {
+        word(e, " (the card's own ", rd(e, CP_RB0_RPTR) & (r.*.words - 1))
+    } else {
+        const selector = rd(e, engines.SRBM_GFX_CNTL)
+        wr(e, engines.SRBM_GFX_CNTL, engines.queue(r.*.me, r.*.pipe, r.*.queue))
+        const active = rd(e, engines.CP_HQD_ACTIVE)
+        const rptr = rd(e, engines.CP_HQD_PQ_RPTR)
+        const wptr = rd(e, engines.CP_HQD_PQ_WPTR)
+        wr(e, engines.SRBM_GFX_CNTL, selector)
+        word(e, " (the queue's own ", rptr)
+        word(e, ", its write pointer ", wptr)
+        word(e, ", active ", active)
+    }
+    word(e, "), write pointer ", r.*.wptr)
+    word(e, ", fence ", memoryRead(e, r.*.record + FENCE_SLOT))
+    word(e, " of ", r.*.sent)
+    word(e, ", CP_STAT ", rd(e, CP_STAT))
+    word(e, ", CPC status ", rd(e, CP_CPC_STATUS))
+    word(e, ", GRBM status ", rd(e, engines.GRBM_STATUS))
+    word(e, " and ", rd(e, engines.GRBM_STATUS2))
+}
+
+// A wait's end in words ("hung: ..."), with the ring's state.
+pub fn sayWaited(e: *engines.Engines, r: *const Ring, how: Waited) -> void {
+    if how == Waited.gone {
+        say(e, "the card no longer answers")
+        return
+    }
+    if how == Waited.faulted {
+        say(e, "a privileged ")
+        say(e, if r.*.faultSource[0] == VISLANDS30_IV_SRCID_CP_PRIV_REG_FAULT { "register" } else { "instruction" })
+        word(e, " fault for the ring (data ", r.*.faultData[0])
+        say(e, "); ")
+    } else if how == Waited.hung {
+        say(e, "the ring is hung: its read pointer did not move in ")
+        decimal(e, r.*.waited / 1000)
+        say(e, " ms; ")
+    } else if how == Waited.late && reached(e, r, r.*.sent) {
+        say(e, "the fence came, its end-of-pipe entry did not, within ")
+        decimal(e, r.*.waited / 1000)
+        say(e, " ms; ")
+    } else if how == Waited.late {
+        say(e, "the fence did not come within ")
+        decimal(e, r.*.waited / 1000)
+        say(e, " ms; ")
+    }
+    sayState(e, r)
+}

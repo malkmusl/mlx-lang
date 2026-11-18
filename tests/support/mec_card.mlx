@@ -1,0 +1,573 @@
+// The user's RX 580 as a table for stage 5 of the kernel's way to a card
+// that takes commands (tests/504_gpu_engines_graphics_block_runtime.mlx and
+// 505_gpu_engines_compute_ring_runtime.mlx): the card of tests 500 and 501
+// (./smc_card.mlx on ./engine_card.mlx) with what stage 5 needs on top:
+// the graphics block's words that differ by shader engine (the render back
+// ends, the compute units, the RLC's serial buses, behind GRBM_GFX_INDEX)
+// and by address space (the shader memory words, behind SRBM_GFX_CNTL's
+// VMID), every register of a compute queue by its micro engine, pipe and
+// queue (behind SRBM_GFX_CNTL), and the command processors as Linux's code
+// counts on them: the compute processor runs a queue that is active from
+// its read pointer to the write pointer its doorbell told it whenever it
+// is unhalted, the KIQ takes SET_RESOURCES, MAP_QUEUES (the queue's
+// registers loaded from its descriptor, read through the GART) and
+// UNMAP_QUEUES, every queue carries out the packets of vid.h these stages
+// send (NOP, SET_UCONFIG_REG, WRITE_DATA to a register or to memory,
+// ACQUIRE_MEM, WAIT_REG_MEM, INDIRECT_BUFFER, RELEASE_MEM with its
+// end-of-pipe entry of source 181 when the pipe's interrupt is on), the read
+// pointer written back where the descriptor says; the graphics ring runs
+// from CP_RB0's registers and its doorbell when its three processors are
+// unhalted (the clear state's packets counted, EVENT_WRITE_EOP). Packets
+// the processors carry out write the card's registers and memory directly:
+// the log of writes (engine_card.mlx's) holds the driver's writes alone.
+//
+// What the card can be made to do wrong is a variable each, below.
+const std = @import("std")
+const engines = @import("../../projects/brix/kernel/gpu_engines.mlx")
+const loaded = @import("../../projects/brix/kernel/gpu_smc_sdma.mlx")
+const compute = @import("../../projects/brix/kernel/gpu_compute.mlx")
+const ring = @import("../../projects/brix/kernel/gpu_ring.mlx")
+const card = @import("./engine_card.mlx")
+const smc = @import("./smc_card.mlx")
+
+pub const NEVER: usize = card.NEVER
+
+// A queue's registers: CP_MQD_BASE_ADDR to CP_HQD_EOP_DONES, by queue (the
+// selector's micro engine x 32 + pipe x 8 + queue).
+pub const FIRST: usize = compute.CP_MQD_BASE_ADDR
+pub const LAST: usize = compute.CP_HQD_EOP_DONES
+pub const WORDS: usize = LAST - FIRST + 1
+pub const QUEUES: usize = card.QUEUES
+pub var queueRegs: [QUEUES][WORDS]usize = undefined
+// The shader memory words of the sixteen address spaces.
+pub var shMem: [16][4]usize = undefined
+// By shader engine: the render back ends and compute units disabled (the
+// fields' bits), whether its compute units' serial bus stays busy.
+pub var rbDisabled: [4]usize = undefined
+pub var cuInactive: [4]usize = undefined
+pub var serdesBusy: [4]bool = undefined
+// The other serial buses stay busy.
+pub var noncuBusy = false
+// The RLC's reset bit stays set once set.
+pub var resetSticks = false
+// How often the RLC was reset (its bit set).
+pub var rlcResets: usize = 0
+
+// What the command processors did: KIQ submissions taken (SET_RESOURCES
+// and its queue mask, maps, unmaps), the packets carried out, the host
+// path's flushes and invalidates, the memory syncs, the indirect buffers
+// run, the end-of-pipe packets and their entries, the clear state's
+// values.
+pub var resources: usize = 0
+pub var queueMask: usize = 0
+pub var maps: usize = 0
+pub var unmaps: usize = 0
+pub var mappedQueue: usize = NEVER
+pub var packets: usize = 0
+pub var flushes: usize = 0
+pub var flushBits: usize = 0
+pub var invalidates: usize = 0
+pub var syncs: usize = 0
+pub var buffers: usize = 0
+pub var bufferSpace: usize = 0
+pub var releases: usize = 0
+pub var eopEntries: usize = 0
+pub var contextValues: usize = 0
+pub var clearStates: usize = 0
+pub var graphicsPackets: usize = 0
+pub var graphicsRead: usize = 0
+pub var graphicsHeld: usize = 0
+
+// What the processors do wrong: the compute processor never runs a queue;
+// the KIQ does not take a map, or takes it only once the graphics ring has
+// run its clear state; compute ring 0 does not hear its doorbell; an
+// end-of-pipe that writes its fence but sends no entry, or writes no
+// fence; a privileged register fault for the queue that runs an indirect
+// buffer; the KIQ does not write the scratch register; the graphics ring
+// does not read; the read pointers are not written back; copy engine 0
+// reads its ring only once the RLC has been started (the study's D1
+// condition). (A dequeue asked of a halted micro engine is never done:
+// the dequeue is the processor's, as Linux's order of dequeue then halt
+// in gfx_v8_0_pre_soft_reset counts on.)
+pub var mecDead = false
+pub var mapRefused = false
+pub var mapNeedsGraphics = false
+pub var ringDeaf = false
+pub var noEntry = false
+pub var noFenceWrite = false
+pub var privFault = false
+pub var kiqMute = false
+pub var graphicsDeaf = false
+pub var noReadBack = false
+pub var sdmaNeedsRlc = false
+// More of what the processors do wrong: the end-of-pipe entry carries
+// another ring's id (NEVER: its own); the KIQ writes the scratch register
+// this many microseconds late (0: at once).
+pub var entryRing: usize = NEVER
+pub var kiqLate: usize = 0
+// An indirect buffer the queue passes over (the fence after it comes).
+pub var bufferSkipped = false
+// A dequeue is the compute processor's to carry out: asked of a queue
+// whose micro engine is halted it is not done (Linux dequeues before it
+// halts, gfx_v8_0_pre_soft_reset). The last request's value, how many were
+// asked.
+pub var dequeueAsked: usize = 0
+pub var dequeueValue: usize = 0
+// The KIQ's late scratch write: its value and when it is due (NEVER: none).
+var lateScratch: usize = 0
+var lateDue: usize = NEVER
+
+fn mem32(at: usize) -> *u32 { return unsafe { @ptrFromInt(*u32, at) } }
+
+fn readCard(address: usize) -> usize {
+    const at = smc.reach(address)
+    if at == 0 { return 0 }
+    return @intCast(usize, mem32(at).*)
+}
+
+fn writeCard(address: usize, value: usize) -> void {
+    const at = smc.reach(address)
+    if at != 0 { mem32(at).* = @intCast(u32, value & 0xFFFFFFFF) }
+}
+
+// The queue the selector names, and a queue by micro engine, pipe, queue.
+pub fn queueOf(me: usize, pipe: usize, queue: usize) -> usize { return (me * 32 + pipe * 8 + queue) % QUEUES }
+
+fn selected() -> usize {
+    const s = card.registers[engines.SRBM_GFX_CNTL]
+    return queueOf((s >> 2) & 3, s & 3, (s >> 8) & 7)
+}
+
+fn vmidSelected() -> usize { return (card.registers[engines.SRBM_GFX_CNTL] >> 4) & 0xF }
+
+fn engineSelected() -> usize {
+    const index = card.registers[loaded.GRBM_GFX_INDEX]
+    if index & loaded.GRBM_GFX_INDEX__SE_BROADCAST_WRITES != 0 { return 0 }
+    return ((index >> 16) & 0xFF) % 4
+}
+
+// A queue's own register (the four engine_card.mlx keeps are its).
+fn ownQueueRegister(number: usize) -> bool { return number >= FIRST && number <= LAST && number != engines.CP_HQD_ACTIVE && number != engines.CP_HQD_DEQUEUE_REQUEST && number != engines.CP_HQD_PQ_RPTR && number != engines.CP_HQD_PQ_WPTR }
+
+// A descriptor word's place among a queue's registers.
+fn word(w: usize) -> usize { return w - compute.vi_mqd__cp_mqd_base_addr_lo }
+
+pub fn queueRegister(q: usize, number: usize) -> usize {
+    if number == engines.CP_HQD_ACTIVE { return card.queueActive[q] }
+    if number == engines.CP_HQD_PQ_RPTR { return card.queueRead[q] }
+    if number == engines.CP_HQD_PQ_WPTR { return card.queueWrite[q] }
+    if number == engines.CP_HQD_DEQUEUE_REQUEST { return card.queueDequeue[q] }
+    return queueRegs[q][number - FIRST]
+}
+
+fn shMemIndex(number: usize) -> usize {
+    if number == compute.SH_MEM_CONFIG { return 0 }
+    if number == compute.SH_MEM_BASES { return 1 }
+    if number == compute.SH_MEM_APE1_BASE { return 2 }
+    if number == compute.SH_MEM_APE1_LIMIT { return 3 }
+    return NEVER
+}
+
+// ---- The hands.
+
+pub fn read(number: usize) -> u32 {
+    if card.gone { return 0xFFFFFFFF }
+    if ownQueueRegister(number) { return @intCast(u32, queueRegs[selected()][number - FIRST] & 0xFFFFFFFF) }
+    const sh = shMemIndex(number)
+    if sh != NEVER { return @intCast(u32, shMem[vmidSelected()][sh] & 0xFFFFFFFF) }
+    if number == compute.CC_RB_BACKEND_DISABLE { return @intCast(u32, (rbDisabled[engineSelected()] << 16) & 0xFF0000) }
+    if number == compute.CC_GC_SHADER_ARRAY_CONFIG { return @intCast(u32, (cuInactive[engineSelected()] << 16) & 0xFFFF0000) }
+    if number == loaded.RLC_SERDES_CU_MASTER_BUSY { return if serdesBusy[engineSelected()] { 1 } else { 0 } }
+    if number == loaded.RLC_SERDES_NONCU_MASTER_BUSY { return if noncuBusy { 0x10000 } else { 0 } }
+    return smc.read(number)
+}
+
+pub fn write(number: usize, value32: u32) -> void {
+    const value = @intCast(usize, value32)
+    const wasMec = card.registers[engines.CP_MEC_CNTL]
+    const wasMe = card.registers[engines.CP_ME_CNTL]
+    const wasActive = card.queueActive[selected()]
+    smc.write(number, value32)
+    if card.gone || number == card.stuck { return }
+    if number == engines.CP_HQD_DEQUEUE_REQUEST && value & engines.CP_HQD_DEQUEUE_REQUEST__DEQUEUE_REQ != 0 {
+        dequeueAsked += 1
+        dequeueValue = value & engines.CP_HQD_DEQUEUE_REQUEST__DEQUEUE_REQ
+        if halted(selected()) { card.queueActive[selected()] = wasActive }
+    }
+    if ownQueueRegister(number) { queueRegs[selected()][number - FIRST] = value }
+    if number == engines.CP_HQD_ACTIVE { card.queueActive[selected()] = value & 1 }
+    const sh = shMemIndex(number)
+    if sh != NEVER { shMem[vmidSelected()][sh] = value }
+    if number == compute.GRBM_SOFT_RESET {
+        if value & compute.GRBM_SOFT_RESET__SOFT_RESET_RLC != 0 { rlcResets += 1 }
+        if resetSticks && rlcResets != 0 { card.registers[number] |= compute.GRBM_SOFT_RESET__SOFT_RESET_RLC }
+    }
+    if number == engines.RLC_CNTL && value & engines.RLC_CNTL__RLC_ENABLE_F32 != 0 && sdmaNeedsRlc { smc.dead = NEVER }
+    if number == engines.CP_MEC_CNTL && wasMec != value { runAll() }
+    if number == engines.CP_ME_CNTL && wasMe != value { runGraphics() }
+    if number == compute.CP_RB0_CNTL && value & compute.CP_RB0_CNTL__RB_RPTR_WR_ENA != 0 { graphicsRead = 0 }
+    if number == ring.CP_RB0_WPTR && card.registers[compute.CP_RB_DOORBELL_CONTROL] & compute.CP_RB_DOORBELL_CONTROL__DOORBELL_EN == 0 {
+        graphicsHeld = value
+        runGraphics()
+    }
+}
+
+pub fn doorbell(index: usize, value: u32) -> void {
+    smc.doorbell(index, value)
+    if card.registers[engines.BIF_DOORBELL_APER_EN] & engines.BIF_DOORBELL_APER_EN__BIF_DOORBELL_APER_EN == 0 { return }
+    const control = card.registers[compute.CP_RB_DOORBELL_CONTROL]
+    if control & compute.CP_RB_DOORBELL_CONTROL__DOORBELL_EN != 0 && (control & compute.CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET) >> 2 == index {
+        graphicsHeld = @intCast(usize, value)
+        runGraphics()
+        return
+    }
+    if card.registers[engines.CP_PQ_STATUS] & compute.CP_PQ_STATUS__DOORBELL_ENABLE == 0 { return }
+    const lower = card.registers[compute.CP_MEC_DOORBELL_RANGE_LOWER] >> 2
+    const upper = card.registers[compute.CP_MEC_DOORBELL_RANGE_UPPER] >> 2
+    if index < lower || index > upper { return }
+    var q: usize = 0
+    while q < QUEUES {
+        const bell = queueRegs[q][compute.CP_HQD_PQ_DOORBELL_CONTROL - FIRST]
+        if card.queueActive[q] & 1 != 0 && bell & compute.CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN != 0 && (bell & compute.CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET) >> 2 == index {
+            card.queueWrite[q] = @intCast(usize, value)
+            runQueue(q)
+            return
+        }
+        q += 1
+    }
+}
+
+// ---- The compute processor.
+
+fn halted(q: usize) -> bool {
+    const me = q / 32
+    const control = card.registers[engines.CP_MEC_CNTL]
+    if me == 1 { return control & engines.CP_MEC_CNTL__MEC_ME1_HALT != 0 }
+    return control & engines.CP_MEC_CNTL__MEC_ME2_HALT != 0
+}
+
+fn runAll() -> void {
+    var q: usize = 0
+    while q < QUEUES {
+        if card.queueActive[q] & 1 != 0 { runQueue(q) }
+        q += 1
+    }
+}
+
+// A queue runs from its read pointer to its write pointer (CP_HQD_PQ_WPTR:
+// what its doorbell told it, or the register), when the processor is
+// unhalted and the queue active; its read pointer written back.
+fn runQueue(q: usize) -> void {
+    if mecDead || halted(q) || card.queueActive[q] & 1 == 0 { return }
+    if ringDeaf && q == queueOf(compute.RING0_ME, compute.RING0_PIPE, compute.RING0_QUEUE) { return }
+    const base = ((queueRegs[q][word(compute.vi_mqd__cp_hqd_pq_base_hi)] << 32) | queueRegs[q][word(compute.vi_mqd__cp_hqd_pq_base_lo)]) << 8
+    const words = @intCast(usize, 2) << @intCast(u6, queueRegs[q][compute.CP_HQD_PQ_CONTROL - FIRST] & 0x3F)
+    var rounds: usize = 0
+    while card.queueRead[q] != card.queueWrite[q] % words && rounds < 4096 {
+        const used = carry(q, base, words, card.queueRead[q])
+        card.queueRead[q] = (card.queueRead[q] + used) & (words - 1)
+        rounds += 1
+    }
+    if !noReadBack {
+        const report = (queueRegs[q][word(compute.vi_mqd__cp_hqd_pq_rptr_report_addr_hi)] << 32) | (queueRegs[q][word(compute.vi_mqd__cp_hqd_pq_rptr_report_addr_lo)] & 0xFFFFFFFC)
+        writeCard(report, card.queueRead[q])
+    }
+}
+
+// Word `n` of the packet at word `k` of a ring (wrapping) or a buffer
+// (`words` 0).
+fn take(base: usize, words: usize, k: usize, n: usize) -> usize {
+    const index = if words == 0 { k + n } else { (k + n) & (words - 1) }
+    return readCard(base + index * 4)
+}
+
+// The queue a doorbell offset names.
+fn queueOfDoorbell(index: usize) -> usize {
+    var q: usize = 0
+    while q < QUEUES {
+        const bell = queueRegs[q][compute.CP_HQD_PQ_DOORBELL_CONTROL - FIRST]
+        if card.queueActive[q] & 1 != 0 && (bell & compute.CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET) >> 2 == index { return q }
+        q += 1
+    }
+    return NEVER
+}
+
+// MAP_QUEUES: the queue named, its registers loaded from the descriptor
+// read through the GART (words 128 to 181), active, its pointers 0.
+fn map(base: usize, words: usize, k: usize) -> void {
+    if mapRefused || (mapNeedsGraphics && clearStates == 0) { return }
+    const placed = take(base, words, k, 2)
+    const queue = (placed >> 26) & 7
+    const pipe = (placed >> 29) & 3
+    const me: usize = if placed >> 31 != 0 { 2 } else { 1 }
+    const mqd = take(base, words, k, 3) | (take(base, words, k, 4) << 32)
+    if readCard(mqd) != compute.MQD_HEADER { return }
+    const q = queueOf(me, pipe, queue)
+    var w: usize = 0
+    while w < WORDS {
+        queueRegs[q][w] = readCard(mqd + (compute.vi_mqd__cp_mqd_base_addr_lo + w) * 4)
+        w += 1
+    }
+    // (The doorbell's offset is the packet's.)
+    const offset = (placed >> 2) & 0x1FFFFF
+    queueRegs[q][compute.CP_HQD_PQ_DOORBELL_CONTROL - FIRST] = (queueRegs[q][compute.CP_HQD_PQ_DOORBELL_CONTROL - FIRST] & ~compute.CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET) | (offset << 2)
+    card.queueActive[q] = 1
+    card.queueRead[q] = 0
+    card.queueWrite[q] = 0
+    mappedQueue = q
+    maps += 1
+}
+
+// One packet at word `k` of a ring of `words` words at card address
+// `base` (or of an indirect buffer: `words` 0) carried out for queue `q`
+// (NEVER: the graphics ring); how many words it took.
+fn carry(q: usize, base: usize, words: usize, k: usize) -> usize {
+    const first = take(base, words, k, 0)
+    if first == ring.nop() { return 1 }
+    if first >> 30 != 3 { return 1 }
+    const op = (first >> 8) & 0xFF
+    const count = ((first >> 16) & 0x3FFF) + 1
+    packets += 1
+    if q == NEVER { graphicsPackets += 1 }
+    if op == ring.PACKET3_NOP { return count + 1 }
+    if op == ring.PACKET3_SET_UCONFIG_REG {
+        const kiq = q == queueOf(compute.KIQ_ME, compute.KIQ_PIPE, compute.KIQ_QUEUE)
+        if kiq && kiqLate != 0 && ring.PACKET3_SET_UCONFIG_REG_START + take(base, words, k, 1) == engines.SCRATCH_REG0 {
+            lateScratch = take(base, words, k, 2)
+            lateDue = card.clock + kiqLate * 1000
+            return count + 1
+        }
+        if !(kiqMute && kiq) {
+            var n: usize = 0
+            while n + 1 < count {
+                card.registers[ring.PACKET3_SET_UCONFIG_REG_START + take(base, words, k, 1) + n] = take(base, words, k, 2 + n)
+                n += 1
+            }
+        }
+        return count + 1
+    }
+    if op == ring.PACKET3_WRITE_DATA {
+        const control = take(base, words, k, 1)
+        const target = take(base, words, k, 2) | (take(base, words, k, 3) << 32)
+        var n: usize = 0
+        while n + 3 < count {
+            const value = take(base, words, k, 4 + n)
+            if (control >> 8) & 0xF == 0 {
+                card.registers[(target + n) % card.ROOM] = value
+                if target == loaded.HDP_DEBUG0 { invalidates += 1 }
+            } else {
+                writeCard(target + 4 * n, value)
+            }
+            n += 1
+        }
+        return count + 1
+    }
+    if op == ring.PACKET3_SET_RESOURCES {
+        resources += 1
+        queueMask = take(base, words, k, 2) | (take(base, words, k, 3) << 32)
+        return count + 1
+    }
+    if op == ring.PACKET3_MAP_QUEUES {
+        map(base, words, k)
+        return count + 1
+    }
+    if op == ring.PACKET3_UNMAP_QUEUES {
+        const target = queueOfDoorbell((take(base, words, k, 2) >> 2) & 0x1FFFFF)
+        if target != NEVER {
+            card.queueActive[target] = 0
+            unmaps += 1
+        }
+        return count + 1
+    }
+    if op == ring.PACKET3_ACQUIRE_MEM || op == ring.PACKET3_SURFACE_SYNC {
+        syncs += 1
+        return count + 1
+    }
+    if op == ring.PACKET3_WAIT_REG_MEM {
+        if take(base, words, k, 2) == loaded.GPU_HDP_FLUSH_REQ {
+            flushes += 1
+            flushBits = take(base, words, k, 4)
+        }
+        return count + 1
+    }
+    if op == ring.PACKET3_INDIRECT_BUFFER {
+        const address = (take(base, words, k, 1) & 0xFFFFFFFC) | ((take(base, words, k, 2) & 0xFFFF) << 32)
+        const control = take(base, words, k, 3)
+        bufferSpace = (control >> 24) & 0xF
+        buffers += 1
+        if privFault && q != NEVER {
+            smc.deliver(ring.VISLANDS30_IV_SRCID_CP_PRIV_REG_FAULT, 0x1234, ring.ringId(q / 32, (q / 8) % 4, q % 8))
+            return count + 1
+        }
+        if q != NEVER && control & ring.INDIRECT_BUFFER_VALID == 0 { return count + 1 }
+        if bufferSkipped { return count + 1 }
+        const length = control & 0xFFFFF
+        var n: usize = 0
+        while n < length { n += carry(q, address, 0, n) }
+        return count + 1
+    }
+    if op == ring.PACKET3_RELEASE_MEM {
+        releases += 1
+        const select = take(base, words, k, 2)
+        const target = (take(base, words, k, 3) & 0xFFFFFFFC) | (take(base, words, k, 4) << 32)
+        if !noFenceWrite { writeCard(target, take(base, words, k, 5)) }
+        if (select >> 24) & 7 == 2 && q != NEVER && q / 32 == 1 {
+            const pipe = (q / 8) % 4
+            if card.registers[compute.CP_ME1_PIPE0_INT_CNTL + pipe] & compute.CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE != 0 && !noEntry {
+                eopEntries += 1
+                smc.deliver(ring.VISLANDS30_IV_SRCID_CP_END_OF_PIPE, 0, if entryRing != NEVER { entryRing } else { ring.ringId(1, pipe, q % 8) })
+            }
+        }
+        return count + 1
+    }
+    if op == ring.PACKET3_EVENT_WRITE_EOP {
+        releases += 1
+        const target = (take(base, words, k, 2) & 0xFFFFFFFC) | ((take(base, words, k, 3) & 0xFFFF) << 32)
+        if !noFenceWrite { writeCard(target, take(base, words, k, 4)) }
+        if (take(base, words, k, 3) >> 24) & 7 == 2 && card.registers[loaded.CP_INT_CNTL_RING0] & compute.CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE != 0 && !noEntry {
+            eopEntries += 1
+            smc.deliver(ring.VISLANDS30_IV_SRCID_CP_END_OF_PIPE, 0, 0)
+        }
+        return count + 1
+    }
+    if op == ring.PACKET3_SET_CONTEXT_REG {
+        contextValues += count - 1
+        return count + 1
+    }
+    if op == ring.PACKET3_CLEAR_STATE {
+        clearStates += 1
+        return count + 1
+    }
+    if op == ring.PACKET3_PREAMBLE_CNTL || op == ring.PACKET3_CONTEXT_CONTROL || op == ring.PACKET3_SET_BASE || op == ring.PACKET3_COND_EXEC { return count + 1 }
+    // An operation no packet of these steps has: the processor stops there.
+    return if words == 0 { 0x100000 } else { words }
+}
+
+// ---- The graphics ring.
+
+fn runGraphics() -> void {
+    const halts = engines.CP_ME_CNTL__ME_HALT | engines.CP_ME_CNTL__PFP_HALT | engines.CP_ME_CNTL__CE_HALT
+    if graphicsDeaf || card.registers[engines.CP_ME_CNTL] & halts != 0 { return }
+    const control = card.registers[compute.CP_RB0_CNTL]
+    const words = @intCast(usize, 2) << @intCast(u6, control & 0x3F)
+    const base = ((card.registers[compute.CP_RB0_BASE_HI] << 32) | card.registers[compute.CP_RB0_BASE]) << 8
+    if base == 0 { return }
+    var rounds: usize = 0
+    while graphicsRead != graphicsHeld % words && rounds < 4096 {
+        const used = carry(NEVER, base, words, graphicsRead)
+        graphicsRead = (graphicsRead + used) & (words - 1)
+        rounds += 1
+    }
+    card.registers[ring.CP_RB0_RPTR] = graphicsRead
+    if !noReadBack { writeCard((card.registers[compute.CP_RB0_RPTR_ADDR_HI] << 32) | (card.registers[compute.CP_RB0_RPTR_ADDR] & 0xFFFFFFFC), graphicsRead) }
+}
+
+// ---- The card.
+
+// The card's pause, and the KIQ's late scratch write once its time came.
+pub fn pause(microseconds: usize) -> void {
+    smc.pause(microseconds)
+    if lateDue != NEVER && card.clock >= lateDue {
+        card.registers[engines.SCRATCH_REG0] = lateScratch
+        lateDue = NEVER
+    }
+}
+
+pub fn hands() -> engines.Hands {
+    var h = smc.hands()
+    h.read = read
+    h.write = write
+    h.pause = pause
+    return h
+}
+
+pub fn more() -> loaded.More { return loaded.More.{ .memoryWrite = smc.memoryWrite, .doorbell = doorbell, .doorbells = 0x80000 } }
+
+// A queue register's value as the card holds it at its start (a pattern,
+// so that a descriptor's field read from it is told from 0).
+pub fn queueDefault(q: usize, w: usize) -> usize { return ((w + 1) * 0x01000193 + q * 0x10) & 0x0F0F0F0F }
+
+// The card anew (smc_card.mlx's reset) with the graphics block as the
+// study expects it after the firmware's start: every shader engine's
+// render back ends and compute units there, the serial buses idle, the
+// block idle, no queue active, nothing of this file's wrong.
+pub fn reset() -> void {
+    smc.reset()
+    var q: usize = 0
+    while q < QUEUES {
+        var w: usize = 0
+        while w < WORDS {
+            queueRegs[q][w] = queueDefault(q, w)
+            w += 1
+        }
+        queueRegs[q][compute.CP_HQD_PQ_DOORBELL_CONTROL - FIRST] = 0
+        q += 1
+    }
+    var v: usize = 0
+    while v < 16 {
+        shMem[v][0] = 0
+        shMem[v][1] = 0
+        shMem[v][2] = 0
+        shMem[v][3] = 0
+        v += 1
+    }
+    var s: usize = 0
+    while s < 4 {
+        rbDisabled[s] = 0
+        cuInactive[s] = 0
+        serdesBusy[s] = false
+        s += 1
+    }
+    noncuBusy = false
+    resetSticks = false
+    rlcResets = 0
+    resources = 0
+    queueMask = 0
+    maps = 0
+    unmaps = 0
+    mappedQueue = NEVER
+    packets = 0
+    flushes = 0
+    flushBits = 0
+    invalidates = 0
+    syncs = 0
+    buffers = 0
+    bufferSpace = 0
+    releases = 0
+    eopEntries = 0
+    contextValues = 0
+    clearStates = 0
+    graphicsPackets = 0
+    graphicsRead = 0
+    graphicsHeld = 0
+    mecDead = false
+    mapRefused = false
+    mapNeedsGraphics = false
+    ringDeaf = false
+    noEntry = false
+    noFenceWrite = false
+    privFault = false
+    kiqMute = false
+    graphicsDeaf = false
+    noReadBack = false
+    sdmaNeedsRlc = false
+    entryRing = NEVER
+    kiqLate = 0
+    bufferSkipped = false
+    dequeueAsked = 0
+    dequeueValue = 0
+    lateScratch = 0
+    lateDue = NEVER
+    // The block idle (gfx_v8_0_is_idle), the array words with their
+    // inactive units (the ROM's 9 of 16: bits 9 to 15 set, as a card with
+    // 9 units an array reads).
+    card.registers[engines.GRBM_STATUS2] = compute.IDLE_STATUS2
+    card.registers[compute.GC_USER_SHADER_ARRAY_CONFIG] = 0
+    card.registers[compute.GC_USER_RB_BACKEND_DISABLE] = 0
+    s = 0
+    while s < 4 {
+        cuInactive[s] = 0xFE00
+        rbDisabled[s] = 0xFC
+        s += 1
+    }
+}

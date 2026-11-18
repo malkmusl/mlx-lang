@@ -1417,7 +1417,7 @@ when the screen stays dark).
 ### The card's engines: how far a boot goes (the digits)
 
 The first steps toward a Radeon that takes commands (kernel/
-gpu_engines.mlx and gpu_smc_sdma.mlx, after the study of the kernel's part of that, its
+gpu_engines.mlx, gpu_smc_sdma.mlx and gpu_compute.mlx, after the study of the kernel's part of that, its
 section 8, worked out from Linux 6.6's amdgpu). A digit held while the machine starts says how far they go
 at this boot; it is read by the same loader as F, N, R and A, holds for
 that boot only and is never remembered (projects/brix/engine_choice.mlx;
@@ -1434,24 +1434,33 @@ the word Info.STAGE):
 - 3: stage 3. The card's SMC is given its firmware and started ("gpu:
   step F1"), then it loads the engines' firmware ("gpu: step F2"). The
   engines are halted again afterwards: nothing runs on them yet.
-- 4 (or more: this kernel has stages up to 4): stage 4, the two copy
-  engines run: one by itself first ("gpu: step D1"), then both, with a
-  fill and a copy of the card's memory checked by the processor ("gpu:
-  step D2"). They are stopped again when the machine restarts or powers
-  off.
+- 4: stage 4, the two copy engines run: one by itself first ("gpu: step
+  D1"), then both, with a fill and a copy of the card's memory checked
+  by the processor ("gpu: step D2").
+- 5 (or more: this kernel has stages up to 5): stage 5, the graphics
+  block's settings ("gpu: step G1"), its RLC ("gpu: step G2"), the compute
+  processor with its KIQ and compute ring 0 ("gpu: step G3"), and a small
+  program of the card's run on that ring, its end and its interrupt
+  checked ("gpu: step G4"). When copy engine 0 does not read its ring at
+  such a boot, G1 and G2 come first and D1 is tried once more; the log
+  says which order worked.
+The rings are stopped again when the machine restarts or powers off.
 
 F keeps every stage at 0. One line says which stage a boot goes to and
 why ("gpu: this boot: the card's engines up to stage 2, the interrupt
 ring (2 was pressed at this start and holds for this boot only)"). Each
 step has one line that says whether it worked; a step that fails puts
 its registers back as the firmware had them and no later step runs (a
-failed F1 leaves the SMC held in reset, a failed F2, D1 or D2 leaves
-the engines halted). No
+failed F1 leaves the SMC held in reset and the kernel watching the
+card's temperature, a failed F2, D1, D2 or G step leaves the engines
+halted). No
 step writes a register of the display's, and the picture is watched
 around each one. From stage 3 on each step says the card's temperature
 before and after, and none begins at 85 C or more; nothing sets a clock,
-a voltage or the fan. Try 1 first, then 2, 3 and 4. tests/493, 494, 500
-and 501 hold the steps on a card that is a table;
+a voltage or the fan; while a ring runs the kernel reads the temperature
+once a second, takes no new work at 85 C and stops every ring at 95 C.
+Try 1 first, then 2, 3, 4 and 5. tests/493, 494, 500, 501, 504 and 505
+hold the steps on a card that is a table;
 tools/check_gpu_registers.py holds their numbers against Linux's.
 
 ### A display's mode while the system runs
