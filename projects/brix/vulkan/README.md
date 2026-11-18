@@ -8,10 +8,9 @@ side, each held against Mesa's and Linux's sources; the study is not
 kept in the repository, its section numbers are given here where it is
 followed). This directory holds the first part, the one that needs no
 card: the card's instruction set, a compiler from SPIR-V to it, and an
-interpreter that runs the compiler's output on the host. Nothing here
-touches the kernel or a card, and nothing is built into brixOS's image
-yet: the files are a library the driver will use, built for the host by
-the tests.
+interpreter that runs the compiler's output on the host; and the driver's
+stage (a), the device found and listed (below), which programs on brixOS
+link in.
 
 ## What stands
 
@@ -52,6 +51,63 @@ The shader's entry state is the study's own choice for pointers (its
 `shader.Facts` says the rest the driver writes into the dispatch's
 registers: the number of words, the vector and scalar registers used, the
 group size, the push words and bindings read.
+
+## The driver, stage (a): the device is found and listed
+
+| File | What it is |
+| --- | --- |
+| `card.mlx` | The driver's one interface to the kernel (the study's 8.1): the calls of brixOS's native interface for a card, as a record of functions |
+| `card_brix.mlx` | Its brixOS implementation: the native calls through `std.gpucard` |
+| `card_host.mlx` | A card on the host, its second implementation: the same statuses, handles and record (the kernel's own encoder, `projects/brix/kernel/gpu_record.mlx`), answered in the process; later stages run its streams and shaders here |
+| `driver.mlx` | The Vulkan driver: the loader/driver interface, the instance, the physical device's queries, the device and its queue |
+
+The kernel's side (spec/04-stdlib/os/brix.xml, `<GpuDevices>`, calls 80
+to 85; `std.gpucard`): the card is `/devices/gpu0`, whose read gives its
+record (what it is, where it sits on PCI, its memory, the ROM's counts of
+its graphics block, the rings that take commands and why there are none);
+opening it to write gives a handle of the kind gpu, which is the
+process's context on the card. Memory for the card, its addresses,
+submits and fences are specified and refused for now (unsupported): the
+kernel starts none of the card's engines yet.
+
+How a program reaches the driver: x86_64 writes no shared objects, so the
+driver is a module of the program (the study's decision 3). The program
+offers it (`driver.offer(card_brix.interface())`), and
+`std.vulkan.loader`'s native path lists it first, as `builtin:brix-radeon`,
+while it has a card, and opens it by its entry points with the interface
+negotiated as for any driver. `vkinfo` (projects/brix/tools/vkinfo, in the
+image) and the compositor (its `card.brixos.mlx`) do so.
+
+What it answers: the instance is Vulkan 1.1 and answers every
+instance-level command of 1.0 and 1.1 (all of them queries); the device
+is 1.0 and has `vkDestroyDevice` and `vkGetDeviceQueue`; every other
+command is not exported (the loader gets 0, never a wrong function).
+What the device says is only what works: every feature false (also
+robustBufferAccess, 1.0's one required feature, until the card shows it
+checks a buffer's range: the study's 11.5), no format feature and no
+image format until stage (c), one queue family (compute and transfer, one
+queue, no timestamps), the memory from the card's record in the
+reference's types on up to three heaps (the system's memory only while
+the card's GART is on, no heap without bytes), the reference's limits for this
+generation, and the stage in the driver's information string.
+`vkCreateDevice` is refused (VK_ERROR_INITIALIZATION_FAILED) while the
+card's record lists no compute ring; on the host card that lists one it
+opens a context on the card, which the device holds.
+
+On the user's machine `vkinfo` lists the RX 580 (its name, ids, memory,
+compute units) and says that no device can be made yet; the compositor
+says in its log that it found the device and composes on the processor,
+as before. Without the card (QEMU) both say there is no Vulkan device.
+
+The proof: `tests/502_gpu_card_interface_runtime.mlx` (the interface's
+calls and statuses, and the record against the spec, on the host card),
+`tests/503_vulkan_driver_entry_runtime.mlx` (every entry point against
+what the registry, std/registry/vulkan/vk.xml, requires of it), and
+`tools/check_brix_vulkan.sh` (brixOS in QEMU, without the card). The
+driver's numbers (the limits, the Polaris 10 device numbers) are held
+against Mesa's radv_physical_device.c and radv_constants.h and Linux's
+amdgpu_drv.c by `tools/check_vulkan_driver.py MESA LINUX`, a development
+check that needs those files fetched.
 
 ## Where the numbers come from
 
@@ -179,9 +235,7 @@ trusted:
 The study's section 8 has the stages; this directory is the compiler and
 the interpreter of stage (b), built ahead of it.
 
-- (a) The driver is found and its device listed: `/devices/gpu0` and its
-  record from the kernel, the loader's native path, instance and physical
-  device queries. Nothing of this directory is needed yet.
+- (a) The driver is found and its device listed: built (above).
 - (b) Compute: std.gpu's kernels on the card, the desktop composing with
   it. From the kernel: memory, mapping, submit and fences on a compute
   ring. From the driver: devices, queues, memory, buffers, descriptor

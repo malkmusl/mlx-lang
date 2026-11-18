@@ -28,6 +28,14 @@
 //     vk.loadInstanceCommands(&commands, instance, driver.getInstanceProcAddr)
 //     ... vk.loadDeviceCommands(&deviceCommands, device, commands.vkGetDeviceProcAddr)
 //
+// The native path: a driver that is a module of the program, not a shared
+// object (on brixOS, where x86_64 writes no shared objects, our own Vulkan
+// driver for the card is linked into the programs that use it). The
+// program offers it (`offer`) before findDrivers; findDrivers lists each
+// one offered that has a device now first, before every manifest (native
+// first), and openDriver takes its entry points where it would dlopen a
+// library, negotiating the interface as with any driver.
+//
 // Search order for manifests (Linux, as in the Khronos loader's
 // LoaderDriverInterface): VK_DRIVER_FILES (or the older VK_ICD_FILENAMES),
 // when set, is used alone -- a colon-separated list of manifest files or
@@ -108,6 +116,9 @@ pub const Manifest = struct {
     // The Vulkan version the driver reports in its manifest.
     apiVersion: u32
     portability: bool
+    // A driver offered as a module of the program (its place in the
+    // offered list, from 1); 0 for a manifest file's.
+    builtIn: usize
 }
 
 pub const Manifests = struct {
@@ -277,6 +288,7 @@ fn readManifest(allocator: Allocator, file_path: *const Path, manifest: *Manifes
         manifest.*.path = file_path.*
         manifest.*.apiVersion = parseVersion(version)
         manifest.*.portability = portability
+        manifest.*.builtIn = 0
         const library_path = libraryOf(manifest)
         pathReset(library_path)
         var ok = true
@@ -435,11 +447,80 @@ fn addHomeDirectory(manifests: *Manifests, allocator: Allocator, arguments: [][*
     if length > 0 { addDirectory(manifests, allocator, string.fromSlice(bytes[0..length])) }
 }
 
-// Finds the ICD manifests of the Vulkan drivers installed on this system
-// (Linux). `arguments` is main's argument slice (for the environment).
-// Returns the number of usable manifests.
+// ---------------------------------------------------------------------------
+// Drivers that are modules of the program
+
+pub const MAX_BUILT_IN: usize = 4
+
+pub const BuiltIn = struct {
+    // Its name: findDrivers' entry for it has the path "builtin:NAME".
+    name: []const u8
+    // Its vk_icdNegotiateLoaderICDInterfaceVersion,
+    // vk_icdGetInstanceProcAddr and vk_icdGetPhysicalDeviceProcAddr (0:
+    // none) by their addresses.
+    negotiate: usize
+    getInstanceProcAddr: usize
+    getPhysicalDeviceProcAddr: usize
+    // The Vulkan version it answers, as a manifest's api_version says it.
+    apiVersion: u32
+    // A `fn() -> bool` by its address: whether the driver has a device to
+    // offer now (brixOS: whether /devices/gpu0 is there); 0: always.
+    available: usize
+}
+
+const Available = fn() -> bool
+
+var builtIns: [4]BuiltIn = undefined // (per run)
+var builtInCount: usize = 0 // (per run)
+
+// Offers a driver that is a module of the program; one of the same name
+// offered before is replaced. False when MAX_BUILT_IN others are offered.
+pub fn offer(driver: *const BuiltIn) -> bool {
+    var index: usize = 0
+    while index < builtInCount {
+        if string.eql(string.fromSlice(builtIns[index].name), string.fromSlice(driver.*.name)) {
+            builtIns[index] = driver.*
+            return true
+        }
+        index += 1
+    }
+    if builtInCount >= MAX_BUILT_IN { return false }
+    builtIns[builtInCount] = driver.*
+    builtInCount += 1
+    return true
+}
+
+// The drivers offered (for a program that lists them).
+pub fn offered() -> usize { return builtInCount }
+
+// The offered drivers that have a device now, as entries of `manifests`.
+fn addBuiltIns(manifests: *Manifests) -> void {
+    var index: usize = 0
+    while index < builtInCount && manifests.*.count < MAX_DRIVERS {
+        const driver = &builtIns[index]
+        index += 1
+        if driver.*.available != 0 {
+            var available: Available = unsafe { @ptrFromInt(Available, driver.*.available) }
+            if !available() { continue }
+        }
+        const manifest = manifestAt(manifests, manifests.*.count)
+        pathReset(manifestPathOf(manifest))
+        if !pathAppend(manifestPathOf(manifest), string.fromSlice("builtin:")) || !pathAppend(manifestPathOf(manifest), string.fromSlice(driver.*.name)) { continue }
+        pathReset(libraryOf(manifest))
+        manifest.*.apiVersion = driver.*.apiVersion
+        manifest.*.portability = false
+        manifest.*.builtIn = index
+        manifests.*.count += 1
+    }
+}
+
+// Finds the Vulkan drivers: those the program offered that have a device,
+// then the ICD manifests installed on this system (Linux). `arguments` is
+// main's argument slice (for the environment). Returns the number of
+// usable entries.
 pub fn findDrivers(manifests: *Manifests, arguments: [][*]const u8, allocator: Allocator) -> usize {
     manifests.*.count = 0
+    addBuiltIns(manifests)
     var exclusive = variable(arguments, "VK_DRIVER_FILES")
     if exclusive.length == 0 { exclusive = variable(arguments, "VK_ICD_FILENAMES") }
     if exclusive.length > 0 {
@@ -497,6 +578,7 @@ fn clear(driver: *Driver) -> void {
 // life of the program).
 pub fn openDriver(driver: *Driver, manifest: *const Manifest, allocator: Allocator) -> Status {
     clear(driver)
+    if manifest.*.builtIn != 0 { return openBuiltIn(driver, manifest, allocator) }
     const library = dlopen(libraryPath(manifest), RTLD_LAZY)
     if library == 0 { return Status.libraryNotFound }
     driver.*.library = library
@@ -520,6 +602,24 @@ pub fn openDriver(driver: *Driver, manifest: *const Manifest, allocator: Allocat
         return Status.missingEntryPoint
     }
     if version >= 4 { driver.*.getPhysicalDeviceProcAddr = symbol(library, "vk_icdGetPhysicalDeviceProcAddr") }
+    driver.*.apiVersion = manifest.*.apiVersion
+    return finish(driver, allocator)
+}
+
+// A driver that is a module of the program: its entry points as offered,
+// the interface negotiated as with a library.
+fn openBuiltIn(driver: *Driver, manifest: *const Manifest, allocator: Allocator) -> Status {
+    if manifest.*.builtIn > builtInCount { return Status.libraryNotFound }
+    const offered_driver = &builtIns[manifest.*.builtIn - 1]
+    if offered_driver.*.negotiate == 0 { return Status.interfaceUnsupported }
+    var function: PfnNegotiate = unsafe { @ptrFromInt(PfnNegotiate, offered_driver.*.negotiate) }
+    var version = INTERFACE_VERSION
+    if function(&version) != vk.Result.success || version < MINIMUM_INTERFACE_VERSION { return Status.interfaceUnsupported }
+    if version > INTERFACE_VERSION { version = INTERFACE_VERSION }
+    driver.*.interfaceVersion = version
+    driver.*.getInstanceProcAddr = offered_driver.*.getInstanceProcAddr
+    if driver.*.getInstanceProcAddr == 0 { return Status.missingEntryPoint }
+    if version >= 4 { driver.*.getPhysicalDeviceProcAddr = offered_driver.*.getPhysicalDeviceProcAddr }
     driver.*.apiVersion = manifest.*.apiVersion
     return finish(driver, allocator)
 }
