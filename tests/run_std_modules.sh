@@ -134,6 +134,21 @@
 #                                       the headers of the same for brixOS,
 #                                       of a versioned plugin and of a
 #                                       freestanding program (no .bss)
+#   tests/521_cts_framework_runtime.mlx  the Vulkan conformance suite's
+#                                       framework (projects/cts) built by
+#                                       mlx-cc and mlx-ld on mlxlibc and
+#                                       its self-tests run (tools/
+#                                       check_cts.sh --framework, from the
+#                                       sources tools/fetch_cts.sh fetches)
+#   tests/522_cts_cases_runtime.mlx     the suite's cases of projects/cts/
+#                                       check-cases.txt passed by our
+#                                       driver over the host card, as
+#                                       tools/check_cts.sh's run wrote them
+#                                       (the port's tag, our driver, each
+#                                       result ended); its reading of a
+#                                       result file held against made-up
+#                                       ones, tools/run_cts.sh against a
+#                                       stand-in suite
 #   tests/502_gpu_card_interface_runtime.mlx  the kernel interface of the
 #   tests/503_vulkan_driver_entry_runtime.mlx  Vulkan driver on the host's
 #                                       card, and the driver's stage (a)
@@ -315,6 +330,19 @@ run 425_vp9_header_runtime "a 48x32 VP9 stream's uncompressed headers (profile, 
 run 417_aac_decode_runtime "AAC-LC decoded from an MP4 and an ADTS stream, each within 15 dB of the WAV it was encoded from; damaged blocks refused; reset"
 run 416_mp4_demux_runtime "MP4 files read: a plain file's sample tables (chunks, composition offsets, sync samples, an edit list, seeking), fragments (trex defaults, tfdt, trun flags, one without tfdt), avcC parameter sets and Annex B, AudioSpecificConfig, a fragment cut short, damage"
 run 512_zero_data_runtime "a linked program's globals that start zero (undefined, zeros, structs and arrays of them, null, false, 0.0, vectors aligned to 16, a 4 MiB array) in its .bss, in memory only: the file smaller than they are, p_memsz past p_filesz over them, a .bss of no bits, every byte zero at the start, the globals with a value beside them in .data and kept"
+# The conformance suite is fetched and built outside this runner (its
+# sources are not in the repository): without its results the two are
+# skipped, as tests/run_vulkan.sh skips what needs lavapipe.
+if [[ -f mlx-out/cts/results/framework.txt ]]; then
+    run 521_cts_framework_runtime "the Vulkan conformance suite's framework built by our toolchain from the sources at vulkan-cts-1.3.10.0 (delibs and qphelper by mlx-cc, linked by mlx-ld on mlxlibc and mlxlibcpp, no other compiler's object in it) and its 33 self-tests run, each ok: debase, depool, dethread, deutil, decpp, a test log written and read back"
+else
+    echo "skip 521_cts_framework_runtime (no mlx-out/cts/results/framework.txt: tools/fetch_cts.sh, then tools/check_cts.sh --framework)"
+fi
+if [[ -f mlx-out/cts/results/check-cases.qpa ]]; then
+    run 522_cts_cases_runtime "the conformance suite's cases of projects/cts/check-cases.txt (info, device_init, object_management.single, memory.allocation.basic, api.buffer, synchronization.basic: what the driver's stage has) passed by our driver over the host card, each once with Pass in the suite's result file, its result ended, no other case beside them, every run the port's tag against our driver; the reading held against made-up result files (a crash before a pass, a run cut off, another library, another release) and tools/run_cts.sh against a stand-in suite (a crash, a case not run, not supported for want of the port, a command the port could not give)"
+else
+    echo "skip 522_cts_cases_runtime (no mlx-out/cts/results/check-cases.qpa: tools/fetch_cts.sh, then tools/check_cts.sh)"
+fi
 
 # The same program static (object/elf64.mlx's image).
 status=0

@@ -8,10 +8,10 @@
 
 namespace std {
 
-ostream cout = { {}, 1, 6, false, 0, 0, 0, 0 };
-ostream cerr = { {}, 2, 6, false, 0, 0, 0, 0 };
-ostream clog = { {}, 2, 6, false, 0, 0, 0, 0 };
-istream cin = { {}, 0, false, false };
+ostream cout(1, 6);
+ostream cerr(2, 6);
+ostream clog(2, 6);
+istream cin;
 
 static FILE *fileOf(int which) {
     if (which == 1) return stdout;
@@ -24,6 +24,10 @@ ostream &ostream::write(const char *bytes, size_t count) {
         sink->append(bytes, count);
         return *this;
     }
+    if (buffer) {
+        if (buffer->sputn(bytes, (streamsize)count) != (streamsize)count) failed = true;
+        return *this;
+    }
     if (fwrite(bytes, 1, count, fileOf(which)) != count) failed = true;
     return *this;
 }
@@ -33,12 +37,20 @@ ostream &ostream::put(char c) {
         sink->push_back(c);
         return *this;
     }
+    if (buffer) {
+        if (buffer->sputc(c) == -1) failed = true;
+        return *this;
+    }
     if (fputc(c, fileOf(which)) < 0) failed = true;
     return *this;
 }
 
 ostream &ostream::flush() {
-    if (!sink) fflush(fileOf(which));
+    if (buffer) {
+        if (buffer->pubsync() == -1) failed = true;
+    } else if (!sink) {
+        fflush(fileOf(which));
+    }
     return *this;
 }
 
@@ -152,8 +164,24 @@ ostream &ends(ostream &out) { return out.put(0); }
 
 // ---------------------------------------------------------------------------
 
+// The next character of IN (-1 at the end): its buffer's, else its C
+// stream's; and one just read given back.
+static int fetch(istream &in) {
+    if (in.buffer) return in.buffer->sbumpc();
+    return fgetc(fileOf(in.which));
+}
+
+static void giveBack(istream &in, int c) {
+    if (c < 0) return;
+    if (in.buffer) {
+        in.buffer->sungetc();
+        return;
+    }
+    ungetc(c, fileOf(in.which));
+}
+
 int istream::get() {
-    int c = fgetc(fileOf(which));
+    int c = fetch(*this);
     if (c < 0) {
         ended = true;
         failed = true;
@@ -168,6 +196,11 @@ istream &istream::get(char &c) {
 }
 
 int istream::peek() {
+    if (buffer) {
+        int c = buffer->sgetc();
+        if (c < 0) ended = true;
+        return c;
+    }
     int c = fgetc(fileOf(which));
     if (c < 0) {
         ended = true;
@@ -178,13 +211,32 @@ int istream::peek() {
 }
 
 istream &istream::unget() {
+    if (buffer) {
+        if (buffer->sungetc() < 0) failed = true;
+        return *this;
+    }
     fseek(fileOf(which), -1, SEEK_CUR);
     return *this;
 }
 
+istream &istream::seekg(long offset, int direction) {
+    ended = false;
+    if (buffer) {
+        if (buffer->pubseekoff(offset, direction, ios_base::in) < 0) failed = true;
+        return *this;
+    }
+    if (fseek(fileOf(which), offset, direction == ios_base::beg ? SEEK_SET : direction == ios_base::cur ? SEEK_CUR : SEEK_END) != 0) failed = true;
+    return *this;
+}
+
+long istream::tellg() {
+    if (buffer) return buffer->pubseekoff(0, ios_base::cur, ios_base::in);
+    return ftell(fileOf(which));
+}
+
 istream &istream::ignore(size_t count, int delimiter) {
     while (count > 0) {
-        int c = fgetc(fileOf(which));
+        int c = fetch(*this);
         if (c < 0) {
             ended = true;
             break;
@@ -195,10 +247,10 @@ istream &istream::ignore(size_t count, int delimiter) {
     return *this;
 }
 
-istream &istream::getline(char *buffer, size_t size, char delimiter) {
+istream &istream::getline(char *into, size_t size, char delimiter) {
     size_t n = 0;
     while (1) {
-        int c = fgetc(fileOf(which));
+        int c = fetch(*this);
         if (c < 0) {
             ended = true;
             if (n == 0) failed = true;
@@ -207,17 +259,23 @@ istream &istream::getline(char *buffer, size_t size, char delimiter) {
         if (c == delimiter) break;
         if (n + 1 >= size) {
             failed = true;
-            ungetc(c, fileOf(which));
+            giveBack(*this, c);
             break;
         }
-        buffer[n++] = (char)c;
+        into[n++] = (char)c;
     }
-    buffer[n] = 0;
+    into[n] = 0;
     return *this;
 }
 
-istream &istream::read(char *buffer, size_t count) {
-    if (fread(buffer, 1, count, fileOf(which)) != count) {
+istream &istream::read(char *into, size_t count) {
+    size_t n = 0;
+    if (buffer) {
+        n = (size_t)buffer->sgetn(into, (streamsize)count);
+    } else {
+        n = fread(into, 1, count, fileOf(which));
+    }
+    if (n != count) {
         ended = true;
         failed = true;
     }
@@ -226,29 +284,29 @@ istream &istream::read(char *buffer, size_t count) {
 
 // Whitespace before a value is passed; the first character of the value
 // comes back (-1 at the end).
-static int skipSpace(istream &in, int which) {
+static int skipSpace(istream &in) {
     while (1) {
-        int c = fgetc(fileOf(which));
+        int c = fetch(in);
         if (c < 0) return -1;
         if (!isspace(c)) return c;
     }
 }
 
 // A word (to the next whitespace) into buffer, at most size - 1 chars.
-static size_t readWord(istream &in, int which, char *buffer, size_t size) {
-    int c = skipSpace(in, which);
+static size_t readWord(istream &in, char *into, size_t size) {
+    int c = skipSpace(in);
     size_t n = 0;
     while (c >= 0 && !isspace(c)) {
-        if (n + 1 < size) buffer[n++] = (char)c;
-        c = fgetc(fileOf(which));
+        if (n + 1 < size) into[n++] = (char)c;
+        c = fetch(in);
     }
-    if (c >= 0) ungetc(c, fileOf(which));
-    buffer[n] = 0;
+    giveBack(in, c);
+    into[n] = 0;
     return n;
 }
 
 istream &istream::operator>>(char &c) {
-    int read = skipSpace(*this, which);
+    int read = skipSpace(*this);
     if (read < 0) {
         ended = true;
         failed = true;
@@ -259,7 +317,7 @@ istream &istream::operator>>(char &c) {
 }
 
 istream &istream::operator>>(char *word) {
-    if (readWord(*this, which, word, 4096) == 0) {
+    if (readWord(*this, word, 4096) == 0) {
         failed = true;
         ended = true;
     }
@@ -268,7 +326,7 @@ istream &istream::operator>>(char *word) {
 
 istream &istream::operator>>(long &value) {
     char buffer[64];
-    if (readWord(*this, which, buffer, sizeof buffer) == 0) {
+    if (readWord(*this, buffer, sizeof buffer) == 0) {
         failed = true;
         ended = true;
         return *this;
@@ -281,7 +339,7 @@ istream &istream::operator>>(long &value) {
 
 istream &istream::operator>>(unsigned long &value) {
     char buffer[64];
-    if (readWord(*this, which, buffer, sizeof buffer) == 0) {
+    if (readWord(*this, buffer, sizeof buffer) == 0) {
         failed = true;
         ended = true;
         return *this;
@@ -294,7 +352,7 @@ istream &istream::operator>>(unsigned long &value) {
 
 istream &istream::operator>>(double &value) {
     char buffer[400];
-    if (readWord(*this, which, buffer, sizeof buffer) == 0) {
+    if (readWord(*this, buffer, sizeof buffer) == 0) {
         failed = true;
         ended = true;
         return *this;
@@ -349,7 +407,7 @@ istream &istream::operator>>(float &value) {
 
 istream &operator>>(istream &in, string &word) {
     char buffer[4096];
-    size_t n = readWord(in, in.which, buffer, sizeof buffer);
+    size_t n = readWord(in, buffer, sizeof buffer);
     if (n == 0) {
         in.failed = true;
         in.ended = true;
