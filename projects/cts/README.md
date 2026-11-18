@@ -8,6 +8,16 @@ sources we do not edit: the sources are not in the repository at all
 (UPSTREAM.md: which tag and why, the commits and trees, what is not
 fetched), only what the port adds.
 
+It is a measuring tool of the development host and nothing more. The
+suite is Khronos' C++ and runs as a program of the host (Linux) against
+the driver over the host card; nothing of it goes into the brixOS image,
+and nothing of the driver depends on it. The driver itself is Mlx, and
+on brixOS it reaches the card through brixOS's native calls alone (80 to
+85: std.gpucard over std.os.brix), with no C, no C++ and no Linux call
+in its way. What mlx-cc and mlxlibcpp grew for the suite (C++
+exceptions, the stream and container headers) is there so that the
+suite is built by our toolchain rather than a foreign one.
+
     tools/fetch_cts.sh                 the sources, at UPSTREAM.md's commits,
                                        into $CTS_SOURCES (mlx-out/cts/sources)
     ./mlx build cts                    mlx-out/cts/bin/deqp-vk and
