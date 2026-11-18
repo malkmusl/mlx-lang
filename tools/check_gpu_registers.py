@@ -157,6 +157,23 @@
 # under the copy engine's 21 bits of bytes and the driver's most, and the
 # calls' numbers, flags, states and record size against the spec and
 # std.gpucard.
+# THE ENGINES' REGISTERS ARE GENERATED (projects/brix/registers, made by
+# tools/gpu_registers_generate.py from Linux's headers and Mesa's register
+# database at fixed tags, and held against them by tests/519 and 520): in
+# gpu_engines.mlx, gpu_smc_sdma.mlx, gpu_compute.mlx, gpu_graphics.mlx,
+# gpu_first_space.mlx and tests/support/engine_card.mlx a register, field
+# or enum value is `const NAME: usize = module.NAME`, and a golden table's
+# register is `module.NAME`. This reads those modules for the numbers and
+# holds what the generator cannot: that each such constant names the
+# generated one of its own name in the block Linux's header has it in, that
+# a golden table names Linux's row's register in Linux's order (by its name,
+# never a number), that every register those files read or write is named
+# where it is used, never a number written in its place, and, as
+# for every number here, where the kernel uses it (the values written,
+# their orders, the display's registers never written, Linux's numbers
+# that are no register). The display's files (gpu_display.mlx and the
+# others above) still type their numbers and are held as they were.
+#
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -164,6 +181,37 @@ if len(sys.argv) != 2:
     sys.exit("usage: check_gpu_registers.py HEADERS (see the file's head)")
 hdr = sys.argv[1]
 here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "projects", "brix", "kernel")
+
+# The generated register modules: "module.NAME" and "module.ENUM.NAME" to
+# their numbers.
+generated_dir = os.path.join(here, "..", "registers")
+GENERATED = {}
+for module_file in sorted(os.listdir(generated_dir)):
+    if not module_file.endswith(".mlx"):
+        continue
+    inside = None
+    for line in open(os.path.join(generated_dir, module_file)):
+        m = re.match(r"pub const (\w+) = struct \{", line)
+        if m:
+            inside = m.group(1)
+            continue
+        if line.startswith("}"):
+            inside = None
+            continue
+        m = re.match(r"\s*pub const (\w+) = (0x[0-9A-F]+|\d+)\s*(//.*)?$", line)
+        if m:
+            GENERATED[module_file[:-4] + "." + (inside + "." if inside else "") + m.group(1)] = int(m.group(2), 0)
+# Each constant that names a generated one, as (name, what it names).
+ALIASES = []
+
+def item_number(item):
+    # A number written, or a generated module's.
+    item = item.strip()
+    if re.match(r"0x[0-9A-Fa-f]+$|\d+$", item):
+        return int(item, 0)
+    if item not in GENERATED:
+        sys.exit("%s: no generated register of that name (projects/brix/registers)" % item)
+    return GENERATED[item]
 
 def defines(path):
     out = {}
@@ -466,7 +514,22 @@ def constants(text):
         m = re.match(r"\s*(?:pub )?const (\w+): usize = (0x[0-9A-Fa-f]+|\d+)\b", line)
         if m:
             out.append((m.group(1), int(m.group(2), 0), inside))
+        m = re.match(r"\s*(?:pub )?const (\w+): usize = (\w+\.(?:\w+\.)?\w+)\s*$", line)
+        if m and m.group(2).split(".")[0] in set(k.split(".")[0] for k in GENERATED):
+            out.append((m.group(1), item_number(m.group(2)), inside))
+            ALIASES.append((m.group(1), m.group(2)))
     return out
+
+def items(text, name):
+    # A table's items: numbers written and generated registers.
+    body = re.search(r"pub const %s = \[_\]usize\{([^}]*)\}" % name, text).group(1)
+    return [x.strip() for x in body.replace("\n", " ").split(",") if x.strip()]
+
+def named_as(item, row, what):
+    # A golden table's register named as Linux's row names it, never a
+    # number written in its place.
+    named = not re.match(r"0x|\d", item)
+    hold("%s names %s as Linux's row does" % (what, item), int(named and row.startswith("mm") and item.split(".")[-1] == row[2:]), 1)
 
 # The packed structures of atombios.h: a field's offset, a structure's
 # size.
@@ -1174,10 +1237,12 @@ for table, source, mine in (("golden_settings_polaris10_a11", gfx_c, "GOLDEN_GRA
                             ("golden_settings_polaris10_a11", sdma_c, "GOLDEN_COPY")):
     rows = golden(source, table)
     wanted = [resolve(rows[k]) for k in range(0, len(rows), 3)]
-    code = table_of = [int(x, 0) for x in re.search(r"pub const %s = \[_\]usize\{([^}]*)\}" % mine, engines_text).group(1).replace(" ", "").split(",")]
+    names = items(engines_text, mine)
+    code = [item_number(x) for x in names]
     hold("%s's registers, as many" % mine, len(code), len(wanted))
     for k in range(min(len(code), len(wanted))):
         hold("%s %d" % (mine, k), code[k], wanted[k])
+        named_as(names[k], rows[3 * k], "%s %d" % (mine, k))
 # The firmware files' names as Linux asks for them, and the header
 # versions the repository's files have.
 names = re.findall(r'"(polaris10_\w+\.bin)"', re.search(r"pub const FILES = \[_\]\[\]const u8\{([^}]*)\}", engines_text).group(1))
@@ -1203,8 +1268,9 @@ for v in display_numbers[1:]:
     last = v
 runs += [first, last]
 card_text = open(os.path.join(here, "..", "..", "..", "tests", "support", "engine_card.mlx")).read()
-card_runs = [int(x, 0) for x in re.search(r"pub const DISPLAY_RUNS = \[_\]usize\{([^}]*)\}", card_text).group(1).replace(" ", "").split(",")]
-hold("the display's runs of engine_card.mlx are dce_11_2_d.h's", int(card_runs == runs), 1)
+generated_runs = [item_number(x) for x in re.search(r"pub const MMIO_RUNS = \[_\]usize\{([^}]*)\}", open(os.path.join(generated_dir, "dce_11_2.mlx")).read()).group(1).replace("\n", " ").split(",") if x.strip()]
+hold("the display's runs (dce_11_2.mlx's MMIO_RUNS) are dce_11_2_d.h's", int(generated_runs == runs), 1)
+hold("engine_card.mlx tells the display's registers by dce_11_2.MMIO_RUNS", int("number >= dce_11_2.MMIO_RUNS[k] && number <= dce_11_2.MMIO_RUNS[k + 1]" in card_text), 1)
 # No register a step writes is the display's.
 written_names = set(re.findall(r"\b(?:put|alter|set|whereDiffers|change)\(e, (\w+)", engines_text)) | set(re.findall(r"\bwr\(e, (\w+)", engines_text))
 for name in sorted(written_names):
@@ -1366,10 +1432,13 @@ hold("the SMC's list after the GART's table and the default page", int(loaded_na
 hold("the SMC's working memory after its list", int(loaded_names["SMU_BUFFER_AT"] >= loaded_names["LIST_AT"] + loaded_names["HEADER_BUFFER_BYTES"]), 1)
 hold("the fill's and the copy's pages within what M1 proved", int(fill_at + 3 * 4096 <= proved and re.search(r"pub const FILL_AT: usize = LIST_AT \+ HEADER_BUFFER_BYTES \+ SMU_BUFFER_BYTES", loaded_text) is not None), 1)
 # The copy engines' golden table, row for row in Linux's order.
-code_golden = [int(x, 0) for x in re.search(r"pub const GOLDEN_COPY_WORDS = \[_\]usize\{([^}]*)\}", loaded_text).group(1).replace(" ", "").split(",")]
+golden_items = items(loaded_text, "GOLDEN_COPY_WORDS")
+code_golden = [item_number(x) for x in golden_items]
 hold("the copy engines' golden rows, as many", len(code_golden), len(golden_rows))
 for k in range(min(len(code_golden), len(golden_rows))):
     hold("the copy engines' golden word %d" % k, code_golden[k], resolve(golden_rows[k]))
+    if k % 3 == 0:
+        named_as(golden_items[k], golden_rows[k], "the copy engines' golden word %d" % k)
 # The list's order (smu7_request_smu_load_fw) and each kind's file
 # (gpu_engines.mlx's FILES: pfp, me, ce, mec, rlc, sdma, sdma1).
 order = re.findall(r"smu7_populate_single_firmware_entry\(hwmgr,\s*(UCODE_ID_\w+), &toc->entry", smu7_c)
@@ -1637,10 +1706,13 @@ hold("the ring's record slots are 32 bytes apart as amdgpu_device_wb_get's", sta
 # The golden tables, row for row.
 for table_name, mine_name in (("golden_settings_polaris10_a11", "GOLDEN_GRAPHICS_WORDS"), ("polaris10_golden_common_all", "GOLDEN_COMMON_WORDS")):
     rows = golden(gfx_c, table_name)
-    code = [int(x, 0) for x in re.search(r"pub const %s = \[_\]usize\{([^}]*)\}" % mine_name, compute_text).group(1).replace(" ", "").split(",")]
+    names = items(compute_text, mine_name)
+    code = [item_number(x) for x in names]
     hold("%s's rows, as many" % mine_name, len(code), len(rows))
     for k in range(min(len(code), len(rows))):
         hold("%s word %d" % (mine_name, k), code[k], resolve(rows[k]))
+        if k % 3 == 0:
+            named_as(names[k], rows[k], "%s word %d" % (mine_name, k))
 # The tiling words.
 code_tiles = [int(x, 0) for x in re.search(r"pub const TILE_MODES = \[_\]usize\{([^}]*)\}", compute_text).group(1).replace(" ", "").split(",")]
 code_macrotiles = [int(x, 0) for x in re.search(r"pub const MACROTILE_MODES = \[_\]usize\{([^}]*)\}", compute_text).group(1).replace(" ", "").split(",")]
@@ -1966,4 +2038,72 @@ for name in ("READ", "WRITE", "EXECUTE"):
     hold("gpu_map's %s (the spec)" % name, work_value(name), STAGE67_LINUX.get(name))
 hold("WHY_RING_DOWN (the spec's why 4, std.gpucard)", work_value("WHY_RING_DOWN"), int(re.search(r"pub const RING_DOWN: u32 = (\d+)", gpucard_text).group(1)))
 print("the programs' work: %d numbers of gpu_work.mlx held against Linux's and Mesa's files, the spec and std.gpucard, %d wrong" % (held - calls_before, bad - calls_bad_before))
+# ---- The engines' files on the generated modules: each constant that
+# names a generated register, field or enum value names the one of its own
+# name, in the block whose Linux header has that name with that number; no
+# register, field or enum value of those headers is typed as a number in
+# these files any more.
+names_before = held
+names_bad_before = bad
+BLOCK_HEADERS = ("gmc_8_1", "oss_3_0", "bif_5_0", "gfx_8_0", "smu_7_1_3", "dce_11_2")
+block_regs = dict((m, defines(os.path.join(hdr, m + "_d.h"))) for m in BLOCK_HEADERS)
+block_masks = dict((m, defines(os.path.join(hdr, m + "_sh_mask.h"))) for m in BLOCK_HEADERS)
+block_enums = {}
+for m in re.finditer(r"typedef enum (\w+) \{(.*?)\} \w+;", text_of("gfx_8_0_enum.h"), re.S):
+    block_enums[m.group(1)] = dict((a, int(v, 0)) for a, v in re.findall(r"(\w+)\s*=\s*(0x[0-9a-fA-F]+|\d+)", m.group(2)))
+
+def header_number(module, enum, name):
+    # What Linux's header of the block gives the name (None: nothing).
+    if enum is not None:
+        return block_enums.get(enum, {}).get(name) if module == "gfx_8_0" else None
+    if name.startswith("ix"):
+        return block_regs[module].get(name)
+    if name.endswith("__SHIFT"):
+        return block_masks[module].get(name)
+    if "__" in name:
+        return block_masks[module].get(name + "_MASK")
+    return block_regs[module].get("mm" + name)
+
+moved_files = ("gpu_engines.mlx", "gpu_smc_sdma.mlx", "gpu_compute.mlx", "gpu_graphics.mlx", "gpu_first_space.mlx")
+del ALIASES[:]
+for name in moved_files:
+    constants(open(os.path.join(here, name)).read())
+named = list(ALIASES)
+for name, target in named:
+    parts = target.split(".")
+    module, enum = parts[0], (parts[1] if len(parts) == 3 else None)
+    hold("%s names the generated %s of its own name" % (name, target), int(parts[-1] == name and module in BLOCK_HEADERS), 1)
+    hold("%s (%s) is the header's" % (name, target), GENERATED[target], header_number(module, enum, name) if module in BLOCK_HEADERS else None)
+# (Two of stage 5's own values have a register's name of the bus interface,
+# the values CP_DEVICE_ID and CP_MAX_CONTEXT are given: no register.)
+VALUES_NAMED_AS_REGISTERS = {"DEVICE_ID", "MAX_CONTEXT"}
+typed = 0
+for name in moved_files + (os.path.join("..", "..", "..", "tests", "support", "engine_card.mlx"),):
+    for const, value, inside in constants(open(os.path.join(here, name)).read()):
+        if any(const == a for a, _ in named) or const in VALUES_NAMED_AS_REGISTERS:
+            continue
+        hits = [m for m in BLOCK_HEADERS if header_number(m, None, const) == value]
+        hits += ["gfx_8_0 enum " + e for e in ("MTYPE", "SH_MEM_ALIGNMENT_MODE", "SH_MEM_ADDRESS_MODE") if block_enums[e].get(const) == value]
+        if hits:
+            typed += 1
+            print("TYPED %s: %s = %#x is the header's (%s): name it through ../registers" % (name, const, value, ", ".join(hits)))
+hold("no register, field or enum value typed as a number in the engines' files", typed, 0)
+# The register a step reads or writes is named where it is used, never a
+# number written in its place: the argument after the engines (and after
+# the step's own state, for put) of every register access in these files.
+ACCESS = re.compile(r"\b(?:rd|wr|set|smc|smcRead|smcWrite|smcField|smcWait|alter|whereDiffers)\(e, (\w+)|\bput\(e, (?:(?:c|l), )?(\w+)")
+literal = 0
+accesses = 0
+for name in moved_files:
+    for number, line in enumerate(open(os.path.join(here, name)), 1):
+        if line.strip().startswith("//"):
+            continue
+        for m in ACCESS.finditer(line):
+            accesses += 1
+            first = m.group(1) or m.group(2)
+            if re.match(r"\d", first):
+                literal += 1
+                print("TYPED %s:%d: register %s is a number written in its place: name it through ../registers" % (name, number, first))
+hold("every register the engines' files read or write is named (%d accesses), none a number in its place" % accesses, literal, 0)
+print("the engines' registers: %d constants of the engines' files name a generated register, field or enum value; %d numbers held, %d wrong" % (len(named), held - names_before, bad - names_bad_before))
 sys.exit(1 if bad or rom_bad or wrong or display_bad else 0)
