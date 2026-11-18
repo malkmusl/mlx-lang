@@ -1,0 +1,1669 @@
+// An interpreter of the RX 580's shader code (GFX8) on the host: a wave of
+// 64 lanes with its scalar and vector registers, the exec mask, vcc and
+// scc, scalar loads and buffer loads and stores on a memory of the test's,
+// the work groups of a compute dispatch started as the card starts them.
+// It runs the WORDS (decode.mlx), not the compiler's records: what is
+// proven is what would be sent to the card.
+//
+// IT REFUSES rather than guesses. The card's behaviour is known here only
+// from Mesa's sources; where they do not say what the card does, a run
+// stops and says where, instead of making something up:
+// - an instruction this file does not model (its effect is not written
+//   here): Stop.notModelled;
+// - a value the sources do not give: a conversion of a float out of range,
+//   a reciprocal of 0, an infinity or a NaN, a denormal (the shader runs
+//   with float32 denormals flushed, as ACO's emit_rcp assumes when it uses
+//   v_rcp_f32 plainly), v_readfirstlane with no lane on, the scratch
+//   descriptor in s0 and s1: Stop.unknown;
+// - a buffer access past the descriptor's range: the card is said to give
+//   0 and drop the store, but no source says so of this card (the study's
+//   12.7), so it is an error here: Stop.range; an address outside the
+//   memory the test gave: Stop.unmapped;
+// - a register read before anything wrote it in that lane, a register
+//   beyond the counts the program declares: Stop.register.
+//
+// IT KEEPS THE CARD'S RULES that a shader must obey and that the card does
+// not check (it misbehaves instead). A program that breaks one stops here:
+// - the waits (aco_insert_waitcnt.cpp): a loaded register is not there
+//   before an s_waitcnt has let its counter run down far enough; vector
+//   memory returns in the order it was issued, scalar memory in any order
+//   ("Instructions of the same event will finish in-order except for smem");
+//   reading such a register early, or writing it while its load is
+//   pending, is Stop.wait; so is ending the program with loads or stores
+//   still counted (whether s_endpgm waits by itself on this generation is
+//   not said: the study's 12.6);
+// - the wait states between instructions (aco_insert_NOPs.cpp,
+//   handle_instruction_gfx6 and NOP_ctx_gfx6, every row that holds for
+//   GFX8; a wait state is an instruction issued, s_nop n is n + 1):
+//     1 a VALU writes an SGPR, a buffer, image or flat instruction reads
+//       it: 5
+//     2 a VALU writes an SGPR, v_readlane or v_writelane takes it as its
+//       lane: 4
+//     3 a VALU writes vcc, v_div_fmas: 4
+//     4 a VALU writes exec, a DPP instruction: 5
+//     5 a VALU writes a VGPR, a DPP instruction reads it as its first
+//       source: 2
+//     6 s_setreg, then s_getreg or s_setreg: 2
+//     7 s_setreg sets MODE.vskip, then any vector or memory instruction: 2
+//     8 a SALU writes m0, then GDS, s_sendmsg or s_ttracedata: 1
+//     9 a buffer store of more than two registers with a constant offset
+//       (and the like for images and flat), then a VALU writes one of its
+//       data registers: 1
+//    10 a scalar load joins a clause with a scalar store or atomic: 1
+//   Stop.hazard names the rule by its number;
+// - the constant bus (aco_validate.cpp): a vector instruction reads at
+//   most one scalar value on GFX8, an SGPR (vcc and exec too, a pair once)
+//   or a literal: Stop.bus.
+//
+// WHAT EACH INSTRUCTION DOES is the NIR operation ACO selects it for
+// (Mesa's nir_opcodes.py: ishl masks the count to 5 bits, umul_high is the
+// high half of the 64-bit product, iadd wraps), with the carries and flags
+// as ACO uses them: the scalar logic operations set scc when their result
+// is not zero (bool_to_scalar_condition), a vector add writes its carry
+// into vcc or its scalar pair, a comparison writes one bit a lane. What a
+// comparison writes for the lanes that are off is not said (ACO ands a
+// ballot with exec: "Make sure that all inactive lanes return zero"); the
+// interpreter writes ones there, so that code counting on zeros goes wrong
+// here first. A float operation is the host's IEEE operation; the card's
+// v_rcp_f32 is not the host's division (the study's 11.14), so `rcpError`
+// moves its result by that many units in the last place, to show what a
+// sequence that leans on it tolerates.
+
+const isa = @import("./isa.mlx")
+const encode = @import("./encode.mlx")
+const decode = @import("./decode.mlx")
+
+const Inst = encode.Inst
+const Form = encode.Form
+
+pub const LANES: usize = 64
+pub const VGPRS: usize = 256
+pub const SGPRS: usize = 128
+pub const MAX_WORDS: usize = 16384
+pub const MAX_REGIONS: usize = 8
+
+pub const Stop = enum(u8) {
+    done,
+    undecodable,
+    notModelled,
+    unknown,
+    range,
+    unmapped,
+    register,
+    wait,
+    hazard,
+    bus,
+    steps,
+    entry,
+}
+
+// How a run ended, and where: the word of the instruction, the
+// instruction, and a number that says more (the register, the rule, the
+// address).
+pub const Result = struct {
+    stop: Stop
+    pc: usize
+    op: isa.Op
+    detail: u64
+    // Instructions run, and wait states issued.
+    steps: u64
+    waits: u64
+}
+
+// Memory the card reaches: regions of the test's words at card addresses.
+pub const Region = struct {
+    base: u64
+    words: []u32
+    writable: bool
+}
+
+pub const Memory = struct {
+    regions: [MAX_REGIONS]Region
+    count: usize
+}
+
+pub fn emptyMemory(memory: *Memory) -> void { memory.*.count = 0 }
+
+pub fn addRegion(memory: *Memory, base: u64, words: []u32, writable: bool) -> bool {
+    if memory.*.count == MAX_REGIONS || (base & 3) != 0 { return false }
+    memory.*.regions[memory.*.count] = Region.{ .base = base, .words = words, .writable = writable }
+    memory.*.count += 1
+    return true
+}
+
+// The region and word of byte address `address`, 4 bytes long.
+fn locate(memory: *Memory, address: u64, region: *usize, word: *usize) -> bool {
+    if (address & 3) != 0 { return false }
+    var r: usize = 0
+    while r < memory.*.count {
+        const base = memory.*.regions[r].base
+        const length = @intCast(u64, memory.*.regions[r].words.length) * 4
+        if address >= base && address - base < length {
+            region.* = r
+            word.* = @intCast(usize, (address - base) / 4)
+            return true
+        }
+        r += 1
+    }
+    return false
+}
+
+// What a compute dispatch gives each wave (the shader's facts, from the
+// compiler, and what the driver writes into COMPUTE_PGM_RSRC2 and
+// COMPUTE_USER_DATA_n).
+pub const Launch = struct {
+    // Registers the program may use (RSRC1's counts).
+    vgprs: u32
+    sgprs: u32
+    // User data words loaded into s0.. (USER_SGPR of RSRC2).
+    userCount: u32
+    user: [16]u32
+    // TGID_X_EN .. TGID_Z_EN: the work group id into the scalar registers
+    // after the user words, x first.
+    groupIdX: bool
+    groupIdY: bool
+    groupIdZ: bool
+    // TIDIG_COMP_CNT: how many of the local id's components go into v0..
+    // (0: x, 1: x and y, 2: all three).
+    localIdComponents: u32
+    groupSizeX: u32
+    groupSizeY: u32
+    groupSizeZ: u32
+    // Units in the last place added to every v_rcp_f32 result.
+    rcpError: i32
+    maxSteps: u64
+}
+
+// Register states for the waits: what counter a register's pending load
+// is on and its place in that counter's order.
+const PENDING_NONE: u32 = 0
+const PENDING_VM: u32 = 1
+const PENDING_LGKM: u32 = 2
+
+pub const Wave = struct {
+    s: [SGPRS]u32
+    // The lanes of each scalar register written: all or none.
+    sWritten: [SGPRS]bool
+    v: [VGPRS * LANES]u32
+    vWritten: [VGPRS]u64
+    scc: bool
+    sccWritten: bool
+    pc: usize
+    // The waits: what each register waits for, counted per counter.
+    sPendingKind: [SGPRS]u32
+    sPendingSeq: [SGPRS]u64
+    vPendingKind: [VGPRS]u32
+    vPendingSeq: [VGPRS]u64
+    vmIssued: u64
+    vmDone: u64
+    lgkmIssued: u64
+    lgkmDone: u64
+    lgkmUnordered: u64
+    // The hazards: the wait-state count after the last write of each kind.
+    now: u64
+    sValuWrite: [SGPRS]u64
+    vValuWrite: [VGPRS]u64
+    sSaluWriteM0: u64
+    setreg: u64
+    vskip: u64
+    storeData: [VGPRS]u64
+    smemClause: bool
+    smemWrite: bool
+    // The hardware registers s_setreg and s_getreg name (their fields as
+    // the immediate gives them: id [5:0], offset [10:6], size - 1
+    // [15:11], as aco_insert_NOPs.cpp decodes it), with the bits set so
+    // far; MODE (1) once written makes the float operations and, with its
+    // vskip bit (28), every vector one not modelled.
+    hw: [64]u32
+    hwSet: [64]u32
+    modeTouched: bool
+}
+
+pub var wave: Wave = undefined
+var program: [MAX_WORDS]Inst = undefined
+var lengths: [MAX_WORDS]u8 = undefined
+var programWords: usize = 0
+
+fn stopAt(result: *Result, stop: Stop, pc: usize, op: isa.Op, detail: u64) -> void {
+    result.*.stop = stop
+    result.*.pc = pc
+    result.*.op = op
+    result.*.detail = detail
+}
+
+// Decodes the program once: every word that starts an instruction gets
+// it. A word that is no instruction stops the load, with its place.
+pub fn load(code: []const u32, result: *Result) -> bool {
+    result.*.stop = Stop.done
+    result.*.steps = 0
+    result.*.waits = 0
+    if code.length > MAX_WORDS {
+        stopAt(result, Stop.undecodable, MAX_WORDS, isa.S_NOP, 0)
+        return false
+    }
+    var at: usize = 0
+    while at < code.length {
+        lengths[at] = 0
+        at += 1
+    }
+    at = 0
+    while at < code.length {
+        var inst: Inst = undefined
+        const length = decode.decode(code, at, &inst)
+        if length == 0 {
+            stopAt(result, Stop.undecodable, at, isa.S_NOP, @intCast(u64, code[at]))
+            return false
+        }
+        program[at] = inst
+        lengths[at] = @intCast(u8, length)
+        at += length
+    }
+    programWords = code.length
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Registers
+
+fn laneOn(exec: u64, lane: usize) -> bool { return ((exec >> lane) & 1) != 0 }
+
+fn execMask() -> u64 { return @intCast(u64, wave.s[126]) | @intCast(u64, wave.s[127]) << 32 }
+
+fn setPair(first: u16, value: u64) -> void {
+    const r = @intCast(usize, first)
+    wave.s[r] = @intCast(u32, value & 0xFFFFFFFF)
+    wave.s[r + 1] = @intCast(u32, value >> 32)
+    wave.sWritten[r] = true
+    wave.sWritten[r + 1] = true
+}
+
+// Checks a scalar register (or pair) may be read now.
+fn readableScalar(first: u16, size: u32, launch: *const Launch, result: *Result) -> bool {
+    var k: u32 = 0
+    while k < size {
+        const r = @intCast(usize, first) + @intCast(usize, k)
+        if r >= SGPRS || (r < 102 && r >= @intCast(usize, launch.*.sgprs)) {
+            stopAt(result, Stop.register, wave.pc, program[wave.pc].op, @intCast(u64, r))
+            return false
+        }
+        if r < 2 && !wave.sWritten[r] {
+            // s0 and s1 hold the scratch descriptor, which no shader of
+            // these stages uses.
+            stopAt(result, Stop.unknown, wave.pc, program[wave.pc].op, @intCast(u64, r))
+            return false
+        }
+        if !wave.sWritten[r] {
+            stopAt(result, Stop.register, wave.pc, program[wave.pc].op, @intCast(u64, r))
+            return false
+        }
+        if !scalarArrived(r, result) { return false }
+        k += 1
+    }
+    return true
+}
+
+fn scalarArrived(r: usize, result: *Result) -> bool {
+    const kind = wave.sPendingKind[r]
+    if kind == PENDING_NONE { return true }
+    if kind == PENDING_LGKM && wave.sPendingSeq[r] < wave.lgkmDone {
+        wave.sPendingKind[r] = PENDING_NONE
+        return true
+    }
+    stopAt(result, Stop.wait, wave.pc, program[wave.pc].op, @intCast(u64, r))
+    return false
+}
+
+fn vectorArrived(r: usize, result: *Result) -> bool {
+    const kind = wave.vPendingKind[r]
+    if kind == PENDING_NONE { return true }
+    if kind == PENDING_VM && wave.vPendingSeq[r] < wave.vmDone {
+        wave.vPendingKind[r] = PENDING_NONE
+        return true
+    }
+    stopAt(result, Stop.wait, wave.pc, program[wave.pc].op, 256 + @intCast(u64, r))
+    return false
+}
+
+fn readableVector(first: u16, size: u32, lanes: u64, launch: *const Launch, result: *Result) -> bool {
+    var k: u32 = 0
+    while k < size {
+        const r = @intCast(usize, first - encode.VGPR) + @intCast(usize, k)
+        if r >= @intCast(usize, launch.*.vgprs) {
+            stopAt(result, Stop.register, wave.pc, program[wave.pc].op, 256 + @intCast(u64, r))
+            return false
+        }
+        if (wave.vWritten[r] & lanes) != lanes {
+            stopAt(result, Stop.register, wave.pc, program[wave.pc].op, 256 + @intCast(u64, r))
+            return false
+        }
+        if !vectorArrived(r, result) { return false }
+        k += 1
+    }
+    return true
+}
+
+// A register about to be written must not wait for a load still.
+fn writableScalar(first: u16, size: u32, launch: *const Launch, result: *Result) -> bool {
+    var k: u32 = 0
+    while k < size {
+        const r = @intCast(usize, first) + @intCast(usize, k)
+        if r >= SGPRS || (r < 102 && r >= @intCast(usize, launch.*.sgprs)) || r == 125 {
+            stopAt(result, Stop.register, wave.pc, program[wave.pc].op, @intCast(u64, r))
+            return false
+        }
+        if wave.sPendingKind[r] != PENDING_NONE && !scalarArrived(r, result) { return false }
+        k += 1
+    }
+    return true
+}
+
+fn writableVector(first: u16, size: u32, launch: *const Launch, result: *Result) -> bool {
+    var k: u32 = 0
+    while k < size {
+        const r = @intCast(usize, first - encode.VGPR) + @intCast(usize, k)
+        if r >= @intCast(usize, launch.*.vgprs) {
+            stopAt(result, Stop.register, wave.pc, program[wave.pc].op, 256 + @intCast(u64, r))
+            return false
+        }
+        if wave.vPendingKind[r] != PENDING_NONE && !vectorArrived(r, result) { return false }
+        k += 1
+    }
+    return true
+}
+
+// The bits of an inline constant (aco_ir.h, Operand::c32), or false for an
+// operand that is none (1/(2 pi) is named for 16 bits only there).
+fn inlineValue(operand: u16, value: *u32) -> bool {
+    const o = @intCast(u32, operand)
+    if o >= 128 && o <= 192 {
+        value.* = o - 128
+        return true
+    }
+    if o >= 193 && o <= 208 {
+        value.* = 0 -% (o - 192)
+        return true
+    }
+    if o == 240 { value.* = 0x3F000000 } else if o == 241 { value.* = 0xBF000000 } else if o == 242 { value.* = 0x3F800000 } else if o == 243 { value.* = 0xBF800000 } else if o == 244 { value.* = 0x40000000 } else if o == 245 { value.* = 0xC0000000 } else if o == 246 { value.* = 0x40800000 } else if o == 247 { value.* = 0xC0800000 } else { return false }
+    return true
+}
+
+// A scalar source's value (an SGPR, a constant, the literal), checked.
+fn scalarSource(inst: *const Inst, operand: u16, launch: *const Launch, result: *Result, value: *u32) -> bool {
+    if operand < 128 {
+        if !readableScalar(operand, 1, launch, result) { return false }
+        value.* = wave.s[@intCast(usize, operand)]
+        return true
+    }
+    if operand == encode.LITERAL {
+        value.* = inst.*.literal
+        return true
+    }
+    if inlineValue(operand, value) { return true }
+    stopAt(result, Stop.unknown, wave.pc, inst.*.op, @intCast(u64, operand))
+    return false
+}
+
+fn scalarPair(inst: *const Inst, operand: u16, launch: *const Launch, result: *Result, value: *u64) -> bool {
+    if operand < 128 {
+        if !readableScalar(operand, 2, launch, result) { return false }
+        value.* = @intCast(u64, wave.s[@intCast(usize, operand)]) | @intCast(u64, wave.s[@intCast(usize, operand) + 1]) << 32
+        return true
+    }
+    var low: u32 = 0
+    if !scalarSource(inst, operand, launch, result, &low) { return false }
+    // A 64-bit operand from a 32-bit constant: sign-extended for the
+    // integers (aco_ir.h, c32_or_c64 makes -1 .. -16 64-bit ones too).
+    value.* = @intCast(u64, low)
+    if operand >= 193 && operand <= 208 { value.* |= 0xFFFFFFFF00000000 }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Running
+
+// Runs the loaded program on the wave as it stands until s_endpgm or a
+// stop.
+pub fn run(launch: *const Launch, memory: *Memory, result: *Result) -> void {
+    result.*.stop = Stop.done
+    while true {
+        if result.*.steps >= launch.*.maxSteps {
+            stopAt(result, Stop.steps, wave.pc, isa.S_NOP, result.*.steps)
+            return
+        }
+        if wave.pc >= programWords || lengths[wave.pc] == 0 {
+            stopAt(result, Stop.undecodable, wave.pc, isa.S_NOP, 0)
+            return
+        }
+        const inst = program[wave.pc]
+        const length = @intCast(usize, lengths[wave.pc])
+        if !checkHazards(&inst, launch, result) { return }
+        var next = wave.pc + length
+        if !step(&inst, launch, memory, result, &next) { return }
+        result.*.steps += 1
+        const states = if inst.op.format == isa.Format.sopp && inst.op.number == isa.S_NOP.number { @intCast(u64, inst.imm & 0xFFFF) + 1 } else { @intCast(u64, 1) }
+        wave.now += states
+        result.*.waits = wave.now
+        if inst.op.format == isa.Format.sopp && inst.op.number == isa.S_ENDPGM.number {
+            if wave.vmIssued != wave.vmDone || wave.lgkmIssued != wave.lgkmDone {
+                stopAt(result, Stop.wait, wave.pc, inst.op, 0)
+                return
+            }
+            stopAt(result, Stop.done, wave.pc, inst.op, 0)
+            return
+        }
+        wave.pc = next
+    }
+}
+
+fn isValu(f: isa.Format) -> bool {
+    return f == isa.Format.vop1 || f == isa.Format.vop2 || f == isa.Format.vopc || f == isa.Format.vop3 || f == isa.Format.vintrp
+}
+fn isSalu(f: isa.Format) -> bool {
+    return f == isa.Format.sop1 || f == isa.Format.sop2 || f == isa.Format.sopc || f == isa.Format.sopk || f == isa.Format.sopp
+}
+
+// Wait states since `when` (the count after the write): those issued in
+// between.
+fn since(when: u64) -> u64 { return wave.now - when }
+
+fn hazard(inst: *const Inst, result: *Result, rule: u64, needed: u64, when: u64) -> bool {
+    if when == 0 { return true }
+    if since(when) >= needed { return true }
+    stopAt(result, Stop.hazard, wave.pc, inst.*.op, rule)
+    return false
+}
+
+fn scalarOperandRead(r: u16, inst: *const Inst, result: *Result, rule: u64, needed: u64, size: u32) -> bool {
+    var k: u32 = 0
+    while k < size {
+        const at = @intCast(usize, r) + @intCast(usize, k)
+        if at < SGPRS && !hazard(inst, result, rule, needed, wave.sValuWrite[at]) { return false }
+        k += 1
+    }
+    return true
+}
+
+// The rules of the header, before the instruction runs.
+fn checkHazards(inst: *const Inst, launch: *const Launch, result: *Result) -> bool {
+    const i = inst.*
+    const f = i.op.format
+    const n = decode.name(i.op)
+    // 1: VALU writes an SGPR, a vector memory instruction reads it.
+    if f == isa.Format.mubuf || f == isa.Format.mtbuf {
+        if !scalarOperandRead(i.src1, inst, result, 1, 5, 4) { return false }
+        if i.src2 < 128 && !scalarOperandRead(i.src2, inst, result, 1, 5, 1) { return false }
+    }
+    if f == isa.Format.mimg {
+        if !scalarOperandRead(i.src1, inst, result, 1, 5, 8) { return false }
+        if !scalarOperandRead(i.src2, inst, result, 1, 5, 4) { return false }
+    }
+    if isValu(f) {
+        // 2: the lane of v_readlane / v_writelane.
+        if f == isa.Format.vop3 && (i.op.number == isa.V_READLANE_B32_E64.number || i.op.number == isa.V_WRITELANE_B32_E64.number) && i.src1 < 128 {
+            if !scalarOperandRead(i.src1, inst, result, 2, 4, 1) { return false }
+        }
+        // 3: vcc written, v_div_fmas.
+        if f == isa.Format.vop3 && (i.op.number == isa.V_DIV_FMAS_F32.number || i.op.number == isa.V_DIV_FMAS_F64.number) {
+            if !scalarOperandRead(encode.VCC, inst, result, 3, 4, 2) { return false }
+        }
+        if i.form == Form.dpp {
+            // 4: exec written, DPP.
+            if !scalarOperandRead(encode.EXEC, inst, result, 4, 5, 2) { return false }
+            // 5: the first source written by a VALU, DPP.
+            const r = @intCast(usize, i.src0 - encode.VGPR)
+            if !hazard(inst, result, 5, 2, wave.vValuWrite[r]) { return false }
+        }
+        // 9: a VALU writing the data of a wide store.
+        if i.dst >= encode.VGPR {
+            const r = @intCast(usize, i.dst - encode.VGPR)
+            if !hazard(inst, result, 9, 1, wave.storeData[r]) { return false }
+        }
+    }
+    // 6: setreg, then getreg or setreg.
+    if f == isa.Format.sopk && (i.op.number == isa.S_SETREG_B32.number || i.op.number == isa.S_SETREG_IMM32_B32.number || i.op.number == isa.S_GETREG_B32.number) {
+        if !hazard(inst, result, 6, 2, wave.setreg) { return false }
+    }
+    // 7: vskip set, then anything but scalar arithmetic and scalar loads.
+    if !isSalu(f) && f != isa.Format.smem {
+        if !hazard(inst, result, 7, 2, wave.vskip) { return false }
+    }
+    // 8: m0 written by a SALU, then GDS, s_sendmsg, s_ttracedata.
+    if (f == isa.Format.ds && (i.flags & encode.GDS) != 0) || (f == isa.Format.sopp && (i.op.number == isa.S_SENDMSG.number || i.op.number == isa.S_TTRACEDATA.number)) {
+        if !hazard(inst, result, 8, 1, wave.sSaluWriteM0) { return false }
+    }
+    // 10: a scalar store or atomic in a clause of scalar loads.
+    if f == isa.Format.smem {
+        const writes = startsWith(n, "s_store") || startsWith(n, "s_buffer_store") || startsWith(n, "s_atomic") || startsWith(n, "s_buffer_atomic") || startsWith(n, "s_scratch_store")
+        if (wave.smemClause || wave.smemWrite) && (wave.smemWrite || writes) {
+            stopAt(result, Stop.hazard, wave.pc, i.op, 10)
+            return false
+        }
+    }
+    _ = launch
+    return true
+}
+
+fn startsWith(text: []const u8, head: []const u8) -> bool {
+    if head.length > text.length { return false }
+    var k: usize = 0
+    while k < head.length {
+        if text[k] != head[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// After the instruction ran: what later rules look at.
+fn noteWrites(inst: *const Inst) -> void {
+    const i = inst.*
+    const f = i.op.format
+    const after = wave.now + 1
+    if f != isa.Format.smem {
+        wave.smemClause = false
+        wave.smemWrite = false
+    }
+    if isValu(f) {
+        if i.dst < 128 && f != isa.Format.vopc {
+            // v_readfirstlane, v_readlane: one scalar register
+            wave.sValuWrite[@intCast(usize, i.dst)] = after
+        }
+        if i.dst >= encode.VGPR && i.dst < encode.VGPR + 256 {
+            wave.vValuWrite[@intCast(usize, i.dst - encode.VGPR)] = after
+        }
+        if encode.hasSecondDestination(i.op) || f == isa.Format.vopc {
+            var pair = encode.VCC
+            if i.form == Form.vop3 || f == isa.Format.vop3 {
+                pair = if f == isa.Format.vopc { i.dst } else { i.dst2 }
+            }
+            if pair < 127 {
+                wave.sValuWrite[@intCast(usize, pair)] = after
+                wave.sValuWrite[@intCast(usize, pair) + 1] = after
+            }
+            if f == isa.Format.vopc && startsWith(decode.name(i.op), "v_cmpx") {
+                wave.sValuWrite[126] = after
+                wave.sValuWrite[127] = after
+            }
+        }
+    }
+    if isSalu(f) && f != isa.Format.sopp && f != isa.Format.sopc && i.dst == encode.M0 {
+        wave.sSaluWriteM0 = after
+    }
+    if f == isa.Format.sopk && (i.op.number == isa.S_SETREG_B32.number || i.op.number == isa.S_SETREG_IMM32_B32.number) {
+        wave.setreg = after
+        // The register is SQ_WAVE_MODE (1) and the field reaches bit 28,
+        // VSKIP (aco_insert_NOPs.cpp: reg == 1 && offset >= 28 && size >
+        // (28 - offset), as written there).
+        const reg = i.imm & 0x3F
+        const offset = (i.imm >> 6) & 0x1F
+        const size = ((i.imm >> 11) & 0x1F) + 1
+        if reg == 1 && offset >= 28 && size > 28 -% offset { wave.vskip = after }
+    }
+    if f == isa.Format.smem {
+        const n = decode.name(i.op)
+        if startsWith(n, "s_store") || startsWith(n, "s_buffer_store") || startsWith(n, "s_atomic") || startsWith(n, "s_buffer_atomic") || startsWith(n, "s_scratch_store") {
+            wave.smemWrite = true
+        } else {
+            wave.smemClause = true
+        }
+    }
+    if (f == isa.Format.mubuf || f == isa.Format.mtbuf) && i.src2 >= 128 {
+        // a store of more than two registers with a constant scalar offset
+        const n = decode.name(i.op)
+        const size = storeSize(n)
+        if size > 2 {
+            var k: u32 = 0
+            while k < size {
+                wave.storeData[@intCast(usize, i.dst - encode.VGPR) + @intCast(usize, k)] = after
+                k += 1
+            }
+        }
+    }
+}
+
+fn storeSize(n: []const u8) -> u32 {
+    if !(startsWith(n, "buffer_store") || startsWith(n, "tbuffer_store")) { return 0 }
+    if endsWith(n, "x3") || endsWith(n, "_xyz") { return 3 }
+    if endsWith(n, "x4") || endsWith(n, "_xyzw") { return 4 }
+    if endsWith(n, "x2") || endsWith(n, "_xy") { return 2 }
+    return 1
+}
+
+fn endsWith(text: []const u8, tail: []const u8) -> bool {
+    if tail.length > text.length { return false }
+    var k: usize = 0
+    while k < tail.length {
+        if text[text.length - tail.length + k] != tail[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+fn step(inst: *const Inst, launch: *const Launch, memory: *Memory, result: *Result, next: *usize) -> bool {
+    const f = inst.*.op.format
+    var ok = false
+    if f == isa.Format.sopp {
+        ok = stepSopp(inst, result, next)
+    } else if f == isa.Format.sop1 || f == isa.Format.sop2 || f == isa.Format.sopc || f == isa.Format.sopk {
+        ok = stepScalar(inst, launch, result)
+    } else if f == isa.Format.smem {
+        ok = stepScalarLoad(inst, launch, memory, result)
+    } else if f == isa.Format.mubuf {
+        ok = stepBuffer(inst, launch, memory, result)
+    } else if isValu(f) {
+        ok = stepVector(inst, launch, result)
+    } else {
+        stopAt(result, Stop.notModelled, wave.pc, inst.*.op, 0)
+        return false
+    }
+    if ok { noteWrites(inst) }
+    return ok
+}
+
+// ---------------------------------------------------------------------------
+// Program control
+
+fn stepSopp(inst: *const Inst, result: *Result, next: *usize) -> bool {
+    const i = inst.*
+    const n = i.op.number
+    // A branch's target: the word after it plus the signed immediate
+    // (aco_assembler.cpp, the branches fixed after emission).
+    var offset: i64 = @intCast(i64, i.imm & 0xFFFF)
+    if offset >= 32768 { offset -= 65536 }
+    const target = @intCast(i64, wave.pc) + 1 + offset
+    var taken = false
+    if n == isa.S_NOP.number || n == isa.S_ENDPGM.number { return true }
+    if n == isa.S_WAITCNT.number {
+        const vm = @intCast(u64, i.imm & encode.WAIT_VM_MASK)
+        const lgkm = @intCast(u64, (i.imm >> encode.WAIT_LGKM_SHIFT) & encode.WAIT_LGKM_MASK)
+        // At most `vm` vector memory operations still out: the oldest are
+        // done (they return in order).
+        if wave.vmIssued - wave.vmDone > vm { wave.vmDone = wave.vmIssued - vm }
+        // Scalar loads return in any order: only a count of 0 says which.
+        if lgkm == 0 {
+            wave.lgkmDone = wave.lgkmIssued
+        } else if wave.lgkmIssued - wave.lgkmDone > lgkm && wave.lgkmUnordered == 0 {
+            wave.lgkmDone = wave.lgkmIssued - lgkm
+        }
+        if wave.lgkmDone == wave.lgkmIssued { wave.lgkmUnordered = 0 }
+        return true
+    }
+    if n == isa.S_BRANCH.number {
+        taken = true
+    } else if n == isa.S_CBRANCH_SCC0.number || n == isa.S_CBRANCH_SCC1.number {
+        if !wave.sccWritten {
+            stopAt(result, Stop.register, wave.pc, i.op, @intCast(u64, encode.SCC))
+            return false
+        }
+        taken = wave.scc == (n == isa.S_CBRANCH_SCC1.number)
+    } else if n == isa.S_CBRANCH_VCCZ.number || n == isa.S_CBRANCH_VCCNZ.number {
+        if !wave.sWritten[106] || !wave.sWritten[107] {
+            stopAt(result, Stop.register, wave.pc, i.op, @intCast(u64, encode.VCC))
+            return false
+        }
+        const zero = wave.s[106] == 0 && wave.s[107] == 0
+        taken = zero == (n == isa.S_CBRANCH_VCCZ.number)
+    } else if n == isa.S_CBRANCH_EXECZ.number || n == isa.S_CBRANCH_EXECNZ.number {
+        const zero = execMask() == 0
+        taken = zero == (n == isa.S_CBRANCH_EXECZ.number)
+    } else {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    if taken {
+        if target < 0 || target >= @intCast(i64, programWords) || lengths[@intCast(usize, target)] == 0 {
+            stopAt(result, Stop.undecodable, wave.pc, i.op, @intCast(u64, target))
+            return false
+        }
+        next.* = @intCast(usize, target)
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Scalar arithmetic
+
+fn setScalar(dst: u16, value: u32) -> void {
+    wave.s[@intCast(usize, dst)] = value
+    wave.sWritten[@intCast(usize, dst)] = true
+}
+
+fn setScc(value: bool) -> void {
+    wave.scc = value
+    wave.sccWritten = true
+}
+
+fn stepScalar(inst: *const Inst, launch: *const Launch, result: *Result) -> bool {
+    const i = inst.*
+    const f = i.op.format
+    const n = i.op.number
+    if f == isa.Format.sopk {
+        if n == isa.S_SETREG_B32.number || n == isa.S_SETREG_IMM32_B32.number || n == isa.S_GETREG_B32.number {
+            const id = @intCast(usize, i.imm & 0x3F)
+            const offset = (i.imm >> 6) & 0x1F
+            const size = ((i.imm >> 11) & 0x1F) + 1
+            var field: u32 = 0xFFFFFFFF
+            if size < 32 { field = ((@intCast(u32, 1) << size) - 1) }
+            const mask = field << offset
+            if n == isa.S_GETREG_B32.number {
+                if (wave.hwSet[id] & mask) != mask {
+                    stopAt(result, Stop.unknown, wave.pc, i.op, @intCast(u64, id))
+                    return false
+                }
+                if !writableScalar(i.dst, 1, launch, result) { return false }
+                setScalar(i.dst, (wave.hw[id] & mask) >> offset)
+                return true
+            }
+            var value: u32 = 0
+            if n == isa.S_SETREG_IMM32_B32.number {
+                value = i.literal
+            } else {
+                if !readableScalar(i.dst, 1, launch, result) { return false }
+                value = wave.s[@intCast(usize, i.dst)]
+            }
+            wave.hw[id] = (wave.hw[id] & ~mask) | ((value << offset) & mask)
+            wave.hwSet[id] |= mask
+            if id == 1 { wave.modeTouched = true }
+            return true
+        }
+        if n == isa.S_MOVK_I32.number {
+            if !writableScalar(i.dst, 1, launch, result) { return false }
+            var value = i.imm & 0xFFFF
+            if value >= 0x8000 { value |= 0xFFFF0000 }
+            setScalar(i.dst, value)
+            return true
+        }
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    if f == isa.Format.sopc && (n == isa.S_CMP_EQ_U64.number || n == isa.S_CMP_LG_U64.number) {
+        var a: u64 = 0
+        var b: u64 = 0
+        if !scalarPair(inst, i.src0, launch, result, &a) { return false }
+        if !scalarPair(inst, i.src1, launch, result, &b) { return false }
+        setScc((a == b) == (n == isa.S_CMP_EQ_U64.number))
+        return true
+    }
+    if f == isa.Format.sopc {
+        var a: u32 = 0
+        var b: u32 = 0
+        if !scalarSource(inst, i.src0, launch, result, &a) { return false }
+        if !scalarSource(inst, i.src1, launch, result, &b) { return false }
+        const sa = @bitCast(i32, a)
+        const sb = @bitCast(i32, b)
+        if n == isa.S_CMP_EQ_I32.number || n == isa.S_CMP_EQ_U32.number {
+            setScc(a == b)
+        } else if n == isa.S_CMP_LG_I32.number || n == isa.S_CMP_LG_U32.number {
+            setScc(a != b)
+        } else if n == isa.S_CMP_GT_I32.number {
+            setScc(sa > sb)
+        } else if n == isa.S_CMP_GE_I32.number {
+            setScc(sa >= sb)
+        } else if n == isa.S_CMP_LT_I32.number {
+            setScc(sa < sb)
+        } else if n == isa.S_CMP_LE_I32.number {
+            setScc(sa <= sb)
+        } else if n == isa.S_CMP_GT_U32.number {
+            setScc(a > b)
+        } else if n == isa.S_CMP_GE_U32.number {
+            setScc(a >= b)
+        } else if n == isa.S_CMP_LT_U32.number {
+            setScc(a < b)
+        } else if n == isa.S_CMP_LE_U32.number {
+            setScc(a <= b)
+        } else {
+            stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+            return false
+        }
+        return true
+    }
+    if f == isa.Format.sop1 {
+        if n == isa.S_MOV_B32.number || n == isa.S_NOT_B32.number {
+            var a: u32 = 0
+            if !scalarSource(inst, i.src0, launch, result, &a) { return false }
+            if !writableScalar(i.dst, 1, launch, result) { return false }
+            if n == isa.S_NOT_B32.number {
+                setScalar(i.dst, ~a)
+                setScc(~a != 0)
+            } else {
+                setScalar(i.dst, a)
+            }
+            return true
+        }
+        if n == isa.S_MOV_B64.number || n == isa.S_NOT_B64.number || n == isa.S_AND_SAVEEXEC_B64.number || n == isa.S_OR_SAVEEXEC_B64.number || n == isa.S_ANDN2_SAVEEXEC_B64.number {
+            var a: u64 = 0
+            if !scalarPair(inst, i.src0, launch, result, &a) { return false }
+            if !writableScalar(i.dst, 2, launch, result) { return false }
+            if n == isa.S_MOV_B64.number {
+                setPair(i.dst, a)
+                return true
+            }
+            if n == isa.S_NOT_B64.number {
+                setPair(i.dst, ~a)
+                setScc(~a != 0)
+                return true
+            }
+            // The saveexec forms: the destination gets exec, exec gets the
+            // operation of the source and exec, scc says whether it is not
+            // 0 (aco_lower_to_hw_instr.cpp keeps the old exec in the
+            // destination: "tmp_exec").
+            const old = execMask()
+            var mask = a & old
+            if n == isa.S_OR_SAVEEXEC_B64.number { mask = a | old }
+            if n == isa.S_ANDN2_SAVEEXEC_B64.number { mask = a & ~old }
+            setPair(i.dst, old)
+            setPair(encode.EXEC, mask)
+            setScc(mask != 0)
+            return true
+        }
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    // SOP2
+    const wide = n == isa.S_AND_B64.number || n == isa.S_OR_B64.number || n == isa.S_XOR_B64.number || n == isa.S_ANDN2_B64.number || n == isa.S_ORN2_B64.number || n == isa.S_NAND_B64.number || n == isa.S_NOR_B64.number || n == isa.S_XNOR_B64.number || n == isa.S_CSELECT_B64.number
+    if wide {
+        var a: u64 = 0
+        var b: u64 = 0
+        if !scalarPair(inst, i.src0, launch, result, &a) { return false }
+        if !scalarPair(inst, i.src1, launch, result, &b) { return false }
+        if !writableScalar(i.dst, 2, launch, result) { return false }
+        var value: u64 = 0
+        if n == isa.S_CSELECT_B64.number {
+            if !wave.sccWritten {
+                stopAt(result, Stop.register, wave.pc, i.op, @intCast(u64, encode.SCC))
+                return false
+            }
+            value = if wave.scc { a } else { b }
+            setPair(i.dst, value)
+            return true
+        }
+        if n == isa.S_AND_B64.number { value = a & b }
+        if n == isa.S_OR_B64.number { value = a | b }
+        if n == isa.S_XOR_B64.number { value = a ^ b }
+        if n == isa.S_ANDN2_B64.number { value = a & ~b }
+        if n == isa.S_ORN2_B64.number { value = a | ~b }
+        if n == isa.S_NAND_B64.number { value = ~(a & b) }
+        if n == isa.S_NOR_B64.number { value = ~(a | b) }
+        if n == isa.S_XNOR_B64.number { value = ~(a ^ b) }
+        setPair(i.dst, value)
+        setScc(value != 0)
+        return true
+    }
+    var a: u32 = 0
+    var b: u32 = 0
+    if !scalarSource(inst, i.src0, launch, result, &a) { return false }
+    if !scalarSource(inst, i.src1, launch, result, &b) { return false }
+    if !writableScalar(i.dst, 1, launch, result) { return false }
+    const wa = @intCast(u64, a)
+    const wb = @intCast(u64, b)
+    var value: u32 = 0
+    if n == isa.S_ADD_U32.number {
+        value = a +% b
+        setScc(wa + wb > 0xFFFFFFFF)
+    } else if n == isa.S_SUB_U32.number {
+        value = a -% b
+        setScc(b > a)
+    } else if n == isa.S_ADD_I32.number || n == isa.S_SUB_I32.number {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    } else if n == isa.S_MUL_I32.number {
+        value = a *% b
+    } else if n == isa.S_LSHL_B32.number {
+        value = a << (b & 31)
+        setScc(value != 0)
+    } else if n == isa.S_LSHR_B32.number {
+        value = a >> (b & 31)
+        setScc(value != 0)
+    } else if n == isa.S_ASHR_I32.number {
+        value = @bitCast(u32, @bitCast(i32, a) >> (b & 31))
+        setScc(value != 0)
+    } else if n == isa.S_AND_B32.number {
+        value = a & b
+        setScc(value != 0)
+    } else if n == isa.S_OR_B32.number {
+        value = a | b
+        setScc(value != 0)
+    } else if n == isa.S_XOR_B32.number {
+        value = a ^ b
+        setScc(value != 0)
+    } else if n == isa.S_ANDN2_B32.number {
+        value = a & ~b
+        setScc(value != 0)
+    } else if n == isa.S_CSELECT_B32.number {
+        if !wave.sccWritten {
+            stopAt(result, Stop.register, wave.pc, i.op, @intCast(u64, encode.SCC))
+            return false
+        }
+        value = if wave.scc { a } else { b }
+    } else {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    setScalar(i.dst, value)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Scalar loads: s_load_dword .. x16 from the address in a pair of
+// registers plus the byte offset.
+
+fn stepScalarLoad(inst: *const Inst, launch: *const Launch, memory: *Memory, result: *Result) -> bool {
+    const i = inst.*
+    const n = decode.name(i.op)
+    var count: u32 = 0
+    if startsWith(n, "s_load_dword") {
+        count = 1
+        if endsWith(n, "x2") { count = 2 }
+        if endsWith(n, "x4") { count = 4 }
+        if endsWith(n, "x8") { count = 8 }
+        if endsWith(n, "x16") { count = 16 }
+    } else {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    if !readableScalar(i.src0, 2, launch, result) { return false }
+    // The data's registers: aligned to the load's size, at most 4.
+    var alignment = count
+    if alignment > 4 { alignment = 4 }
+    if (@intCast(u32, i.dst) % alignment) != 0 {
+        stopAt(result, Stop.register, wave.pc, i.op, @intCast(u64, i.dst))
+        return false
+    }
+    if !writableScalar(i.dst, count, launch, result) { return false }
+    var offset: u64 = 0
+    if (i.flags & encode.IMM) != 0 {
+        offset = @intCast(u64, i.imm)
+    } else {
+        if !readableScalar(i.src1, 1, launch, result) { return false }
+        offset = @intCast(u64, wave.s[@intCast(usize, i.src1)])
+    }
+    // The base: 48 bits of the pair (the high register's low 16 bits).
+    const base = @intCast(u64, wave.s[@intCast(usize, i.src0)]) | (@intCast(u64, wave.s[@intCast(usize, i.src0) + 1]) & 0xFFFF) << 32
+    var k: u32 = 0
+    while k < count {
+        const address = base + offset + 4 * @intCast(u64, k)
+        var region: usize = 0
+        var word: usize = 0
+        if !locate(memory, address, &region, &word) {
+            stopAt(result, Stop.unmapped, wave.pc, i.op, address)
+            return false
+        }
+        const r = @intCast(usize, i.dst) + @intCast(usize, k)
+        wave.s[r] = memory.*.regions[region].words[word]
+        wave.sWritten[r] = true
+        wave.sPendingKind[r] = PENDING_LGKM
+        wave.sPendingSeq[r] = wave.lgkmIssued
+        k += 1
+    }
+    wave.lgkmIssued += 1
+    wave.lgkmUnordered += 1
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Buffer loads and stores (MUBUF, dwords, raw buffers)
+
+fn stepBuffer(inst: *const Inst, launch: *const Launch, memory: *Memory, result: *Result) -> bool {
+    const i = inst.*
+    const n = decode.name(i.op)
+    var count: u32 = 0
+    var store = false
+    if startsWith(n, "buffer_load_dword") {
+        count = 1
+    } else if startsWith(n, "buffer_store_dword") {
+        count = 1
+        store = true
+    } else {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    if endsWith(n, "x2") { count = 2 }
+    if endsWith(n, "x3") { count = 3 }
+    if endsWith(n, "x4") { count = 4 }
+    if (i.flags & (encode.IDXEN | encode.LDS | encode.TFE)) != 0 {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    if !readableScalar(i.src1, 4, launch, result) { return false }
+    var soffset: u32 = 0
+    if !scalarSource(inst, i.src2, launch, result, &soffset) { return false }
+    const r = @intCast(usize, i.src1)
+    // The descriptor (Mesa's registers/gfx8.json, SQ_BUF_RSRC_WORD0..3):
+    // the base low; BASE_ADDRESS_HI [15:0] and STRIDE [29:16] and the two
+    // swizzle bits; NUM_RECORDS; the selects and formats, and ADD_TID
+    // [23]. A raw buffer (stride 0, no swizzle, no ADD_TID) is modelled.
+    const word1 = wave.s[r + 1]
+    const word3 = wave.s[r + 3]
+    if ((word1 >> 16) & 0x3FFF) != 0 || (word1 >> 30) != 0 || ((word3 >> 23) & 1) != 0 {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, @intCast(u64, word1))
+        return false
+    }
+    const base = @intCast(u64, wave.s[r]) | (@intCast(u64, word1) & 0xFFFF) << 32
+    const records = @intCast(u64, wave.s[r + 2])
+    const exec = execMask()
+    if (i.flags & encode.OFFEN) != 0 {
+        if !readableVector(i.src0, 1, exec, launch, result) { return false }
+    }
+    if store {
+        if !readableVector(i.dst, count, exec, launch, result) { return false }
+    } else {
+        if !writableVector(i.dst, count, launch, result) { return false }
+    }
+    var lane: usize = 0
+    while lane < LANES {
+        if laneOn(exec, lane) {
+            var offset = @intCast(u64, soffset) + @intCast(u64, i.imm)
+            if (i.flags & encode.OFFEN) != 0 { offset += @intCast(u64, wave.v[@intCast(usize, i.src0 - encode.VGPR) * LANES + lane]) }
+            if offset + 4 * @intCast(u64, count) > records {
+                stopAt(result, Stop.range, wave.pc, i.op, offset)
+                return false
+            }
+            var k: u32 = 0
+            while k < count {
+                var region: usize = 0
+                var word: usize = 0
+                const address = base + offset + 4 * @intCast(u64, k)
+                if !locate(memory, address, &region, &word) {
+                    stopAt(result, Stop.unmapped, wave.pc, i.op, address)
+                    return false
+                }
+                const v = (@intCast(usize, i.dst - encode.VGPR) + @intCast(usize, k)) * LANES + lane
+                if store {
+                    if !memory.*.regions[region].writable {
+                        stopAt(result, Stop.unmapped, wave.pc, i.op, address)
+                        return false
+                    }
+                    memory.*.regions[region].words[word] = wave.v[v]
+                } else {
+                    wave.v[v] = memory.*.regions[region].words[word]
+                }
+                k += 1
+            }
+        }
+        lane += 1
+    }
+    if !store {
+        var k: u32 = 0
+        while k < count {
+            const v = @intCast(usize, i.dst - encode.VGPR) + @intCast(usize, k)
+            wave.vWritten[v] |= exec
+            wave.vPendingKind[v] = PENDING_VM
+            wave.vPendingSeq[v] = wave.vmIssued
+            k += 1
+        }
+    }
+    wave.vmIssued += 1
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Vector arithmetic
+
+// The sources of a vector instruction for one lane, read and checked once
+// for the whole instruction.
+const Sources = struct {
+    count: u32
+    operand: [3]u16
+    scalar: [3]bool
+    value: [3]u32
+}
+
+// Checks every source (written, arrived, the constant bus) and keeps the
+// scalar ones' values.
+fn gatherSources(inst: *const Inst, count: u32, launch: *const Launch, result: *Result, sources: *Sources) -> bool {
+    const i = inst.*
+    sources.*.count = count
+    sources.*.operand[0] = i.src0
+    sources.*.operand[1] = i.src1
+    sources.*.operand[2] = i.src2
+    const exec = execMask()
+    var busFirst: u16 = 0xFFFF
+    var bus: u32 = 0
+    var k: u32 = 0
+    while k < count {
+        const o = sources.*.operand[k]
+        if o >= encode.VGPR {
+            if !readableVector(o, 1, exec, launch, result) { return false }
+            sources.*.scalar[k] = false
+        } else {
+            if !scalarSource(inst, o, launch, result, &sources.*.value[k]) { return false }
+            sources.*.scalar[k] = true
+            if o < 128 || o == encode.LITERAL {
+                if o != busFirst {
+                    bus += 1
+                    busFirst = o
+                }
+            }
+        }
+        k += 1
+    }
+    // the implicit vcc of v_cndmask, v_addc and v_subb in their own form
+    if usesVcc(inst) && i.form == Form.native {
+        if busFirst != encode.VCC { bus += 1 }
+    }
+    if usesVcc(inst) && i.form == Form.vop3 {
+        if i.src2 != busFirst { bus += 1 }
+    }
+    if bus > 1 {
+        stopAt(result, Stop.bus, wave.pc, i.op, @intCast(u64, bus))
+        return false
+    }
+    return true
+}
+
+fn usesVcc(inst: *const Inst) -> bool {
+    const i = inst.*
+    if i.op.format != isa.Format.vop2 { return false }
+    const n = i.op.number
+    return n == isa.V_CNDMASK_B32.number || n == isa.V_ADDC_CO_U32.number || n == isa.V_SUBB_CO_U32.number || n == isa.V_SUBBREV_CO_U32.number
+}
+
+fn lane(sources: *const Sources, which: u32, l: usize) -> u32 {
+    if sources.*.scalar[which] { return sources.*.value[which] }
+    return wave.v[@intCast(usize, sources.*.operand[which] - encode.VGPR) * LANES + l]
+}
+
+// The mask a v_cndmask or a carry-in reads: vcc natively, its third
+// source in the VOP3 form.
+fn maskOperand(inst: *const Inst, launch: *const Launch, result: *Result, mask: *u64) -> bool {
+    var operand = encode.VCC
+    if inst.*.form == Form.vop3 { operand = inst.*.src2 }
+    if operand >= 128 {
+        stopAt(result, Stop.unknown, wave.pc, inst.*.op, @intCast(u64, operand))
+        return false
+    }
+    if !readableScalar(operand, 2, launch, result) { return false }
+    mask.* = @intCast(u64, wave.s[@intCast(usize, operand)]) | @intCast(u64, wave.s[@intCast(usize, operand) + 1]) << 32
+    return true
+}
+
+fn bit(mask: u64, l: usize) -> bool { return ((mask >> l) & 1) != 0 }
+
+fn isDenormal(bits32: u32) -> bool { return (bits32 & 0x7F800000) == 0 && (bits32 & 0x007FFFFF) != 0 }
+fn isSpecial(bits32: u32) -> bool { return (bits32 & 0x7F800000) == 0x7F800000 }
+
+// The vector instructions whose effect this file writes.
+fn modelled(op: isa.Op) -> bool {
+    const n = op.number
+    if op.format == isa.Format.vop1 {
+        return n == isa.V_MOV_B32.number || n == isa.V_NOT_B32.number || n == isa.V_NOP.number || n == isa.V_READFIRSTLANE_B32.number || n == isa.V_CVT_F32_U32.number || n == isa.V_CVT_F32_I32.number || n == isa.V_CVT_U32_F32.number || n == isa.V_CVT_I32_F32.number || n == isa.V_RCP_F32.number
+    }
+    if op.format == isa.Format.vop2 {
+        return n == isa.V_CNDMASK_B32.number || n == isa.V_ADD_CO_U32.number || n == isa.V_SUB_CO_U32.number || n == isa.V_SUBREV_CO_U32.number || n == isa.V_ADDC_CO_U32.number || n == isa.V_AND_B32.number || n == isa.V_OR_B32.number || n == isa.V_XOR_B32.number || n == isa.V_LSHLREV_B32.number || n == isa.V_LSHRREV_B32.number || n == isa.V_ASHRREV_I32.number || n == isa.V_MIN_U32.number || n == isa.V_MAX_U32.number || n == isa.V_MIN_I32.number || n == isa.V_MAX_I32.number || n == isa.V_MUL_U32_U24.number || n == isa.V_MUL_F32.number
+    }
+    if op.format == isa.Format.vopc {
+        return (n >= isa.V_CMP_F_I32.number && n <= isa.V_CMP_TRU_I32.number) || (n >= isa.V_CMP_F_U32.number && n <= isa.V_CMP_TRU_U32.number) || (n >= isa.V_CMPX_F_I32.number && n <= isa.V_CMPX_TRU_I32.number) || (n >= isa.V_CMPX_F_U32.number && n <= isa.V_CMPX_TRU_U32.number)
+    }
+    if op.format == isa.Format.vop3 {
+        return n == isa.V_MUL_LO_U32.number || n == isa.V_MUL_HI_U32.number || n == isa.V_MUL_HI_I32.number || n == isa.V_BFE_U32.number || n == isa.V_MAD_U32_U24.number
+    }
+    return false
+}
+
+fn isFloat(op: isa.Op) -> bool {
+    const n = op.number
+    if op.format == isa.Format.vop1 { return n == isa.V_CVT_F32_U32.number || n == isa.V_CVT_F32_I32.number || n == isa.V_CVT_U32_F32.number || n == isa.V_CVT_I32_F32.number || n == isa.V_RCP_F32.number }
+    return op.format == isa.Format.vop2 && n == isa.V_MUL_F32.number
+}
+
+fn stepVector(inst: *const Inst, launch: *const Launch, result: *Result) -> bool {
+    const i = inst.*
+    const f = i.op.format
+    const n = i.op.number
+    if i.form == Form.sdwa || i.form == Form.dpp || f == isa.Format.vintrp || !modelled(i.op) || (wave.modeTouched && isFloat(i.op)) || ((wave.hw[1] >> 28) & 1) != 0 {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    // Modifiers are for floats; omod and clamp are not modelled.
+    if (i.mods & 0xC0) != 0 || (i.flags & encode.CLAMP) != 0 {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    if (i.mods & 0x3F) != 0 {
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    const exec = execMask()
+    var sources: Sources = undefined
+    if f == isa.Format.vopc {
+        if !gatherSources(inst, 2, launch, result, &sources) { return false }
+        var mask: u64 = 0
+        var l: usize = 0
+        while l < LANES {
+            if laneOn(exec, l) {
+                if compare(n, lane(&sources, 0, l), lane(&sources, 1, l), result, inst) { mask |= @intCast(u64, 1) << l }
+                if result.*.stop != Stop.done { return false }
+            } else {
+                mask |= @intCast(u64, 1) << l
+            }
+            l += 1
+        }
+        var target = encode.VCC
+        if i.form == Form.vop3 { target = i.dst }
+        if target > 126 || (target & 1) != 0 {
+            stopAt(result, Stop.register, wave.pc, i.op, @intCast(u64, target))
+            return false
+        }
+        if !writableScalar(target, 2, launch, result) { return false }
+        setPair(target, mask)
+        if startsWith(decode.name(i.op), "v_cmpx") {
+            setPair(encode.EXEC, mask & exec)
+        }
+        return true
+    }
+    if f == isa.Format.vop1 && n == isa.V_READFIRSTLANE_B32.number {
+        if !gatherSources(inst, 1, launch, result, &sources) { return false }
+        if exec == 0 {
+            stopAt(result, Stop.unknown, wave.pc, i.op, 0)
+            return false
+        }
+        var first: usize = 0
+        while !laneOn(exec, first) { first += 1 }
+        if !writableScalar(i.dst, 1, launch, result) { return false }
+        setScalar(i.dst, lane(&sources, 0, first))
+        return true
+    }
+    if f == isa.Format.vop1 && n == isa.V_NOP.number { return true }
+    var count: u32 = 2
+    if f == isa.Format.vop1 { count = 1 }
+    if f == isa.Format.vop3 {
+        count = 2
+        if n == isa.V_BFE_U32.number || n == isa.V_MAD_U32_U24.number { count = 3 }
+    }
+    if usesVcc(inst) && i.form == Form.vop3 { count = 2 }
+    if !gatherSources(inst, count, launch, result, &sources) { return false }
+    if i.dst < encode.VGPR {
+        stopAt(result, Stop.register, wave.pc, i.op, @intCast(u64, i.dst))
+        return false
+    }
+    if !writableVector(i.dst, 1, launch, result) { return false }
+    var maskIn: u64 = 0
+    if usesVcc(inst) {
+        if !maskOperand(inst, launch, result, &maskIn) { return false }
+    }
+    const carries = encode.hasSecondDestination(i.op)
+    var carryOut: u64 = 0
+    const d = @intCast(usize, i.dst - encode.VGPR)
+    var l: usize = 0
+    while l < LANES {
+        if laneOn(exec, l) {
+            const a = lane(&sources, 0, l)
+            var b: u32 = 0
+            if count > 1 { b = lane(&sources, 1, l) }
+            var c: u32 = 0
+            if count > 2 { c = lane(&sources, 2, l) }
+            var value: u32 = 0
+            var carry = false
+            if !compute(inst, a, b, c, bit(maskIn, l), &value, &carry, launch, result) { return false }
+            wave.v[d * LANES + l] = value
+            if carry { carryOut |= @intCast(u64, 1) << l }
+        }
+        l += 1
+    }
+    wave.vWritten[d] |= exec
+    if carries {
+        var target = encode.VCC
+        if i.form == Form.vop3 { target = i.dst2 }
+        if target > 126 || (target & 1) != 0 {
+            stopAt(result, Stop.register, wave.pc, i.op, @intCast(u64, target))
+            return false
+        }
+        if !writableScalar(target, 2, launch, result) { return false }
+        // The lanes that are off: as for a comparison, ones.
+        setPair(target, carryOut | ~exec)
+    }
+    return true
+}
+
+// One lane of a comparison (VOPC, by its number: the conditions of the
+// file's loops, f lt eq le gt lg ge tru for i32 at 0xC0 + condition and u32
+// at 0xC8 + condition, and the v_cmpx forms 0x10 above).
+fn compare(n: u16, a: u32, b: u32, result: *Result, inst: *const Inst) -> bool {
+    var condition = n
+    var signed = false
+    if n >= isa.V_CMP_F_I32.number && n <= isa.V_CMP_TRU_I32.number {
+        condition = n - isa.V_CMP_F_I32.number
+        signed = true
+    } else if n >= isa.V_CMP_F_U32.number && n <= isa.V_CMP_TRU_U32.number {
+        condition = n - isa.V_CMP_F_U32.number
+    } else if n >= isa.V_CMPX_F_I32.number && n <= isa.V_CMPX_TRU_I32.number {
+        condition = n - isa.V_CMPX_F_I32.number
+        signed = true
+    } else if n >= isa.V_CMPX_F_U32.number && n <= isa.V_CMPX_TRU_U32.number {
+        condition = n - isa.V_CMPX_F_U32.number
+    } else {
+        stopAt(result, Stop.notModelled, wave.pc, inst.*.op, 0)
+        return false
+    }
+    var less = a < b
+    if signed { less = @bitCast(i32, a) < @bitCast(i32, b) }
+    const equal = a == b
+    if condition == 0 { return false }
+    if condition == 1 { return less }
+    if condition == 2 { return equal }
+    if condition == 3 { return less || equal }
+    if condition == 4 { return !less && !equal }
+    if condition == 5 { return !equal }
+    if condition == 6 { return !less }
+    return true
+}
+
+fn floatBits(value: f32) -> u32 { return @bitCast(u32, value) }
+fn floatOf(value: u32) -> f32 { return @bitCast(f32, value) }
+
+// One lane of an arithmetic instruction.
+fn compute(inst: *const Inst, a: u32, b: u32, c: u32, maskBit: bool, value: *u32, carry: *bool, launch: *const Launch, result: *Result) -> bool {
+    const i = inst.*
+    const f = i.op.format
+    const n = i.op.number
+    const wa = @intCast(u64, a)
+    const wb = @intCast(u64, b)
+    if f == isa.Format.vop1 {
+        if n == isa.V_MOV_B32.number {
+            value.* = a
+            return true
+        }
+        if n == isa.V_NOT_B32.number {
+            value.* = ~a
+            return true
+        }
+        if n == isa.V_CVT_F32_U32.number {
+            // u2f32: the nearest float, ties to even.
+            value.* = floatBits(@floatFromInt(f32, a))
+            return true
+        }
+        if n == isa.V_CVT_F32_I32.number {
+            value.* = floatBits(@floatFromInt(f32, @bitCast(i32, a)))
+            return true
+        }
+        if n == isa.V_CVT_U32_F32.number {
+            // f2u32: toward zero; outside [0, 2^32) the card's answer is
+            // not in the sources.
+            const x = floatOf(a)
+            if isSpecial(a) || isDenormal(a) || !(x > -1.0) || !(x < 4294967296.0) {
+                stopAt(result, Stop.unknown, wave.pc, i.op, @intCast(u64, a))
+                return false
+            }
+            if x <= 0.0 { value.* = 0 } else { value.* = @intFromFloat(u32, @trunc(x)) }
+            return true
+        }
+        if n == isa.V_CVT_I32_F32.number {
+            const x = floatOf(a)
+            if isSpecial(a) || isDenormal(a) || !(x > -2147483649.0) || !(x < 2147483648.0) {
+                stopAt(result, Stop.unknown, wave.pc, i.op, @intCast(u64, a))
+                return false
+            }
+            value.* = @bitCast(u32, @intFromFloat(i32, @trunc(x)))
+            return true
+        }
+        if n == isa.V_RCP_F32.number {
+            // frcp: 1 / x, here the host's, moved by `rcpError` units in
+            // the last place. 0, infinities, NaNs and denormals in or out:
+            // not known.
+            if isSpecial(a) || isDenormal(a) || (a & 0x7FFFFFFF) == 0 {
+                stopAt(result, Stop.unknown, wave.pc, i.op, @intCast(u64, a))
+                return false
+            }
+            const one: f32 = 1.0
+            var r = floatBits(one / floatOf(a))
+            if launch.*.rcpError > 0 { r +%= @intCast(u32, launch.*.rcpError) }
+            if launch.*.rcpError < 0 { r -%= @intCast(u32, 0 - launch.*.rcpError) }
+            if isSpecial(r) || isDenormal(r) || (r & 0x7FFFFFFF) == 0 {
+                stopAt(result, Stop.unknown, wave.pc, i.op, @intCast(u64, a))
+                return false
+            }
+            value.* = r
+            return true
+        }
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    if f == isa.Format.vop2 {
+        if n == isa.V_CNDMASK_B32.number {
+            value.* = if maskBit { b } else { a }
+            return true
+        }
+        if n == isa.V_ADD_CO_U32.number {
+            value.* = a +% b
+            carry.* = wa + wb > 0xFFFFFFFF
+            return true
+        }
+        if n == isa.V_SUB_CO_U32.number {
+            value.* = a -% b
+            carry.* = b > a
+            return true
+        }
+        if n == isa.V_SUBREV_CO_U32.number {
+            value.* = b -% a
+            carry.* = a > b
+            return true
+        }
+        if n == isa.V_ADDC_CO_U32.number {
+            const sum = wa + wb + (if maskBit { @intCast(u64, 1) } else { @intCast(u64, 0) })
+            value.* = @intCast(u32, sum & 0xFFFFFFFF)
+            carry.* = sum > 0xFFFFFFFF
+            return true
+        }
+        if n == isa.V_AND_B32.number {
+            value.* = a & b
+            return true
+        }
+        if n == isa.V_OR_B32.number {
+            value.* = a | b
+            return true
+        }
+        if n == isa.V_XOR_B32.number {
+            value.* = a ^ b
+            return true
+        }
+        // The shifts take their count as the first source (the "rev"
+        // forms: aco_instruction_selection.cpp swaps the operands).
+        if n == isa.V_LSHLREV_B32.number {
+            value.* = b << (a & 31)
+            return true
+        }
+        if n == isa.V_LSHRREV_B32.number {
+            value.* = b >> (a & 31)
+            return true
+        }
+        if n == isa.V_ASHRREV_I32.number {
+            value.* = @bitCast(u32, @bitCast(i32, b) >> (a & 31))
+            return true
+        }
+        if n == isa.V_MIN_U32.number {
+            value.* = if b > a { a } else { b }
+            return true
+        }
+        if n == isa.V_MAX_U32.number {
+            value.* = if b > a { b } else { a }
+            return true
+        }
+        if n == isa.V_MIN_I32.number {
+            value.* = if @bitCast(i32, b) > @bitCast(i32, a) { a } else { b }
+            return true
+        }
+        if n == isa.V_MAX_I32.number {
+            value.* = if @bitCast(i32, b) > @bitCast(i32, a) { b } else { a }
+            return true
+        }
+        if n == isa.V_MUL_U32_U24.number {
+            value.* = @intCast(u32, ((wa & 0xFFFFFF) * (wb & 0xFFFFFF)) & 0xFFFFFFFF)
+            return true
+        }
+        if n == isa.V_MUL_F32.number {
+            if isSpecial(a) || isSpecial(b) || isDenormal(a) || isDenormal(b) {
+                stopAt(result, Stop.unknown, wave.pc, i.op, 0)
+                return false
+            }
+            const r = floatBits(floatOf(a) * floatOf(b))
+            if isSpecial(r) || isDenormal(r) {
+                stopAt(result, Stop.unknown, wave.pc, i.op, 0)
+                return false
+            }
+            value.* = r
+            return true
+        }
+        stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+        return false
+    }
+    // VOP3
+    if n == isa.V_MUL_LO_U32.number {
+        value.* = a *% b
+        return true
+    }
+    if n == isa.V_MUL_HI_U32.number {
+        value.* = @intCast(u32, (wa * wb) >> 32)
+        return true
+    }
+    if n == isa.V_MUL_HI_I32.number {
+        const product = @intCast(i64, @bitCast(i32, a)) * @intCast(i64, @bitCast(i32, b))
+        value.* = @intCast(u32, (@bitCast(u64, product) >> 32) & 0xFFFFFFFF)
+        return true
+    }
+    if n == isa.V_BFE_U32.number {
+        // ubfe: (a >> (b & 31)) & ((1 << (c & 31)) - 1), all of a from the
+        // offset on when the width is 0 is not modelled.
+        const width = c & 31
+        if width == 0 {
+            stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+            return false
+        }
+        value.* = (a >> (b & 31)) & ((@intCast(u32, 1) << (width)) - 1)
+        return true
+    }
+    if n == isa.V_MAD_U32_U24.number {
+        value.* = @intCast(u32, ((wa & 0xFFFFFF) * (wb & 0xFFFFFF)) & 0xFFFFFFFF) +% c
+        return true
+    }
+    stopAt(result, Stop.notModelled, wave.pc, i.op, 0)
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// Starting waves
+
+// Clears the wave and puts in what the card puts into it when it starts:
+// the user data words in s0.., the work group's id after them (x, y, z, as
+// enabled), the local ids in v0.. (x, y, z, as many as asked), exec for the
+// lanes that exist (`lanes` of them). The layout is RADV's argument order
+// (radv_shader_args.c, declare_shader_args); that the card loads them so is
+// the study's conclusion, to be shown by the entry probe of its 11.2.
+pub fn start(launch: *const Launch, groupX: u32, groupY: u32, groupZ: u32, firstInvocation: u32) -> bool {
+    var r: usize = 0
+    while r < SGPRS {
+        wave.s[r] = 0
+        wave.sWritten[r] = false
+        wave.sPendingKind[r] = PENDING_NONE
+        wave.sPendingSeq[r] = 0
+        wave.sValuWrite[r] = 0
+        r += 1
+    }
+    r = 0
+    while r < VGPRS {
+        wave.vWritten[r] = 0
+        wave.vPendingKind[r] = PENDING_NONE
+        wave.vPendingSeq[r] = 0
+        wave.vValuWrite[r] = 0
+        wave.storeData[r] = 0
+        r += 1
+    }
+    wave.scc = false
+    wave.sccWritten = false
+    wave.pc = 0
+    wave.vmIssued = 0
+    wave.vmDone = 0
+    wave.lgkmIssued = 0
+    wave.lgkmDone = 0
+    wave.lgkmUnordered = 0
+    // Every rule's "last write" is 0 for never: the count starts at 100.
+    wave.now = 100
+    wave.sSaluWriteM0 = 0
+    wave.setreg = 0
+    wave.vskip = 0
+    wave.smemClause = false
+    wave.smemWrite = false
+    var h: usize = 0
+    while h < 64 {
+        wave.hw[h] = 0
+        wave.hwSet[h] = 0
+        h += 1
+    }
+    wave.modeTouched = false
+    if launch.*.userCount > 16 || launch.*.userCount + 3 > launch.*.sgprs { return false }
+    // s0 and s1 are the scratch descriptor's: not written, so that a read
+    // of them stops.
+    var k: u32 = 2
+    while k < launch.*.userCount {
+        setScalar(@intCast(u16, k), launch.*.user[k])
+        k += 1
+    }
+    var next = launch.*.userCount
+    if launch.*.groupIdX {
+        setScalar(@intCast(u16, next), groupX)
+        next += 1
+    }
+    if launch.*.groupIdY {
+        setScalar(@intCast(u16, next), groupY)
+        next += 1
+    }
+    if launch.*.groupIdZ {
+        setScalar(@intCast(u16, next), groupZ)
+        next += 1
+    }
+    const size = launch.*.groupSizeX * launch.*.groupSizeY * launch.*.groupSizeZ
+    var exec: u64 = 0
+    var lane: usize = 0
+    while lane < LANES {
+        const invocation = firstInvocation + @intCast(u32, lane)
+        if invocation < size {
+            exec |= @intCast(u64, 1) << lane
+            const x = invocation % launch.*.groupSizeX
+            const y = (invocation / launch.*.groupSizeX) % launch.*.groupSizeY
+            const z = invocation / (launch.*.groupSizeX * launch.*.groupSizeY)
+            wave.v[0 * LANES + lane] = x
+            if launch.*.localIdComponents >= 1 { wave.v[1 * LANES + lane] = y }
+            if launch.*.localIdComponents >= 2 { wave.v[2 * LANES + lane] = z }
+        }
+        lane += 1
+    }
+    wave.vWritten[0] = exec
+    if launch.*.localIdComponents >= 1 { wave.vWritten[1] = exec }
+    if launch.*.localIdComponents >= 2 { wave.vWritten[2] = exec }
+    setPair(encode.EXEC, exec)
+    // vcc and m0 hold what the wave before left: unwritten here.
+    return true
+}
+
+// Runs a whole dispatch: every wave of every work group in order.
+pub fn dispatch(code: []const u32, launch: *const Launch, groupsX: u32, groupsY: u32, groupsZ: u32, memory: *Memory, result: *Result) -> void {
+    if !load(code, result) { return }
+    const size = launch.*.groupSizeX * launch.*.groupSizeY * launch.*.groupSizeZ
+    var steps: u64 = 0
+    var gz: u32 = 0
+    while gz < groupsZ {
+        var gy: u32 = 0
+        while gy < groupsY {
+            var gx: u32 = 0
+            while gx < groupsX {
+                var first: u32 = 0
+                while first < size {
+                    if !start(launch, gx, gy, gz, first) {
+                        stopAt(result, Stop.entry, 0, isa.S_NOP, 0)
+                        return
+                    }
+                    result.*.steps = 0
+                    run(launch, memory, result)
+                    steps += result.*.steps
+                    if result.*.stop != Stop.done {
+                        result.*.steps = steps
+                        return
+                    }
+                    first += @intCast(u32, LANES)
+                }
+                gx += 1
+            }
+            gy += 1
+        }
+        gz += 1
+    }
+    result.*.steps = steps
+}

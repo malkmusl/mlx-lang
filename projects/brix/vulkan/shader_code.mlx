@@ -1,0 +1,1435 @@
+// The shader compiler's back end: from the intermediate form
+// (shader_ir.mlx) to the card's words. The study's 5.4, parts 6 to 11:
+// instruction selection in two flavours (scalar for uniform values, vector
+// for varying ones), control flow on the exec mask, registers by linear
+// scan without spilling, the waits and the wait states, assembly, and the
+// shader's facts for the driver.
+//
+// THE ENTRY STATE (the study's 5.2, with its second way out for pointers:
+// every pointer two user data words, low and high, at an even register):
+//   s0, s1   the scratch descriptor's words (never read: no spilling)
+//   s2, s3   descriptor set 0's address; binding b's buffer descriptor (4
+//            words, RADV's write_buffer_descriptor) at byte 16 * b
+//   s4, s5   the push constant block's address
+//            (USER_SGPR 6)
+//   s6, s7, s8  the work group's id x, y, z (TGID_X_EN .. TGID_Z_EN)
+//   v0, v1, v2  the invocation's id in its group (TIDIG_COMP_CNT 2)
+// These registers are never handed out to values.
+//
+// CONTROL FLOW. An if on a uniform condition is a branch on scc; on a
+// varying one exec is narrowed (s_and_saveexec_b64), the then-part runs,
+// exec becomes the other lanes (s_andn2_b64), the else-part runs, exec
+// comes back; a part no lane wants is jumped over (s_cbranch_execz). A loop
+// on a varying condition drops the lanes whose condition fails from exec
+// at its top and ends when none is left; a uniform one branches. A block
+// parameter is a register written at the end of each way in (the lanes
+// that took it write it).
+//
+// REGISTERS. Every value gets a register of its own kind for its whole
+// life (from its definition to its last use, and through a whole loop
+// when it lives across one); vector registers v3 .. v255, scalar ones s9 ..
+// s101 (pairs at even numbers, quads at multiples of four). A shader that
+// needs more is refused: there is no spilling at this stage.
+//
+// THE RULES OF THE CARD kept here, each where it is needed: a vector
+// instruction reads at most one scalar value (aco_validate.cpp's constant
+// bus); a VOP3 instruction takes no literal on GFX8 (aco_validate.cpp,
+// and the assembler of LLVM refuses one); a VOP2 instruction's second
+// source is a vector register; a load's register is waited for before it
+// is read or written again (s_waitcnt, its counter at 0), everything is
+// waited for at a label and before a branch, and the program ends with
+// s_waitcnt 0 and s_endpgm (the study's 5.1: ours waits explicitly); a
+// scalar register written by a vector instruction is read by a buffer
+// instruction only five wait states later (`padHazards`).
+
+const isa = @import("./isa.mlx")
+const encode = @import("./encode.mlx")
+const decode = @import("./decode.mlx")
+const ir = @import("./shader_ir.mlx")
+
+const Inst = encode.Inst
+const NONE = ir.NONE
+
+pub const MAX_LINES: usize = 65536
+pub const MAX_VIRTUAL: usize = 32768
+pub const MAX_LABELS: usize = 8192
+pub const MAX_LOOPS: usize = 512
+
+// Virtual registers: a vector one is VIRTUAL_V + k, a scalar run (1, 2 or
+// 4 registers) VIRTUAL_S + k.
+pub const VIRTUAL_V: u16 = 4096
+pub const VIRTUAL_S: u16 = 36864
+
+// The entry registers.
+pub const SET_POINTER: u16 = 2
+pub const PUSH_POINTER: u16 = 4
+pub const USER_SGPRS: u32 = 6
+pub const GROUP_ID: u16 = 6
+pub const FIRST_FREE_SGPR: u32 = 9
+pub const FIRST_FREE_VGPR: u32 = 3
+pub const LAST_SGPR: u32 = 101
+
+pub const LineKind = enum(u8) {
+    inst,
+    label,
+    branch,
+    loopBegin,
+    loopEnd,
+}
+
+pub const Line = struct {
+    kind: LineKind
+    inst: Inst
+    label: u32
+}
+
+pub var lines: [MAX_LINES]Line = undefined
+pub var lineCount: u32 = 0
+var labelCount: u32 = 0
+
+// Where each value of the form is: a register (virtual until the end), or
+// NONE for a constant (made where it is used).
+var location: [ir.MAX_NODES]u16 = undefined
+
+var vSize: [MAX_VIRTUAL]u8 = undefined
+var vCount: u32 = 0
+var sSize: [MAX_VIRTUAL]u8 = undefined
+var sCount: u32 = 0
+var descriptor: [8]u16 = undefined
+
+pub var failed: ir.Failure = ir.Failure.none
+
+fn fail(kind: ir.Failure) -> void {
+    if failed == ir.Failure.none { failed = kind }
+}
+
+fn newV() -> u16 {
+    if vCount >= @intCast(u32, MAX_VIRTUAL) - 1 {
+        fail(ir.Failure.tooLarge)
+        return VIRTUAL_V
+    }
+    vSize[vCount] = 1
+    vCount += 1
+    return VIRTUAL_V + @intCast(u16, vCount - 1)
+}
+
+fn newS(size: u8) -> u16 {
+    if sCount >= @intCast(u32, MAX_VIRTUAL) - 1 || sCount >= 28000 {
+        fail(ir.Failure.tooLarge)
+        return VIRTUAL_S
+    }
+    sSize[sCount] = size
+    sCount += 1
+    return VIRTUAL_S + @intCast(u16, sCount - 1)
+}
+
+pub fn isVirtualV(r: u16) -> bool { return r >= VIRTUAL_V && r < VIRTUAL_S }
+pub fn isVirtualS(r: u16) -> bool { return r >= VIRTUAL_S }
+// A vector operand: a vector register, virtual or not.
+fn isVector(r: u16) -> bool { return isVirtualV(r) || encode.isVgpr(r) }
+fn isScalar(r: u16) -> bool { return isVirtualS(r) || r < 128 }
+
+fn add(line: Line) -> void {
+    if lineCount >= @intCast(u32, MAX_LINES) {
+        fail(ir.Failure.programTooLarge)
+        return
+    }
+    lines[lineCount] = line
+    lineCount += 1
+}
+
+fn put(inst: Inst) -> void { add(Line.{ .kind = LineKind.inst, .inst = inst, .label = 0 }) }
+
+fn newLabel() -> u32 {
+    labelCount += 1
+    return labelCount
+}
+
+fn placeLabel(label: u32) -> void { add(Line.{ .kind = LineKind.label, .inst = encode.blank(isa.S_NOP), .label = label }) }
+
+fn branch(op: isa.Op, label: u32) -> void { add(Line.{ .kind = LineKind.branch, .inst = encode.blank(op), .label = label }) }
+
+fn mark(kind: LineKind) -> void { add(Line.{ .kind = kind, .inst = encode.blank(isa.S_NOP), .label = 0 }) }
+
+// ---------------------------------------------------------------------------
+// Operands
+
+// A value as an operand: its register, or an inline constant, or LITERAL
+// with the word in `literal`.
+fn operand(value: u32, literal: *u32) -> u16 {
+    const v = ir.find(value)
+    if ir.nodes[v].kind == ir.Kind.constant {
+        var word = ir.nodes[v].imm
+        if ir.nodes[v].sort == ir.Sort.boolean {
+            word = if word != 0 { 0xFFFFFFFF } else { 0 }
+        }
+        const o = encode.constant(word)
+        if o == encode.LITERAL { literal.* = word }
+        return o
+    }
+    return location[v]
+}
+
+// A value in a vector register (moved there if it is not).
+fn inVector(value: u32) -> u16 {
+    var literal: u32 = 0
+    const o = operand(value, &literal)
+    if isVector(o) { return o }
+    const d = newV()
+    var i = encode.blank(isa.V_MOV_B32)
+    i.dst = d
+    i.src0 = o
+    i.literal = literal
+    put(i)
+    return d
+}
+
+// ---------------------------------------------------------------------------
+// Emitting
+
+fn sop2(op: isa.Op, dst: u16, a: u32, b: u32) -> void {
+    var la: u32 = 0
+    var lb: u32 = 0
+    var oa = operand(a, &la)
+    var ob = operand(b, &lb)
+    // one literal word an instruction: the second into a register first
+    if oa == encode.LITERAL && ob == encode.LITERAL && la != lb {
+        ob = materialize(lb)
+    }
+    var i = encode.blank(op)
+    i.dst = dst
+    i.src0 = oa
+    i.src1 = ob
+    i.literal = if oa == encode.LITERAL { la } else { lb }
+    put(i)
+}
+
+fn materialize(word: u32) -> u16 {
+    const r = newS(1)
+    var i = encode.blank(isa.S_MOV_B32)
+    i.dst = r
+    i.src0 = encode.constant(word)
+    i.literal = word
+    put(i)
+    return r
+}
+
+// The sources of a vector instruction made to obey the rules: at most one
+// scalar value (SGPR or literal) among them, no literal in the VOP3 form
+// or where the format has no room for one, a vector register as a VOP2
+// instruction's second source.
+const Sources = struct {
+    count: u32
+    o: [3]u16
+    literal: u32
+}
+
+fn prepare(values: [3]u32, count: u32, vop3: bool, sources: *Sources) -> void {
+    sources.*.count = count
+    sources.*.literal = 0
+    var k: u32 = 0
+    var scalarSeen: u16 = 0xFFFF
+    var literalSeen = false
+    while k < count {
+        var literal: u32 = 0
+        var o = operand(values[k], &literal)
+        if o == encode.LITERAL {
+            if vop3 || literalSeen || (scalarSeen != 0xFFFF) || k > 0 {
+                o = inVector(values[k])
+            } else {
+                literalSeen = true
+                sources.*.literal = literal
+            }
+        } else if isScalar(o) {
+            if literalSeen || (scalarSeen != 0xFFFF && scalarSeen != o) {
+                o = inVector(values[k])
+            } else {
+                scalarSeen = o
+            }
+        }
+        sources.*.o[k] = o
+        k += 1
+    }
+}
+
+// A VOP2 instruction: `swap` says the operation is commutative.
+fn vop2(op: isa.Op, dst: u16, a: u32, b: u32, commutative: bool) -> void {
+    var first = a
+    var second = b
+    var literal: u32 = 0
+    if commutative && !isVector(operand(second, &literal)) && isVector(operand(first, &literal)) {
+        first = b
+        second = a
+    }
+    var sources: Sources = undefined
+    prepare([3]u32{ first, second, NONE }, 2, false, &sources)
+    if !isVector(sources.o[1]) {
+        // the second source must be a vector register
+        sources.o[1] = inVector(second)
+    }
+    var i = encode.blank(op)
+    i.dst = dst
+    i.src0 = sources.o[0]
+    i.src1 = sources.o[1]
+    i.literal = sources.literal
+    put(i)
+}
+
+fn vop1(op: isa.Op, dst: u16, a: u32) -> void {
+    var sources: Sources = undefined
+    prepare([3]u32{ a, NONE, NONE }, 1, false, &sources)
+    var i = encode.blank(op)
+    i.dst = dst
+    i.src0 = sources.o[0]
+    i.literal = sources.literal
+    put(i)
+}
+
+fn vop3(op: isa.Op, dst: u16, a: u32, b: u32, c: u32, count: u32) -> void {
+    var sources: Sources = undefined
+    prepare([3]u32{ a, b, c }, count, true, &sources)
+    var i = encode.blank(op)
+    if op.format != isa.Format.vop3 { i.form = encode.Form.vop3 }
+    i.dst = dst
+    i.src0 = sources.o[0]
+    i.src1 = sources.o[1]
+    if count > 2 { i.src2 = sources.o[2] }
+    put(i)
+}
+
+// ---------------------------------------------------------------------------
+// Selection
+
+fn wordOp(kind: ir.Kind, uniform: bool) -> isa.Op {
+    if uniform {
+        if kind == ir.Kind.add { return isa.S_ADD_U32 }
+        if kind == ir.Kind.sub { return isa.S_SUB_U32 }
+        if kind == ir.Kind.mul { return isa.S_MUL_I32 }
+        if kind == ir.Kind.shl { return isa.S_LSHL_B32 }
+        if kind == ir.Kind.shr { return isa.S_LSHR_B32 }
+        if kind == ir.Kind.sar { return isa.S_ASHR_I32 }
+        if kind == ir.Kind.band { return isa.S_AND_B32 }
+        if kind == ir.Kind.bor { return isa.S_OR_B32 }
+        return isa.S_XOR_B32
+    }
+    if kind == ir.Kind.add { return isa.V_ADD_CO_U32 }
+    if kind == ir.Kind.band { return isa.V_AND_B32 }
+    if kind == ir.Kind.bor { return isa.V_OR_B32 }
+    if kind == ir.Kind.bxor { return isa.V_XOR_B32 }
+    if kind == ir.Kind.smax { return isa.V_MAX_I32 }
+    if kind == ir.Kind.fmul { return isa.V_MUL_F32 }
+    if kind == ir.Kind.shl { return isa.V_LSHLREV_B32 }
+    if kind == ir.Kind.shr { return isa.V_LSHRREV_B32 }
+    return isa.V_ASHRREV_I32
+}
+
+// The comparison instruction for a kind, scalar (SOPC) or vector (VOPC).
+fn compareOp(kind: ir.Kind, uniform: bool) -> isa.Op {
+    if uniform {
+        if kind == ir.Kind.eq { return isa.S_CMP_EQ_U32 }
+        if kind == ir.Kind.ne { return isa.S_CMP_LG_U32 }
+        if kind == ir.Kind.ult { return isa.S_CMP_LT_U32 }
+        if kind == ir.Kind.ule { return isa.S_CMP_LE_U32 }
+        if kind == ir.Kind.ugt { return isa.S_CMP_GT_U32 }
+        if kind == ir.Kind.uge { return isa.S_CMP_GE_U32 }
+        if kind == ir.Kind.slt { return isa.S_CMP_LT_I32 }
+        if kind == ir.Kind.sle { return isa.S_CMP_LE_I32 }
+        if kind == ir.Kind.sgt { return isa.S_CMP_GT_I32 }
+        return isa.S_CMP_GE_I32
+    }
+    if kind == ir.Kind.eq { return isa.V_CMP_EQ_U32 }
+    if kind == ir.Kind.ne { return isa.V_CMP_LG_U32 }
+    if kind == ir.Kind.ult { return isa.V_CMP_LT_U32 }
+    if kind == ir.Kind.ule { return isa.V_CMP_LE_U32 }
+    if kind == ir.Kind.ugt { return isa.V_CMP_GT_U32 }
+    if kind == ir.Kind.uge { return isa.V_CMP_GE_U32 }
+    if kind == ir.Kind.slt { return isa.V_CMP_LT_I32 }
+    if kind == ir.Kind.sle { return isa.V_CMP_LE_I32 }
+    if kind == ir.Kind.sgt { return isa.V_CMP_GT_I32 }
+    return isa.V_CMP_GE_I32
+}
+
+fn isCompare(kind: ir.Kind) -> bool {
+    return kind == ir.Kind.eq || kind == ir.Kind.ne || kind == ir.Kind.ult || kind == ir.Kind.ule || kind == ir.Kind.ugt || kind == ir.Kind.uge || kind == ir.Kind.slt || kind == ir.Kind.sle || kind == ir.Kind.sgt || kind == ir.Kind.sge
+}
+
+// A boolean as a lane mask in a scalar pair (a constant one made).
+fn mask(value: u32) -> u16 {
+    var literal: u32 = 0
+    const o = operand(value, &literal)
+    if isScalar(o) { return o }
+    const d = newS(2)
+    var i = encode.blank(isa.S_MOV_B64)
+    i.dst = d
+    i.src0 = o
+    put(i)
+    return d
+}
+
+// scc = the uniform mask is not 0.
+fn testMask(m: u16) -> void {
+    var i = encode.blank(isa.S_CMP_LG_U64)
+    i.src0 = m
+    i.src1 = encode.constant(0)
+    put(i)
+}
+
+fn selectNode(n: u32) -> void {
+    const node = ir.nodes[n]
+    const k = node.kind
+    const uniform = node.uniform
+    var dst: u16 = 0
+    if k == ir.Kind.constant || k == ir.Kind.param { return }
+    if k == ir.Kind.localId {
+        location[n] = encode.VGPR + @intCast(u16, node.imm)
+        return
+    }
+    if k == ir.Kind.groupId {
+        location[n] = GROUP_ID + @intCast(u16, node.imm)
+        return
+    }
+    if k == ir.Kind.push {
+        dst = newS(1)
+        var i = encode.blank(isa.S_LOAD_DWORD)
+        i.dst = dst
+        i.src0 = PUSH_POINTER
+        i.flags = encode.IMM
+        i.imm = node.imm * 4
+        put(i)
+        location[n] = dst
+        return
+    }
+    if k == ir.Kind.load || k == ir.Kind.store {
+        // the byte offset: index * 4, in a vector register (the form the
+        // card checks against the range: the study's 5.2)
+        const offset = newV()
+        var shift = encode.blank(isa.V_LSHLREV_B32)
+        shift.dst = offset
+        shift.src0 = encode.constant(2)
+        shift.src1 = inVector(node.a)
+        put(shift)
+        var i = encode.blank(if k == ir.Kind.load { isa.BUFFER_LOAD_DWORD } else { isa.BUFFER_STORE_DWORD })
+        if k == ir.Kind.load {
+            dst = newV()
+            i.dst = dst
+            location[n] = dst
+        } else {
+            i.dst = inVector(node.b)
+        }
+        i.src0 = offset
+        i.src1 = descriptor[@intCast(usize, node.imm)]
+        i.src2 = encode.constant(0)
+        i.flags = encode.OFFEN
+        put(i)
+        return
+    }
+    if isCompare(k) {
+        dst = newS(2)
+        location[n] = dst
+        if uniform {
+            sopc(compareOp(k, true), node.a, node.b)
+            var c = encode.blank(isa.S_CSELECT_B64)
+            c.dst = dst
+            c.src0 = encode.constant(0xFFFFFFFF)
+            c.src1 = encode.constant(0)
+            put(c)
+        } else {
+            vop3(compareOp(k, false), dst, node.a, node.b, NONE, 2)
+        }
+        return
+    }
+    if k == ir.Kind.land || k == ir.Kind.lor || k == ir.Kind.leq || k == ir.Kind.lne || k == ir.Kind.lnot {
+        dst = newS(2)
+        location[n] = dst
+        var i = encode.blank(isa.S_AND_B64)
+        if k == ir.Kind.lor { i.op = isa.S_OR_B64 }
+        if k == ir.Kind.leq { i.op = isa.S_XNOR_B64 }
+        if k == ir.Kind.lne { i.op = isa.S_XOR_B64 }
+        if k == ir.Kind.lnot { i.op = isa.S_NOT_B64 }
+        i.dst = dst
+        i.src0 = mask(node.a)
+        if k != ir.Kind.lnot { i.src1 = mask(node.b) }
+        if k == ir.Kind.lnot {
+            var j = encode.blank(isa.S_NOT_B64)
+            j.dst = dst
+            j.src0 = i.src0
+            put(j)
+        } else {
+            put(i)
+        }
+        return
+    }
+    if k == ir.Kind.select {
+        if node.sort == ir.Sort.boolean {
+            // (c & a) | (b & ~c)
+            dst = newS(2)
+            location[n] = dst
+            const c = mask(node.a)
+            const t1 = newS(2)
+            const t2 = newS(2)
+            var i = encode.blank(isa.S_AND_B64)
+            i.dst = t1
+            i.src0 = c
+            i.src1 = mask(node.b)
+            put(i)
+            var j = encode.blank(isa.S_ANDN2_B64)
+            j.dst = t2
+            j.src0 = mask(node.c)
+            j.src1 = c
+            put(j)
+            var o = encode.blank(isa.S_OR_B64)
+            o.dst = dst
+            o.src0 = t1
+            o.src1 = t2
+            put(o)
+            return
+        }
+        if uniform {
+            dst = newS(1)
+            location[n] = dst
+            testMask(mask(node.a))
+            sop2(isa.S_CSELECT_B32, dst, node.b, node.c)
+            return
+        }
+        // v_cndmask_b32_e64 dst, false, true, mask: the mask is the one
+        // scalar value it may read
+        dst = newV()
+        location[n] = dst
+        const m = mask(node.a)
+        var i = encode.blank(isa.V_CNDMASK_B32)
+        i.form = encode.Form.vop3
+        i.dst = dst
+        i.src0 = vectorOrInline(node.c)
+        i.src1 = vectorOrInline(node.b)
+        i.src2 = m
+        put(i)
+        return
+    }
+    // The word operations.
+    if uniform {
+        dst = newS(1)
+        location[n] = dst
+        if k == ir.Kind.bnot {
+            var i = encode.blank(isa.S_NOT_B32)
+            var literal: u32 = 0
+            i.dst = dst
+            i.src0 = operand(node.a, &literal)
+            i.literal = literal
+            put(i)
+            return
+        }
+        sop2(wordOp(k, true), dst, node.a, node.b)
+        return
+    }
+    dst = newV()
+    location[n] = dst
+    if k == ir.Kind.bnot {
+        vop1(isa.V_NOT_B32, dst, node.a)
+    } else if k == ir.Kind.u2f {
+        vop1(isa.V_CVT_F32_U32, dst, node.a)
+    } else if k == ir.Kind.f2u {
+        vop1(isa.V_CVT_U32_F32, dst, node.a)
+    } else if k == ir.Kind.rcp {
+        vop1(isa.V_RCP_F32, dst, node.a)
+    } else if k == ir.Kind.mul {
+        vop3(isa.V_MUL_LO_U32, dst, node.a, node.b, NONE, 2)
+    } else if k == ir.Kind.mulhi {
+        vop3(isa.V_MUL_HI_U32, dst, node.a, node.b, NONE, 2)
+    } else if k == ir.Kind.sub {
+        // dst = a - b; with b not in a vector register: b - a reversed
+        var literal: u32 = 0
+        if !isVector(operand(node.b, &literal)) && isVector(operand(node.a, &literal)) {
+            vop2(isa.V_SUBREV_CO_U32, dst, node.b, node.a, false)
+        } else {
+            vop2(isa.V_SUB_CO_U32, dst, node.a, node.b, false)
+        }
+    } else if k == ir.Kind.shl || k == ir.Kind.shr || k == ir.Kind.sar {
+        // the count is the first source
+        vop2(wordOp(k, false), dst, node.b, node.a, false)
+    } else {
+        vop2(wordOp(k, false), dst, node.a, node.b, true)
+    }
+}
+
+fn sopc(op: isa.Op, a: u32, b: u32) -> void {
+    var la: u32 = 0
+    var lb: u32 = 0
+    const oa = operand(a, &la)
+    var ob = operand(b, &lb)
+    if oa == encode.LITERAL && ob == encode.LITERAL && la != lb { ob = materialize(lb) }
+    var i = encode.blank(op)
+    i.src0 = oa
+    i.src1 = ob
+    i.literal = if oa == encode.LITERAL { la } else { lb }
+    put(i)
+}
+
+fn vectorOrInline(value: u32) -> u16 {
+    var literal: u32 = 0
+    const o = operand(value, &literal)
+    if isVector(o) || encode.isInline(o) { return o }
+    return inVector(value)
+}
+
+// A parameter's register gets `value` (in the lanes that run here).
+fn copyInto(param: u32, value: u32) -> void {
+    const p = location[param]
+    var literal: u32 = 0
+    const o = operand(value, &literal)
+    if o == p { return }
+    if isVirtualS(p) {
+        var i = encode.blank(isa.S_MOV_B32)
+        i.dst = p
+        i.src0 = o
+        i.literal = literal
+        put(i)
+    } else {
+        var i = encode.blank(isa.V_MOV_B32)
+        i.dst = p
+        i.src0 = o
+        i.literal = literal
+        put(i)
+    }
+}
+
+fn giveRegisters(first: u32, count: u32) -> void {
+    var p = first
+    while p < first + count {
+        const v = ir.params[p].value
+        if ir.nodes[v].uniform { location[v] = newS(1) } else { location[v] = newV() }
+        p += 1
+    }
+}
+
+fn selectList(head: u32) -> void {
+    var at = head
+    while at != NONE && failed == ir.Failure.none {
+        const item = ir.items[at]
+        if item.kind == ir.ItemKind.node {
+            selectNode(item.node)
+        } else if item.kind == ir.ItemKind.branch {
+            selectIf(&item)
+        } else {
+            selectLoop(&item)
+        }
+        at = item.next
+    }
+}
+
+fn selectIf(item: *const ir.Item) -> void {
+    const i = item.*
+    giveRegisters(i.params, i.paramCount)
+    const elseLabel = newLabel()
+    const end = newLabel()
+    const c = mask(i.cond)
+    if ir.nodes[ir.find(i.cond)].uniform {
+        testMask(c)
+        branch(isa.S_CBRANCH_SCC0, elseLabel)
+        selectList(i.first)
+        var p = i.params
+        while p < i.params + i.paramCount {
+            copyInto(ir.params[p].value, ir.params[p].from0)
+            p += 1
+        }
+        branch(isa.S_BRANCH, end)
+        placeLabel(elseLabel)
+        selectList(i.second)
+        p = i.params
+        while p < i.params + i.paramCount {
+            copyInto(ir.params[p].value, ir.params[p].from1)
+            p += 1
+        }
+        placeLabel(end)
+        return
+    }
+    const saved = newS(2)
+    var save = encode.blank(isa.S_AND_SAVEEXEC_B64)
+    save.dst = saved
+    save.src0 = c
+    put(save)
+    branch(isa.S_CBRANCH_EXECZ, elseLabel)
+    selectList(i.first)
+    var p = i.params
+    while p < i.params + i.paramCount {
+        copyInto(ir.params[p].value, ir.params[p].from0)
+        p += 1
+    }
+    placeLabel(elseLabel)
+    var other = encode.blank(isa.S_ANDN2_B64)
+    other.dst = encode.EXEC
+    other.src0 = saved
+    other.src1 = c
+    put(other)
+    branch(isa.S_CBRANCH_EXECZ, end)
+    selectList(i.second)
+    p = i.params
+    while p < i.params + i.paramCount {
+        copyInto(ir.params[p].value, ir.params[p].from1)
+        p += 1
+    }
+    placeLabel(end)
+    var back = encode.blank(isa.S_MOV_B64)
+    back.dst = encode.EXEC
+    back.src0 = saved
+    put(back)
+}
+
+fn selectLoop(item: *const ir.Item) -> void {
+    const i = item.*
+    // the parameters that are still parameters (not aliased away)
+    giveRegisters(i.params, i.paramCount)
+    var p = i.params
+    while p < i.params + i.paramCount {
+        if ir.nodes[ir.params[p].value].alias == NONE { copyInto(ir.params[p].value, ir.params[p].from0) }
+        p += 1
+    }
+    const uniform = ir.nodes[ir.find(i.cond)].uniform
+    var saved: u16 = 0
+    if !uniform {
+        saved = newS(2)
+        var save = encode.blank(isa.S_MOV_B64)
+        save.dst = saved
+        save.src0 = encode.EXEC
+        put(save)
+    }
+    const top = newLabel()
+    const exit = newLabel()
+    mark(LineKind.loopBegin)
+    placeLabel(top)
+    selectList(i.first)
+    const c = mask(i.cond)
+    if uniform {
+        testMask(c)
+        branch(isa.S_CBRANCH_SCC0, exit)
+    } else {
+        var narrow = encode.blank(isa.S_AND_B64)
+        narrow.dst = encode.EXEC
+        narrow.src0 = encode.EXEC
+        narrow.src1 = c
+        put(narrow)
+        branch(isa.S_CBRANCH_EXECZ, exit)
+    }
+    selectList(i.second)
+    selectList(i.third)
+    // the back edge: the parameters get their new values together (a value
+    // that is itself a parameter of this loop is copied aside first)
+    var temporaries: [ir.MAX_SLOTS]u16 = undefined
+    var t: u32 = 0
+    p = i.params
+    while p < i.params + i.paramCount && t < @intCast(u32, ir.MAX_SLOTS) {
+        temporaries[t] = 0
+        const from = ir.find(ir.params[p].from1)
+        if ir.nodes[ir.params[p].value].alias == NONE && ir.nodes[from].kind == ir.Kind.param && isParamOf(from, i.params, i.paramCount) {
+            const r = if ir.nodes[ir.params[p].value].uniform { newS(1) } else { newV() }
+            var copy = encode.blank(if isVirtualS(r) { isa.S_MOV_B32 } else { isa.V_MOV_B32 })
+            copy.dst = r
+            copy.src0 = location[from]
+            put(copy)
+            temporaries[t] = r
+        }
+        p += 1
+        t += 1
+    }
+    p = i.params
+    t = 0
+    while p < i.params + i.paramCount {
+        if ir.nodes[ir.params[p].value].alias == NONE {
+            if t < @intCast(u32, ir.MAX_SLOTS) && temporaries[t] != 0 {
+                var copy = encode.blank(if isVirtualS(location[ir.params[p].value]) { isa.S_MOV_B32 } else { isa.V_MOV_B32 })
+                copy.dst = location[ir.params[p].value]
+                copy.src0 = temporaries[t]
+                put(copy)
+            } else {
+                copyInto(ir.params[p].value, ir.params[p].from1)
+            }
+        }
+        p += 1
+        t += 1
+    }
+    branch(isa.S_BRANCH, top)
+    mark(LineKind.loopEnd)
+    placeLabel(exit)
+    if !uniform {
+        var back = encode.blank(isa.S_MOV_B64)
+        back.dst = encode.EXEC
+        back.src0 = saved
+        put(back)
+    }
+}
+
+fn isParamOf(value: u32, first: u32, count: u32) -> bool {
+    var p = first
+    while p < first + count {
+        if ir.params[p].value == value { return true }
+        p += 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// Which registers an instruction reads and writes
+
+pub const Use = struct {
+    reg: u16
+    size: u32
+    write: bool
+}
+
+fn sizeIn(word: u32, which: u32) -> u32 {
+    if word == 0xFFFFFFFF { return 1 }
+    const b = (word >> (8 * which)) & 255
+    if b == 0 || b > 16 { return if b == @intCast(u32, encode.VCC) || b == @intCast(u32, encode.EXEC_HI) { 2 } else { 1 } }
+    return b
+}
+
+fn loadSize(n: []const u8) -> u32 {
+    if endsWith(n, "x2") { return 2 }
+    if endsWith(n, "x3") { return 3 }
+    if endsWith(n, "x4") { return 4 }
+    if endsWith(n, "x8") { return 8 }
+    if endsWith(n, "x16") { return 16 }
+    return 1
+}
+
+fn endsWith(text: []const u8, tail: []const u8) -> bool {
+    if tail.length > text.length { return false }
+    var k: usize = 0
+    while k < tail.length {
+        if text[text.length - tail.length + k] != tail[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+fn startsWith(text: []const u8, head: []const u8) -> bool {
+    if head.length > text.length { return false }
+    var k: usize = 0
+    while k < head.length {
+        if text[k] != head[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+fn note(uses: *[8]Use, count: *u32, reg: u16, size: u32, write: bool) -> void {
+    if count.* < 8 {
+        uses.*[count.*] = Use.{ .reg = reg, .size = size, .write = write }
+        count.* += 1
+    }
+}
+
+fn isRegister(r: u16) -> bool { return r < 128 || isVector(r) || isVirtualS(r) }
+
+// The registers `i` reads and writes, with their sizes (what this
+// compiler emits; the formats it does not emit say nothing).
+pub fn usesOf(i: *const Inst, uses: *[8]Use) -> u32 {
+    var count: u32 = 0
+    const f = i.*.op.format
+    const at = encode.find(i.*.op)
+    var defs: u32 = 0xFFFFFFFF
+    var ops: u32 = 0xFFFFFFFF
+    if at != isa.COUNT {
+        defs = isa.DEFS[at]
+        ops = isa.OPS[at]
+    }
+    if f == isa.Format.sop2 || f == isa.Format.sop1 || f == isa.Format.sopc || f == isa.Format.sopk {
+        if isRegister(i.*.src0) && f != isa.Format.sopk { note(uses, &count, i.*.src0, sizeIn(ops, 0), false) }
+        if isRegister(i.*.src1) && (f == isa.Format.sop2 || f == isa.Format.sopc) { note(uses, &count, i.*.src1, sizeIn(ops, 1), false) }
+        if f != isa.Format.sopc && (defs & 255) != @intCast(u32, encode.SCC) && (defs & 255) != 0 { note(uses, &count, i.*.dst, sizeIn(defs, 0), true) }
+        if f == isa.Format.sop1 && (i.*.op.number == isa.S_AND_SAVEEXEC_B64.number || i.*.op.number == isa.S_OR_SAVEEXEC_B64.number || i.*.op.number == isa.S_ANDN2_SAVEEXEC_B64.number) {
+            note(uses, &count, encode.EXEC, 2, false)
+            note(uses, &count, encode.EXEC, 2, true)
+        }
+        return count
+    }
+    if f == isa.Format.smem {
+        const n = decode.name(i.*.op)
+        note(uses, &count, i.*.src0, 2, false)
+        if (i.*.flags & encode.IMM) == 0 { note(uses, &count, i.*.src1, 1, false) }
+        note(uses, &count, i.*.dst, loadSize(n), true)
+        return count
+    }
+    if f == isa.Format.mubuf {
+        const n = decode.name(i.*.op)
+        if (i.*.flags & encode.OFFEN) != 0 { note(uses, &count, i.*.src0, 1, false) }
+        note(uses, &count, i.*.src1, 4, false)
+        if isRegister(i.*.src2) { note(uses, &count, i.*.src2, 1, false) }
+        note(uses, &count, i.*.dst, loadSize(n), !startsWith(n, "buffer_store"))
+        return count
+    }
+    if f == isa.Format.vop1 || f == isa.Format.vop2 || f == isa.Format.vopc || f == isa.Format.vop3 {
+        if isRegister(i.*.src0) { note(uses, &count, i.*.src0, sizeIn(ops, 0), false) }
+        if f != isa.Format.vop1 && isRegister(i.*.src1) { note(uses, &count, i.*.src1, sizeIn(ops, 1), false) }
+        if (i.*.form == encode.Form.vop3 || f == isa.Format.vop3) && isRegister(i.*.src2) && ((ops >> 16) & 255) != 0 { note(uses, &count, i.*.src2, sizeIn(ops, 2), false) }
+        if f == isa.Format.vopc {
+            if i.*.form == encode.Form.vop3 { note(uses, &count, i.*.dst, 2, true) } else { note(uses, &count, encode.VCC, 2, true) }
+        } else {
+            note(uses, &count, i.*.dst, 1, true)
+        }
+        if encode.hasSecondDestination(i.*.op) {
+            if i.*.form == encode.Form.vop3 || f == isa.Format.vop3 { note(uses, &count, i.*.dst2, 2, true) } else { note(uses, &count, encode.VCC, 2, true) }
+        }
+        return count
+    }
+    return count
+}
+
+// ---------------------------------------------------------------------------
+// Registers: linear scan over the lines
+
+var first: [MAX_VIRTUAL * 2]u32 = undefined
+var last: [MAX_VIRTUAL * 2]u32 = undefined
+var assigned: [MAX_VIRTUAL * 2]u16 = undefined
+var order: [MAX_VIRTUAL * 2]u32 = undefined
+var loopBegin: [MAX_LOOPS]u32 = undefined
+var loopEnd: [MAX_LOOPS]u32 = undefined
+pub var highestV: u32 = 0
+pub var highestS: u32 = 0
+
+// The index of a virtual register in the interval tables.
+fn slot(r: u16) -> usize {
+    if isVirtualV(r) { return @intCast(usize, r - VIRTUAL_V) }
+    return @intCast(usize, MAX_VIRTUAL) + @intCast(usize, r - VIRTUAL_S)
+}
+
+fn touch(r: u16, at: u32) -> void {
+    if !(isVirtualV(r) || isVirtualS(r)) { return }
+    const s = slot(r)
+    if first[s] == NONE || at < first[s] { first[s] = at }
+    if last[s] == NONE || at > last[s] { last[s] = at }
+}
+
+fn intervals() -> void {
+    var s: usize = 0
+    while s < MAX_VIRTUAL * 2 {
+        first[s] = NONE
+        last[s] = NONE
+        s += 1
+    }
+    var loops: u32 = 0
+    var stack: [64]u32 = undefined
+    var depth: u32 = 0
+    var at: u32 = 0
+    while at < lineCount {
+        const line = lines[at]
+        if line.kind == LineKind.inst {
+            var uses: [8]Use = undefined
+            const count = usesOf(&line.inst, &uses)
+            var k: u32 = 0
+            while k < count {
+                touch(uses[k].reg, at)
+                k += 1
+            }
+        } else if line.kind == LineKind.loopBegin {
+            if depth < 64 {
+                stack[depth] = at
+                depth += 1
+            }
+        } else if line.kind == LineKind.loopEnd {
+            if depth > 0 && loops < @intCast(u32, MAX_LOOPS) {
+                depth -= 1
+                loopBegin[loops] = stack[depth]
+                loopEnd[loops] = at
+                loops += 1
+            }
+        }
+        at += 1
+    }
+    // Through a loop: a register used in it and made before it lives to
+    // its end; one made in it and used after it lives from its beginning.
+    var round: u32 = 0
+    while round < 3 {
+        var l: u32 = 0
+        while l < loops {
+            s = 0
+            while s < MAX_VIRTUAL * 2 {
+                if first[s] != NONE {
+                    const inside = last[s] >= loopBegin[l] && first[s] <= loopEnd[l]
+                    if inside && first[s] < loopBegin[l] && last[s] < loopEnd[l] { last[s] = loopEnd[l] }
+                    if inside && last[s] > loopEnd[l] && first[s] > loopBegin[l] { first[s] = loopBegin[l] }
+                }
+                s += 1
+            }
+            l += 1
+        }
+        round += 1
+    }
+}
+
+// Linear scan: in the order of the intervals' starts, each register gets
+// the lowest free physical register(s) of its kind and alignment.
+fn allocate() -> bool {
+    var count: u32 = 0
+    var s: usize = 0
+    while s < MAX_VIRTUAL * 2 {
+        if first[s] != NONE {
+            order[count] = @intCast(u32, s)
+            count += 1
+        }
+        s += 1
+    }
+    sortByStart(count)
+    var vFree: [256]u32 = undefined
+    var sFree: [128]u32 = undefined
+    var k: usize = 0
+    while k < 256 {
+        vFree[k] = 0
+        k += 1
+    }
+    k = 0
+    while k < 128 {
+        sFree[k] = 0
+        k += 1
+    }
+    highestV = FIRST_FREE_VGPR - 1
+    highestS = FIRST_FREE_SGPR - 1
+    // vFree[r] / sFree[r]: the line after which r is free (0: free).
+    var n: u32 = 0
+    while n < count {
+        const v = @intCast(usize, order[n])
+        const start = first[v]
+        if v < MAX_VIRTUAL {
+            var r: u32 = FIRST_FREE_VGPR
+            while r < 256 && vFree[r] > start { r += 1 }
+            if r >= 256 { return false }
+            vFree[r] = last[v] + 1
+            assigned[v] = encode.VGPR + @intCast(u16, r)
+            if r > highestV { highestV = r }
+        } else {
+            const size = @intCast(u32, sSize[v - MAX_VIRTUAL])
+            var step = size
+            if step > 4 { step = 4 }
+            var r: u32 = FIRST_FREE_SGPR
+            while r % step != 0 { r += 1 }
+            while true {
+                if r + size - 1 > LAST_SGPR { return false }
+                var free = true
+                var j: u32 = 0
+                while j < size {
+                    if sFree[r + j] > start { free = false }
+                    j += 1
+                }
+                if free { break }
+                r += step
+            }
+            var j: u32 = 0
+            while j < size {
+                sFree[r + j] = last[v] + 1
+                j += 1
+            }
+            assigned[v] = @intCast(u16, r)
+            if r + size - 1 > highestS { highestS = r + size - 1 }
+        }
+        n += 1
+    }
+    return true
+}
+
+fn sortByStart(count: u32) -> void {
+    // insertion sort by start, then by index (the intervals come nearly
+    // in order)
+    var a: u32 = 1
+    while a < count {
+        const value = order[a]
+        var b = a
+        while b > 0 && first[@intCast(usize, order[b - 1])] > first[@intCast(usize, value)] {
+            order[b] = order[b - 1]
+            b -= 1
+        }
+        order[b] = value
+        a += 1
+    }
+}
+
+fn physical(r: u16) -> u16 {
+    if isVirtualV(r) || isVirtualS(r) { return assigned[slot(r)] }
+    return r
+}
+
+fn rewrite() -> void {
+    var at: u32 = 0
+    while at < lineCount {
+        if lines[at].kind == LineKind.inst {
+            var i = lines[at].inst
+            i.dst = physical(i.dst)
+            i.dst2 = physical(i.dst2)
+            i.src0 = physical(i.src0)
+            i.src1 = physical(i.src1)
+            i.src2 = physical(i.src2)
+            lines[at].inst = i
+        }
+        at += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Waits and wait states
+
+var finalLines: [MAX_LINES]Line = undefined
+var finalCount: u32 = 0
+
+fn out(line: Line) -> void {
+    if finalCount >= @intCast(u32, MAX_LINES) {
+        fail(ir.Failure.programTooLarge)
+        return
+    }
+    finalLines[finalCount] = line
+    finalCount += 1
+}
+
+fn waitLine(vm: bool, lgkm: bool) -> Line {
+    var i = encode.blank(isa.S_WAITCNT)
+    i.imm = encode.waitWord(if vm { 0 } else { encode.WAIT_VM_MASK }, encode.WAIT_EXP_MASK, if lgkm { 0 } else { encode.WAIT_LGKM_MASK })
+    return Line.{ .kind = LineKind.inst, .inst = i, .label = 0 }
+}
+
+// s_waitcnt where a loaded register is read or written again, at every
+// label and before every branch while anything is out, and at the end.
+fn insertWaits() -> void {
+    var pendingS: [128]u8 = undefined
+    var pendingV: [256]u8 = undefined
+    var k: usize = 0
+    while k < 128 {
+        pendingS[k] = 0
+        k += 1
+    }
+    k = 0
+    while k < 256 {
+        pendingV[k] = 0
+        k += 1
+    }
+    var outVm = false
+    var outLgkm = false
+    finalCount = 0
+    var at: u32 = 0
+    while at < lineCount {
+        const line = lines[at]
+        var needVm = false
+        var needLgkm = false
+        if line.kind == LineKind.label || line.kind == LineKind.branch {
+            needVm = outVm
+            needLgkm = outLgkm
+        } else if line.kind == LineKind.inst {
+            var uses: [8]Use = undefined
+            const count = usesOf(&line.inst, &uses)
+            var u: u32 = 0
+            while u < count {
+                var j: u32 = 0
+                while j < uses[u].size {
+                    const r = uses[u].reg + @intCast(u16, j)
+                    if r < 128 {
+                        if pendingS[@intCast(usize, r)] == 1 { needLgkm = true }
+                    } else if encode.isVgpr(r) {
+                        if pendingV[@intCast(usize, r - encode.VGPR)] == 1 { needVm = true }
+                    }
+                    j += 1
+                }
+                u += 1
+            }
+        }
+        if needVm || needLgkm {
+            if line.kind == LineKind.label {
+                // the wait belongs to the paths that reach the label: before
+                // the label for the one that falls through; the branches to
+                // it waited before branching
+            }
+            out(waitLine(needVm, needLgkm))
+            if needVm {
+                outVm = false
+                k = 0
+                while k < 256 {
+                    pendingV[k] = 0
+                    k += 1
+                }
+            }
+            if needLgkm {
+                outLgkm = false
+                k = 0
+                while k < 128 {
+                    pendingS[k] = 0
+                    k += 1
+                }
+            }
+        }
+        out(line)
+        if line.kind == LineKind.inst {
+            const f = line.inst.op.format
+            if f == isa.Format.smem {
+                var uses: [8]Use = undefined
+                const count = usesOf(&line.inst, &uses)
+                var u: u32 = 0
+                while u < count {
+                    if uses[u].write {
+                        var j: u32 = 0
+                        while j < uses[u].size {
+                            pendingS[@intCast(usize, uses[u].reg) + @intCast(usize, j)] = 1
+                            j += 1
+                        }
+                    }
+                    u += 1
+                }
+                outLgkm = true
+            }
+            if f == isa.Format.mubuf {
+                var uses: [8]Use = undefined
+                const count = usesOf(&line.inst, &uses)
+                var u: u32 = 0
+                while u < count {
+                    if uses[u].write {
+                        var j: u32 = 0
+                        while j < uses[u].size {
+                            pendingV[@intCast(usize, uses[u].reg - encode.VGPR) + @intCast(usize, j)] = 1
+                            j += 1
+                        }
+                    }
+                    u += 1
+                }
+                // a store leaves no register to wait for: only the end
+                // waits for it
+                if line.inst.op.number != isa.BUFFER_STORE_DWORD.number { outVm = true }
+            }
+        }
+        at += 1
+    }
+    // the end: everything waited for, then s_endpgm
+    out(waitLine(true, true))
+    out(Line.{ .kind = LineKind.inst, .inst = encode.blank(isa.S_ENDPGM), .label = 0 })
+}
+
+// The wait states the card needs between instructions, as s_nop: a scalar
+// register written by a vector instruction, read by a buffer instruction
+// (5; the study's first row, aco_insert_NOPs.cpp); and before a branch,
+// when a register some buffer instruction reads was written so by a
+// vector instruction less than 5 states before, the rest of the 5, so
+// that every path into a label has its states. The other rows of the
+// study's table are for instructions this compiler does not emit (DPP,
+// s_setreg, m0, v_readlane, v_div_fmas, scalar stores, stores of more than
+// two registers). Works on any line list
+// of physical registers: `padHazards(input, count, output)`.
+pub fn padHazards(input: []const Line, output: []Line) -> usize {
+    var written: [128]u64 = undefined
+    var k: usize = 0
+    while k < 128 {
+        written[k] = 0
+        k += 1
+    }
+    // the scalar registers any buffer instruction of the program reads
+    var vmemReads: [128]bool = undefined
+    k = 0
+    while k < 128 {
+        vmemReads[k] = false
+        k += 1
+    }
+    var scan: usize = 0
+    while scan < input.length {
+        const line = input[scan]
+        if line.kind == LineKind.inst && (line.inst.op.format == isa.Format.mubuf || line.inst.op.format == isa.Format.mtbuf) {
+            var j: usize = 0
+            while j < 4 {
+                if @intCast(usize, line.inst.src1) + j < 128 { vmemReads[@intCast(usize, line.inst.src1) + j] = true }
+                j += 1
+            }
+            if line.inst.src2 < 128 { vmemReads[@intCast(usize, line.inst.src2)] = true }
+        }
+        scan += 1
+    }
+    var now: u64 = 100
+    var lastValuScalar: u64 = 0
+    var count: usize = 0
+    var at: usize = 0
+    while at < input.length {
+        const line = input[at]
+        var needed: u64 = 0
+        if line.kind == LineKind.inst {
+            const f = line.inst.op.format
+            if f == isa.Format.mubuf || f == isa.Format.mtbuf {
+                var j: u16 = 0
+                while j < 4 {
+                    const r = @intCast(usize, line.inst.src1 + j)
+                    if r < 128 && written[r] != 0 && now - written[r] < 5 {
+                        const gap = 5 - (now - written[r])
+                        if gap > needed { needed = gap }
+                    }
+                    j += 1
+                }
+                if line.inst.src2 < 128 {
+                    const r = @intCast(usize, line.inst.src2)
+                    if written[r] != 0 && now - written[r] < 5 {
+                        const gap = 5 - (now - written[r])
+                        if gap > needed { needed = gap }
+                    }
+                }
+            }
+        } else if line.kind == LineKind.branch {
+            if lastValuScalar != 0 && now - lastValuScalar < 5 { needed = 5 - (now - lastValuScalar) }
+        }
+        if needed > 0 && count < output.length {
+            var nop = encode.blank(isa.S_NOP)
+            nop.imm = @intCast(u32, needed - 1)
+            output[count] = Line.{ .kind = LineKind.inst, .inst = nop, .label = 0 }
+            count += 1
+            now += needed
+        }
+        if count < output.length {
+            output[count] = line
+            count += 1
+        }
+        if line.kind == LineKind.inst || line.kind == LineKind.branch {
+            const f = line.inst.op.format
+            const isValu = f == isa.Format.vop1 || f == isa.Format.vop2 || f == isa.Format.vopc || f == isa.Format.vop3
+            if isValu {
+                var uses: [8]Use = undefined
+                const n = usesOf(&line.inst, &uses)
+                var u: u32 = 0
+                while u < n {
+                    if uses[u].write && uses[u].reg < 128 {
+                        var j: u32 = 0
+                        while j < uses[u].size {
+                            const r = @intCast(usize, uses[u].reg) + @intCast(usize, j)
+                            if r < 128 {
+                                written[r] = now + 1
+                                if vmemReads[r] { lastValuScalar = now + 1 }
+                            }
+                            j += 1
+                        }
+                    }
+                    u += 1
+                }
+            }
+            if line.kind == LineKind.inst && f == isa.Format.sopp && line.inst.op.number == isa.S_NOP.number {
+                now += @intCast(u64, line.inst.imm & 0xFFFF) + 1
+            } else {
+                now += 1
+            }
+        }
+        at += 1
+    }
+    return count
+}
+
+var paddedLines: [MAX_LINES]Line = undefined
+
+// Words of the lines (labels take none), the branches' distances put in.
+pub fn assemble(input: []const Line, words: []u32) -> usize {
+    var labelAt: [MAX_LABELS]u32 = undefined
+    var k: usize = 0
+    while k < MAX_LABELS {
+        labelAt[k] = NONE
+        k += 1
+    }
+    // first the places
+    var offset: u32 = 0
+    var at: usize = 0
+    while at < input.length {
+        const line = input[at]
+        if line.kind == LineKind.label {
+            if line.label < @intCast(u32, MAX_LABELS) { labelAt[@intCast(usize, line.label)] = offset }
+        } else if line.kind == LineKind.inst || line.kind == LineKind.branch {
+            var scratch: [3]u32 = undefined
+            const n = encode.encode(&line.inst, scratch[0..])
+            if n == 0 { return 0 }
+            offset += @intCast(u32, n)
+        }
+        at += 1
+    }
+    if @intCast(usize, offset) > words.length { return 0 }
+    var count: usize = 0
+    at = 0
+    while at < input.length {
+        const line = input[at]
+        if line.kind == LineKind.inst || line.kind == LineKind.branch {
+            var i = line.inst
+            if line.kind == LineKind.branch {
+                const target = labelAt[@intCast(usize, line.label)]
+                if target == NONE { return 0 }
+                const distance = @intCast(i64, target) - @intCast(i64, count) - 1
+                if distance < -32768 || distance > 32767 { return 0 }
+                i.imm = @intCast(u32, distance & 0xFFFF)
+            }
+            const n = encode.encode(&i, words[count..])
+            if n == 0 { return 0 }
+            count += n
+        }
+        at += 1
+    }
+    return count
+}
+
+// ---------------------------------------------------------------------------
+
+// What the driver needs of a compiled shader.
+pub const Facts = struct {
+    words: usize
+    vgprs: u32
+    sgprs: u32
+    userSgprs: u32
+    groupIdX: bool
+    groupIdY: bool
+    groupIdZ: bool
+    localIdComponents: u32
+    groupSizeX: u32
+    groupSizeY: u32
+    groupSizeZ: u32
+    pushWords: u32
+    bindings: u32
+}
+
+// The program of the form read by shader_ir.read: its words into `words`.
+pub fn generate(words: []u32, facts: *Facts) -> bool {
+    failed = ir.Failure.none
+    lineCount = 0
+    labelCount = 0
+    vCount = 0
+    sCount = 0
+    var n: u32 = 0
+    while n < ir.nodeCount {
+        location[n] = 0
+        n += 1
+    }
+    // the buffers' descriptors, once
+    var b: u32 = 0
+    while b < ir.MAX_BINDINGS {
+        descriptor[b] = 0
+        if (ir.shape.bindings & (@intCast(u32, 1) << b)) != 0 {
+            const d = newS(4)
+            descriptor[b] = d
+            var i = encode.blank(isa.S_LOAD_DWORDX4)
+            i.dst = d
+            i.src0 = SET_POINTER
+            i.flags = encode.IMM
+            i.imm = 16 * b
+            put(i)
+        }
+        b += 1
+    }
+    selectList(ir.root)
+    if failed != ir.Failure.none { return false }
+    intervals()
+    if !allocate() {
+        fail(ir.Failure.registers)
+        return false
+    }
+    rewrite()
+    insertWaits()
+    if failed != ir.Failure.none { return false }
+    const padded = padHazards(finalLines[0..@intCast(usize, finalCount)], paddedLines[0..])
+    const count = assemble(paddedLines[0..padded], words)
+    if count == 0 {
+        fail(ir.Failure.programTooLarge)
+        return false
+    }
+    facts.*.words = count
+    facts.*.vgprs = highestV + 1
+    facts.*.sgprs = highestS + 1
+    facts.*.userSgprs = USER_SGPRS
+    facts.*.groupIdX = true
+    facts.*.groupIdY = true
+    facts.*.groupIdZ = true
+    facts.*.localIdComponents = 2
+    facts.*.groupSizeX = ir.shape.localSizeX
+    facts.*.groupSizeY = ir.shape.localSizeY
+    facts.*.groupSizeZ = ir.shape.localSizeZ
+    facts.*.pushWords = ir.shape.pushWords
+    facts.*.bindings = ir.shape.bindings
+    return true
+}

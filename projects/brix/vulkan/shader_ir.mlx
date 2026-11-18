@@ -1,0 +1,1155 @@
+// The shader compiler's intermediate form, and the reading of a SPIR-V
+// compute shader into it: the first two parts of the compiler the study
+// designs (its 5.4: reading and typing, the intermediate form, variables
+// to values, lowering what the card lacks).
+//
+// THE FORM (the study's decision 8.3.2): values in SSA, every value one
+// node; the control flow kept as SPIR-V structures it, a tree of lists:
+// a list holds nodes, ifs and loops in order; an if has a then-list and an
+// else-list, a loop a header list (run every time round, ending in its
+// condition), a body list and a continue list. Where control flow joins,
+// the values that differ are BLOCK PARAMETERS: an if's parameter takes
+// its then-value or its else-value, a loop's its value from before the
+// loop or from the end of the continue list (no phis). A value is a word
+// (32 bits: an integer, or a float's bits after lowering) or a boolean;
+// a boolean is a LANE MASK on the card, one bit a lane. Every value is
+// marked uniform (one value for the wave: a scalar register) or varying
+// (one a lane: a vector register) by `markUniform`.
+//
+// READING takes what std.spirv.module validated (its structure) and
+// refuses, naming the opcode, everything outside this stage: what is
+// taken is a GLCompute shader with one function, 32-bit integers and
+// booleans, function variables of words (made into values here: the card
+// has no stack), push constant words, storage buffers of words (set 0,
+// any binding), the built-ins GlobalInvocationId, LocalInvocationId and
+// WorkgroupId, the integer arithmetic, comparisons and logic of SPIR-V,
+// selections (OpSelectionMerge) and loops (OpLoopMerge) whose condition
+// is at their top and which end only there (a boolean their header makes
+// is not read after them). Division and remainder are
+// lowered as they are read (`divide`): by a constant power of two into a
+// shift or a mask, else by the sequence Mesa's nir_lower_idiv.c gives for
+// 32 bits (emit_udiv, "ported from LLVM's AMDGPUTargetLowering::
+// LowerUDIVREM", and emit_idiv for the signed ones), with the reciprocal
+// of the card's float unit.
+
+const spv = @import("std.spirv.core")
+const module = @import("std.spirv.module")
+
+pub const NONE: u32 = 0xFFFFFFFF
+pub const MAX_NODES: usize = 32768
+pub const MAX_ITEMS: usize = 32768
+pub const MAX_PARAMS: usize = 4096
+pub const MAX_IDS: usize = 65536
+pub const MAX_SLOTS: usize = 32
+pub const MAX_BINDINGS: u32 = 8
+
+pub const Kind = enum(u8) {
+    constant,
+    param,
+    localId,
+    groupId,
+    push,
+    load,
+    store,
+    add,
+    sub,
+    mul,
+    shl,
+    shr,
+    sar,
+    band,
+    bor,
+    bxor,
+    bnot,
+    smax,
+    mulhi,
+    eq,
+    ne,
+    ult,
+    ule,
+    ugt,
+    uge,
+    slt,
+    sle,
+    sgt,
+    sge,
+    land,
+    lor,
+    lnot,
+    leq,
+    lne,
+    select,
+    u2f,
+    f2u,
+    rcp,
+    fmul,
+}
+
+pub const Sort = enum(u8) {
+    word,
+    boolean,
+    none,
+}
+
+pub const Node = struct {
+    kind: Kind
+    sort: Sort
+    a: u32
+    b: u32
+    c: u32
+    imm: u32
+    uniform: bool
+    // Another value this one is (a load of a variable, a bitcast, a loop
+    // parameter that never changes): `find` follows it.
+    alias: u32
+}
+
+pub const ItemKind = enum(u8) {
+    node,
+    branch,
+    loop,
+}
+
+// An entry of a list. node: `node`. branch: `cond`, then-list `first`,
+// else-list `second`. loop: header-list `first` (ending in `cond`: go on
+// while it holds), body-list `second`, continue-list `third`. Both: the
+// parameters `params` .. `params + paramCount`.
+pub const Item = struct {
+    kind: ItemKind
+    node: u32
+    cond: u32
+    first: u32
+    second: u32
+    third: u32
+    params: u32
+    paramCount: u32
+    next: u32
+}
+
+// A block parameter: `value` (a node of kind param) takes `from0` (the
+// then-value; a loop: from before it) or `from1` (the else-value; a loop:
+// from the end of the continue list).
+pub const Param = struct {
+    value: u32
+    from0: u32
+    from1: u32
+}
+
+pub const Failure = enum(u8) {
+    none,
+    invalid,
+    notCompute,
+    tooLarge,
+    unsupported,
+    structure,
+    undefinedValue,
+    registers,
+    programTooLarge,
+    // A boolean made in a loop's header and read after the loop: a lane
+    // mask is written whole every time round, so the lanes that left the
+    // loop earlier would read what the last round made for the others.
+    loopBoolean,
+}
+
+// What the shader is, besides its code.
+pub const Shape = struct {
+    localSizeX: u32
+    localSizeY: u32
+    localSizeZ: u32
+    // The highest push constant word read, plus one.
+    pushWords: u32
+    // Bit b: binding b of set 0 is used.
+    bindings: u32
+    usesLocalY: bool
+    usesLocalZ: bool
+    usesGroup: [3]bool
+}
+
+pub var nodes: [MAX_NODES]Node = undefined
+pub var nodeCount: u32 = 0
+pub var items: [MAX_ITEMS]Item = undefined
+pub var itemCount: u32 = 0
+pub var params: [MAX_PARAMS]Param = undefined
+pub var paramCount: u32 = 0
+pub var root: u32 = NONE
+pub var shape: Shape = undefined
+
+// Why reading stopped: the failure, the SPIR-V opcode and the word where.
+pub var failure: Failure = Failure.none
+pub var failureOpcode: u32 = 0
+pub var failureOffset: usize = 0
+
+fn fail(kind: Failure, opcode: u32, offset: usize) -> bool {
+    if failure == Failure.none {
+        failure = if loopBooleanRead { Failure.loopBoolean } else { kind }
+        failureOpcode = opcode
+        failureOffset = offset
+    }
+    return false
+}
+
+pub fn find(value: u32) -> u32 {
+    var v = value
+    while v != NONE && nodes[v].alias != NONE { v = nodes[v].alias }
+    return v
+}
+
+pub fn node(kind: Kind, sort: Sort, a: u32, b: u32, c: u32, imm: u32) -> u32 {
+    if nodeCount >= @intCast(u32, MAX_NODES) {
+        _ = fail(Failure.tooLarge, 0, 0)
+        return NONE
+    }
+    nodes[nodeCount] = Node.{ .kind = kind, .sort = sort, .a = a, .b = b, .c = c, .imm = imm, .uniform = false, .alias = NONE }
+    closedHeader[nodeCount] = false
+    nodeCount += 1
+    return nodeCount - 1
+}
+
+// Constants are made once each and stand outside the lists.
+var constantSeen: [64]u32 = undefined
+var constantNodes: [64]u32 = undefined
+var constantKept: u32 = 0
+
+pub fn constant(sort: Sort, value: u32) -> u32 {
+    var k: u32 = 0
+    while k < constantKept {
+        const n = constantNodes[k]
+        if constantSeen[k] == value && nodes[n].sort == sort { return n }
+        k += 1
+    }
+    const n = node(Kind.constant, sort, NONE, NONE, NONE, value)
+    if constantKept < 64 {
+        constantSeen[constantKept] = value
+        constantNodes[constantKept] = n
+        constantKept += 1
+    }
+    return n
+}
+
+// A list being built: its first and last items.
+pub const List = struct {
+    head: u32
+    tail: u32
+}
+
+pub fn emptyList() -> List { return List.{ .head = NONE, .tail = NONE } }
+
+pub fn append(list: *List, item: Item) -> u32 {
+    if itemCount >= @intCast(u32, MAX_ITEMS) {
+        _ = fail(Failure.tooLarge, 0, 0)
+        return NONE
+    }
+    items[itemCount] = item
+    items[itemCount].next = NONE
+    if list.*.tail == NONE {
+        list.*.head = itemCount
+    } else {
+        items[list.*.tail].next = itemCount
+    }
+    list.*.tail = itemCount
+    itemCount += 1
+    return itemCount - 1
+}
+
+fn blankItem(kind: ItemKind) -> Item {
+    return Item.{ .kind = kind, .node = NONE, .cond = NONE, .first = NONE, .second = NONE, .third = NONE, .params = 0, .paramCount = 0, .next = NONE }
+}
+
+// A node in the list: its value.
+pub fn emit(list: *List, kind: Kind, sort: Sort, a: u32, b: u32, c: u32, imm: u32) -> u32 {
+    const n = node(kind, sort, a, b, c, imm)
+    if n == NONE { return NONE }
+    var item = blankItem(ItemKind.node)
+    item.node = n
+    _ = append(list, item)
+    return n
+}
+
+fn word2(list: *List, kind: Kind, a: u32, b: u32) -> u32 { return emit(list, kind, Sort.word, a, b, NONE, 0) }
+fn bool2(list: *List, kind: Kind, a: u32, b: u32) -> u32 { return emit(list, kind, Sort.boolean, a, b, NONE, 0) }
+
+// ---------------------------------------------------------------------------
+// Division (nir_lower_idiv.c)
+
+fn isPowerOfTwo(value: u32) -> bool { return value != 0 && (value & (value - 1)) == 0 }
+
+fn log2(value: u32) -> u32 {
+    var k: u32 = 0
+    while (@intCast(u32, 1) << k) != value { k += 1 }
+    return k
+}
+
+// emit_udiv: the quotient, or with `modulo` the remainder, of n / d.
+fn udivide(list: *List, n: u32, d: u32, modulo: bool) -> u32 {
+    const dn = find(d)
+    if nodes[dn].kind == Kind.constant && isPowerOfTwo(nodes[dn].imm) {
+        if modulo { return word2(list, Kind.band, n, constant(Sort.word, nodes[dn].imm - 1)) }
+        return word2(list, Kind.shr, n, constant(Sort.word, log2(nodes[dn].imm)))
+    }
+    const scale: f32 = 4294966784.0
+    // rcp = f2u32(frcp(u2f32(d)) * 4294966784.0)
+    const real = emit(list, Kind.u2f, Sort.word, d, NONE, NONE, 0)
+    const inverse = emit(list, Kind.rcp, Sort.word, real, NONE, NONE, 0)
+    const scaled = word2(list, Kind.fmul, inverse, constant(Sort.word, @bitCast(u32, scale)))
+    const first = emit(list, Kind.f2u, Sort.word, scaled, NONE, NONE, 0)
+    // rcp = rcp + umul_high(rcp, rcp * (0 - d))
+    const negative = word2(list, Kind.sub, constant(Sort.word, 0), d)
+    const product = word2(list, Kind.mul, first, negative)
+    const correction = word2(list, Kind.mulhi, first, product)
+    const reciprocal = word2(list, Kind.add, first, correction)
+    // q = umul_high(n, rcp); r = n - q * d
+    const quotient = word2(list, Kind.mulhi, n, reciprocal)
+    const remainder = word2(list, Kind.sub, n, word2(list, Kind.mul, quotient, d))
+    // first refinement
+    const ge = bool2(list, Kind.uge, remainder, d)
+    const one = constant(Sort.word, 1)
+    var q1 = quotient
+    if !modulo { q1 = emit(list, Kind.select, Sort.word, ge, word2(list, Kind.add, quotient, one), quotient, 0) }
+    const r1 = emit(list, Kind.select, Sort.word, ge, word2(list, Kind.sub, remainder, d), remainder, 0)
+    // second refinement
+    const ge2 = bool2(list, Kind.uge, r1, d)
+    if modulo { return emit(list, Kind.select, Sort.word, ge2, word2(list, Kind.sub, r1, d), r1, 0) }
+    return emit(list, Kind.select, Sort.word, ge2, word2(list, Kind.add, q1, one), q1, 0)
+}
+
+// iabs as ACO selects it: v_max_i32(src, 0 - src).
+fn absolute(list: *List, value: u32) -> u32 {
+    return word2(list, Kind.smax, value, word2(list, Kind.sub, constant(Sort.word, 0), value))
+}
+
+// emit_idiv for idiv and irem (SPIR-V's SDiv and SRem: the remainder's
+// sign is the dividend's).
+fn sdivide(list: *List, n: u32, d: u32, remainder: bool) -> u32 {
+    const lhs = absolute(list, n)
+    const rhs = absolute(list, d)
+    const zero = constant(Sort.word, 0)
+    if !remainder {
+        const sign = bool2(list, Kind.slt, word2(list, Kind.bxor, n, d), zero)
+        const result = udivide(list, lhs, rhs, false)
+        return emit(list, Kind.select, Sort.word, sign, word2(list, Kind.sub, zero, result), result, 0)
+    }
+    const sign = bool2(list, Kind.slt, n, zero)
+    const result = udivide(list, lhs, rhs, true)
+    return emit(list, Kind.select, Sort.word, sign, word2(list, Kind.sub, zero, result), result, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Reading SPIR-V
+
+// What an id is.
+const IdKind = enum(u8) {
+    nothing,
+    typeVoid,
+    typeBool,
+    typeInt,
+    typeFloat,
+    typeVector,
+    typePointer,
+    typeStruct,
+    typeArray,
+    typeFunction,
+    value,
+    variable,
+    pointer,
+    builtin,
+    label,
+    function,
+    other,
+}
+
+// For each id: its kind and three words (a type's parts; a value's node; a
+// variable's storage class, its slot or binding; a pointer's target; a
+// label's word offset).
+var idKind: [MAX_IDS]IdKind = undefined
+var idA: [MAX_IDS]u32 = undefined
+var idB: [MAX_IDS]u32 = undefined
+var idC: [MAX_IDS]u32 = undefined
+var decoBinding: [MAX_IDS]u32 = undefined
+var decoSet: [MAX_IDS]u32 = undefined
+var decoBuiltin: [MAX_IDS]u32 = undefined
+var bound: u32 = 0
+var spirv: []const u32 = undefined
+
+// Push constant member offsets: (struct id, member) -> byte offset.
+var memberStruct: [64]u32 = undefined
+var memberIndex: [64]u32 = undefined
+var memberOffset: [64]u32 = undefined
+var memberCount: u32 = 0
+
+// The function's variables' current values.
+var env: [MAX_SLOTS]u32 = undefined
+var slotCount: u32 = 0
+
+// Pointer targets (idA of a pointer id).
+const TARGET_SLOT: u32 = 1
+const TARGET_PUSH: u32 = 2
+const TARGET_BUFFER: u32 = 3
+const TARGET_BUILTIN: u32 = 4
+
+const STORAGE_FUNCTION: u32 = 7
+const STORAGE_INPUT: u32 = 1
+const STORAGE_PUSH: u32 = 9
+const STORAGE_BUFFER: u32 = 12
+const STORAGE_UNIFORM: u32 = 2
+
+fn op(value: spv.Op) -> u32 { return @intCast(u32, @intFromEnum(value)) }
+
+fn opcodeAt(at: usize) -> u32 { return spirv[at] & 0xFFFF }
+fn countAt(at: usize) -> usize { return @intCast(usize, spirv[at] >> 16) }
+
+fn idOk(id: u32) -> bool { return id != 0 && id < bound }
+
+// The booleans made in the header of a loop that has ended: reading one
+// is refused (Failure.loopBoolean), and `loopBooleanRead` says so to `fail`.
+var closedHeader: [MAX_NODES]bool = undefined
+var loopBooleanRead = false
+
+fn valueOf(id: u32) -> u32 {
+    if !idOk(id) || idKind[id] != IdKind.value { return NONE }
+    const value = find(idA[id])
+    if value != NONE && closedHeader[value] {
+        loopBooleanRead = true
+        return NONE
+    }
+    return value
+}
+
+fn typeOf(typeId: u32) -> Sort {
+    if !idOk(typeId) { return Sort.none }
+    if idKind[typeId] == IdKind.typeBool { return Sort.boolean }
+    if idKind[typeId] == IdKind.typeInt && idA[typeId] == 32 { return Sort.word }
+    return Sort.none
+}
+
+fn setValue(id: u32, value: u32) -> void {
+    idKind[id] = IdKind.value
+    idA[id] = value
+}
+
+fn pushOffset(structId: u32, member: u32) -> u32 {
+    var k: u32 = 0
+    while k < memberCount {
+        if memberStruct[k] == structId && memberIndex[k] == member { return memberOffset[k] }
+        k += 1
+    }
+    return NONE
+}
+
+// The declarations before the function: types, constants, variables,
+// decorations, the execution mode.
+fn declarations() -> bool {
+    var at: usize = 5
+    var entries: u32 = 0
+    var compute = false
+    while at < spirv.length {
+        const opcode = opcodeAt(at)
+        const count = countAt(at)
+        const w = spirv[at..at + count]
+        if opcode == op(spv.Op.function) { return entries == 1 && compute || fail(Failure.notCompute, opcode, at) }
+        if opcode == op(spv.Op.entryPoint) {
+            entries += 1
+            compute = w[1] == @intCast(u32, @intFromEnum(spv.ExecutionModel.glCompute))
+        } else if opcode == op(spv.Op.executionMode) {
+            if w[2] == @intCast(u32, @intFromEnum(spv.ExecutionMode.localSize)) && count >= 6 {
+                shape.localSizeX = w[3]
+                shape.localSizeY = w[4]
+                shape.localSizeZ = w[5]
+            }
+        } else if opcode == op(spv.Op.decorate) {
+            const target = w[1]
+            if idOk(target) {
+                const decoration = w[2]
+                if decoration == @intCast(u32, @intFromEnum(spv.Decoration.binding)) && count >= 4 { decoBinding[target] = w[3] }
+                if decoration == @intCast(u32, @intFromEnum(spv.Decoration.descriptorSet)) && count >= 4 { decoSet[target] = w[3] }
+                if decoration == @intCast(u32, @intFromEnum(spv.Decoration.builtIn)) && count >= 4 { decoBuiltin[target] = w[3] }
+            }
+        } else if opcode == op(spv.Op.memberDecorate) {
+            if w[3] == @intCast(u32, @intFromEnum(spv.Decoration.offset)) && count >= 5 && memberCount < 64 {
+                memberStruct[memberCount] = w[1]
+                memberIndex[memberCount] = w[2]
+                memberOffset[memberCount] = w[4]
+                memberCount += 1
+            }
+        } else if opcode == op(spv.Op.typeVoid) {
+            idKind[w[1]] = IdKind.typeVoid
+        } else if opcode == op(spv.Op.typeBool) {
+            idKind[w[1]] = IdKind.typeBool
+        } else if opcode == op(spv.Op.typeInt) {
+            idKind[w[1]] = IdKind.typeInt
+            idA[w[1]] = w[2]
+            idB[w[1]] = w[3]
+        } else if opcode == op(spv.Op.typeFloat) {
+            idKind[w[1]] = IdKind.typeFloat
+            idA[w[1]] = w[2]
+        } else if opcode == op(spv.Op.typeVector) {
+            idKind[w[1]] = IdKind.typeVector
+            idA[w[1]] = w[2]
+            idB[w[1]] = w[3]
+        } else if opcode == op(spv.Op.typePointer) {
+            idKind[w[1]] = IdKind.typePointer
+            idA[w[1]] = w[2]
+            idB[w[1]] = w[3]
+        } else if opcode == op(spv.Op.typeStruct) {
+            idKind[w[1]] = IdKind.typeStruct
+            idA[w[1]] = @intCast(u32, count - 2)
+            if count > 2 { idB[w[1]] = w[2] }
+        } else if opcode == op(spv.Op.typeRuntimeArray) || opcode == op(spv.Op.typeArray) {
+            idKind[w[1]] = IdKind.typeArray
+            idA[w[1]] = w[2]
+        } else if opcode == op(spv.Op.typeFunction) {
+            idKind[w[1]] = IdKind.typeFunction
+        } else if opcode == op(spv.Op.constant) {
+            const t = typeOf(w[1])
+            if t != Sort.word { return fail(Failure.unsupported, opcode, at) }
+            setValue(w[2], constant(Sort.word, w[3]))
+        } else if opcode == op(spv.Op.constantTrue) || opcode == op(spv.Op.constantFalse) {
+            setValue(w[2], constant(Sort.boolean, if opcode == op(spv.Op.constantTrue) { 1 } else { 0 }))
+        } else if opcode == op(spv.Op.variable) {
+            if !idOk(w[1]) || idKind[w[1]] != IdKind.typePointer { return fail(Failure.invalid, opcode, at) }
+            const storage = w[3]
+            const id = w[2]
+            idKind[id] = IdKind.variable
+            idA[id] = storage
+            idB[id] = idB[w[1]]
+            if storage == STORAGE_BUFFER || storage == STORAGE_UNIFORM {
+                if decoSet[id] != 0 || decoBinding[id] >= MAX_BINDINGS { return fail(Failure.unsupported, opcode, at) }
+                if storage == STORAGE_UNIFORM { return fail(Failure.unsupported, opcode, at) }
+            } else if storage == STORAGE_INPUT {
+                const b = decoBuiltin[id]
+                if b != 28 && b != 27 && b != 26 { return fail(Failure.unsupported, opcode, at) }
+            } else if storage != STORAGE_PUSH {
+                return fail(Failure.unsupported, opcode, at)
+            }
+        } else if opcode == op(spv.Op.capability) || opcode == op(spv.Op.memoryModel) || opcode == op(spv.Op.name) || opcode == op(spv.Op.memberName) || opcode == op(spv.Op.source) || opcode == op(spv.Op.sourceExtension) || opcode == op(spv.Op.extension) || opcode == op(spv.Op.string) || opcode == op(spv.Op.moduleProcessed) || opcode == op(spv.Op.line) || opcode == op(spv.Op.noLine) {
+            // nothing to take
+        } else if opcode == op(spv.Op.extInstImport) {
+            idKind[w[1]] = IdKind.other
+        } else {
+            return fail(Failure.unsupported, opcode, at)
+        }
+        at += count
+    }
+    return fail(Failure.invalid, 0, at)
+}
+
+// The word offset of every label of the function, and its variables.
+fn labels(start: usize, entry: *u32) -> bool {
+    var at = start
+    entry.* = NONE
+    while at < spirv.length {
+        const opcode = opcodeAt(at)
+        const count = countAt(at)
+        if opcode == op(spv.Op.label) {
+            idKind[spirv[at + 1]] = IdKind.label
+            idA[spirv[at + 1]] = @intCast(u32, at)
+            if entry.* == NONE { entry.* = spirv[at + 1] }
+        } else if opcode == op(spv.Op.functionEnd) {
+            at += count
+            if at < spirv.length { return fail(Failure.unsupported, opcodeAt(at), at) }
+            return entry.* != NONE
+        } else if opcode == op(spv.Op.functionParameter) || opcode == op(spv.Op.phi) {
+            return fail(Failure.unsupported, opcode, at)
+        }
+        at += count
+    }
+    return fail(Failure.invalid, 0, at)
+}
+
+// The terminator of the block at label `label`, and the merge instruction
+// before it if there is one.
+const Block = struct {
+    first: usize
+    end: usize
+    merge: usize
+    terminator: usize
+}
+
+fn blockOf(label: u32, block: *Block) -> bool {
+    if !idOk(label) || idKind[label] != IdKind.label { return fail(Failure.structure, 0, 0) }
+    var at = @intCast(usize, idA[label])
+    at += countAt(at)
+    block.*.first = at
+    block.*.merge = 0
+    while at < spirv.length {
+        const opcode = opcodeAt(at)
+        if opcode == op(spv.Op.selectionMerge) || opcode == op(spv.Op.loopMerge) {
+            block.*.merge = at
+        } else if opcode == op(spv.Op.branch) || opcode == op(spv.Op.branchConditional) || opcode == op(spv.Op.return_) || opcode == op(spv.Op.returnValue) || opcode == op(spv.Op.switch) || opcode == op(spv.Op.kill) || opcode == op(spv.Op.unreachable) {
+            block.*.terminator = at
+            if block.*.merge == 0 { block.*.end = at } else { block.*.end = block.*.merge }
+            return true
+        }
+        at += countAt(at)
+    }
+    return fail(Failure.structure, 0, at)
+}
+
+// The instructions of a block that are not its merge and terminator.
+fn translateBody(block: *const Block, list: *List) -> bool {
+    var at = block.*.first
+    while at < block.*.end {
+        if !translate(at, list) { return false }
+        at += countAt(at)
+    }
+    return true
+}
+
+fn translate(at: usize, list: *List) -> bool {
+    const opcode = opcodeAt(at)
+    const count = countAt(at)
+    const w = spirv[at..at + count]
+    if opcode == op(spv.Op.variable) {
+        if w[3] != STORAGE_FUNCTION || slotCount >= @intCast(u32, MAX_SLOTS) || count > 4 { return fail(Failure.unsupported, opcode, at) }
+        if typeOf(idB[w[1]]) != Sort.word { return fail(Failure.unsupported, opcode, at) }
+        idKind[w[2]] = IdKind.pointer
+        idA[w[2]] = TARGET_SLOT
+        idB[w[2]] = slotCount
+        env[slotCount] = NONE
+        slotCount += 1
+        return true
+    }
+    if opcode == op(spv.Op.accessChain) || opcode == op(spv.Op.inBoundsAccessChain) {
+        return accessChain(w, at, list)
+    }
+    if opcode == op(spv.Op.load) {
+        const pointer = w[3]
+        if !idOk(pointer) { return fail(Failure.invalid, opcode, at) }
+        if idKind[pointer] == IdKind.variable && idA[pointer] == STORAGE_INPUT {
+            // a built-in vector: its components are read by
+            // OpCompositeExtract
+            idKind[w[2]] = IdKind.builtin
+            idA[w[2]] = decoBuiltin[pointer]
+            return true
+        }
+        if idKind[pointer] != IdKind.pointer { return fail(Failure.unsupported, opcode, at) }
+        const target = idA[pointer]
+        if target == TARGET_SLOT {
+            const value = env[idB[pointer]]
+            if value == NONE { return fail(Failure.undefinedValue, opcode, at) }
+            setValue(w[2], value)
+            return true
+        }
+        if target == TARGET_PUSH {
+            const word = idB[pointer]
+            if word + 1 > shape.pushWords { shape.pushWords = word + 1 }
+            setValue(w[2], emit(list, Kind.push, Sort.word, NONE, NONE, NONE, word))
+            return true
+        }
+        if target == TARGET_BUFFER {
+            setValue(w[2], emit(list, Kind.load, Sort.word, idC[pointer], NONE, NONE, idB[pointer]))
+            return true
+        }
+        if target == TARGET_BUILTIN {
+            setValue(w[2], builtin(list, idB[pointer], idC[pointer]))
+            return true
+        }
+        return fail(Failure.unsupported, opcode, at)
+    }
+    if opcode == op(spv.Op.store) {
+        const pointer = w[1]
+        const value = valueOf(w[2])
+        if value == NONE { return fail(Failure.undefinedValue, opcode, at) }
+        if !idOk(pointer) || idKind[pointer] != IdKind.pointer { return fail(Failure.unsupported, opcode, at) }
+        if idA[pointer] == TARGET_SLOT {
+            env[idB[pointer]] = value
+            return true
+        }
+        if idA[pointer] == TARGET_BUFFER {
+            if nodes[value].sort != Sort.word { return fail(Failure.unsupported, opcode, at) }
+            _ = emit(list, Kind.store, Sort.none, idC[pointer], value, NONE, idB[pointer])
+            return true
+        }
+        return fail(Failure.unsupported, opcode, at)
+    }
+    if opcode == op(spv.Op.compositeExtract) {
+        const composite = w[3]
+        if count != 5 || !idOk(composite) || idKind[composite] != IdKind.builtin || w[4] > 2 { return fail(Failure.unsupported, opcode, at) }
+        setValue(w[2], builtin(list, idA[composite], w[4]))
+        return true
+    }
+    if opcode == op(spv.Op.bitcast) || opcode == op(spv.Op.copyObject) {
+        const value = valueOf(w[3])
+        if value == NONE || typeOf(w[1]) != nodes[value].sort { return fail(Failure.unsupported, opcode, at) }
+        setValue(w[2], value)
+        return true
+    }
+    // Everything else makes one value of its result sort from values.
+    const sort = typeOf(w[1])
+    if sort == Sort.none || count < 4 { return fail(Failure.unsupported, opcode, at) }
+    const a = valueOf(w[3])
+    var b = NONE
+    var c = NONE
+    if count >= 5 { b = valueOf(w[4]) }
+    if count >= 6 { c = valueOf(w[5]) }
+    if a == NONE { return fail(Failure.undefinedValue, opcode, at) }
+    var result = NONE
+    if opcode == op(spv.Op.not) && sort == Sort.word {
+        result = emit(list, Kind.bnot, Sort.word, a, NONE, NONE, 0)
+    } else if opcode == op(spv.Op.logicalNot) && sort == Sort.boolean {
+        result = emit(list, Kind.lnot, Sort.boolean, a, NONE, NONE, 0)
+    } else if opcode == op(spv.Op.sNegate) && sort == Sort.word {
+        result = word2(list, Kind.sub, constant(Sort.word, 0), a)
+    } else if opcode == op(spv.Op.select) {
+        if b == NONE || c == NONE || nodes[a].sort != Sort.boolean || nodes[b].sort != sort || nodes[c].sort != sort { return fail(Failure.unsupported, opcode, at) }
+        result = emit(list, Kind.select, sort, a, b, c, 0)
+    } else {
+        if b == NONE || count != 5 { return fail(Failure.undefinedValue, opcode, at) }
+        const operands = nodes[a].sort
+        if operands != nodes[b].sort { return fail(Failure.unsupported, opcode, at) }
+        if operands == Sort.word && sort == Sort.word {
+            if opcode == op(spv.Op.uDiv) {
+                result = udivide(list, a, b, false)
+            } else if opcode == op(spv.Op.uMod) {
+                result = udivide(list, a, b, true)
+            } else if opcode == op(spv.Op.sDiv) {
+                result = sdivide(list, a, b, false)
+            } else if opcode == op(spv.Op.sRem) {
+                result = sdivide(list, a, b, true)
+            } else {
+                const kind = wordKind(opcode)
+                if kind != null { result = word2(list, kind.?, a, b) }
+            }
+        } else if operands == Sort.word && sort == Sort.boolean {
+            const kind = compareKind(opcode)
+            if kind != null { result = bool2(list, kind.?, a, b) }
+        } else if operands == Sort.boolean && sort == Sort.boolean {
+            const kind = logicKind(opcode)
+            if kind != null { result = bool2(list, kind.?, a, b) }
+        }
+    }
+    if result == NONE { return fail(Failure.unsupported, opcode, at) }
+    setValue(w[2], result)
+    return true
+}
+
+// The node of a SPIR-V operation of two words that gives a word.
+fn wordKind(opcode: u32) -> ?Kind {
+    if opcode == op(spv.Op.iAdd) { return Kind.add }
+    if opcode == op(spv.Op.iSub) { return Kind.sub }
+    if opcode == op(spv.Op.iMul) { return Kind.mul }
+    if opcode == op(spv.Op.shiftLeftLogical) { return Kind.shl }
+    if opcode == op(spv.Op.shiftRightLogical) { return Kind.shr }
+    if opcode == op(spv.Op.shiftRightArithmetic) { return Kind.sar }
+    if opcode == op(spv.Op.bitwiseAnd) { return Kind.band }
+    if opcode == op(spv.Op.bitwiseOr) { return Kind.bor }
+    if opcode == op(spv.Op.bitwiseXor) { return Kind.bxor }
+    return null
+}
+
+// ... of two words that gives a boolean.
+fn compareKind(opcode: u32) -> ?Kind {
+    if opcode == op(spv.Op.iEqual) { return Kind.eq }
+    if opcode == op(spv.Op.iNotEqual) { return Kind.ne }
+    if opcode == op(spv.Op.uLessThan) { return Kind.ult }
+    if opcode == op(spv.Op.uLessThanEqual) { return Kind.ule }
+    if opcode == op(spv.Op.uGreaterThan) { return Kind.ugt }
+    if opcode == op(spv.Op.uGreaterThanEqual) { return Kind.uge }
+    if opcode == op(spv.Op.sLessThan) { return Kind.slt }
+    if opcode == op(spv.Op.sLessThanEqual) { return Kind.sle }
+    if opcode == op(spv.Op.sGreaterThan) { return Kind.sgt }
+    if opcode == op(spv.Op.sGreaterThanEqual) { return Kind.sge }
+    return null
+}
+
+// ... of two booleans.
+fn logicKind(opcode: u32) -> ?Kind {
+    if opcode == op(spv.Op.logicalAnd) { return Kind.land }
+    if opcode == op(spv.Op.logicalOr) { return Kind.lor }
+    if opcode == op(spv.Op.logicalEqual) { return Kind.leq }
+    if opcode == op(spv.Op.logicalNotEqual) { return Kind.lne }
+    return null
+}
+
+// A built-in's component k: the invocation's id in its group, the group's
+// id, or the global id (group * size + local: the card gives the two
+// parts, Mesa's radv_shader.c adds them).
+fn builtin(list: *List, which: u32, k: u32) -> u32 {
+    if k == 1 { shape.usesLocalY = true }
+    if k == 2 { shape.usesLocalZ = true }
+    if which == 27 { return emit(list, Kind.localId, Sort.word, NONE, NONE, NONE, k) }
+    shape.usesGroup[k] = true
+    const group = emit(list, Kind.groupId, Sort.word, NONE, NONE, NONE, k)
+    if which == 26 { return group }
+    var size = shape.localSizeX
+    if k == 1 { size = shape.localSizeY }
+    if k == 2 { size = shape.localSizeZ }
+    const local = emit(list, Kind.localId, Sort.word, NONE, NONE, NONE, k)
+    return word2(list, Kind.add, word2(list, Kind.mul, group, constant(Sort.word, size)), local)
+}
+
+fn accessChain(w: []const u32, at: usize, list: *List) -> bool {
+    const opcode = w[0] & 0xFFFF
+    const base = w[3]
+    const id = w[2]
+    if !idOk(base) { return fail(Failure.invalid, opcode, at) }
+    _ = list
+    if idKind[base] == IdKind.variable && idA[base] == STORAGE_PUSH {
+        // one index, a constant member of the push block
+        if w.length != 5 { return fail(Failure.unsupported, opcode, at) }
+        const member = valueOf(w[4])
+        if member == NONE || nodes[member].kind != Kind.constant { return fail(Failure.unsupported, opcode, at) }
+        const offset = pushOffset(idB[base], nodes[member].imm)
+        if offset == NONE || (offset & 3) != 0 { return fail(Failure.unsupported, opcode, at) }
+        idKind[id] = IdKind.pointer
+        idA[id] = TARGET_PUSH
+        idB[id] = offset / 4
+        return true
+    }
+    if idKind[base] == IdKind.variable && idA[base] == STORAGE_BUFFER {
+        // member 0 (the array of words), then the word's index
+        if w.length != 6 { return fail(Failure.unsupported, opcode, at) }
+        const member = valueOf(w[4])
+        const index = valueOf(w[5])
+        if member == NONE || nodes[member].kind != Kind.constant || nodes[member].imm != 0 || index == NONE || nodes[index].sort != Sort.word { return fail(Failure.unsupported, opcode, at) }
+        idKind[id] = IdKind.pointer
+        idA[id] = TARGET_BUFFER
+        idB[id] = decoBinding[base]
+        idC[id] = index
+        shape.bindings |= @intCast(u32, 1) << decoBinding[base]
+        return true
+    }
+    if idKind[base] == IdKind.variable && idA[base] == STORAGE_INPUT {
+        if w.length != 5 { return fail(Failure.unsupported, opcode, at) }
+        const component = valueOf(w[4])
+        if component == NONE || nodes[component].kind != Kind.constant || nodes[component].imm > 2 { return fail(Failure.unsupported, opcode, at) }
+        idKind[id] = IdKind.pointer
+        idA[id] = TARGET_BUILTIN
+        idB[id] = decoBuiltin[base]
+        idC[id] = nodes[component].imm
+        return true
+    }
+    return fail(Failure.unsupported, opcode, at)
+}
+
+// ---------------------------------------------------------------------------
+// The structured walk
+
+const Reached = enum(u8) {
+    stop,
+    returned,
+    failed,
+}
+
+// Translates blocks from `start` on into `list` until the block `stop` is
+// reached (or the function returns).
+fn walk(start: u32, stop: u32, list: *List) -> Reached {
+    var label = start
+    var steps: u32 = 0
+    while true {
+        if label == stop { return Reached.stop }
+        steps += 1
+        if steps > 100000 {
+            _ = fail(Failure.structure, 0, 0)
+            return Reached.failed
+        }
+        var block: Block = undefined
+        if !blockOf(label, &block) { return Reached.failed }
+        if block.merge != 0 && opcodeAt(block.merge) == op(spv.Op.loopMerge) {
+            if !loop(label, &block, list) { return Reached.failed }
+            label = spirv[block.merge + 1]
+            continue
+        }
+        if !translateBody(&block, list) { return Reached.failed }
+        const t = block.terminator
+        const opcode = opcodeAt(t)
+        if opcode == op(spv.Op.return_) { return Reached.returned }
+        if opcode == op(spv.Op.branch) {
+            if block.merge != 0 {
+                _ = fail(Failure.structure, opcode, t)
+                return Reached.failed
+            }
+            label = spirv[t + 1]
+            continue
+        }
+        if opcode == op(spv.Op.branchConditional) && block.merge != 0 && opcodeAt(block.merge) == op(spv.Op.selectionMerge) {
+            const merge = spirv[block.merge + 1]
+            if !selection(spirv[t + 1], spirv[t + 2], spirv[t + 3], merge, list, t) { return Reached.failed }
+            label = merge
+            continue
+        }
+        _ = fail(Failure.structure, opcode, t)
+        return Reached.failed
+    }
+}
+
+fn copyEnv(into: *[MAX_SLOTS]u32) -> void {
+    var s: usize = 0
+    while s < MAX_SLOTS {
+        into.*[s] = env[s]
+        s += 1
+    }
+}
+
+fn selection(condId: u32, thenLabel: u32, elseLabel: u32, merge: u32, list: *List, at: usize) -> bool {
+    const cond = valueOf(condId)
+    if cond == NONE || nodes[cond].sort != Sort.boolean { return fail(Failure.undefinedValue, op(spv.Op.branchConditional), at) }
+    var saved: [MAX_SLOTS]u32 = undefined
+    copyEnv(&saved)
+    var thenList = emptyList()
+    if walk(thenLabel, merge, &thenList) != Reached.stop { return fail(Failure.structure, op(spv.Op.branchConditional), at) }
+    var thenEnv: [MAX_SLOTS]u32 = undefined
+    copyEnv(&thenEnv)
+    var s: usize = 0
+    while s < MAX_SLOTS {
+        env[s] = saved[s]
+        s += 1
+    }
+    var elseList = emptyList()
+    if walk(elseLabel, merge, &elseList) != Reached.stop { return fail(Failure.structure, op(spv.Op.branchConditional), at) }
+    var item = blankItem(ItemKind.branch)
+    item.cond = cond
+    item.first = thenList.head
+    item.second = elseList.head
+    item.params = paramCount
+    s = 0
+    while s < @intCast(usize, slotCount) {
+        var fromThen = find(thenEnv[s])
+        var fromElse = find(env[s])
+        if fromThen != fromElse {
+            // A side on which the variable was never written gives 0 (it
+            // is undefined there: any value will do, but it must be one
+            // that exists in those lanes).
+            if fromThen == NONE { fromThen = constant(Sort.word, 0) }
+            if fromElse == NONE { fromElse = constant(Sort.word, 0) }
+            if paramCount >= @intCast(u32, MAX_PARAMS) { return fail(Failure.tooLarge, 0, at) }
+            const p = node(Kind.param, Sort.word, NONE, NONE, NONE, 0)
+            if p == NONE { return false }
+            params[paramCount] = Param.{ .value = p, .from0 = fromThen, .from1 = fromElse }
+            paramCount += 1
+            env[s] = p
+        }
+        s += 1
+    }
+    item.paramCount = paramCount - item.params
+    _ = append(list, item)
+    return failure == Failure.none
+}
+
+fn loop(header: u32, block: *const Block, list: *List) -> bool {
+    const merge = spirv[block.*.merge + 1]
+    const continueLabel = spirv[block.*.merge + 2]
+    const at = block.*.merge
+    var item = blankItem(ItemKind.loop)
+    item.params = paramCount
+    // A parameter for every variable; those the loop does not change are
+    // taken out afterwards.
+    var s: usize = 0
+    while s < @intCast(usize, slotCount) {
+        if paramCount >= @intCast(u32, MAX_PARAMS) { return fail(Failure.tooLarge, 0, at) }
+        const p = node(Kind.param, Sort.word, NONE, NONE, NONE, 0)
+        if p == NONE { return false }
+        var init = find(env[s])
+        if init == NONE { init = constant(Sort.word, 0) }
+        params[paramCount] = Param.{ .value = p, .from0 = init, .from1 = NONE }
+        paramCount += 1
+        env[s] = p
+        s += 1
+    }
+    item.paramCount = paramCount - item.params
+    // The header list: the header block's own instructions and the blocks
+    // it goes on to, up to the conditional branch that leaves the loop.
+    var headerList = emptyList()
+    var current = block.*
+    var label = header
+    var condValue = NONE
+    var bodyLabel = NONE
+    var steps: u32 = 0
+    const headerFirst = nodeCount
+    while true {
+        steps += 1
+        if steps > 1000 { return fail(Failure.structure, 0, at) }
+        if !translateBody(&current, &headerList) { return false }
+        const t = current.terminator
+        const opcode = opcodeAt(t)
+        if opcode == op(spv.Op.branchConditional) {
+            if label != header && current.merge != 0 { return fail(Failure.structure, opcode, t) }
+            const c = valueOf(spirv[t + 1])
+            if c == NONE || nodes[c].sort != Sort.boolean { return fail(Failure.undefinedValue, opcode, t) }
+            if spirv[t + 3] == merge {
+                condValue = c
+                bodyLabel = spirv[t + 2]
+            } else if spirv[t + 2] == merge {
+                condValue = emit(&headerList, Kind.lnot, Sort.boolean, c, NONE, NONE, 0)
+                bodyLabel = spirv[t + 3]
+            } else {
+                return fail(Failure.structure, opcode, t)
+            }
+            break
+        }
+        if opcode != op(spv.Op.branch) || (label != header && current.merge != 0) { return fail(Failure.structure, opcode, t) }
+        label = spirv[t + 1]
+        if label == merge || label == continueLabel { return fail(Failure.structure, opcode, t) }
+        if !blockOf(label, &current) { return false }
+    }
+    const headerEnd = nodeCount
+    var afterHeader: [MAX_SLOTS]u32 = undefined
+    copyEnv(&afterHeader)
+    var bodyList = emptyList()
+    if walk(bodyLabel, continueLabel, &bodyList) != Reached.stop { return fail(Failure.structure, op(spv.Op.loopMerge), at) }
+    var continueList = emptyList()
+    if continueLabel != header {
+        if walk(continueLabel, header, &continueList) != Reached.stop { return fail(Failure.structure, op(spv.Op.loopMerge), at) }
+    }
+    // (only the loop's own parameters: those of the ifs inside it come
+    // after them)
+    const end = item.params + item.paramCount
+    var k = item.params
+    s = 0
+    while k < end {
+        params[k].from1 = find(env[s])
+        k += 1
+        s += 1
+    }
+    // A parameter that comes back as itself is its value from before.
+    k = item.params
+    while k < end {
+        if params[k].from1 == params[k].value {
+            nodes[params[k].value].alias = params[k].from0
+        }
+        k += 1
+    }
+    s = 0
+    while s < MAX_SLOTS {
+        env[s] = find(afterHeader[s])
+        s += 1
+    }
+    // The header's booleans are not to be read after the loop (the words
+    // are: a lane that leaves keeps its value in its vector register).
+    var h = headerFirst
+    while h < headerEnd {
+        if nodes[h].sort == Sort.boolean && nodes[h].kind != Kind.constant { closedHeader[h] = true }
+        h += 1
+    }
+    item.cond = condValue
+    item.first = headerList.head
+    item.second = bodyList.head
+    item.third = continueList.head
+    _ = append(list, item)
+    return failure == Failure.none
+}
+
+// ---------------------------------------------------------------------------
+// Uniform and varying
+
+// The values a lane has of its own are varying: the local id, what a
+// buffer gives (every load is taken as varying, uniform address or not:
+// safe, and only slower), what is computed from a varying value, a
+// parameter where control flow on a varying condition joins, and what the
+// card computes only in its vector unit (the float steps of a division,
+// umul_high and max, which have no scalar instruction on GFX8).
+fn varyingByKind(kind: Kind) -> bool {
+    return kind == Kind.localId || kind == Kind.load || kind == Kind.mulhi || kind == Kind.smax || kind == Kind.u2f || kind == Kind.f2u || kind == Kind.rcp || kind == Kind.fmul
+}
+
+var changed = false
+
+fn uniformOf(value: u32) -> bool {
+    if value == NONE { return true }
+    return nodes[find(value)].uniform
+}
+
+fn setVarying(value: u32) -> void {
+    if nodes[value].uniform {
+        nodes[value].uniform = false
+        changed = true
+    }
+}
+
+fn markList(head: u32, varyingContext: bool) -> void {
+    var at = head
+    while at != NONE {
+        const item = items[at]
+        if item.kind == ItemKind.node {
+            const n = item.node
+            const k = nodes[n].kind
+            if varyingByKind(k) || !uniformOf(nodes[n].a) || !uniformOf(nodes[n].b) || !uniformOf(nodes[n].c) { setVarying(n) }
+        } else if item.kind == ItemKind.branch {
+            const divergent = varyingContext || !uniformOf(item.cond)
+            markList(item.first, divergent)
+            markList(item.second, divergent)
+            var p = item.params
+            while p < item.params + item.paramCount {
+                if !uniformOf(item.cond) || !uniformOf(params[p].from0) || !uniformOf(params[p].from1) { setVarying(params[p].value) }
+                p += 1
+            }
+        } else {
+            markList(item.first, varyingContext)
+            const divergent = varyingContext || !uniformOf(item.cond)
+            var p = item.params
+            while p < item.params + item.paramCount {
+                if !uniformOf(item.cond) || !uniformOf(params[p].from0) || !uniformOf(params[p].from1) { setVarying(params[p].value) }
+                p += 1
+            }
+            markList(item.second, divergent)
+            markList(item.third, divergent)
+        }
+        at = item.next
+    }
+}
+
+// Starts with every value uniform and makes varying what must be, until
+// nothing changes (a loop's condition can depend on its own parameters).
+pub fn markUniform() -> void {
+    var n: u32 = 0
+    while n < nodeCount {
+        nodes[n].uniform = true
+        n += 1
+    }
+    changed = true
+    var rounds: u32 = 0
+    while changed && rounds < 1000 {
+        changed = false
+        markList(root, false)
+        rounds += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+// Reads a validated module into the form above. False with `failure` set
+// when it is not what this stage takes.
+pub fn read(words: []const u32, allocator: module.Allocator) -> bool {
+    failure = Failure.none
+    failureOpcode = 0
+    failureOffset = 0
+    loopBooleanRead = false
+    nodeCount = 0
+    itemCount = 0
+    paramCount = 0
+    constantKept = 0
+    memberCount = 0
+    slotCount = 0
+    root = NONE
+    shape = Shape.{ .localSizeX = 1, .localSizeY = 1, .localSizeZ = 1, .pushWords = 0, .bindings = 0, .usesLocalY = false, .usesLocalZ = false, .usesGroup = [3]bool{ false, false, false } }
+    var diagnostic: module.Diagnostic = undefined
+    unsafe {
+        if module.validate(@ptrCast([*]const u32, words.pointer), words.length, allocator, &diagnostic) != module.Error.none {
+            return fail(Failure.invalid, diagnostic.opcode, diagnostic.offset)
+        }
+    }
+    bound = words[3]
+    if bound > @intCast(u32, MAX_IDS) { return fail(Failure.tooLarge, 0, 0) }
+    spirv = words
+    var id: usize = 0
+    while id < @intCast(usize, bound) {
+        idKind[id] = IdKind.nothing
+        idA[id] = 0
+        idB[id] = 0
+        idC[id] = 0
+        decoBinding[id] = 0
+        decoSet[id] = 0
+        decoBuiltin[id] = NONE
+        id += 1
+    }
+    if !declarations() { return false }
+    // The function: from its OpFunction on.
+    var at: usize = 5
+    while at < spirv.length && opcodeAt(at) != op(spv.Op.function) { at += countAt(at) }
+    var entry: u32 = 0
+    if !labels(at, &entry) { return false }
+    var top = emptyList()
+    if walk(entry, NONE, &top) != Reached.returned { return fail(Failure.structure, 0, 0) }
+    root = top.head
+    markUniform()
+    return failure == Failure.none
+}
