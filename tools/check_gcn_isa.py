@@ -28,7 +28,17 @@
 #      constants' ranges, the VOP3 offsets, the SDWA and DPP sources, the
 #      wait word's fields;
 #   3. wave.mlx's float constants and wait-state counts, the descriptor's
-#      fields; shader_ir.mlx's division scale.
+#      fields; shader_ir.mlx's division scale;
+#   4. (stage (c), the graphics stages) shader_ir.mlx's GLSL.std.450
+#      numbers (src/compiler/spirv/GLSL.std.450.h), the float compares'
+#      conditions as aco_opcodes.py numbers the VOPC f32 compares (v_cmp_*_f32
+#      less v_cmp_f_f32), the typed fetch's number formats (gfx8.json's
+#      BUF_NUM_FORMAT), 1.0 and -1.0; and with LINUX (a directory with
+#      Linux v6.6's drivers/gpu/drm/amd/include/asic_reg/gca/gfx_8_0_enum.h,
+#      which Mesa's files do not have) the export targets (SQ_EXP_*) and
+#      SPI_SHADER_32_ABGR:
+#
+#   tools/check_gcn_isa.py MESA [LINUX]
 import ast
 import hashlib
 import json
@@ -315,13 +325,60 @@ def check_rest(mesa):
         ok("wave.mlx and shader_ir.mlx: the float constants, the wait states of rules 1-9, the descriptor's fields, the division's scale")
 
 
+def check_graphics(mesa, linux):
+    import struct
+    ir = mlx_constants(os.path.join(driver, "shader_ir.mlx"))
+    held = 0
+    wrong = 0
+
+    def hold(what, got, want):
+        nonlocal held, wrong
+        held += 1
+        if got != want:
+            fail("%s: ours %r, the source %r" % (what, got, want))
+            wrong += 1
+    glsl = open(os.path.join(mesa, "src/compiler/spirv/GLSL.std.450.h")).read()
+    names = {"FABS": "FAbs", "SABS": "SAbs", "FLOOR": "Floor", "FRACT": "Fract", "FMIN": "FMin", "UMIN": "UMin", "SMIN": "SMin", "FMAX": "FMax", "UMAX": "UMax", "SMAX": "SMax", "FCLAMP": "FClamp", "UCLAMP": "UClamp", "SCLAMP": "SClamp", "FMIX": "FMix", "STEP": "Step"}
+    for ours, theirs in names.items():
+        m = re.search(r"GLSLstd450%s = (\d+)," % theirs, glsl)
+        hold("GLSL_" + ours, number(ir["GLSL_" + ours]), int(m.group(1)) if m else None)
+    table = gfx8_instructions(os.path.join(mesa, "src/amd/compiler/aco_opcodes.py"))
+    base = table.get("v_cmp_f_f32")
+    for ours, theirs in (("LT", "lt"), ("EQ", "eq"), ("LG", "lg"), ("GE", "ge"), ("NGE", "nge"), ("NLG", "nlg"), ("NEQ", "neq"), ("NLT", "nlt")):
+        other = table.get("v_cmp_%s_f32" % theirs)
+        hold("CMP_" + ours, number(ir["CMP_" + ours]), other[1] - base[1] if other and base else None)
+    registers = json.load(open(os.path.join(mesa, "src/amd/registers/gfx8.json")))
+    formats = {e["name"]: e["value"] for e in registers["enums"]["BUF_NUM_FORMAT"]["entries"]}
+    for ours, theirs in (("UINT", "BUF_NUM_FORMAT_UINT"), ("SINT", "BUF_NUM_FORMAT_SINT"), ("FLOAT", "BUF_NUM_FORMAT_FLOAT")):
+        hold("NUMBER_" + ours, number(ir["NUMBER_" + ours]), formats.get(theirs))
+    hold("FLOAT_ONE", number(ir["FLOAT_ONE"]), struct.unpack("<I", struct.pack("<f", 1.0))[0])
+    hold("FLOAT_MINUS_ONE", number(ir["FLOAT_MINUS_ONE"]), struct.unpack("<I", struct.pack("<f", -1.0))[0])
+    if linux:
+        enum = open(os.path.join(linux, "drivers/gpu/drm/amd/include/asic_reg/gca/gfx_8_0_enum.h")).read()
+        for ours, theirs in (("MRT0", "SQ_EXP_MRT0"), ("MRTZ", "SQ_EXP_MRTZ"), ("NULL", "SQ_EXP_NULL"), ("POS0", "SQ_EXP_POS0"), ("PARAM0", "SQ_EXP_PARAM0")):
+            m = re.search(r"#define %s\s+(0x[0-9a-fA-F]+)" % theirs, enum)
+            hold("EXP_" + ours, number(ir["EXP_" + ours]), int(m.group(1), 16) if m else None)
+        gp = mlx_constants(os.path.join(driver, "graphics_packets.mlx"))
+        m = re.search(r"SPI_SHADER_32_ABGR\s+= (0x[0-9a-fA-F]+),", enum)
+        hold("SPI_SHADER_32_ABGR (gfx_8_0_enum.h)", number(gp["SPI_SHADER_32_ABGR"]), int(m.group(1), 16) if m else None)
+    if not wrong:
+        ok("stage (c): %d numbers of the graphics stages' compiler held" % held)
+
+
 def main():
+    if len(sys.argv) == 3:
+        check_table(sys.argv[1])
+        check_encoder(sys.argv[1])
+        check_rest(sys.argv[1])
+        check_graphics(sys.argv[1], sys.argv[2])
+        return 1 if failures else 0
     if len(sys.argv) != 2:
-        print("usage: tools/check_gcn_isa.py MESA", file=sys.stderr)
+        print("usage: tools/check_gcn_isa.py MESA [LINUX]", file=sys.stderr)
         return 2
     check_table(sys.argv[1])
     check_encoder(sys.argv[1])
     check_rest(sys.argv[1])
+    check_graphics(sys.argv[1], None)
     return 1 if failures else 0
 
 

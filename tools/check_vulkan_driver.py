@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Holds the numbers of our Vulkan driver's stages (a) and (b) (projects/
+# Holds the numbers of our Vulkan driver's stages (a), (b) and (c) (projects/
 # brix/vulkan: driver.mlx; packets.mlx, card_host.mlx, device.mlx,
 # pipeline.mlx) against the reference's own files at the tags the driver
 # follows, so that none is from memory:
@@ -27,7 +27,13 @@
 #      CHIP_POLARIS10 (not a range: the list has gaps);
 #   3. every opcode, register range, register, field, enumeration and
 #      value of a compute stream in packets.mlx, the address spaces' start
-#      and the numbers of RSRC1's formula (below).
+#      and the numbers of RSRC1's formula (below);
+#   4. (stage (c)) every opcode, register, field and enumeration value of
+#      graphics_packets.mlx, the graphics preamble's values (queue.mlx) by
+#      their fields, RADV's own numbers (radv_emit_graphics, the raster
+#      configuration of Polaris 10, ac_compute_late_alloc's RSRC3_VS and
+#      late allocation), the linear tile mode's entry in the kernel's table
+#      and Linux's, and the clear state's PA_SC_EDGERULE (below).
 import os
 import re
 import sys
@@ -133,6 +139,14 @@ OURS = {
     # No timestamps at this stage: the queue family's valid bits are 0.
     "timestampComputeAndGraphics": 0,
     "timestampPeriod": 1.0,
+    # Stage (c)'s own: 16 vertex locations and bindings, offsets the typed
+    # fetch's field takes (the registry's least each), one viewport (no
+    # multiViewport), one sample.
+    "maxVertexInputAttributes": 16,
+    "maxVertexInputBindings": 16,
+    "maxVertexInputAttributeOffset": 2047,
+    "maxViewports": 1,
+    "framebufferColorSampleCounts": 1,
 }
 
 
@@ -324,6 +338,182 @@ def check_packets(mesa, linux):
     ok("stage (b): %d numbers of packets.mlx, card_host.mlx, device.mlx and pipeline.mlx held against Mesa's and Linux's files" % held)
 
 
+# ---- Stage (c): the graphics ring's packets and registers (projects/brix/
+# vulkan/graphics_packets.mlx), the numbers of RADV's own the driver writes
+# (queue.mlx's preamble, graphics.mlx's pipeline words), the linear tile
+# mode entry and the linear layout (image.mlx) and the clear state's edge
+# rule. Beside the files above, of Mesa: src/amd/vulkan/si_cmd_buffer.c
+# (radv_emit_graphics), radv_pipeline_graphics.c, radv_cmd_buffer.c,
+# radv_cs.h, src/amd/common/ac_shader_util.c (ac_compute_late_alloc's
+# formula), ac_gpu_info.c (the raster configuration of Polaris 10), src/
+# amd/addrlib/src/r800/siaddrlib.cpp and egbaddrlib.cpp (the linear
+# alignments), and of Linux: gfx_v8_0.c (its tiling table, Polaris 10's
+# GB_ADDR_CONFIG), clearstate_vi.h, include/asic_reg/gca/gfx_8_0_enum.h.
+def check_graphics(mesa, linux):
+    import json
+    import struct
+    vulkan = os.path.join(root, "projects", "brix", "vulkan")
+    ours = {}
+    for m in re.finditer(r"pub const ([A-Z0-9_]+): (?:u32|usize) = (0x[0-9A-Fa-f]+|\d+)", open(os.path.join(vulkan, "graphics_packets.mlx")).read()):
+        ours[m.group(1)] = int(m.group(2), 0)
+    sid = constants(open(os.path.join(mesa, "src/amd/common/sid.h")).read())
+    vid = constants(open(os.path.join(linux, "drivers/gpu/drm/amd/amdgpu/vid.h")).read())
+    regs = {m.group(1): m.group(2) for m in re.finditer(r"^#define\s+(mm\w+)\s+(0x[0-9a-fA-F]+)", open(os.path.join(linux, "drivers/gpu/drm/amd/include/asic_reg/gca/gfx_8_0_d.h")).read(), re.M)}
+    database = json.load(open(os.path.join(mesa, "src/amd/registers/gfx8.json")))
+    at = {r["name"]: r["map"]["at"] for r in database["register_mappings"]}
+    kinds = {r["name"]: r.get("type_ref", r["name"]) for r in database["register_mappings"]}
+    types = database["register_types"]
+    enums = {}
+    for name, value in database["enums"].items():
+        for e in value["entries"]:
+            enums.setdefault(e["name"], set()).add(e["value"])
+    held = 0
+
+    def hold(what, got, want):
+        nonlocal held
+        held += 1
+        if got != want:
+            fail("%s: ours %r, the source %r" % (what, got, want))
+
+    def number(text_value):
+        return int(re.sub(r"[uUlL]+$", "", text_value.strip("()")), 0)
+
+    def mask(register, field):
+        kind = kinds.get(register, register)
+        if kind not in types:
+            return None
+        fields = {f["name"]: f["bits"] for f in types[kind]["fields"]}
+        if field not in fields:
+            return None
+        low, high = fields[field]
+        return ((1 << (high - low + 1)) - 1) << low
+    # The opcodes.
+    for name, value in ours.items():
+        if name.startswith("PKT3_"):
+            hold(name + " (sid.h)", value, number(sid[name]))
+            hold(name + " (vid.h)", value, number(vid["PACKET3" + name[4:]]))
+    # The registers: gfx8.json's offset and gfx_8_0_d.h's word times 4.
+    fields_of = {"SPI_SHADER_PGM_RSRC1": "SPI_SHADER_PGM_RSRC1_VS", "SPI_SHADER_PGM_RSRC2": "SPI_SHADER_PGM_RSRC2_VS", "SPI_SHADER_PGM_RSRC3": "SPI_SHADER_PGM_RSRC3_VS", "SPI_SHADER_PGM_RSRC3_HS": "SPI_SHADER_PGM_RSRC3_HS", "SPI_SHADER_PGM_HI": "SPI_SHADER_PGM_HI_VS", "SPI_PS_INPUT_CNTL": "SPI_PS_INPUT_CNTL_0", "SCISSOR": "PA_SC_GENERIC_SCISSOR_TL", "SCREEN_SCISSOR": "PA_SC_SCREEN_SCISSOR_TL", "GB_TILE_MODE": "GB_TILE_MODE0"}
+    renamed = {("SCISSOR", "X"): ("PA_SC_GENERIC_SCISSOR_TL", "TL_X"), ("SCISSOR", "Y"): ("PA_SC_GENERIC_SCISSOR_TL", "TL_Y"), ("SCREEN_SCISSOR", "X"): ("PA_SC_SCREEN_SCISSOR_TL", "TL_X"), ("SCREEN_SCISSOR", "Y"): ("PA_SC_SCREEN_SCISSOR_TL", "TL_Y"), ("CB_COLOR_CONTROL", "MODE"): ("CB_COLOR_CONTROL", "MODE"), ("VGT_SHADER_STAGES_EN", "ALL"): None, ("CP_COHER_CNTL", "CB_DEST_BASE_ALL"): None, ("PA_CL_VTE_CNTL", "ALL_SCALES_OFFSETS"): None, ("SPI_SHADER_POS_FORMAT", "POS0_EXPORT_FORMAT"): ("SPI_SHADER_POS_FORMAT", "POS0_EXPORT_FORMAT")}
+    for name, value in ours.items():
+        if "__" in name:
+            register, field = name.split("__", 1)
+            key = renamed.get((register, field), (fields_of.get(register, register), field))
+            if key is None:
+                continue
+            want = mask(key[0], key[1])
+            if want is None and register in ("VGT_DRAW_INITIATOR", "EOP"):
+                continue
+            hold(name + " (gfx8.json %s.%s)" % key, value, want)
+        elif name.startswith(("PA_", "CB_", "DB_", "SPI_", "VGT_", "IA_")) and name not in ("CB_COLOR_STRIDE", "SPI_SHADER_ZERO", "SPI_SHADER_32_ABGR", "SPI_SHADER_4COMP", "CB_NORMAL", "SPI_PNT_SPRITE_SEL_0", "SPI_PNT_SPRITE_SEL_1", "SPI_PNT_SPRITE_SEL_S", "SPI_PNT_SPRITE_SEL_T", "VGT_INDEX_16", "VGT_INDEX_32") and value >= 0x8000:
+            hold(name + " (gfx8.json)", value, at.get(name))
+            if "mm" + name in regs:
+                hold(name + " (gfx_8_0_d.h)", value, number(regs["mm" + name]) * 4)
+    hold("CB_COLOR_STRIDE", ours["CB_COLOR_STRIDE"], at["CB_COLOR1_BASE"] - at["CB_COLOR0_BASE"])
+    hold("CP_COHER_CNTL__CB_DEST_BASE_ALL", ours["CP_COHER_CNTL__CB_DEST_BASE_ALL"], sum(mask("CP_COHER_CNTL", "CB%d_DEST_BASE_ENA" % k) for k in range(8)))
+    # The enumerations' values by their names in gfx8.json.
+    for name in ("COLOR_INVALID", "COLOR_8_8_8_8", "SWAP_STD", "SWAP_ALT", "CB_NORMAL", "BLEND_ZERO", "BLEND_ONE", "BLEND_SRC_COLOR", "BLEND_ONE_MINUS_SRC_COLOR", "BLEND_SRC_ALPHA", "BLEND_ONE_MINUS_SRC_ALPHA", "BLEND_DST_ALPHA", "BLEND_ONE_MINUS_DST_ALPHA", "BLEND_DST_COLOR", "BLEND_ONE_MINUS_DST_COLOR", "BLEND_CONSTANT_COLOR", "BLEND_ONE_MINUS_CONSTANT_COLOR", "BLEND_CONSTANT_ALPHA", "BLEND_ONE_MINUS_CONSTANT_ALPHA", "COMB_DST_PLUS_SRC", "COMB_SRC_MINUS_DST", "COMB_MIN_DST_SRC", "COMB_MAX_DST_SRC", "COMB_DST_MINUS_SRC", "SPI_SHADER_ZERO", "SPI_SHADER_32_ABGR", "SPI_SHADER_4COMP", "SPI_PNT_SPRITE_SEL_0", "SPI_PNT_SPRITE_SEL_1", "SPI_PNT_SPRITE_SEL_S", "SPI_PNT_SPRITE_SEL_T", "X_ROUND_TO_EVEN", "X_16_8_FIXED_POINT_1_256TH", "DI_PT_TRILIST", "DI_PT_TRISTRIP", "DI_SRC_SEL_DMA", "DI_SRC_SEL_AUTO_INDEX", "VGT_INDEX_16", "VGT_INDEX_32", "VS_PARTIAL_FLUSH", "PS_PARTIAL_FLUSH", "PIPELINESTAT_START", "FLUSH_AND_INV_CB_DATA_TS", "FLUSH_AND_INV_CB_META", "FLUSH_AND_INV_DB_META", "FORCE_DISABLE", "ARRAY_LINEAR_ALIGNED", "NUMBER_UNORM", "EARLY_Z_THEN_LATE_Z"):
+            found = enums.get(name, set())
+            hold(name + " (gfx8.json)", ours[name] if len(found) <= 1 or ours[name] in found else None, next(iter(found)) if len(found) == 1 else (ours[name] if ours[name] in found else None))
+    # RADV's own numbers (radv_emit_graphics and the pipeline's).
+    cmd = open(os.path.join(mesa, "src/amd/vulkan/si_cmd_buffer.c")).read()
+    graphics_text = cmd[cmd.index("radv_emit_graphics(struct radv_device"):]
+    graphics_text = graphics_text[:graphics_text.index("\n}\n")]
+    fui = lambda x: struct.unpack("<I", struct.pack("<f", x))[0]
+    hold("MAX_TESS_LEVEL fui(64)", ours["MAX_TESS_LEVEL"], fui(64.0) if "R_028A18_VGT_HOS_MAX_TESS_LEVEL, fui(64)" in graphics_text else None)
+    hold("ES_PER_GS", ours["ES_PER_GS"], 0x40 if "R_028A58_VGT_ES_PER_GS, 0x40" in graphics_text else None)
+    constants_h = constants(open(os.path.join(mesa, "src/amd/vulkan/radv_constants.h")).read())
+    hold("GS_PER_ES (SI_GS_PER_ES)", ours["GS_PER_ES"], number(constants_h["SI_GS_PER_ES"]))
+    hold("LINE_STIPPLE_SCALE", ours["LINE_STIPPLE_SCALE"], 0x3F800000 if "R_028828_PA_SU_LINE_STIPPLE_SCALE, 0x3f800000" in graphics_text else None)
+    hold("POINT_SIZE (unsigned)(1.0 * 8.0)", ours["POINT_SIZE"], 8 if "unsigned tmp = (unsigned)(1.0 * 8.0);" in graphics_text else None)
+    hold("POINT_MAX_SIZE radv_pack_float_12p4(8191.875 / 2)", ours["POINT_MAX_SIZE"], min(int(8191.875 / 2 * 16), 0xFFFF) if "radv_pack_float_12p4(8191.875 / 2)" in graphics_text else None)
+    hold("ES_VERTS_PER_SUBGRP", ours["ES_VERTS_PER_SUBGRP"], 64 if "S_028A44_ES_VERTS_PER_SUBGRP(64) | S_028A44_GS_PRIMS_PER_SUBGRP(4)" in graphics_text else None)
+    hold("GS_PRIMS_PER_SUBGRP", ours["GS_PRIMS_PER_SUBGRP"], 4 if "S_028A44_ES_VERTS_PER_SUBGRP(64) | S_028A44_GS_PRIMS_PER_SUBGRP(4)" in graphics_text else None)
+    info = open(os.path.join(mesa, "src/amd/common/ac_gpu_info.c")).read()
+    polaris = re.search(r"case CHIP_POLARIS10:\s*raster_config = (0x[0-9a-f]+);\s*raster_config_1 = (0x[0-9a-f]+);", info)
+    hold("RASTER_CONFIG_POLARIS10", ours["RASTER_CONFIG_POLARIS10"], int(polaris.group(1), 16) if polaris else None)
+    hold("RASTER_CONFIG_1_POLARIS10", ours["RASTER_CONFIG_1_POLARIS10"], int(polaris.group(2), 16) if polaris else None)
+    sid_text = open(os.path.join(mesa, "src/amd/common/sid.h")).read()
+    for name in ("CC0_UPDATE_LOAD_ENABLES", "CC1_UPDATE_SHADOW_ENABLES"):
+        hold(name, ours[name], 1 << 31 if re.search(r"#define\s+%s\(x\)\s+\(\(\(unsigned\)\(x\)&0x1\) << 31\)" % name, sid_text) else None)
+    hold("PA_CL_VTE_CNTL__ALL_SCALES_OFFSETS (the six ENA fields)", ours["PA_CL_VTE_CNTL__ALL_SCALES_OFFSETS"], sum(mask("PA_CL_VTE_CNTL", f) for f in ("VPORT_X_SCALE_ENA", "VPORT_X_OFFSET_ENA", "VPORT_Y_SCALE_ENA", "VPORT_Y_OFFSET_ENA", "VPORT_Z_SCALE_ENA", "VPORT_Z_OFFSET_ENA")))
+    # The queue's preamble values (queue.mlx) by their fields.
+    queue = {}
+    for m in re.finditer(r"pub const ([A-Z0-9_]+): u32 = (0x[0-9A-Fa-f]+|[0-9 |<]+)", open(os.path.join(vulkan, "queue.mlx")).read()):
+        queue[m.group(1)] = eval(m.group(2))
+    put = lambda register, field, value: (value << ((mask(register, field) & -mask(register, field)).bit_length() - 1)) & mask(register, field)
+    hold("DB_RENDER_OVERRIDE (FORCE_HIS_ENABLE0, 1: FORCE_DISABLE)", queue["DB_RENDER_OVERRIDE_VALUE"], put("DB_RENDER_OVERRIDE", "FORCE_HIS_ENABLE0", ours["FORCE_DISABLE"]) | put("DB_RENDER_OVERRIDE", "FORCE_HIS_ENABLE1", ours["FORCE_DISABLE"]))
+    hold("RSRC3 CU_EN 0xffff, WAVE_LIMIT 0x3F", queue["RSRC3_ALL"], put("SPI_SHADER_PGM_RSRC3_LS", "CU_EN", 0xFFFF) | put("SPI_SHADER_PGM_RSRC3_LS", "WAVE_LIMIT", 0x3F))
+    hold("RSRC3_HS WAVE_LIMIT 0x3F", queue["RSRC3_HS"], put("SPI_SHADER_PGM_RSRC3_HS", "WAVE_LIMIT", 0x3F))
+    hold("VGT_GS_ONCHIP_CNTL", queue["GS_ONCHIP"], put("VGT_GS_ONCHIP_CNTL", "ES_VERTS_PER_SUBGRP", 64) | put("VGT_GS_ONCHIP_CNTL", "GS_PRIMS_PER_SUBGRP", 4))
+    hold("PA_SU_POINT_SIZE", queue["POINT_SIZE"], put("PA_SU_POINT_SIZE", "HEIGHT", 8) | put("PA_SU_POINT_SIZE", "WIDTH", 8))
+    hold("PA_SU_POINT_MINMAX", queue["POINT_MINMAX"], put("PA_SU_POINT_MINMAX", "MAX_SIZE", 0xFFFF))
+    hold("SPI_INTERP_CONTROL_0", queue["INTERP_CONTROL"], put("SPI_INTERP_CONTROL_0", "FLAT_SHADE_ENA", 1) | put("SPI_INTERP_CONTROL_0", "PNT_SPRITE_ENA", 1) | put("SPI_INTERP_CONTROL_0", "PNT_SPRITE_OVRD_X", ours["SPI_PNT_SPRITE_SEL_S"]) | put("SPI_INTERP_CONTROL_0", "PNT_SPRITE_OVRD_Y", ours["SPI_PNT_SPRITE_SEL_T"]) | put("SPI_INTERP_CONTROL_0", "PNT_SPRITE_OVRD_Z", ours["SPI_PNT_SPRITE_SEL_0"]) | put("SPI_INTERP_CONTROL_0", "PNT_SPRITE_OVRD_W", ours["SPI_PNT_SPRITE_SEL_1"]))
+    hold("PA_SU_VTX_CNTL", queue["VTX_CNTL"], put("PA_SU_VTX_CNTL", "PIX_CENTER", 1) | put("PA_SU_VTX_CNTL", "ROUND_MODE", ours["X_ROUND_TO_EVEN"]) | put("PA_SU_VTX_CNTL", "QUANT_MODE", ours["X_16_8_FIXED_POINT_1_256TH"]))
+    hold("PA_CL_VTE_CNTL", queue["VTE_CNTL"], sum(put("PA_CL_VTE_CNTL", f, 1) for f in ("VTX_W0_FMT", "VPORT_X_SCALE_ENA", "VPORT_X_OFFSET_ENA", "VPORT_Y_SCALE_ENA", "VPORT_Y_OFFSET_ENA", "VPORT_Z_SCALE_ENA", "VPORT_Z_OFFSET_ENA")))
+    hold("PA_SU_PRIM_FILTER_CNTL", queue["PRIM_FILTER"], put("PA_SU_PRIM_FILTER_CNTL", "XMAX_RIGHT_EXCLUSION", 1) | put("PA_SU_PRIM_FILTER_CNTL", "YMAX_BOTTOM_EXCLUSION", 1))
+    # The vertex shader's RSRC3 and late allocation (ac_compute_late_alloc
+    # for 36 compute units in 4 engines of 1 array: 9 an array).
+    late = open(os.path.join(mesa, "src/amd/common/ac_shader_util.c")).read()
+    graphics_mlx = open(os.path.join(vulkan, "graphics.mlx")).read()
+    # (ac_compute_late_alloc's GFX8 branch, as graphics.mlx's lateAlloc
+    # computes it from the record's compute units a shader array)
+    def constant(name):
+        return int(re.search(r"pub const %s: u32 = (0x[0-9A-F]+|\d+)" % name, graphics_mlx).group(1), 0)
+    hold("late allocation: none at min_good_cu_per_sa <= %d" % constant("LATE_ALLOC_NONE_AT"), "if (info->min_good_cu_per_sa <= %d)\n      return;" % constant("LATE_ALLOC_NONE_AT") in late, True)
+    hold("late allocation: %d at min_good_cu_per_sa <= %d" % (constant("LATE_ALLOC_FEW"), constant("LATE_ALLOC_FEW_AT")), "if (info->min_good_cu_per_sa <= %d) {" % constant("LATE_ALLOC_FEW_AT") in late and "*late_alloc_wave64 = %d;" % constant("LATE_ALLOC_FEW") in late, True)
+    hold("late allocation: (min_good_cu_per_sa - %d) * %d" % (constant("LATE_ALLOC_SPARED"), constant("LATE_ALLOC_PER_CU")), "*late_alloc_wave64 = (info->min_good_cu_per_sa - %d) * %d;" % (constant("LATE_ALLOC_SPARED"), constant("LATE_ALLOC_PER_CU")) in late, True)
+    hold("RSRC3_VS's CU_EN 0x%X above %d waves" % (constant("CU_EN_ONE_OFF"), constant("LATE_ALLOC_FEW")), "if (*late_alloc_wave64 > %d)\n         *cu_mask = 0x%x; /* 1 CU disabled */" % (constant("LATE_ALLOC_FEW"), constant("CU_EN_ONE_OFF")) in late, True)
+    hold("RSRC3_VS's CU_EN 0x%X else" % constant("CU_EN_ALL"), "*cu_mask = 0x%x;" % constant("CU_EN_ALL") in late, True)
+    hold("RSRC3_VS's WAVE_LIMIT 0x3F", constant("RSRC3_VS_WAVE_LIMIT"), put("SPI_SHADER_PGM_RSRC3_VS", "WAVE_LIMIT", 0x3F))
+    hold("RSRC3_VS's CU_EN field", put("SPI_SHADER_PGM_RSRC3_VS", "CU_EN", 0xFFFF), constant("CU_EN_ALL"))
+    # The linear tile mode: the kernel's table's entry 8 is ARRAY_LINEAR_
+    # ALIGNED, as Linux's Polaris 10 table's modearray[8].
+    kernel = open(os.path.join(root, "projects", "brix", "kernel", "gpu_compute.mlx")).read()
+    table = [int(x, 16) for x in re.search(r"pub const TILE_MODES = \[_\]usize\{([^}]*)\}", kernel).group(1).replace(" ", "").split(",")]
+    index = int(re.search(r"pub const LINEAR_TILE_MODE: u32 = (\d+)", open(os.path.join(vulkan, "image.mlx")).read()).group(1))
+    hold("the kernel's TILE_MODES[%d] ARRAY_MODE" % index, (table[index] & ours["GB_TILE_MODE__ARRAY_MODE"]) >> 2, ours["ARRAY_LINEAR_ALIGNED"])
+    gfx = open(os.path.join(linux, "drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c")).read()
+    polaris_table = gfx[gfx.index("case CHIP_POLARIS10:", gfx.index("gfx_v8_0_tiling_mode_table_init")):]
+    entry = re.search(r"modearray\[%d\] = \(ARRAY_MODE\((\w+)\)" % index, polaris_table)
+    hold("Linux's Polaris 10 modearray[%d]" % index, entry.group(1) if entry else None, "ARRAY_LINEAR_ALIGNED")
+    # The linear layout (image.mlx) against addrlib (src/amd/addrlib/src/
+    # r800/siaddrlib.cpp, egbaddrlib.cpp) and Polaris 10's pipe interleave
+    # (Linux's gfx_v8_0.c, the golden GB_ADDR_CONFIG its case takes).
+    image_mlx = open(os.path.join(vulkan, "image.mlx")).read()
+    def image_constant(name):
+        return int(re.search(r"pub const %s: u(?:32|64) = (0x[0-9A-F]+|\d+)" % name, image_mlx).group(1), 0)
+    si = open(os.path.join(mesa, "src/amd/addrlib/src/r800/siaddrlib.cpp")).read()
+    eg = open(os.path.join(mesa, "src/amd/addrlib/src/r800/egbaddrlib.cpp")).read()
+    masks = constants(open(os.path.join(linux, "drivers/gpu/drm/amd/include/asic_reg/gca/gfx_8_0_sh_mask.h")).read())
+    early = gfx[gfx.index("gfx_v8_0_gpu_early_init"):]
+    polaris = early[early.index("case CHIP_POLARIS10:"):]
+    golden = re.search(r"gb_addr_config = (\w+);", polaris).group(1)
+    config = int(re.search(r"#define %s (0x[0-9a-fA-F]+)" % golden, gfx).group(1), 16)
+    interleave_mask = int(masks["GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE_MASK"], 0)
+    interleave_shift = int(masks["GB_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE__SHIFT"], 0)
+    interleave = 256 << ((config & interleave_mask) >> interleave_shift)
+    hold("linear base alignment: the pipe interleave (%s)" % golden, image_constant("BASE_ALIGNMENT"), interleave if "*pBaseAlign     = m_pipeInterleaveBytes;" in eg else None)
+    pitch_align = max(8, 64 // 4) if "pitchAlign = Max(8u, 64 / BITS_TO_BYTES(bpp));" in si else None
+    hold("linear pitch alignment max(8, 64 / 4)", image_constant("PITCH_PIXELS"), pitch_align)
+    slice_align = max(64, interleave // 4) if "UINT_32 sliceAlignInPixel = pixelsPerPipeInterleave < 64 ? 64 : pixelsPerPipeInterleave;" in si and "pitch += pitchAlign;" in si else None
+    hold("linear slice alignment in pixels, the pitch grown", image_constant("SLICE_PIXELS"), slice_align)
+    # The edge rule: the clear state's PA_SC_EDGERULE.
+    clear = open(os.path.join(root, "projects", "brix", "kernel", "gpu_clear_state.mlx")).read()
+    firsts = [int(x, 16) for x in re.search(r"RUN_FIRST = \[_\]usize\{([^}]*)\}", clear).group(1).replace(" ", "").split(",")]
+    counts = [int(x) for x in re.search(r"RUN_COUNT = \[_\]usize\{([^}]*)\}", clear).group(1).replace(" ", "").split(",")]
+    values = [int(x, 16) for x in re.findall(r"0x[0-9A-Fa-f]+", re.search(r"VALUES = \[_\]u32\{(.*?)\}", clear, re.S).group(1))]
+    word = ours["PA_SC_EDGERULE"] // 4
+    edge = None
+    done = 0
+    for first, count in zip(firsts, counts):
+        if first <= word < first + count:
+            edge = values[done + word - first]
+        done += count
+    hold("EDGE_RULE (the clear state's PA_SC_EDGERULE)", ours["EDGE_RULE"], edge)
+    ok("stage (c): %d numbers of graphics_packets.mlx, queue.mlx, graphics.mlx and image.mlx held against Mesa's and Linux's files" % held)
+
+
 def main():
     if len(sys.argv) != 3:
         print("usage: tools/check_vulkan_driver.py MESA LINUX")
@@ -331,6 +521,7 @@ def main():
     check_limits(sys.argv[1])
     check_serves(sys.argv[2])
     check_packets(sys.argv[1], sys.argv[2])
+    check_graphics(sys.argv[1], sys.argv[2])
     if failures:
         print("%d checks failed" % failures)
         return 1

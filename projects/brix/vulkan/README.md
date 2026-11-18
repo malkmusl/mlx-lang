@@ -202,6 +202,29 @@ numbers of `packets.mlx` and the address spaces are held against Mesa's
 and Linux's files by `tools/check_vulkan_driver.py MESA LINUX` (its
 head names the files).
 
+## The driver, stage (c): the first triangle into a buffer
+
+| File | What it is |
+| --- | --- |
+| `shader_ir.mlx`, `shader_code.mlx` | The compiler's vertex and fragment stages beside compute: floats, vectors and matrices (split into scalars), the float instructions ACO selects, the typed vertex fetch (`tbuffer_load_format_x`, RADV's per-binding descriptor), the interpolation (`v_interp_p1/p2/mov`, m0 the primitive's mask), the exports (pos0, the parameters, mrt n) |
+| `wave.mlx` | The interpreter's float instructions (each one's specials and denormals refused), the typed fetch, the interpolation and the exports, a graphics wave started with its primitive |
+| `graphics_packets.mlx` | The graphics ring's packets and registers (Mesa's sid.h and gfx8.json, Linux's vid.h and gfx_8_0_*.h) |
+| `card_run.mlx`, `card_draw.mlx`, `card_cache.mlx` | The host card's graphics ring: CONTEXT_CONTROL, CLEAR_STATE (the kernel's table), SURFACE_SYNC, the EOP colour flush, the draws; a model of the fixed part (the vertices, triangles, viewport, the 1/256 grid, culling, the top-left tie rule, barycentrics, the pixel waves, linear 8888 targets, blending); the colour block's cache, past L2 |
+| `image.mlx` | Linear colour images (R8G8B8A8 and B8G8R8A8 UNORM) laid out as addrlib lays out a linear aligned surface (the row a multiple of 16 pixels, grown until the image is a multiple of 64), views, render passes (one subpass, the implicit dependencies of Mesa's runtime added) and framebuffers, the 1.1 binding and needs forms |
+| `graphics.mlx` | Graphics pipelines: a VS and a FS compiled, the pipeline's register words as radv_pipeline_emit_pm4 orders them |
+| `render.mlx`, `clear.mlx` | Dynamic rendering (VK_KHR_dynamic_rendering, with its dependencies VK_KHR_depth_stencil_resolve and VK_KHR_create_renderpass2), render passes on it, vertex and index buffers, viewport and scissor, vkCmdDraw and vkCmdDrawIndexed, the clear as a drawn rectangle, the copy of an image into a buffer, vkCmdDispatchBase and vkCmdSetDeviceMask |
+| `commands.mlx`, `queue.mlx` | The graphics queue's flush (radv_cs_emit_cache_flush's !is_mec form), its preamble (radv_emit_graphics for GFX8 with a clear state) |
+
+The graphics queue family (graphics, compute and transfer: family 1),
+the extensions and every format feature are offered only when the card's
+record lists a graphics ring; brixOS's kernel lists none yet, so nothing
+changes there. Tests 515 (the host card's graphics ring, word for word)
+and 516 (the driver through the loader, pixel for pixel against
+`tests/support/reference_raster.mlx`, and against a second reference
+written apart by the stage's reviewer, `tests/support/raster_rules.mlx`,
+over 600 triangles with perspective, viewports, scissors and every cull
+mode) are the proof.
+
 ## Where the numbers come from
 
 Every number of the card in these files is from Mesa at the tag

@@ -5,16 +5,59 @@
 // scan without spilling, the waits and the wait states, assembly, and the
 // shader's facts for the driver.
 //
-// THE ENTRY STATE (the study's 5.2, with its second way out for pointers:
-// every pointer two user data words, low and high, at an even register):
-//   s0, s1   the scratch descriptor's words (never read: no spilling)
-//   s2, s3   descriptor set 0's address; binding b's buffer descriptor (4
-//            words, RADV's write_buffer_descriptor) at byte 16 * b
-//   s4, s5   the push constant block's address
-//            (USER_SGPR 6)
-//   s6, s7, s8  the work group's id x, y, z (TGID_X_EN .. TGID_Z_EN)
-//   v0, v1, v2  the invocation's id in its group (TIDIG_COMP_CNT 2)
+// THE ENTRY STATE of each stage (the study's 5.2 with its second way out
+// for pointers: every pointer two user data words, low and high, at an
+// even register; for the vertex and fragment stages RADV's argument order
+// of radv_shader_args.c, declare_vs_input_vgprs and declare_ps_input_vgprs,
+// with our user data words):
+//   compute
+//     s0, s1   the scratch descriptor's words (never read: no spilling)
+//     s2, s3   descriptor set 0's address; binding b's buffer descriptor (4
+//              words, RADV's write_buffer_descriptor) at byte 16 * b
+//     s4, s5   the push constant block's address
+//              (USER_SGPR 6)
+//     s6, s7, s8  the work group's id x, y, z (TGID_X_EN .. TGID_Z_EN)
+//     v0, v1, v2  the invocation's id in its group (TIDIG_COMP_CNT 2)
+//   vertex (the card's VS stage)
+//     s0, s1   the scratch descriptor's words
+//     s2, s3   the vertex buffers' descriptors' address: binding b's (RADV's
+//              radv_write_vertex_descriptors for GFX8: its address, stride,
+//              bytes) at byte 16 * b
+//     s4       the base vertex (firstVertex, or an indexed draw's
+//              vertexOffset), s5 the first instance
+//     s6, s7   descriptor set 0's address, s8, s9 the push constants'
+//              (USER_SGPR 10)
+//     v0       the vertex's index, v1 its instance (VGPR_COMP_CNT 1:
+//              "InstanceID / StepRate0", the step rate 1)
+//   fragment (the card's PS stage)
+//     s0, s1   the scratch descriptor's words
+//     s2, s3   descriptor set 0's address, s4, s5 the push constants'
+//              (USER_SGPR 6)
+//     s6       the primitive's mask (PRIM_MASK), which the interpolation
+//              reads in m0
+//     v0, v1   the barycentrics I and J with perspective at the pixel's
+//              centre (SPI_PS_INPUT_ENA's PERSP_CENTER_ENA alone, the one
+//              RADV's radv_compute_spi_ps_input always enables)
 // These registers are never handed out to values.
+//
+// A VERTEX SHADER fetches its inputs at its start: for each location the
+// pipeline describes, one typed buffer load (tbuffer_load_format_x, the
+// format 32 and the number format of the input, ACO's MTBUF with idxen)
+// a component, from the binding's descriptor at the vertex's index (v0
+// plus the base vertex) or the instance's (v1 plus the first instance),
+// at the input's offset; a component the format lacks is 0, or 1 (1.0
+// for a float format) for the fourth (the format's DST_SEL X, 0, 0, 1:
+// ac_shader_util.c's vertex format table). It ends with its exports: the
+// position (pos0, with done: the last position export, aco_assembler.cpp
+// fix_exports), then each output as a parameter.
+// A FRAGMENT SHADER interpolates its inputs at its start (m0 the
+// primitive's mask; ACO's emit_interp_instr: v_interp_p1_f32 with I, then
+// v_interp_p2_f32 with J into the same register; a flat input
+// v_interp_mov_f32 of P0), the n-th location it reads being attribute n
+// (SPI_PS_INPUT_CNTL_n), and ends with its exports to the colour targets
+// of its outputs' locations, the last with done and the valid mask (or
+// one null export when it has none), each in SPI_SHADER_32_ABGR: four
+// floats.
 //
 // CONTROL FLOW. An if on a uniform condition is a branch on scc; on a
 // varying one exec is narrowed (s_and_saveexec_b64), the then-part runs,
@@ -27,9 +70,10 @@
 //
 // REGISTERS. Every value gets a register of its own kind for its whole
 // life (from its definition to its last use, and through a whole loop
-// when it lives across one); vector registers v3 .. v255, scalar ones s9 ..
-// s101 (pairs at even numbers, quads at multiples of four). A shader that
-// needs more is refused: there is no spilling at this stage.
+// when it lives across one); vector and scalar registers above the
+// stage's entry registers, to v255 and s101 (pairs at even numbers, quads
+// at multiples of four). A shader that needs more is refused: there is no
+// spilling at this stage.
 //
 // THE RULES OF THE CARD kept here, each where it is needed: a vector
 // instruction reads at most one scalar value (aco_validate.cpp's constant
@@ -40,7 +84,9 @@
 // waited for at a label and before a branch, and the program ends with
 // s_waitcnt 0 and s_endpgm (the study's 5.1: ours waits explicitly); a
 // scalar register written by a vector instruction is read by a buffer
-// instruction only five wait states later (`padHazards`).
+// instruction only five wait states later (`padHazards`). An inline
+// constant is an integer of 0 to 64 or -1 to -16, or one of the eight
+// floats (aco_ir.h, Operand::c32), whatever the instruction.
 
 const isa = @import("./isa.mlx")
 const encode = @import("./encode.mlx")
@@ -60,7 +106,8 @@ pub const MAX_LOOPS: usize = 512
 pub const VIRTUAL_V: u16 = 4096
 pub const VIRTUAL_S: u16 = 36864
 
-// The entry registers.
+// The entry registers (the compute stage's; the others' are set by
+// `enter`).
 pub const SET_POINTER: u16 = 2
 pub const PUSH_POINTER: u16 = 4
 pub const USER_SGPRS: u32 = 6
@@ -68,6 +115,22 @@ pub const GROUP_ID: u16 = 6
 pub const FIRST_FREE_SGPR: u32 = 9
 pub const FIRST_FREE_VGPR: u32 = 3
 pub const LAST_SGPR: u32 = 101
+// The vertex stage's.
+pub const VERTEX_BUFFERS: u16 = 2
+pub const BASE_VERTEX: u16 = 4
+pub const BASE_INSTANCE: u16 = 5
+pub const VERTEX_SET_POINTER: u16 = 6
+pub const VERTEX_PUSH_POINTER: u16 = 8
+pub const VERTEX_USER_SGPRS: u32 = 10
+// The fragment stage's.
+pub const FRAGMENT_USER_SGPRS: u32 = 6
+pub const PRIM_MASK: u16 = 6
+
+var setPointer: u16 = SET_POINTER
+var pushPointer: u16 = PUSH_POINTER
+var userSgprs: u32 = USER_SGPRS
+var firstFreeSgpr: u32 = FIRST_FREE_SGPR
+var firstFreeVgpr: u32 = FIRST_FREE_VGPR
 
 pub const LineKind = enum(u8) {
     inst,
@@ -163,11 +226,28 @@ fn operand(value: u32, literal: *u32) -> u16 {
         if ir.nodes[v].sort == ir.Sort.boolean {
             word = if word != 0 { 0xFFFFFFFF } else { 0 }
         }
-        const o = encode.constant(word)
+        const o = inlineOf(word)
         if o == encode.LITERAL { literal.* = word }
         return o
     }
     return location[v]
+}
+
+// The operand of a constant: an inline integer, one of the eight inline
+// floats (0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0 at 240 to 247:
+// aco_ir.h, Operand::c32), else LITERAL.
+pub fn inlineOf(word: u32) -> u16 {
+    const o = encode.constant(word)
+    if o != encode.LITERAL { return o }
+    if word == 0x3F000000 { return encode.FLOAT_HALF }
+    if word == 0xBF000000 { return encode.FLOAT_HALF + 1 }
+    if word == 0x3F800000 { return encode.FLOAT_HALF + 2 }
+    if word == 0xBF800000 { return encode.FLOAT_HALF + 3 }
+    if word == 0x40000000 { return encode.FLOAT_HALF + 4 }
+    if word == 0xC0000000 { return encode.FLOAT_HALF + 5 }
+    if word == 0x40800000 { return encode.FLOAT_HALF + 6 }
+    if word == 0xC0800000 { return encode.FLOAT_HALF + 7 }
+    return encode.LITERAL
 }
 
 // A value in a vector register (moved there if it is not).
@@ -208,7 +288,7 @@ fn materialize(word: u32) -> u16 {
     const r = newS(1)
     var i = encode.blank(isa.S_MOV_B32)
     i.dst = r
-    i.src0 = encode.constant(word)
+    i.src0 = inlineOf(word)
     i.literal = word
     put(i)
     return r
@@ -318,6 +398,12 @@ fn wordOp(kind: ir.Kind, uniform: bool) -> isa.Op {
     if kind == ir.Kind.bxor { return isa.V_XOR_B32 }
     if kind == ir.Kind.smax { return isa.V_MAX_I32 }
     if kind == ir.Kind.fmul { return isa.V_MUL_F32 }
+    if kind == ir.Kind.fadd { return isa.V_ADD_F32 }
+    if kind == ir.Kind.fmin { return isa.V_MIN_F32 }
+    if kind == ir.Kind.fmax { return isa.V_MAX_F32 }
+    if kind == ir.Kind.smin { return isa.V_MIN_I32 }
+    if kind == ir.Kind.umin { return isa.V_MIN_U32 }
+    if kind == ir.Kind.umax { return isa.V_MAX_U32 }
     if kind == ir.Kind.shl { return isa.V_LSHLREV_B32 }
     if kind == ir.Kind.shr { return isa.V_LSHRREV_B32 }
     return isa.V_ASHRREV_I32
@@ -388,11 +474,33 @@ fn selectNode(n: u32) -> void {
         location[n] = GROUP_ID + @intCast(u16, node.imm)
         return
     }
+    if k == ir.Kind.attribute {
+        location[n] = attributeRegister[@intCast(usize, node.imm & 0x3F)]
+        return
+    }
+    if k == ir.Kind.interp {
+        location[n] = interpRegister[@intCast(usize, node.imm & 0x3F)]
+        return
+    }
+    if k == ir.Kind.vertexIndex {
+        location[n] = if node.imm == 0 { vertexIndexRegister } else { instanceIndexRegister }
+        return
+    }
+    if k == ir.Kind.fcmp {
+        // a float comparison: VOPC v_cmp_<condition>_f32 into a pair (the
+        // f32 comparisons are numbered from v_cmp_f_f32 by their
+        // condition, aco_opcodes.py)
+        dst = newS(2)
+        location[n] = dst
+        const op = isa.Op.{ .format = isa.Format.vopc, .number = isa.V_CMP_F_F32.number + @intCast(u16, node.imm) }
+        vop3(op, dst, node.a, node.b, NONE, 2)
+        return
+    }
     if k == ir.Kind.push {
         dst = newS(1)
         var i = encode.blank(isa.S_LOAD_DWORD)
         i.dst = dst
-        i.src0 = PUSH_POINTER
+        i.src0 = pushPointer
         i.flags = encode.IMM
         i.imm = node.imm * 4
         put(i)
@@ -531,6 +639,30 @@ fn selectNode(n: u32) -> void {
         vop1(isa.V_CVT_U32_F32, dst, node.a)
     } else if k == ir.Kind.rcp {
         vop1(isa.V_RCP_F32, dst, node.a)
+    } else if k == ir.Kind.ffloor {
+        vop1(isa.V_FLOOR_F32, dst, node.a)
+    } else if k == ir.Kind.ffract {
+        vop1(isa.V_FRACT_F32, dst, node.a)
+    } else if k == ir.Kind.i2f {
+        vop1(isa.V_CVT_F32_I32, dst, node.a)
+    } else if k == ir.Kind.f2i {
+        vop1(isa.V_CVT_I32_F32, dst, node.a)
+    } else if k == ir.Kind.fabs {
+        // ACO's fabs: v_mul_f32_e64 dst, 1.0, |x|
+        var i = encode.blank(isa.V_MUL_F32)
+        i.form = encode.Form.vop3
+        i.dst = dst
+        i.src0 = inlineOf(ir.FLOAT_ONE)
+        i.src1 = vectorOrScalar(node.a)
+        i.mods = 2
+        put(i)
+    } else if k == ir.Kind.fsub {
+        var literal: u32 = 0
+        if !isVector(operand(node.b, &literal)) && isVector(operand(node.a, &literal)) {
+            vop2(isa.V_SUBREV_F32, dst, node.b, node.a, false)
+        } else {
+            vop2(isa.V_SUB_F32, dst, node.a, node.b, false)
+        }
     } else if k == ir.Kind.mul {
         vop3(isa.V_MUL_LO_U32, dst, node.a, node.b, NONE, 2)
     } else if k == ir.Kind.mulhi {
@@ -562,6 +694,15 @@ fn sopc(op: isa.Op, a: u32, b: u32) -> void {
     i.src1 = ob
     i.literal = if oa == encode.LITERAL { la } else { lb }
     put(i)
+}
+
+// A VOP3 instruction's source: its register or an inline constant (a
+// literal moved into a vector register).
+fn vectorOrScalar(value: u32) -> u16 {
+    var literal: u32 = 0
+    const o = operand(value, &literal)
+    if o == encode.LITERAL { return inVector(value) }
+    return o
 }
 
 fn vectorOrInline(value: u32) -> u16 {
@@ -849,12 +990,29 @@ pub fn usesOf(i: *const Inst, uses: *[8]Use) -> u32 {
         note(uses, &count, i.*.dst, loadSize(n), true)
         return count
     }
-    if f == isa.Format.mubuf {
+    if f == isa.Format.mubuf || f == isa.Format.mtbuf {
         const n = decode.name(i.*.op)
-        if (i.*.flags & encode.OFFEN) != 0 { note(uses, &count, i.*.src0, 1, false) }
+        if (i.*.flags & (encode.OFFEN | encode.IDXEN)) != 0 { note(uses, &count, i.*.src0, 1, false) }
         note(uses, &count, i.*.src1, 4, false)
         if isRegister(i.*.src2) { note(uses, &count, i.*.src2, 1, false) }
-        note(uses, &count, i.*.dst, loadSize(n), !startsWith(n, "buffer_store"))
+        note(uses, &count, i.*.dst, loadSize(n), !startsWith(n, "buffer_store") && !startsWith(n, "tbuffer_store"))
+        return count
+    }
+    if f == isa.Format.vintrp {
+        // p1 reads I, p2 J and the register it accumulates in, mov a
+        // parameter; each reads m0 (the primitive's mask)
+        if i.*.op.number != isa.V_INTERP_MOV_F32.number { note(uses, &count, i.*.src0, 1, false) }
+        if i.*.op.number == isa.V_INTERP_P2_F32.number { note(uses, &count, i.*.dst, 1, false) }
+        note(uses, &count, encode.M0, 1, false)
+        note(uses, &count, i.*.dst, 1, true)
+        return count
+    }
+    if f == isa.Format.exp {
+        // the enabled sources
+        if (i.*.extra & 1) != 0 { note(uses, &count, i.*.src0, 1, false) }
+        if (i.*.extra & 2) != 0 { note(uses, &count, i.*.src1, 1, false) }
+        if (i.*.extra & 4) != 0 { note(uses, &count, i.*.src2, 1, false) }
+        if (i.*.extra & 8) != 0 { note(uses, &count, i.*.src3, 1, false) }
         return count
     }
     if f == isa.Format.vop1 || f == isa.Format.vop2 || f == isa.Format.vopc || f == isa.Format.vop3 {
@@ -981,15 +1139,15 @@ fn allocate() -> bool {
         sFree[k] = 0
         k += 1
     }
-    highestV = FIRST_FREE_VGPR - 1
-    highestS = FIRST_FREE_SGPR - 1
+    highestV = firstFreeVgpr - 1
+    highestS = firstFreeSgpr - 1
     // vFree[r] / sFree[r]: the line after which r is free (0: free).
     var n: u32 = 0
     while n < count {
         const v = @intCast(usize, order[n])
         const start = first[v]
         if v < MAX_VIRTUAL {
-            var r: u32 = FIRST_FREE_VGPR
+            var r: u32 = firstFreeVgpr
             while r < 256 && vFree[r] > start { r += 1 }
             if r >= 256 { return false }
             vFree[r] = last[v] + 1
@@ -999,7 +1157,7 @@ fn allocate() -> bool {
             const size = @intCast(u32, sSize[v - MAX_VIRTUAL])
             var step = size
             if step > 4 { step = 4 }
-            var r: u32 = FIRST_FREE_SGPR
+            var r: u32 = firstFreeSgpr
             while r % step != 0 { r += 1 }
             while true {
                 if r + size - 1 > LAST_SGPR { return false }
@@ -1056,6 +1214,7 @@ fn rewrite() -> void {
             i.src0 = physical(i.src0)
             i.src1 = physical(i.src1)
             i.src2 = physical(i.src2)
+            i.src3 = physical(i.src3)
             lines[at].inst = i
         }
         at += 1
@@ -1170,7 +1329,7 @@ fn insertWaits() -> void {
                 }
                 outLgkm = true
             }
-            if f == isa.Format.mubuf {
+            if f == isa.Format.mubuf || f == isa.Format.mtbuf {
                 var uses: [8]Use = undefined
                 const count = usesOf(&line.inst, &uses)
                 var u: u32 = 0
@@ -1186,7 +1345,7 @@ fn insertWaits() -> void {
                 }
                 // a store leaves no register to wait for: only the end
                 // waits for it
-                if line.inst.op.number != isa.BUFFER_STORE_DWORD.number { outVm = true }
+                if !(f == isa.Format.mubuf && line.inst.op.number == isa.BUFFER_STORE_DWORD.number) { outVm = true }
             }
         }
         at += 1
@@ -1359,6 +1518,7 @@ pub fn assemble(input: []const Line, words: []u32) -> usize {
 
 // What the driver needs of a compiled shader.
 pub const Facts = struct {
+    stage: ir.Stage
     words: usize
     vgprs: u32
     sgprs: u32
@@ -1372,7 +1532,243 @@ pub const Facts = struct {
     groupSizeZ: u32
     pushWords: u32
     bindings: u32
+    // A vertex shader: the vertex buffer bindings it reads (bit b), how
+    // many vector registers the card loads at its start (VGPR_COMP_CNT:
+    // 1, v0 and v1), its parameter exports and each output location's
+    // parameter (NONE: none).
+    vertexBindings: u32
+    vgprComponents: u32
+    parameters: u32
+    parameterOf: [16]u32
+    // A fragment shader: its interpolated inputs (NUM_INTERP), attribute
+    // n's location and whether it is flat (bit n), the colour targets it
+    // exports to (bit t).
+    interpolated: u32
+    interpLocation: [16]u32
+    interpFlat: u32
+    colourTargets: u32
 }
+
+// The registers the entry values are in: each vertex input's component
+// (location * 4 + component), each fragment input's, the vertex's and
+// the instance's index.
+var attributeRegister: [64]u16 = undefined
+var interpRegister: [64]u16 = undefined
+var vertexIndexRegister: u16 = 0
+var instanceIndexRegister: u16 = 0
+var vertexDescriptor: [32]u16 = undefined
+
+// The stage's entry registers.
+fn enter(stage: ir.Stage) -> void {
+    if stage == ir.Stage.vertex {
+        setPointer = VERTEX_SET_POINTER
+        pushPointer = VERTEX_PUSH_POINTER
+        userSgprs = VERTEX_USER_SGPRS
+        firstFreeSgpr = VERTEX_USER_SGPRS
+        firstFreeVgpr = 2
+    } else if stage == ir.Stage.fragment {
+        setPointer = SET_POINTER
+        pushPointer = PUSH_POINTER
+        userSgprs = FRAGMENT_USER_SGPRS
+        firstFreeSgpr = FRAGMENT_USER_SGPRS + 1
+        firstFreeVgpr = 2
+    } else {
+        setPointer = SET_POINTER
+        pushPointer = PUSH_POINTER
+        userSgprs = USER_SGPRS
+        firstFreeSgpr = FIRST_FREE_SGPR
+        firstFreeVgpr = FIRST_FREE_VGPR
+    }
+}
+
+// v_add_co_u32 d, s, v (the carry into vcc, not read).
+fn addIndex(base: u16, vector: u16) -> u16 {
+    const d = newV()
+    var i = encode.blank(isa.V_ADD_CO_U32)
+    i.dst = d
+    i.src0 = base
+    i.src1 = vector
+    put(i)
+    return d
+}
+
+// A vertex shader's start: the bindings' descriptors, the indices, every
+// input component the shader reads.
+fn vertexStart(facts: *Facts) -> bool {
+    var b: u32 = 0
+    while b < 32 {
+        vertexDescriptor[b] = 0
+        b += 1
+    }
+    var perVertex = ir.shape.usesVertexIndex
+    var perInstance = ir.shape.usesInstanceIndex
+    var location: u32 = 0
+    while location < ir.MAX_LOCATIONS {
+        if (ir.shape.attributes >> @intCast(u5, location)) & 1 != 0 {
+            const input = ir.vertexInputs[location]
+            if input.binding >= 32 || input.components == 0 || input.components > 4 || input.offset + 4 * input.components > 4096 {
+                fail(ir.Failure.interface)
+                return false
+            }
+            if input.perInstance { perInstance = true } else { perVertex = true }
+            if vertexDescriptor[input.binding] == 0 {
+                const d = newS(4)
+                vertexDescriptor[input.binding] = d
+                var i = encode.blank(isa.S_LOAD_DWORDX4)
+                i.dst = d
+                i.src0 = VERTEX_BUFFERS
+                i.flags = encode.IMM
+                i.imm = 16 * input.binding
+                put(i)
+                facts.*.vertexBindings |= @intCast(u32, 1) << @intCast(u5, input.binding)
+            }
+        }
+        location += 1
+    }
+    vertexIndexRegister = 0
+    instanceIndexRegister = 0
+    if perVertex { vertexIndexRegister = addIndex(BASE_VERTEX, encode.VGPR) }
+    if perInstance { instanceIndexRegister = addIndex(BASE_INSTANCE, encode.VGPR + 1) }
+    location = 0
+    while location < ir.MAX_LOCATIONS {
+        if (ir.shape.attributes >> @intCast(u5, location)) & 1 != 0 {
+            const input = ir.vertexInputs[location]
+            const wanted = ir.shape.attributeComponents[location]
+            var k: u32 = 0
+            while k < wanted {
+                const r = newV()
+                attributeRegister[location * 4 + k] = r
+                if k < input.components {
+                    var i = encode.blank(isa.TBUFFER_LOAD_FORMAT_X)
+                    i.dst = r
+                    i.src0 = if input.perInstance { instanceIndexRegister } else { vertexIndexRegister }
+                    i.src1 = vertexDescriptor[input.binding]
+                    i.src2 = encode.constant(0)
+                    i.flags = encode.IDXEN
+                    i.imm = input.offset + 4 * k
+                    // the format 32 (BUF_DATA_FORMAT_32) and the input's
+                    // number format
+                    i.extra = BUF_DATA_FORMAT_32 | input.number << 4
+                    put(i)
+                } else {
+                    // what the format does not have: 0, 0, then 1
+                    var word: u32 = 0
+                    if k == 3 { word = if input.number == ir.NUMBER_FLOAT { ir.FLOAT_ONE } else { 1 } }
+                    var i = encode.blank(isa.V_MOV_B32)
+                    i.dst = r
+                    i.src0 = inlineOf(word)
+                    put(i)
+                }
+                k += 1
+            }
+        }
+        location += 1
+    }
+    return true
+}
+
+// gfx8.json's BUF_DATA_FORMAT_32.
+pub const BUF_DATA_FORMAT_32: u32 = 4
+
+// A fragment shader's start: m0, then each input component interpolated.
+fn fragmentStart(facts: *Facts) -> void {
+    var m = encode.blank(isa.S_MOV_B32)
+    m.dst = encode.M0
+    m.src0 = PRIM_MASK
+    put(m)
+    var attribute: u32 = 0
+    var location: u32 = 0
+    while location < ir.MAX_LOCATIONS {
+        if (ir.shape.inputs >> @intCast(u5, location)) & 1 != 0 {
+            const flat = (ir.shape.inputFlat >> @intCast(u5, location)) & 1 != 0
+            facts.*.interpLocation[attribute] = location
+            if flat { facts.*.interpFlat |= @intCast(u32, 1) << @intCast(u5, attribute) }
+            var c: u32 = 0
+            while c < 4 {
+                if (ir.shape.inputMask[location] >> @intCast(u5, c)) & 1 != 0 {
+                    const r = newV()
+                    interpRegister[location * 4 + c] = r
+                    if flat {
+                        // v_interp_mov_f32 of P0 (its source 2: ACO's
+                        // emit_interp_mov_instr)
+                        var i = encode.blank(isa.V_INTERP_MOV_F32)
+                        i.dst = r
+                        i.src0 = 2
+                        i.extra = attribute | c << 8
+                        put(i)
+                    } else {
+                        var p1 = encode.blank(isa.V_INTERP_P1_F32)
+                        p1.dst = r
+                        p1.src0 = encode.VGPR
+                        p1.extra = attribute | c << 8
+                        put(p1)
+                        var p2 = encode.blank(isa.V_INTERP_P2_F32)
+                        p2.dst = r
+                        p2.src0 = encode.VGPR + 1
+                        p2.extra = attribute | c << 8
+                        put(p2)
+                    }
+                }
+                c += 1
+            }
+            attribute += 1
+        }
+        location += 1
+    }
+    facts.*.interpolated = attribute
+}
+
+// The exports at the end (ir.exports), each source in a vector register;
+// done on the vertex shader's position export, done and the valid mask
+// on the fragment shader's last one (or a null export).
+fn exportAll(facts: *Facts) -> void {
+    const stage = ir.shape.stage
+    var k: u32 = 0
+    var lastColour: u32 = ir.NONE
+    while k < ir.exportCount {
+        if stage == ir.Stage.fragment { lastColour = k }
+        k += 1
+    }
+    k = 0
+    while k < ir.exportCount {
+        const e = ir.exports[k]
+        var sources: [4]u16 = undefined
+        var c: usize = 0
+        while c < 4 {
+            sources[c] = inVector(if e.values[c] == NONE { ir.constant(ir.Sort.word, 0) } else { e.values[c] })
+            c += 1
+        }
+        var x = encode.blank(EXPORT)
+        x.imm = e.target
+        x.extra = 0xF
+        x.src0 = sources[0]
+        x.src1 = sources[1]
+        x.src2 = sources[2]
+        x.src3 = sources[3]
+        if stage == ir.Stage.vertex && e.target == ir.EXP_POS0 { x.flags = encode.DONE }
+        if stage == ir.Stage.vertex && e.target >= ir.EXP_PARAM0 { facts.*.parameters += 1 }
+        if stage == ir.Stage.fragment {
+            facts.*.colourTargets |= @intCast(u32, 1) << @intCast(u5, e.target - ir.EXP_MRT0)
+            if k == lastColour { x.flags = encode.DONE | encode.VALID_MASK }
+        }
+        put(x)
+        k += 1
+    }
+    if stage == ir.Stage.fragment && ir.exportCount == 0 {
+        var x = encode.blank(EXPORT)
+        x.imm = ir.EXP_NULL
+        x.extra = 0
+        x.src0 = encode.VGPR
+        x.src1 = encode.VGPR
+        x.src2 = encode.VGPR
+        x.src3 = encode.VGPR
+        x.flags = encode.DONE | encode.VALID_MASK
+        put(x)
+    }
+}
+
+// The export instruction (aco_opcodes.py's "exp": format EXP, no number).
+pub const EXPORT = isa.Op.{ .format = isa.Format.exp, .number = 0 }
 
 // The program of the form read by shader_ir.read: its words into `words`.
 pub fn generate(words: []u32, facts: *Facts) -> bool {
@@ -1381,6 +1777,21 @@ pub fn generate(words: []u32, facts: *Facts) -> bool {
     labelCount = 0
     vCount = 0
     sCount = 0
+    const stage = ir.shape.stage
+    enter(stage)
+    facts.*.stage = stage
+    facts.*.vertexBindings = 0
+    facts.*.vgprComponents = 0
+    facts.*.parameters = 0
+    facts.*.interpolated = 0
+    facts.*.interpFlat = 0
+    facts.*.colourTargets = 0
+    var at: usize = 0
+    while at < 16 {
+        facts.*.parameterOf[at] = ir.parameterOf[at]
+        facts.*.interpLocation[at] = NONE
+        at += 1
+    }
     var n: u32 = 0
     while n < ir.nodeCount {
         location[n] = 0
@@ -1395,14 +1806,20 @@ pub fn generate(words: []u32, facts: *Facts) -> bool {
             descriptor[b] = d
             var i = encode.blank(isa.S_LOAD_DWORDX4)
             i.dst = d
-            i.src0 = SET_POINTER
+            i.src0 = setPointer
             i.flags = encode.IMM
             i.imm = 16 * b
             put(i)
         }
         b += 1
     }
+    if stage == ir.Stage.vertex {
+        if !vertexStart(facts) { return false }
+        facts.*.vgprComponents = 1
+    }
+    if stage == ir.Stage.fragment { fragmentStart(facts) }
     selectList(ir.root)
+    if stage != ir.Stage.compute { exportAll(facts) }
     if failed != ir.Failure.none { return false }
     intervals()
     if !allocate() {
@@ -1421,11 +1838,11 @@ pub fn generate(words: []u32, facts: *Facts) -> bool {
     facts.*.words = count
     facts.*.vgprs = highestV + 1
     facts.*.sgprs = highestS + 1
-    facts.*.userSgprs = USER_SGPRS
-    facts.*.groupIdX = true
-    facts.*.groupIdY = true
-    facts.*.groupIdZ = true
-    facts.*.localIdComponents = 2
+    facts.*.userSgprs = userSgprs
+    facts.*.groupIdX = stage == ir.Stage.compute
+    facts.*.groupIdY = stage == ir.Stage.compute
+    facts.*.groupIdZ = stage == ir.Stage.compute
+    facts.*.localIdComponents = if stage == ir.Stage.compute { 2 } else { 0 }
     facts.*.groupSizeX = ir.shape.localSizeX
     facts.*.groupSizeY = ir.shape.localSizeY
     facts.*.groupSizeZ = ir.shape.localSizeZ

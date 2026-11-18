@@ -40,6 +40,21 @@
 // - vkEndCommandBuffer: the owed flush, and when a copy has not been
 //   waited for the zero-byte DMA_DATA with CP_SYNC ("the kernel doesn't
 //   wait for it": radv_cp_dma_wait_for_idle), then the padding.
+//
+// ON THE GRAPHICS QUEUE (stage (c): a command buffer of the graphics
+// family, render.mlx's commands beside these) the same commands write
+// what RADV writes on a GENERAL queue of GFX8: the flush is radv_cs_
+// emit_cache_flush's !is_mec form (FLUSH_AND_INV_CB: CP_COHER_CNTL's
+// CB_ACTION_ENA and CB0 .. CB7_DEST_BASE_ENA and the two EVENT_WRITE_EOP
+// FLUSH_AND_INV_CB_DATA_TS of si_cs_emit_write_event_eop; FLUSH_AND_INV_
+// CB_META; PS_PARTIAL_FLUSH, else VS_PARTIAL_FLUSH; CS_PARTIAL_FLUSH;
+// PFP_SYNC_ME when an action or a wait is asked; SURFACE_SYNC in
+// ACQUIRE_MEM's place, the colour actions last), the barrier adds the
+// graphics stages (radv_stage_flush) and the colour accesses (radv_src_
+// access_flush, radv_dst_access_flush for an image without metadata:
+// FLUSH_AND_INV_CB for a COLOR_ATTACHMENT_WRITE source, and CB_META too
+// when no image is named), and a copy engine's CP_SYNC is followed by
+// PFP_SYNC_ME (radv_cs_emit_cp_dma on RADV_QUEUE_GENERAL).
 const std = @import("std")
 const vk = @import("std.vulkan")
 const icd = @import("std.vulkan.icd")
@@ -48,8 +63,15 @@ const device = @import("./device.mlx")
 const memory = @import("./memory.mlx")
 const pipeline = @import("./pipeline.mlx")
 const packets = @import("./packets.mlx")
+const gp = @import("./graphics_packets.mlx")
 
 const DeviceObject = device.DeviceObject
+
+// The queue families (driver.mlx): compute and transfer, then graphics
+// (with compute and transfer) when the card's record lists a graphics
+// ring.
+pub const COMPUTE_FAMILY: u32 = 0
+pub const GRAPHICS_FAMILY: u32 = 1
 
 pub const MOST_CHUNKS: usize = 32
 pub const CHUNK_BYTES: usize = 65536
@@ -72,6 +94,43 @@ pub const Flush = struct {
     pub const INV_SCACHE: u32 = 0x4
     pub const INV_VCACHE: u32 = 0x8
     pub const INV_L2: u32 = 0x10
+    pub const PS_PARTIAL_FLUSH: u32 = 0x20
+    pub const VS_PARTIAL_FLUSH: u32 = 0x40
+    pub const FLUSH_AND_INV_CB: u32 = 0x80
+    pub const FLUSH_AND_INV_CB_META: u32 = 0x100
+    pub const FLUSH_AND_INV_DB: u32 = 0x200
+    pub const FLUSH_AND_INV_DB_META: u32 = 0x400
+}
+
+// What a graphics command buffer has bound and written (render.mlx).
+pub const MOST_VERTEX_BUFFERS: usize = 16
+
+pub const DrawState = struct {
+    pipeline: usize
+    emitted: usize
+    sets: [4]u64
+    vertexAddress: [16]u64
+    vertexBytes: [16]u64
+    indexAddress: u64
+    indexBytes: u64
+    indexType: u32
+    // INDEX_TYPE as the stream has it (0xFFFFFFFF: not since the last
+    // draw without indices).
+    streamIndexType: u32
+    viewport: vk.Viewport
+    scissor: vk.Rect2D
+    blendConstants: [4]u32
+    // What the stream must get again before the next draw (render.mlx's
+    // Dirty).
+    dirty: u32
+    // Rendering: inside it, its area, its colour targets' views, the
+    // render pass whose end dependency its end applies (0: dynamic
+    // rendering).
+    rendering: bool
+    area: vk.Rect2D
+    targetCount: u32
+    views: [8]usize
+    pass: usize
 }
 
 pub const CommandPoolObject = struct {
@@ -107,6 +166,9 @@ pub const CommandBufferObject = struct {
     copying: bool
     // Out of the card's memory while recording: vkEndCommandBuffer says so.
     failed: bool
+    // A command buffer of the graphics family, and its draws' state.
+    graphics: bool
+    draw: DrawState
 }
 
 pub fn poolOf(handle: vk.CommandPool) -> *CommandPoolObject { return unsafe { @ptrFromInt(*CommandPoolObject, handle) } }
@@ -178,6 +240,7 @@ pub fn allocateCommandBuffers(handle: vk.Device, info: *const vk.CommandBufferAl
         made.*.next = pool.*.first
         pool.*.first = address
         made.*.state = Recording.INITIAL
+        made.*.graphics = pool.*.family == GRAPHICS_FAMILY
         into.?[k] = address
         k += 1
     }
@@ -224,6 +287,28 @@ fn restart(cb: *CommandBufferObject) -> void {
         cb.*.push[k] = 0
         k += 1
     }
+    cb.*.draw.pipeline = 0
+    cb.*.draw.emitted = 0
+    cb.*.draw.indexAddress = 0
+    cb.*.draw.indexBytes = 0
+    cb.*.draw.indexType = 0
+    cb.*.draw.streamIndexType = 0xFFFFFFFF
+    cb.*.draw.dirty = 0xFFFFFFFF
+    cb.*.draw.rendering = false
+    cb.*.draw.targetCount = 0
+    cb.*.draw.pass = 0
+    k = 0
+    while k < 4 {
+        cb.*.draw.sets[k] = 0
+        cb.*.draw.blendConstants[k] = 0
+        k += 1
+    }
+    k = 0
+    while k < MOST_VERTEX_BUFFERS {
+        cb.*.draw.vertexAddress[k] = 0
+        cb.*.draw.vertexBytes[k] = 0
+        k += 1
+    }
 }
 
 pub fn resetCommandBuffer(buffer: vk.CommandBuffer, flags: vk.CommandBufferResetFlags) -> vk.Result {
@@ -251,7 +336,7 @@ fn chunk(cb: *CommandBufferObject, index: usize) -> bool {
     return true
 }
 
-fn put(cb: *CommandBufferObject, word: u32) -> void {
+pub fn put(cb: *CommandBufferObject, word: u32) -> void {
     const words: [*]u32 = unsafe { @ptrFromInt([*]u32, cb.*.chunks[cb.*.current].bytes) }
     words[cb.*.at] = word
     cb.*.at += 1
@@ -267,7 +352,7 @@ fn pad(cb: *CommandBufferObject) -> void {
 // Room for `words` words in the chunk written now, else the next chunk:
 // false when there is none to be had (the command buffer then records
 // nothing more and its end says so).
-fn reserve(cb: *CommandBufferObject, words: usize) -> bool {
+pub fn reserve(cb: *CommandBufferObject, words: usize) -> bool {
     if cb.*.failed { return false }
     if cb.*.at == 0 && !chunk(cb, cb.*.current) {
         cb.*.failed = true
@@ -286,7 +371,7 @@ fn reserve(cb: *CommandBufferObject, words: usize) -> bool {
 
 // `bytes` bytes of an upload piece: their processor's address, and their
 // card address in `address`; 0 when there is no room.
-fn upload(cb: *CommandBufferObject, bytes: usize, address: *u64) -> usize {
+pub fn upload(cb: *CommandBufferObject, bytes: usize, address: *u64) -> usize {
     var at = (cb.*.uploadAt + UPLOAD_ALIGNMENT - 1) / UPLOAD_ALIGNMENT * UPLOAD_ALIGNMENT
     if cb.*.uploadCurrent < cb.*.uploadCount && at + bytes > UPLOAD_BYTES {
         cb.*.uploadCurrent += 1
@@ -306,7 +391,7 @@ fn upload(cb: *CommandBufferObject, bytes: usize, address: *u64) -> usize {
 }
 
 // The SET_SH_REG of `count` registers from `offset`.
-fn setRegisters(cb: *CommandBufferObject, offset: usize, count: u32) -> void {
+pub fn setRegisters(cb: *CommandBufferObject, offset: usize, count: u32) -> void {
     put(cb, packets.header(packets.PKT3_SET_SH_REG, count, false))
     put(cb, @intCast(u32, (offset - packets.SH_START) / 4))
 }
@@ -321,8 +406,78 @@ fn acquire(cb: *CommandBufferObject, actions: u32) -> void {
     put(cb, packets.COHER_POLL)
 }
 
-// The flush owed (radv_cs_emit_cache_flush on a compute ring of GFX8).
-fn emitFlush(cb: *CommandBufferObject) -> void {
+// SURFACE_SYNC over all of memory (radv_emit_acquire_mem, !is_mec).
+fn surfaceSync(cb: *CommandBufferObject, actions: u32) -> void {
+    put(cb, packets.header(gp.PKT3_SURFACE_SYNC, 3, false))
+    put(cb, actions)
+    put(cb, gp.SURFACE_SIZE_ALL)
+    put(cb, 0)
+    put(cb, gp.SURFACE_POLL)
+}
+
+fn eventWrite(cb: *CommandBufferObject, kind: u32, index: u32) -> void {
+    put(cb, packets.header(packets.PKT3_EVENT_WRITE, 0, false))
+    put(cb, packets.event(kind, index))
+}
+
+// FLUSH_AND_INV_CB_DATA_TS at the end of the pipe, nothing written: the
+// two packets si_cs_emit_write_event_eop gives on GFX7 and GFX8.
+fn colourFlushEvents(cb: *CommandBufferObject) -> void {
+    var n: usize = 0
+    while n < 2 {
+        put(cb, packets.header(gp.PKT3_EVENT_WRITE_EOP, 4, false))
+        put(cb, packets.event(gp.FLUSH_AND_INV_CB_DATA_TS, gp.EVENT_INDEX_TS))
+        put(cb, 0)
+        put(cb, 0)
+        put(cb, 0)
+        put(cb, 0)
+        n += 1
+    }
+}
+
+// The flush owed on the graphics queue (radv_cs_emit_cache_flush, !is_mec,
+// GFX8).
+fn emitGraphicsFlush(cb: *CommandBufferObject) -> void {
+    const flush = cb.*.flush
+    if flush == 0 || !reserve(cb, 12 + 2 + 2 + 2 + 2 + 2 + 5 + 5) { return }
+    var actions: u32 = 0
+    if (flush & Flush.INV_ICACHE) != 0 { actions |= packets.CP_COHER_CNTL__SH_ICACHE_ACTION_ENA }
+    if (flush & Flush.INV_SCACHE) != 0 { actions |= packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA }
+    if (flush & Flush.FLUSH_AND_INV_CB) != 0 {
+        actions |= gp.CP_COHER_CNTL__CB_ACTION_ENA | gp.CP_COHER_CNTL__CB_DEST_BASE_ALL
+        colourFlushEvents(cb)
+    }
+    if (flush & Flush.FLUSH_AND_INV_DB) != 0 { actions |= gp.CP_COHER_CNTL__DB_ACTION_ENA | gp.CP_COHER_CNTL__DB_DEST_BASE_ENA }
+    if (flush & Flush.FLUSH_AND_INV_CB_META) != 0 { eventWrite(cb, gp.FLUSH_AND_INV_CB_META, gp.EVENT_INDEX_OTHER) }
+    if (flush & Flush.FLUSH_AND_INV_DB_META) != 0 { eventWrite(cb, gp.FLUSH_AND_INV_DB_META, gp.EVENT_INDEX_OTHER) }
+    if (flush & Flush.PS_PARTIAL_FLUSH) != 0 {
+        eventWrite(cb, gp.PS_PARTIAL_FLUSH, packets.EVENT_INDEX_PARTIAL)
+    } else if (flush & Flush.VS_PARTIAL_FLUSH) != 0 {
+        eventWrite(cb, gp.VS_PARTIAL_FLUSH, packets.EVENT_INDEX_PARTIAL)
+    }
+    if (flush & Flush.CS_PARTIAL_FLUSH) != 0 { eventWrite(cb, packets.CS_PARTIAL_FLUSH, packets.EVENT_INDEX_PARTIAL) }
+    if actions != 0 || (flush & (Flush.CS_PARTIAL_FLUSH | Flush.INV_VCACHE | Flush.INV_L2)) != 0 {
+        put(cb, packets.header(gp.PKT3_PFP_SYNC_ME, 0, false))
+        put(cb, 0)
+    }
+    if (flush & Flush.INV_L2) != 0 {
+        surfaceSync(cb, actions | packets.CP_COHER_CNTL__TC_ACTION_ENA | packets.CP_COHER_CNTL__TCL1_ACTION_ENA | packets.CP_COHER_CNTL__TC_WB_ACTION_ENA)
+        actions = 0
+    } else if (flush & Flush.INV_VCACHE) != 0 {
+        surfaceSync(cb, actions | packets.CP_COHER_CNTL__TCL1_ACTION_ENA)
+        actions = 0
+    }
+    if actions != 0 { surfaceSync(cb, actions) }
+    cb.*.flush = 0
+}
+
+// The flush owed (radv_cs_emit_cache_flush on a compute ring of GFX8, or
+// on the graphics ring).
+pub fn emitFlush(cb: *CommandBufferObject) -> void {
+    if cb.*.graphics {
+        emitGraphicsFlush(cb)
+        return
+    }
     const flush = cb.*.flush
     if flush == 0 || !reserve(cb, 2 + 7 + 7) { return }
     var actions: u32 = 0
@@ -344,7 +499,7 @@ fn emitFlush(cb: *CommandBufferObject) -> void {
 }
 
 // One DMA_DATA packet.
-fn dmaPacket(cb: *CommandBufferObject, control: u32, source: u64, target: u64, command: u32) -> void {
+pub fn dmaPacket(cb: *CommandBufferObject, control: u32, source: u64, target: u64, command: u32) -> void {
     put(cb, packets.header(packets.PKT3_DMA_DATA, 5, false))
     put(cb, control)
     put(cb, @intCast(u32, source & 0xFFFFFFFF))
@@ -355,15 +510,24 @@ fn dmaPacket(cb: *CommandBufferObject, control: u32, source: u64, target: u64, c
 }
 
 // The copy engine waited for (radv_cp_dma_wait_for_idle).
-fn waitForCopies(cb: *CommandBufferObject) -> void {
-    if !cb.*.copying || !reserve(cb, 7) { return }
+pub fn waitForCopies(cb: *CommandBufferObject) -> void {
+    if !cb.*.copying || !reserve(cb, 9) { return }
     dmaPacket(cb, packets.DMA_DATA__CP_SYNC, 0, 0, 0)
+    pfpAfterSync(cb)
     cb.*.copying = false
+}
+
+// After a packet with CP_SYNC on the graphics queue: the prefetcher waits
+// for the engine (radv_cs_emit_cp_dma: index buffers are read by PFP).
+pub fn pfpAfterSync(cb: *CommandBufferObject) -> void {
+    if !cb.*.graphics { return }
+    put(cb, packets.header(gp.PKT3_PFP_SYNC_ME, 0, false))
+    put(cb, 0)
 }
 
 // Before a copy packet: the owed flush, and RAW_WAIT on the packet when
 // there was one (radv_cp_dma_prepare).
-fn beforeCopy(cb: *CommandBufferObject) -> u32 {
+pub fn beforeCopy(cb: *CommandBufferObject) -> u32 {
     if cb.*.flush == 0 { return 0 }
     emitFlush(cb)
     return packets.DMA_DATA__RAW_WAIT
@@ -385,7 +549,7 @@ pub fn streamsOf(buffer: vk.CommandBuffer, streams: [*]gpucard.Stream, at: usize
     const cb = bufferOf(buffer)
     var k: usize = 0
     while k <= cb.*.current && k < cb.*.chunkCount {
-        streams[at + k] = gpucard.Stream.{ .engine = gpucard.Engine.COMPUTE, .flags = 0, .address = cb.*.chunks[k].address, .words = @intCast(u64, cb.*.lengths[k]) }
+        streams[at + k] = gpucard.Stream.{ .engine = if cb.*.graphics { gpucard.Engine.GRAPHICS } else { gpucard.Engine.COMPUTE }, .flags = 0, .address = cb.*.chunks[k].address, .words = @intCast(u64, cb.*.lengths[k]) }
         k += 1
     }
     return k
@@ -395,8 +559,14 @@ pub fn streamsOf(buffer: vk.CommandBuffer, streams: [*]gpucard.Stream, at: usize
 // The commands
 
 pub fn cmdBindPipeline(buffer: vk.CommandBuffer, point: vk.PipelineBindPoint, given: vk.Pipeline) -> void {
+    const cb = bufferOf(buffer)
+    if point == vk.PipelineBindPoint.graphics {
+        if cb.*.draw.pipeline != given { cb.*.draw.dirty = 0xFFFFFFFF }
+        cb.*.draw.pipeline = given
+        return
+    }
     if point != vk.PipelineBindPoint.compute { return }
-    bufferOf(buffer).*.pipeline = given
+    cb.*.pipeline = given
 }
 
 pub fn cmdBindDescriptorSets(buffer: vk.CommandBuffer, point: vk.PipelineBindPoint, layout: vk.PipelineLayout, first: u32, count: u32, sets: ?[*]const vk.DescriptorSet, dynamicCount: u32, offsets: ?[*]const u32) -> void {
@@ -404,7 +574,9 @@ pub fn cmdBindDescriptorSets(buffer: vk.CommandBuffer, point: vk.PipelineBindPoi
     var k: usize = 0
     while k < @intCast(usize, count) {
         const index = @intCast(usize, first) + k
-        if index < pipeline.MOST_SETS { cb.*.sets[index] = if sets.?[k] != 0 { pipeline.setOf(sets.?[k]).*.address } else { 0 } }
+        const address = if sets.?[k] != 0 { pipeline.setOf(sets.?[k]).*.address } else { 0 }
+        if index < pipeline.MOST_SETS && point == vk.PipelineBindPoint.graphics { cb.*.draw.sets[index] = address }
+        if index < pipeline.MOST_SETS && point == vk.PipelineBindPoint.compute { cb.*.sets[index] = address }
         k += 1
     }
 }
@@ -471,22 +643,89 @@ const ACCESS_TRANSFER_WRITE: u32 = 0x1000
 const ACCESS_MEMORY_READ: u32 = 0x8000
 const ACCESS_MEMORY_WRITE: u32 = 0x10000
 
-// radv_src_access_flush for buffers on a compute queue.
-fn sourceFlush(access: u32) -> u32 {
-    if (access & (ACCESS_SHADER_WRITE | ACCESS_TRANSFER_WRITE | ACCESS_MEMORY_WRITE)) != 0 { return Flush.INV_L2 }
-    return 0
+const ACCESS_COLOR_ATTACHMENT_READ: u32 = 0x80
+const ACCESS_COLOR_ATTACHMENT_WRITE: u32 = 0x100
+const ACCESS_DEPTH_STENCIL_READ: u32 = 0x200
+const ACCESS_DEPTH_STENCIL_WRITE: u32 = 0x400
+const STAGE_DRAW_INDIRECT: u32 = 0x2
+const STAGE_VERTEX_INPUT: u32 = 0x4
+const STAGE_VERTEX_SHADER: u32 = 0x8
+const STAGE_TESSELLATION: u32 = 0x30
+const STAGE_GEOMETRY: u32 = 0x40
+const STAGE_FRAGMENT: u32 = 0x80
+const STAGE_FRAGMENT_TESTS: u32 = 0x300
+const STAGE_COLOR_OUTPUT: u32 = 0x400
+const STAGE_ALL_GRAPHICS: u32 = 0x8000
+
+// What radv_emit_cache_flush drops on a compute queue: the graphics
+// blocks' flushes and waits.
+const GRAPHICS_ONLY: u32 = Flush.PS_PARTIAL_FLUSH | Flush.VS_PARTIAL_FLUSH | Flush.FLUSH_AND_INV_CB | Flush.FLUSH_AND_INV_CB_META | Flush.FLUSH_AND_INV_DB | Flush.FLUSH_AND_INV_DB_META
+
+// radv_src_access_flush: `image` whether the barrier names one of this
+// stage's images (linear, no metadata, not coherent with L2, never
+// storage), else a buffer or all memory (metadata assumed).
+pub fn sourceFlush(access: u32, image: bool) -> u32 {
+    var flush: u32 = 0
+    if (access & ACCESS_SHADER_WRITE) != 0 {
+        if image { flush |= Flush.FLUSH_AND_INV_CB }
+        flush |= Flush.INV_L2
+    }
+    if (access & ACCESS_COLOR_ATTACHMENT_WRITE) != 0 {
+        flush |= Flush.FLUSH_AND_INV_CB
+        if !image { flush |= Flush.FLUSH_AND_INV_CB_META }
+    }
+    if (access & ACCESS_DEPTH_STENCIL_WRITE) != 0 {
+        flush |= Flush.FLUSH_AND_INV_DB
+        if !image { flush |= Flush.FLUSH_AND_INV_DB_META }
+    }
+    if (access & (ACCESS_TRANSFER_WRITE | ACCESS_MEMORY_WRITE)) != 0 {
+        flush |= Flush.FLUSH_AND_INV_CB | Flush.FLUSH_AND_INV_DB | Flush.INV_L2
+        if !image { flush |= Flush.FLUSH_AND_INV_CB_META | Flush.FLUSH_AND_INV_DB_META }
+    }
+    return flush
 }
 
-// radv_dst_access_flush for buffers on a compute queue (ACO's SMEM loads
-// of storage buffers: a shader read invalidates the scalar cache too).
-fn targetFlush(access: u32) -> u32 {
+// radv_dst_access_flush (ACO's SMEM loads of storage buffers: a shader
+// read invalidates the scalar cache too, for a buffer).
+pub fn targetFlush(access: u32, image: bool) -> u32 {
     var flush: u32 = 0
     if (access & ACCESS_INDIRECT_COMMAND_READ) != 0 { flush |= Flush.INV_SCACHE }
     if (access & ACCESS_UNIFORM_READ) != 0 { flush |= Flush.INV_VCACHE | Flush.INV_SCACHE }
     if (access & (ACCESS_VERTEX_ATTRIBUTE_READ | ACCESS_INPUT_ATTACHMENT_READ | ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE)) != 0 { flush |= Flush.INV_VCACHE | Flush.INV_L2 }
-    if (access & ACCESS_SHADER_READ) != 0 { flush |= Flush.INV_SCACHE | Flush.INV_VCACHE | Flush.INV_L2 }
-    if (access & (ACCESS_MEMORY_READ | ACCESS_MEMORY_WRITE)) != 0 { flush |= Flush.INV_VCACHE | Flush.INV_SCACHE | Flush.INV_L2 }
+    if (access & ACCESS_SHADER_READ) != 0 {
+        if !image { flush |= Flush.INV_SCACHE }
+        flush |= Flush.INV_VCACHE | Flush.INV_L2
+    }
+    if (access & (ACCESS_COLOR_ATTACHMENT_READ | ACCESS_COLOR_ATTACHMENT_WRITE)) != 0 && !image { flush |= Flush.FLUSH_AND_INV_CB | Flush.FLUSH_AND_INV_CB_META }
+    if (access & (ACCESS_DEPTH_STENCIL_READ | ACCESS_DEPTH_STENCIL_WRITE)) != 0 && !image { flush |= Flush.FLUSH_AND_INV_DB | Flush.FLUSH_AND_INV_DB_META }
+    if (access & (ACCESS_MEMORY_READ | ACCESS_MEMORY_WRITE)) != 0 {
+        flush |= Flush.INV_VCACHE | Flush.INV_SCACHE | Flush.INV_L2
+        if !image { flush |= Flush.FLUSH_AND_INV_CB | Flush.FLUSH_AND_INV_CB_META | Flush.FLUSH_AND_INV_DB | Flush.FLUSH_AND_INV_DB_META }
+    }
     return flush
+}
+
+// radv_stage_flush (unless the destination is the bottom of the pipe
+// alone).
+fn stageFlush(sourceStages: u32, targetStages: u32) -> u32 {
+    if targetStages == STAGE_BOTTOM { return 0 }
+    var flush: u32 = 0
+    if (sourceStages & (STAGE_COMPUTE | STAGE_TRANSFER | STAGE_BOTTOM | STAGE_ALL_COMMANDS)) != 0 { flush |= Flush.CS_PARTIAL_FLUSH }
+    if (sourceStages & (STAGE_FRAGMENT | STAGE_FRAGMENT_TESTS | STAGE_COLOR_OUTPUT | STAGE_TRANSFER | STAGE_BOTTOM | STAGE_ALL_GRAPHICS | STAGE_ALL_COMMANDS)) != 0 {
+        flush |= Flush.PS_PARTIAL_FLUSH
+    } else if (sourceStages & (STAGE_DRAW_INDIRECT | STAGE_VERTEX_INPUT | STAGE_VERTEX_SHADER | STAGE_TESSELLATION | STAGE_GEOMETRY)) != 0 {
+        flush |= Flush.VS_PARTIAL_FLUSH
+    }
+    return flush
+}
+
+// A barrier of the stages and the flushes its accesses ask (radv_barrier):
+// the source's now, the copy engine waited for, the destination's owed.
+pub fn barrier(cb: *CommandBufferObject, sourceStages: u32, targetStages: u32, source: u32, target: u32) -> void {
+    const kept = if cb.*.graphics { 0xFFFFFFFF } else { ~GRAPHICS_ONLY }
+    cb.*.flush |= (source | stageFlush(sourceStages, targetStages)) & kept
+    if (sourceStages & (STAGE_TRANSFER | STAGE_BOTTOM | STAGE_ALL_COMMANDS)) != 0 { waitForCopies(cb) }
+    cb.*.flush |= target & kept
 }
 
 pub fn cmdPipelineBarrier(buffer: vk.CommandBuffer, sourceStages: vk.PipelineStageFlags, targetStages: vk.PipelineStageFlags, dependency: vk.DependencyFlags, memoryCount: u32, memoryBarriers: ?[*]const vk.MemoryBarrier, bufferCount: u32, bufferBarriers: ?[*]const vk.BufferMemoryBarrier, imageCount: u32, imageBarriers: ?[*]const vk.ImageMemoryBarrier) -> void {
@@ -495,21 +734,25 @@ pub fn cmdPipelineBarrier(buffer: vk.CommandBuffer, sourceStages: vk.PipelineSta
     var target: u32 = 0
     var k: usize = 0
     while k < @intCast(usize, memoryCount) {
-        source |= sourceFlush(memoryBarriers.?[k].srcAccessMask)
-        target |= targetFlush(memoryBarriers.?[k].dstAccessMask)
+        source |= sourceFlush(memoryBarriers.?[k].srcAccessMask, false)
+        target |= targetFlush(memoryBarriers.?[k].dstAccessMask, false)
         k += 1
     }
     k = 0
     while k < @intCast(usize, bufferCount) {
-        source |= sourceFlush(bufferBarriers.?[k].srcAccessMask)
-        target |= targetFlush(bufferBarriers.?[k].dstAccessMask)
+        source |= sourceFlush(bufferBarriers.?[k].srcAccessMask, false)
+        target |= targetFlush(bufferBarriers.?[k].dstAccessMask, false)
         k += 1
     }
-    // (There are no images at this stage.)
-    if targetStages != STAGE_BOTTOM && (sourceStages & (STAGE_COMPUTE | STAGE_TRANSFER | STAGE_BOTTOM | STAGE_ALL_COMMANDS)) != 0 { cb.*.flush |= Flush.CS_PARTIAL_FLUSH }
-    cb.*.flush |= source
-    if (sourceStages & (STAGE_TRANSFER | STAGE_BOTTOM | STAGE_ALL_COMMANDS)) != 0 { waitForCopies(cb) }
-    cb.*.flush |= target
+    // (An image's layouts are all the same to a linear image without
+    // metadata: radv_handle_image_transition has nothing to do.)
+    k = 0
+    while k < @intCast(usize, imageCount) {
+        source |= sourceFlush(imageBarriers.?[k].srcAccessMask, true)
+        target |= targetFlush(imageBarriers.?[k].dstAccessMask, true)
+        k += 1
+    }
+    barrier(cb, sourceStages, targetStages, source, target)
 }
 
 pub fn cmdCopyBuffer(buffer: vk.CommandBuffer, sourceBuffer: vk.Buffer, targetBuffer: vk.Buffer, count: u32, regions: ?[*]const vk.BufferCopy) -> void {
@@ -549,6 +792,7 @@ pub fn cmdFillBuffer(buffer: vk.CommandBuffer, targetBuffer: vk.Buffer, offset: 
         const last = bytes == rest
         const control = packets.put(packets.DMA_DATA__SRC_SEL, packets.SRC_SEL_DATA) | (if last { packets.DMA_DATA__CP_SYNC } else { 0 })
         dmaPacket(cb, control, @intCast(u64, data), target, @intCast(u32, bytes) | raw)
+        if last { pfpAfterSync(cb) }
         cb.*.copying = !last
         target += bytes
         rest -= bytes

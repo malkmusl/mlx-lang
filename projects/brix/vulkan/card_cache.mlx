@@ -42,6 +42,23 @@
 // wait for it": si_cmd_buffer.c radv_cp_dma_wait_for_idle). A race stops
 // the model as a stale read does.
 //
+// THE COLOUR BLOCK (stage (c): what a draw's pixels write). Its cache, CB,
+// holds what the draws wrote, and writes it to memory past L2 when it is
+// flushed: on this generation an image is not coherent with L2 (Mesa's
+// radv_image.c radv_image_is_l2_coherent: false below GFX9), so RADV's
+// barrier after COLOR_ATTACHMENT_WRITE flushes CB (FLUSH_AND_INV_CB:
+// the EOP event FLUSH_AND_INV_CB_DATA_TS, or SURFACE_SYNC's CB_ACTION_ENA)
+// and invalidates L2 before others read (radv_dst_access_flush's
+// INV_L2 for a TRANSFER_READ). A word CB holds dirty, read by a shader or
+// the copy engine, is refused (unflushed); the kernel's fence on the
+// graphics ring flushes CB (gfx_v8_0_ring_emit_fence_gfx: CACHE_FLUSH_AND_
+// INV_TS_EVENT). What CB reads (a blend, a masked write) comes from its
+// line, else from memory, and is refused when L2 holds a newer word
+// there (unwritten) or a dispatch or a copy is still writing it.
+//
+// The index fetch (DRAW_INDEX_2) reads through L2 (levelRead): a clean
+// line of L2 older than memory is stale there, as in the caches above.
+//
 // Lines are 64 bytes here: a choice of the model, not a number of the
 // card's (none of the sources read gives it); a larger line holds more
 // words that were never asked for, which only makes the model stricter.
@@ -83,10 +100,13 @@ pub const Failure = enum(u8) {
     dropped,
     // More copies in flight than the model keeps.
     tooMany,
+    // A word the colour block's cache holds that no flush wrote to
+    // memory, read by a shader or the copy engine.
+    unflushed,
 }
 
 // The caches, for the failure's report.
-pub const Where = enum(u8) { memory, instruction, scalar, vector, l2 }
+pub const Where = enum(u8) { memory, instruction, scalar, vector, l2, colour }
 
 pub var failure: Failure = Failure.none // (per run)
 pub var failureWhere: Where = Where.memory // (per run)
@@ -195,6 +215,7 @@ var instruction: Cache = undefined // (per run)
 var scalar: Cache = undefined // (per run)
 var vector: Cache = undefined // (per run)
 var level2: Cache = undefined // (per run)
+var colour: Cache = undefined // (per run)
 var made = false // (per run)
 
 fn makeCache(cache: *Cache, capacity: usize) -> void {
@@ -275,12 +296,14 @@ pub fn reset() -> void {
         makeCache(&scalar, FIRST_CAPACITY)
         makeCache(&vector, FIRST_CAPACITY)
         makeCache(&level2, FIRST_CAPACITY)
+        makeCache(&colour, FIRST_CAPACITY)
         made = true
     }
     clear(&instruction)
     clear(&scalar)
     clear(&vector)
     clear(&level2)
+    clear(&colour)
     copies = 0
     failure = Failure.none
     dispatch = 0
@@ -324,6 +347,7 @@ fn shaderMay(address: u64, where: Where) -> bool {
         if (found.?.*.flight >> @intCast(u5, w)) & 1 != 0 && found.?.*.writer[w] != dispatch { return fail(Failure.shaderRace, where, address) }
     }
     if copies != 0 && copyTouches(address, 4) { return fail(Failure.copyRace, where, address) }
+    if colourDirty(address) { return fail(Failure.unflushed, where, address) }
     return true
 }
 
@@ -529,6 +553,7 @@ fn copyMay(address: u64, rights: usize, reading: bool) -> bool {
         if (found.?.*.flight >> @intCast(u5, w)) & 1 != 0 { return fail(Failure.shaderRace, Where.memory, address) }
         if reading && (found.?.*.dirty >> @intCast(u5, w)) & 1 != 0 { return fail(Failure.unwritten, Where.l2, address) }
     }
+    if colourDirty(word) { return fail(Failure.unflushed, Where.colour, address) }
     return true
 }
 
@@ -573,5 +598,110 @@ pub fn holds(address: u64, where: Where, value: *u32) -> bool {
     const line = find(cache, keyOf(address))
     if line == null { return false }
     value.* = line.?.*.words[wordOf(address)]
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The colour block (CB) and the index fetch
+
+// Whether CB holds the word at `address` newer than memory.
+fn colourDirty(address: u64) -> bool {
+    if colour.used == 0 { return false }
+    const found = find(&colour, keyOf(address))
+    return found != null && (found.?.*.dirty >> @intCast(u5, wordOf(address))) & 1 != 0
+}
+
+// Whether CB may touch the word: mapped with `rights`, no dispatch's word
+// in flight, no copy's, no newer word of L2 (CB does not see L2's).
+fn colourMay(address: u64, rights: usize) -> bool {
+    if !mapped(address, rights) { return fail(Failure.unmapped, Where.colour, address) }
+    const found = find(&level2, keyOf(address))
+    if found != null {
+        const w = wordOf(address)
+        if (found.?.*.flight >> @intCast(u5, w)) & 1 != 0 { return fail(Failure.shaderRace, Where.colour, address) }
+        if (found.?.*.dirty >> @intCast(u5, w)) & 1 != 0 { return fail(Failure.unwritten, Where.colour, address) }
+    }
+    if copies != 0 && copyTouches(address, 4) { return fail(Failure.copyRace, Where.colour, address) }
+    return true
+}
+
+// CB's line of `address`, filled from memory when it had none.
+fn colourLine(address: u64) -> *Line {
+    const key = keyOf(address)
+    const found = find(&colour, key)
+    if found != null { return found.? }
+    const line = insert(&colour, key)
+    const first = address & ~@intCast(u64, 63)
+    var k: usize = 0
+    while k < LINE_WORDS {
+        line.*.words[k] = memoryWord(first + 4 * @intCast(u64, k))
+        k += 1
+    }
+    return line
+}
+
+// A word of a colour target as CB has it (a blend's or a masked write's
+// old pixel).
+pub fn colourRead(address: u64, value: *u32) -> bool {
+    if !colourMay(address, READ | WRITE) { return false }
+    const line = colourLine(address)
+    value.* = line.*.words[wordOf(address)]
+    return true
+}
+
+// A pixel's word into CB: newer than memory until a flush.
+pub fn colourWrite(address: u64, value: u32) -> bool {
+    if !colourMay(address, READ | WRITE) { return false }
+    const line = colourLine(address)
+    const w = wordOf(address)
+    line.*.words[w] = value
+    line.*.dirty |= @intCast(u32, 1) << @intCast(u5, w)
+    return true
+}
+
+// FLUSH_AND_INV_CB: CB's newer words written to memory (past L2), its
+// lines let go.
+pub fn colourFlush() -> void {
+    var k: usize = 0
+    while k < colour.capacity {
+        const line = &colour.lines[k]
+        if line.*.key != 0 && line.*.dirty != 0 {
+            const first = (line.*.key - 1) << LINE_SHIFT
+            var w: usize = 0
+            while w < LINE_WORDS {
+                if (line.*.dirty >> @intCast(u5, w)) & 1 != 0 { setMemoryWord(first + 4 * @intCast(u64, w), line.*.words[w]) }
+                w += 1
+            }
+        }
+        k += 1
+    }
+    clear(&colour)
+}
+
+// Whether CB holds words no flush wrote (a test's look).
+pub fn colourHeld() -> bool {
+    var k: usize = 0
+    while k < colour.capacity {
+        if colour.lines[k].key != 0 && colour.lines[k].dirty != 0 { return true }
+        k += 1
+    }
+    return false
+}
+
+// The index fetch's word through L2: refused when a dispatch or a copy is
+// still writing it, when CB holds it newer, or when L2's clean line is
+// older than memory.
+pub fn levelRead(address: u64, value: *u32) -> bool {
+    if !mapped(address, READ) { return fail(Failure.unmapped, Where.l2, address) }
+    if !shaderMay(address, Where.l2) { return false }
+    const line = level2Line(address)
+    const w = wordOf(address)
+    const got = line.*.words[w]
+    if (line.*.dirty >> @intCast(u5, w)) & 1 == 0 && got != memoryWord(address) {
+        failureGot = got
+        failureTrue = memoryWord(address)
+        return fail(Failure.stale, Where.l2, address)
+    }
+    value.* = got
     return true
 }
