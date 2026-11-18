@@ -146,6 +146,17 @@
 # these stages write is the display's but DMIF_ADDR_CALC, written only
 # where it differs. (tools/check_gpu_clear_state.py holds the graphics
 # ring's first submission, as tests/506 prints it, word for word.)
+# Of the programs' work (gpu_work.mlx: the native calls 80 to 85): the
+# packets a program's stream may have and every field the kernel reads of
+# them, each select read whole up to the next field vid.h names (Mesa
+# mesa-24.0.0's src/amd/common/sid.h, put beside the headers, for
+# WAIT_REG_MEM's memory space), the values it takes as vid.h's comments
+# name them, the packets' lengths as gfx_v8_0.c and vid.h give them,
+# COMPUTE_VMID, the watchdog's bound as Linux's job timeout, the fragment
+# as amdgpu_vm_adjust_size's default for this card, the kernel's fill
+# under the copy engine's 21 bits of bytes and the driver's most, and the
+# calls' numbers, flags, states and record size against the spec and
+# std.gpucard.
 # Prints what it held and ends with 1 when anything differs.
 import os, re, sys
 
@@ -1853,4 +1864,106 @@ for name in sorted(written67):
     hold("%s (%#x) written by stage 6 or 7 is %s register of the display's" % (name, number, "the one" if name == "DMIF_ADDR_CALC" else "no"), int(in_display), int(name == "DMIF_ADDR_CALC"))
 hold("DMIF_ADDR_CALC is written only where it differs", int("if g.*.dmifWas != config {\n            compute.put(e, c, engines.DMIF_ADDR_CALC, config)" in graphics_text), 1)
 print("stages 6 and 7: %d numbers of gpu_graphics.mlx, gpu_space.mlx, gpu_first_space.mlx and gpu_ring.mlx held against Linux's files, %d wrong" % (held - stage67_before, bad - stage67_bad_before))
+
+# ---- The programs' work: gpu_work.mlx (the native calls 80 to 85). Beside
+# the files above: Mesa mesa-24.0.0's src/amd/common/sid.h (as sid.h).
+if not os.path.exists(os.path.join(hdr, "sid.h")):
+    sys.exit("the programs' work is not held: not in %s: sid.h (Mesa mesa-24.0.0's src/amd/common/sid.h)" % hdr)
+calls_before = held
+calls_bad_before = bad
+work_text = open(os.path.join(here, "gpu_work.mlx")).read()
+gpucard_text = open(os.path.join(here, "..", "..", "..", "std", "src", "gpucard.mlx")).read()
+driver_packets = open(os.path.join(here, "..", "vulkan", "packets.mlx")).read()
+vid_text = open(os.path.join(hdr, "vid.h")).read()
+vid_values = defines(os.path.join(hdr, "vid.h"))
+gfx8_regs = defines(os.path.join(hdr, "gfx_8_0_d.h"))
+sid_h = text_of("sid.h")
+device_c = text_of("amdgpu_device.c")
+
+def work_value(name):
+    m = re.search(r"pub const %s: \w+ = ([0-9A-Fa-fx *]+)\n" % name, work_text)
+    return eval(m.group(1)) if m else None
+
+def shift_of(macro):
+    m = re.search(r"#\s*define\s+%s\(x\)\s+\(\(x\) << (\d+)\)" % macro, vid_text)
+    return int(m.group(1)) if m else None
+
+def bit_of(macro):
+    m = re.search(r"#\s*define\s+%s\s+\(1 << (\d+)\)" % macro, vid_text)
+    return int(m.group(1)) if m else None
+
+def field(low, next_field):
+    return ((1 << (next_field - low)) - 1) << low
+
+# The packets.
+for name in ("NOP", "DISPATCH_DIRECT", "WRITE_DATA", "WAIT_REG_MEM", "EVENT_WRITE", "RELEASE_MEM", "DMA_DATA", "ACQUIRE_MEM", "SET_SH_REG", "SET_SH_REG_START", "SET_SH_REG_END"):
+    hold("PACKET3_%s" % name, work_value("PACKET3_" + name), vid_values.get("PACKET3_" + name))
+hold("COMPUTE_VMID", work_value("COMPUTE_VMID"), gfx8_regs.get("mmCOMPUTE_VMID"))
+# WRITE_DATA's destination: bits 8 up to WR_ONE_ADDR; memory, L2, memory
+# direct taken; a register and GDS not.
+hold("WRITE_DATA_DST_SEL_MASK", work_value("WRITE_DATA_DST_SEL_MASK"), field(shift_of("WRITE_DATA_DST_SEL"), bit_of("WR_ONE_ADDR")))
+write_doc = vid_text[vid_text.index("WRITE_DATA_DST_SEL(x)"):vid_text.index("WR_ONE_ADDR")]
+hold("WRITE_DATA's destinations: 0 a register, 1 memory, 2 L2, 3 GDS, 5 memory direct", int(all(t in write_doc for t in ("0 - register", "1 - memory (sync - via GRBM)", "2 - gl2", "3 - gds", "5 - memory (async - direct)"))), 1)
+hold("WRITE_DATA: 1, 2 and 5 taken", int("return target == 1 || target == 2 || target == 5" in work_text), 1)
+# WAIT_REG_MEM: the memory space (two bits from 4: Mesa's mask), memory 1;
+# the operation up to the engine's field, 0 the wait alone; six words.
+hold("WAIT_REG_MEM_MEM_SPACE", work_value("WAIT_REG_MEM_MEM_SPACE"), (1 << shift_of("WAIT_REG_MEM_MEM_SPACE")) if "1 - mem" in vid_text else None)
+space_mask = re.search(r"#define\s+WAIT_REG_MEM_MEM_SPACE\(x\)\s+\(\(\(unsigned\)\(x\)&(0x[0-9a-fA-F]+)\) << (\d+)\)", sid_h)
+hold("WAIT_REG_MEM_MEM_SPACE_MASK", work_value("WAIT_REG_MEM_MEM_SPACE_MASK"), int(space_mask.group(1), 16) << int(space_mask.group(2)) if space_mask else None)
+hold("WAIT_REG_MEM_OPERATION_MASK", work_value("WAIT_REG_MEM_OPERATION_MASK"), field(shift_of("WAIT_REG_MEM_OPERATION"), shift_of("WAIT_REG_MEM_ENGINE")))
+hold("WAIT_REG_MEM's operation 0 the wait alone", int("0 - wait_reg_mem" in vid_text and "1 - wr_wait_wr_reg" in vid_text), 1)
+hold("WAIT_REG_MEM carries 6 words (gfx_v8_0.c)", int("PACKET3(PACKET3_WAIT_REG_MEM, 5)" in gfx_c and "if op == PACKET3_WAIT_REG_MEM {\n        // On memory (never a register), and a wait alone.\n        if count != 6 { return false }" in work_text), 1)
+# DMA_DATA: the selects to the next field, the addresses taken and GDS not,
+# the data word, the sync, the register address spaces; seven words with
+# its header.
+hold("DMA_DATA_DST_SEL_SHIFT", work_value("DMA_DATA_DST_SEL_SHIFT"), shift_of("PACKET3_DMA_DATA_DST_SEL"))
+hold("DMA_DATA_DST_SEL_MASK", work_value("DMA_DATA_DST_SEL_MASK"), field(shift_of("PACKET3_DMA_DATA_DST_SEL"), shift_of("PACKET3_DMA_DATA_DST_CACHE_POLICY")))
+hold("DMA_DATA_SRC_SEL_SHIFT", work_value("DMA_DATA_SRC_SEL_SHIFT"), shift_of("PACKET3_DMA_DATA_SRC_SEL"))
+hold("DMA_DATA_SRC_SEL_MASK", work_value("DMA_DATA_SRC_SEL_MASK"), field(shift_of("PACKET3_DMA_DATA_SRC_SEL"), bit_of("PACKET3_DMA_DATA_CP_SYNC")))
+dma_doc = vid_text[vid_text.index("#define\tPACKET3_DMA_DATA"):vid_text.index("PACKET3_DMA_DATA_CP_SYNC")]
+hold("DMA_DATA's selects: an address 0 and 3, GDS 1, the data 2", int(all(t in dma_doc for t in ("0 - DST_ADDR using DAS", "1 - GDS", "3 - DST_ADDR using L2", "0 - SRC_ADDR using SAS", "2 - DATA", "3 - SRC_ADDR using L2"))), 1)
+hold("DMA_DATA: a destination 0 or 3, a source not 1", int("if (target != 0 && target != 3) || source == 1 { return false }" in work_text), 1)
+hold("DMA_DATA_SRC_SEL_DATA", work_value("DMA_DATA_SRC_SEL_DATA"), 2 << shift_of("PACKET3_DMA_DATA_SRC_SEL"))
+hold("DMA_DATA_CP_SYNC", work_value("DMA_DATA_CP_SYNC"), 1 << bit_of("PACKET3_DMA_DATA_CP_SYNC"))
+hold("DMA_DATA_CMD_SAS", work_value("DMA_DATA_CMD_SAS"), 1 << bit_of("PACKET3_DMA_DATA_CMD_SAS"))
+hold("DMA_DATA_CMD_DAS", work_value("DMA_DATA_CMD_DAS"), 1 << bit_of("PACKET3_DMA_DATA_CMD_DAS"))
+hold("DMA_DATA carries 6 words after its header", int("7. COMMAND [30:21] | BYTE_COUNT [20:0]" in dma_doc and "if op == PACKET3_DMA_DATA {\n        // From an address or the data word, to an address; the addresses\n        // memory's, not the registers'.\n        if count != 6 { return false }" in work_text), 1)
+hold("the kernel's fill a packet is under BYTE_COUNT's 21 bits and the driver's most", int(work_value("FILL_BYTES") < (1 << 21) and work_value("FILL_BYTES") <= eval(re.search(r"pub const DMA_MOST_BYTES: usize = (\d+)", driver_packets).group(1))), 1)
+# SET_SH_REG: within the range, COMPUTE_VMID not among the registers.
+hold("SET_SH_REG: the last register below the end, COMPUTE_VMID outside the run", int("return last < PACKET3_SET_SH_REG_END && (COMPUTE_VMID < first || COMPUTE_VMID > last)" in work_text), 1)
+# RELEASE_MEM: six words after its header (gfx_v8_0_ring_emit_fence_compute),
+# its interrupt select (vid.h's INT_SEL, up to DATA_SEL) 0 in a program's;
+# the kernel's fill a packet of DMA_DATA's seven words.
+hold("RELEASE_MEM_INT_SEL_SHIFT", work_value("RELEASE_MEM_INT_SEL_SHIFT"), shift_of("INT_SEL"))
+hold("RELEASE_MEM_INT_SEL_MASK", work_value("RELEASE_MEM_INT_SEL_MASK"), field(shift_of("INT_SEL"), shift_of("DATA_SEL")) >> shift_of("INT_SEL"))
+hold("INT_SEL's values: 1 an interrupt alone, 2 when the write is confirmed", int("1 - interrupt only (DATA_SEL = 0)" in vid_text and "2 - interrupt when data write is confirmed" in vid_text), 1)
+hold("RELEASE_MEM carries 6 words (gfx_v8_0.c)", int("PACKET3(PACKET3_RELEASE_MEM, 5)" in gfx_c and "if count != 6 { return false }\n        return (copyWord(w, list, at, 2) >> RELEASE_MEM_INT_SEL_SHIFT) & RELEASE_MEM_INT_SEL_MASK == 0" in work_text), 1)
+hold("FILL_PACKET_WORDS (DMA_DATA's header and six words)", work_value("FILL_PACKET_WORDS"), 7 if "7. COMMAND [30:21] | BYTE_COUNT [20:0]" in dma_doc else None)
+# The watchdog: Linux's job timeout for the graphics (and copy) rings, the
+# compute rings' longer one said beside it.
+gfx_timeout = re.search(r"adev->gfx_timeout = msecs_to_jiffies\((\d+)\);", device_c)
+compute_timeout = re.search(r"adev->compute_timeout =  msecs_to_jiffies\((\d+)\);", device_c)
+hold("HANG_NS (Linux's gfx_timeout)", work_value("HANG_NS"), int(gfx_timeout.group(1)) * 1000000 if gfx_timeout else None)
+hold("the compute rings' timeout said as Linux's 60 s", int(compute_timeout is not None and int(compute_timeout.group(1)) == 60000 and "its compute one is 60 s" in work_text), 1)
+# The fragment: gmc_v8_0's amdgpu_vm_adjust_size(adev, 64, 9, ...), taken
+# when amdgpu_vm_fragment_size is -1 (the default).
+fragment = re.search(r"amdgpu_vm_adjust_size\(adev, \d+, (\d+), \d+, \d+\);", gmc8_c)
+hold("FRAGMENT (gmc_v8_0's default fragment of 2^9 pages)", work_value("FRAGMENT"), (4096 << int(fragment.group(1))) if fragment and "adev->vm_manager.fragment_size = fragment_size_default;" in text_of("amdgpu_vm.c") else None)
+# The calls against the spec and std.gpucard.
+hold("FIRST_CALL (the spec's gpu_memory)", work_value("FIRST_CALL"), int(re.search(r'<Call n="(\d+)">gpu_memory\(', spec_text).group(1)))
+hold("the six calls in the spec from it", int(all(re.search(r'<Call n="%d">%s\(' % (work_value("FIRST_CALL") + k, name), spec_text) is not None for k, name in enumerate(("gpu_memory", "gpu_memory_of", "gpu_map", "gpu_unmap", "gpu_submit", "gpu_fence")))), 1)
+hold("STREAM_BYTES (the spec's record)", work_value("STREAM_BYTES"), int(re.search(r"each stream a record of (\d+) bytes", spec_text).group(1)))
+memory_flags = re.search(r"card memory (\d+), the system's (\d+), either (\d+).*?may map it (0x[0-9a-f]+).*?write-combined (0x[0-9a-f]+), zeroed (0x[0-9a-f]+).*?4 GiB of the card's addresses (0x[0-9a-f]+).*?another process (0x[0-9a-f]+)", spec_text)
+memory_struct = gpucard_text[gpucard_text.index("pub const Memory = struct"):]
+for k, name in enumerate(("CARD", "SYSTEM", "EITHER", "PROCESSOR", "WRITE_COMBINED", "ZEROED", "LOW", "SHAREABLE")):
+    hold("gpu_memory's %s (the spec)" % name, work_value(name), int(memory_flags.group(k + 1), 0))
+    std_value = re.search(r"pub const %s: usize = ([0-9x<> ]+)\n" % name, memory_struct)
+    hold("gpu_memory's %s (std.gpucard)" % name, work_value(name), eval(std_value.group(1)) if std_value else None)
+engines_spec = re.search(r"engine u32 \(graphics (\d+), compute (\d+), copy (\d+)", spec_text)
+for k, name in enumerate(("GRAPHICS", "COMPUTE", "COPY")):
+    hold("a stream's engine %s (the spec)" % name, work_value(name), int(engines_spec.group(k + 1)))
+for name in ("READ", "WRITE", "EXECUTE"):
+    hold("gpu_map's %s (the spec)" % name, work_value(name), STAGE67_LINUX.get(name))
+hold("WHY_RING_DOWN (the spec's why 4, std.gpucard)", work_value("WHY_RING_DOWN"), int(re.search(r"pub const RING_DOWN: u32 = (\d+)", gpucard_text).group(1)))
+print("the programs' work: %d numbers of gpu_work.mlx held against Linux's and Mesa's files, the spec and std.gpucard, %d wrong" % (held - calls_before, bad - calls_bad_before))
 sys.exit(1 if bad or rom_bad or wrong or display_bad else 0)

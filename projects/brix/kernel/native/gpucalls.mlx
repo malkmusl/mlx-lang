@@ -3,40 +3,51 @@
 // context is a handle of the kind gpu, which node_open of /devices/gpuN
 // with the write flag gives (`open`, from nodes.mlx). A read of it at a
 // position gives the card's record, as a read of the node does; a write is
-// wrong_kind.
-//
-// The calls that make the card do something are specified and refused
-// for now, whatever their other arguments: the kernel starts none of the
-// card's engines yet. Each says invalid_handle for a handle the process
-// does not hold, wrong_kind for one that is no context, and unsupported
-// for a context:
+// wrong_kind. What the calls do is ../gpu_work.mlx's; here are the handles
+// (a context's, a memory object's of the card, a fence's: the files kinds
+// gpu, gpu_memory and gpu_fence), the rights, and the process's memory
+// the calls read:
 //   80 gpu_memory(gpu h, size, flags) -> memory h
 //   81 gpu_memory_of(gpu h, address, size) -> memory h
 //   82 gpu_map(gpu h, memory h, offset, size, card address, flags)
 //   83 gpu_unmap(gpu h, card address, size)
 //   84 gpu_submit(gpu h, records*, count, fence h or 0) -> sequence
 //   85 gpu_fence(gpu h) -> h
+// Each says invalid_handle for a handle the process does not hold,
+// wrong_kind for one that is no context (or, for the memory and the fence,
+// no memory object of the card and no fence), unsupported while the card
+// serves no calls (the record lists no ring: a boot that did not come to
+// stage 7). A memory handle of the card is mapped for the processor by
+// memory_map_object (`mapMemory`, from timers.mlx): the system's memory's
+// frames, shared; the card's own memory is no processor's (no_right), nor
+// is memory the processor was not to map. A mapping on the card that
+// writes needs the memory handle's write right.
 const files = @import("../files.mlx")
+const memory = @import("../memory.mlx")
 const cards = @import("../gpu_programs.mlx")
+const work = @import("../gpu_work.mlx")
 const Process = @import("../process.mlx").Process
 const Bytes = @import("../bytes.mlx").Bytes
 const Status = @import("../status.mlx").Status
 const objects = @import("./objects.mlx")
 
+const Page = memory.Page
+
 // The calls, from the first (NATIVE_BASE + FIRST).
-pub const FIRST: usize = 80
-pub const LAST: usize = 85
+pub const FIRST: usize = work.FIRST_CALL
+pub const LAST: usize = work.FIRST_CALL + 5
 
 // node_open of card `card`'s node with the write flag: a new context and
-// a descriptor of it (the caller makes the handle), or too_many. The
+// a descriptor of it (the caller makes the handle), or too_many (every
+// context taken, the process has its most, every address space held). The
 // handle reads and writes whatever the open asked: its record is read,
 // and the calls on it are what it writes.
 pub fn open(p: *Process, card: usize) -> isize {
     if card >= cards.count() { return Status.not_found }
-    const which = cards.begin(card)
-    if which == cards.MOST_CONTEXTS { return Status.too_many }
-    const fd = p.*.files.openObject(files.Kind.gpu, which, files.Open.READ_WRITE)
-    if fd < 0 { cards.release(which) }
+    const which = cards.begin(card, p.*.pid)
+    if which < 0 { return which }
+    const fd = p.*.files.openObject(files.Kind.gpu, @bitCast(usize, which), files.Open.READ_WRITE)
+    if fd < 0 { cards.release(@bitCast(usize, which)) }
     return fd
 }
 
@@ -47,6 +58,15 @@ fn contextOf(p: *Process, handle: usize) -> isize {
     if fd < 0 { return Status.invalid_handle }
     const slot = p.*.files.get(fd).?
     if slot.*.kind != files.Kind.gpu { return Status.wrong_kind }
+    return @intCast(isize, slot.*.index)
+}
+
+// The object of kind `kind` that `handle` names, or a status.
+fn objectOf(p: *Process, handle: usize, kind: files.Kind) -> isize {
+    const fd = objects.descriptorOf(p, handle)
+    if fd < 0 { return Status.invalid_handle }
+    const slot = p.*.files.get(fd).?
+    if slot.*.kind != kind { return Status.wrong_kind }
     return @intCast(isize, slot.*.index)
 }
 
@@ -62,10 +82,122 @@ pub fn transfer(p: *Process, fd: isize, address: usize, length: usize, at: usize
     return @intCast(isize, got)
 }
 
-// Call FIRST + `which` on the context `handle`: refused for now.
-pub fn call(p: *Process, which: usize, handle: usize) -> isize {
+// A handle of a new object of `kind` (a memory object or a fence of the
+// card), or a status (the object let go again when no descriptor is
+// left).
+fn handOut(p: *Process, kind: files.Kind, index: usize, flags: usize) -> isize {
+    const fd = p.*.files.openObject(kind, index, flags)
+    if fd < 0 {
+        if kind == files.Kind.gpu_memory { cards.releaseMemory(index) } else { cards.releaseFence(index) }
+        return fd
+    }
+    return @bitCast(isize, objects.handleOf(p, fd))
+}
+
+// A page of process `caller` (the Process itself) at `address`, held for
+// the card: its frame, one holder more; 0 when the process has none there,
+// what is there is no frame of the system's (a device's page), or the
+// process may not write it (a memory object mapped to be read). A page
+// shared copy-on-write (a file's page as node_map maps it, which is the
+// file's own cached frame; a page a branch shares) is first made the
+// process's own, as a write to it would: the card may write what it is
+// given, and it must be what the process may write, nobody else's.
+fn pin(caller: usize, address: usize) -> usize {
+    const p: *Process = unsafe { @ptrFromInt(*Process, caller) }
+    _ = p.*.space.copyOnWrite(address)
+    const frame = p.*.space.translate(address)
+    if frame == 0 || !p.*.space.writable(address) { return 0 }
+    const all = memory.allFrames()
+    var k: usize = 0
+    var ours = false
+    while k < all.*.spanCount {
+        if frame >= all.*.spans[k].start && frame < all.*.spans[k].end { ours = true }
+        k += 1
+    }
+    if !ours || !all.share(frame) { return 0 }
+    return frame
+}
+
+// Call FIRST + `which` on the context `a1` with the arguments after it.
+pub fn call(p: *Process, which: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize, a6: usize) -> isize {
     if which > LAST - FIRST { return Status.unsupported }
-    const context = contextOf(p, handle)
+    const context = contextOf(p, a1)
     if context < 0 { return context }
-    return Status.unsupported
+    const k = @bitCast(usize, context)
+    const w = cards.programs()
+    if which == 0 {
+        const made = work.memory(w, k, a2, a3)
+        if made < 0 { return made }
+        return handOut(p, files.Kind.gpu_memory, @bitCast(usize, made), files.Open.READ_WRITE)
+    }
+    if which == 1 {
+        if a3 == 0 || a2 % Page.SIZE != 0 || a3 % Page.SIZE != 0 { return work.memoryOf(w, k, pin, @intFromPtr(p), a2, a3) }
+        if !p.prepare(a2, a3) { return Status.bad_address }
+        const made = work.memoryOf(w, k, pin, @intFromPtr(p), a2, a3)
+        if made < 0 { return made }
+        return handOut(p, files.Kind.gpu_memory, @bitCast(usize, made), files.Open.READ_WRITE)
+    }
+    if which == 2 {
+        const object = objectOf(p, a2, files.Kind.gpu_memory)
+        if object < 0 { return object }
+        if a6 & work.WRITE != 0 && objects.rightsOf(p, a2) & objects.Rights.WRITE == 0 { return Status.no_right }
+        return work.map(w, k, @bitCast(usize, object), a3, a4, a5, a6)
+    }
+    if which == 3 { return work.unmap(w, k, a2, a3) }
+    if which == 4 {
+        // The records copied in first (the process may change its own
+        // memory meanwhile; what the kernel reads is this copy).
+        if a3 == 0 || a3 > work.MOST_STREAMS || a2 == 0 { return work.submit(w, k, &streams, 0, work.NONE) }
+        if !p.prepare(a2, a3 * work.STREAM_BYTES) { return Status.bad_address }
+        const bytes = Bytes.pointer(a2)
+        var n: usize = 0
+        while n < a3 {
+            streams[n] = work.streamOf(bytes, n)
+            n += 1
+        }
+        var fence = work.NONE
+        if a4 != 0 {
+            const f = objectOf(p, a4, files.Kind.gpu_fence)
+            if f < 0 { return f }
+            fence = @bitCast(usize, f)
+        }
+        return work.submit(w, k, &streams, a3, fence)
+    }
+    const made = work.fence(w, k)
+    if made < 0 { return made }
+    return handOut(p, files.Kind.gpu_fence, @bitCast(usize, made), files.Open.READ_ONLY)
+}
+
+var streams: [work.MOST_STREAMS]work.Stream = undefined // (per run)
+
+// memory_map_object of a memory object of the card: `size` bytes of it
+// from `offset` (a page's start) mapped into the caller, shared with every
+// other mapping (each frame held once more), writable with `writable`. The
+// address, or a Status: no_right for the card's own memory or memory the
+// processor was not to map.
+pub fn mapMemory(p: *Process, which: usize, offset: usize, size: usize, writable: bool) -> isize {
+    const w = cards.programs()
+    if !work.mappable(w, which) || work.flagsOf(w, which) & work.PROCESSOR == 0 { return Status.no_right }
+    const total = work.sizeOf(w, which)
+    if offset & (Page.SIZE - 1) != 0 || size == 0 || offset >= total || Page.up(size) > total - offset { return Status.invalid }
+    const pages = Page.up(size) / Page.SIZE
+    const reserved = p.reserve(pages * Page.SIZE)
+    if reserved < 0 { return reserved }
+    const start = @bitCast(usize, reserved)
+    const flags = Page.PRESENT | Page.USER | Page.SHARED | (if writable { Page.WRITABLE } else { 0 })
+    var k: usize = 0
+    while k < pages {
+        const frame = work.pageOf(w, which, offset / Page.SIZE + k)
+        if frame == 0 || !memory.allFrames().share(frame) {
+            p.unreserve(start, start + pages * Page.SIZE)
+            return Status.no_memory
+        }
+        if !p.mapPage(start + k * Page.SIZE, frame, flags) {
+            memory.allFrames().free(frame)
+            p.unreserve(start, start + pages * Page.SIZE)
+            return Status.no_memory
+        }
+        k += 1
+    }
+    return @bitCast(isize, start)
 }

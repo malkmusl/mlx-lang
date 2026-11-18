@@ -1,0 +1,548 @@
+// The Vulkan driver's interface to the kernel (projects/brix/vulkan/
+// card.mlx) answered on the host by the kernel's own code, for tests/518:
+// the user's RX 580 as the table of tests 504 to 507 and 517 (mec_card.mlx
+// over vm_card.mlx, brought through stages 0 to 7), the programs' work on
+// it as the kernel does it (projects/brix/kernel/gpu_work.mlx), the card's
+// record as gpu_offer.mlx makes it, the contexts' table as
+// gpu_programs.mlx keeps it, and the calls' arguments, records and
+// statuses as native/gpucalls.mlx turns them (the stream records decoded
+// by the kernel's own streamOf, every Status made the native call's
+// -code). What stays out is the kernel's process machinery: the handles
+// are this file's table ((generation << 12) | (slot + 1), as the kernel
+// makes them), the process is one (PROCESS), its mapping of a memory
+// handle is the frames' own bytes (contiguous here: the frames are handed
+// out one after the other and never again).
+//
+// The card runs what the kernel puts on compute ring 0. The kernel's own
+// packets are mec_card.mlx's; a program's buffer (its streams as the
+// kernel copied and checked them, in its address space) is run by the
+// Vulkan host card's engine (card_run.mlx, its caches card_cache.mlx) over
+// what the space's page table maps, as the card reads the table from its
+// memory: the buffer's words read through the space, every page's bytes
+// and rights from its entry. A word the engine finds unmapped is the
+// card's fault in that space (vm_card.mlx's, with its interrupt entry);
+// a stream the engine chokes on (or every buffer, `choke`) stops the
+// compute processor there, as a hang does.
+//
+// The wait (std.os.brix.wait) lets the card's time pass in ticks of the
+// timer (TICK), each taking the card's interrupt and keeping the
+// watchdog, as the kernel's timer and interrupt do while a program waits.
+const std = @import("std")
+const gpucard = @import("std.gpucard")
+const engines = @import("../../projects/brix/kernel/gpu_engines.mlx")
+const loaded = @import("../../projects/brix/kernel/gpu_smc_sdma.mlx")
+const compute = @import("../../projects/brix/kernel/gpu_compute.mlx")
+const graphics = @import("../../projects/brix/kernel/gpu_graphics.mlx")
+const spaces = @import("../../projects/brix/kernel/gpu_space.mlx")
+const first = @import("../../projects/brix/kernel/gpu_first_space.mlx")
+const work = @import("../../projects/brix/kernel/gpu_work.mlx")
+const offering = @import("../../projects/brix/kernel/gpu_offer.mlx")
+const record = @import("../../projects/brix/kernel/gpu_record.mlx")
+const Status = @import("../../projects/brix/kernel/status.mlx").Status
+const card = @import("../../projects/brix/vulkan/card.mlx")
+const cache = @import("../../projects/brix/vulkan/card_cache.mlx")
+const run = @import("../../projects/brix/vulkan/card_run.mlx")
+const engine = @import("./engine_card.mlx")
+const mec = @import("./mec_card.mlx")
+const vm = @import("./vm_card.mlx")
+
+const WaitItem = std.os.brix.WaitItem
+
+// The one process (the program the driver runs in).
+pub const PROCESS: usize = 100
+// A tick of the timer while a program waits.
+pub const TICK: usize = 1000000
+
+// ---- The kernel's state on the card.
+
+pub var e: engines.Engines = undefined
+pub var l: loaded.Loaded = undefined
+pub var c: compute.Compute = undefined
+pub var g: graphics.Graphics = undefined
+pub var s: spaces.Spaces = undefined
+pub var f: first.FirstSpace = undefined
+pub var w: work.Work = undefined
+var where: engines.Card = undefined
+var contexts: offering.Contexts = undefined
+
+// What the engine does wrong: choke on every program buffer; the units in
+// the last place its v_rcp_f32 is off (wave.mlx's rcpError).
+pub var choke = false
+pub var rcpError: i32 = 0
+// The program buffers run, those that failed, the faults they made, the
+// dispatches they ran.
+pub var buffers: usize = 0
+pub var failed: usize = 0
+pub var faulted: usize = 0
+pub var dispatched: usize = 0
+
+// ---- The system's memory: frames from FRAMES_FROM, each with its holders,
+// handed out one after the other.
+
+pub const FRAMES_FROM: usize = 0x0000000200000000
+pub const FRAMES: usize = 32768
+const FRAME_BYTES: usize = FRAMES * 4096
+var frames: usize = 0
+var holders: [FRAMES]u32 = undefined
+var nextFrame: usize = 0
+pub var frameMisses: usize = 0
+
+fn frameIndex(physical: usize) -> usize { return (physical - FRAMES_FROM) / 4096 }
+
+fn takeFrame() -> usize {
+    if nextFrame == FRAMES { return 0 }
+    const at = FRAMES_FROM + nextFrame * 4096
+    nextFrame += 1
+    std.mem.set(unsafe { @ptrFromInt([*]u8, viewOf(at)) }, 0, 4096)
+    holders[frameIndex(at)] = 1
+    return at
+}
+
+fn freeFrame(physical: usize) -> void {
+    const k = frameIndex(physical)
+    if holders[k] == 0 {
+        frameMisses += 1
+        return
+    }
+    holders[k] -= 1
+}
+
+fn viewOf(physical: usize) -> usize { return frames + physical - FRAMES_FROM }
+
+// The frames held now.
+pub fn framesHeld() -> usize {
+    var held: usize = 0
+    var k: usize = 0
+    while k < nextFrame {
+        if holders[k] != 0 { held += 1 }
+        k += 1
+    }
+    return held
+}
+
+// A page of the program's own at `address` (its bytes: a frame's here),
+// held for the card.
+fn pin(caller: usize, address: usize) -> usize {
+    if caller != PROCESS || address < frames || address >= frames + nextFrame * 4096 { return 0 }
+    const physical = FRAMES_FROM + (address - frames)
+    if holders[frameIndex(physical)] == 0 { return 0 }
+    holders[frameIndex(physical)] += 1
+    return physical
+}
+
+// ---- The card brought up.
+
+// The card anew at a boot of `stage`, stages 0 to 7 run, and the calls
+// served when they can be, with `systemMost` bytes of the system's memory
+// for programs: whether they are.
+pub fn boot(stage: usize, systemMost: usize) -> bool {
+    mec.reset()
+    engine.picture(0, 1280, 960, 1800, 1000)
+    engine.registers[loaded.SMC_RESP_0] = 1
+    where = engines.Card.{ .device = 0x67DF, .revision = 0xE7, .view = engine.VIEW, .pictureOffset = 0, .pictureBytes = 1280 * 960 * 4, .dmaBase = engine.DMA_BASE, .dmaPages = 2048, .rom = &engine.machine }
+    const hands = mec.hands()
+    engines.begin(&e, &hands, &where, stage)
+    const more = mec.more()
+    loaded.begin(&l, &more)
+    compute.begin(&c)
+    graphics.begin(&g)
+    spaces.begin(&s)
+    first.begin(&f)
+    if frames == 0 { frames = std.linux.mapAnonymous(FRAME_BYTES) }
+    vm.systemFrom = FRAMES_FROM
+    vm.systemBytes = FRAME_BYTES
+    vm.systemMemory = frames
+    nextFrame = 0
+    frameMisses = 0
+    contexts.reset()
+    resetHandles()
+    choke = false
+    rcpError = 0
+    buffers = 0
+    failed = 0
+    faulted = 0
+    dispatched = 0
+    cachedSpace = 0
+    cache.reset()
+    const lent = work.Hands.{ .frame = takeFrame, .free = freeFrame, .view = viewOf }
+    work.begin(&w, &lent, systemMost)
+    engines.run(&e)
+    first.run(&e, &l, &c, &g, &s, &f)
+    engine.interruptsOn = true
+    engine.waitingMessage = false
+    mec.programRuns = true
+    mec.programHook = runProgram
+    return work.serve(&w, &e, &l, &c, &s, f.v1)
+}
+
+// The card's record as a read of /devices/gpu0 gives it now.
+pub fn facts() -> record.Facts {
+    const lent = offering.Card.{ .present = true, .vendor = 0x1002, .device = 0x67DF, .revision = 0xE7, .pci = 0x2100, .visible = engine.VIEW, .picture = 1280 * 960 * 4, .name = "Radeon RX 580 (Polaris 10)" }
+    var made: record.Facts = undefined
+    offering.gather(&lent, &e, &made)
+    offering.served(&w, &made)
+    return made
+}
+
+// ---- A program's buffer on the card.
+
+const MOST_WORDS: usize = work.COPY_BYTES / 4
+var words: [MOST_WORDS]u32 = undefined // (per run)
+const MOST_RUNS: usize = 4096
+var runs: [MOST_RUNS]cache.Mapping = undefined // (per run)
+// The address space whose lines the caches hold (0: none).
+var cachedSpace: usize = 0
+
+// The host's bytes behind a page table entry `pte` for `address` (0: none
+// of the table's memories).
+fn hostOf(pte: usize, address: usize) -> usize {
+    const physical = (pte & engines.PTE_ADDRESS) | (address & 0xFFF)
+    if pte & engines.AMDGPU_PTE_SYSTEM != 0 {
+        if physical >= vm.systemFrom && physical < vm.systemFrom + vm.systemBytes { return vm.systemMemory + physical - vm.systemFrom }
+        return 0
+    }
+    if physical < engine.VIEW { return engine.vram + physical }
+    if physical < engine.VIEW + engine.BEYOND_VRAM { return engine.beyondVram + physical - engine.VIEW }
+    return 0
+}
+
+fn rightsOf(pte: usize) -> usize {
+    var rights: usize = 0
+    if pte & engines.AMDGPU_PTE_READABLE != 0 { rights |= cache.READ }
+    if pte & engines.AMDGPU_PTE_WRITEABLE != 0 { rights |= cache.WRITE }
+    if pte & engines.AMDGPU_PTE_EXECUTABLE != 0 { rights |= cache.EXECUTE }
+    return rights
+}
+
+// What address space `space` maps for the programs' mappings in it, page
+// by page from its table, in runs sorted by address: how many.
+fn mappingsOf(space: usize) -> usize {
+    var n: usize = 0
+    var at: usize = 0
+    while at < work.MOST_MAPPINGS {
+        const m = &w.mappings[at]
+        at += 1
+        if !m.*.used || work.spaceOf(&w, m.*.context) != space { continue }
+        var page: usize = 0
+        while page < m.*.size / 4096 {
+            const address = m.*.address + page * 4096
+            page += 1
+            const pte = spaces.entry(&e, &s, space, address)
+            const bytes = if pte & engines.AMDGPU_PTE_VALID != 0 { hostOf(pte, address) } else { 0 }
+            if bytes == 0 { continue }
+            const rights = rightsOf(pte)
+            if n > 0 && runs[n - 1].address + runs[n - 1].size == @intCast(u64, address) && runs[n - 1].bytes + @intCast(usize, runs[n - 1].size) == bytes && runs[n - 1].flags == rights {
+                runs[n - 1].size += 4096
+                continue
+            }
+            if n == MOST_RUNS { return n }
+            // In address order (the mappings are not).
+            var to = n
+            while to > 0 && runs[to - 1].address > @intCast(u64, address) {
+                runs[to] = runs[to - 1]
+                to -= 1
+            }
+            runs[to] = cache.Mapping.{ .address = @intCast(u64, address), .size = 4096, .bytes = bytes, .flags = rights }
+            n += 1
+        }
+    }
+    return n
+}
+
+// mec_card.mlx's hook: the buffer of `length` words at `address` of
+// address space `space`. False: the card chokes (the processor stops).
+fn runProgram(space: usize, address: usize, length: usize) -> bool {
+    buffers += 1
+    if choke || length > MOST_WORDS { return false }
+    var k: usize = 0
+    while k < length {
+        const at = vm.reach(space, address + k * 4, false)
+        if at == 0 { return false }
+        words[k] = unsafe { @ptrFromInt(*u32, at) }.*
+        k += 1
+    }
+    if cachedSpace != space {
+        cache.reset()
+        cachedSpace = space
+    }
+    cache.useMappings(&runs, mappingsOf(space))
+    const counts = facts()
+    // The tile mode table the kernel programs (gpu_compute.mlx's): a
+    // program's buffers on compute ring 0 name none, but the card has it.
+    var tile_modes: [32]u32 = undefined
+    var t: usize = 0
+    while t < 32 {
+        tile_modes[t] = @intCast(u32, compute.TILE_MODES[t])
+        t += 1
+    }
+    const card_facts = run.Card.{ .computeUnits = counts.shaderEngines * counts.arraysPerEngine * counts.computeUnitsPerArray, .shaderEngines = counts.shaderEngines, .rcpError = rcpError, .tileModes = tile_modes }
+    var streams = [1]run.Stream{ run.Stream.{ .words = &words, .count = length, .graphics = false } }
+    const ran = run.run(streams[0..1], card_facts)
+    dispatched += run.report.dispatches
+    if ran { return true }
+    failed += 1
+    // A word where the space maps none (or not with the right): the card's
+    // fault in the space, and the buffer goes on (the default page).
+    if run.report.failure == run.Failure.memory && run.report.cacheFailure == cache.Failure.unmapped {
+        const before = vm.faults
+        _ = vm.reach(space, @intCast(usize, cache.failureAddress), true)
+        if vm.faults == before { _ = vm.reach(space, @intCast(usize, cache.failureAddress), false) }
+        cache.reset()
+        if vm.faults != before {
+            faulted += 1
+            return true
+        }
+    }
+    cache.reset()
+    return false
+}
+
+// ---- The handles (the kernel's descriptors and handles, as a table).
+
+const CONTEXT: u8 = 1
+const MEMORY: u8 = 2
+const FENCE: u8 = 3
+const SLOTS: usize = 2048
+const SLOT_BITS: u6 = 12
+
+const Slot = struct {
+    used: bool
+    kind: u8
+    index: usize
+    generation: usize
+}
+
+var slots: [SLOTS]Slot = undefined // (per run)
+
+fn resetHandles() -> void {
+    var k: usize = 0
+    while k < SLOTS {
+        slots[k].used = false
+        slots[k].generation = 1
+        k += 1
+    }
+}
+
+// A handle of a new `kind` object `index`, or the native call's status.
+fn handOut(kind: u8, index: usize) -> isize {
+    var k: usize = 0
+    while k < SLOTS {
+        if !slots[k].used {
+            slots[k] = Slot.{ .used = true, .kind = kind, .index = index, .generation = slots[k].generation }
+            return @intCast(isize, (slots[k].generation << SLOT_BITS) | (k + 1))
+        }
+        k += 1
+    }
+    if kind == MEMORY { work.releaseMemory(&w, index) } else if kind == FENCE { work.releaseFence(&w, index) }
+    return native(Status.too_many)
+}
+
+// The slot of `handle`, or the native call's status.
+fn slotOf(handle: u32) -> isize {
+    const value = @intCast(usize, handle)
+    const k = value & ((@intCast(usize, 1) << SLOT_BITS) - 1)
+    if k == 0 || k > SLOTS || !slots[k - 1].used || slots[k - 1].generation != value >> SLOT_BITS { return native(Status.invalid_handle) }
+    return @intCast(isize, k - 1)
+}
+
+// The object of `kind` `handle` names, or the native call's status.
+fn objectOf(handle: u32, kind: u8) -> isize {
+    const k = slotOf(handle)
+    if k < 0 { return k }
+    if slots[@bitCast(usize, k)].kind != kind { return native(Status.wrong_kind) }
+    return @intCast(isize, slots[@bitCast(usize, k)].index)
+}
+
+// What a kernel operation answered, as the native call gives it (a
+// Status as -code: native/calls.mlx).
+fn native(result: isize) -> isize {
+    if Status.isStatus(result) { return -Status.code(result) }
+    return result
+}
+
+// How many handles the program holds.
+pub fn handles() -> usize {
+    var held: usize = 0
+    var k: usize = 0
+    while k < SLOTS {
+        if slots[k].used { held += 1 }
+        k += 1
+    }
+    return held
+}
+
+// ---- The calls (native/gpucalls.mlx's, over the table).
+
+fn count() -> usize { return 1 }
+
+fn describe(index: usize, into: *gpucard.Device) -> isize {
+    if index >= 1 { return native(Status.not_found) }
+    var made = facts()
+    var bytes: [record.RECORD]u8 = undefined
+    const got = record.readAt(&made, 0, &bytes, record.RECORD)
+    if !gpucard.decode(&bytes, got, into) { return native(Status.invalid) }
+    return 0
+}
+
+fn open(index: usize) -> isize {
+    if index >= 1 { return native(Status.not_found) }
+    contexts.reclaim(&w)
+    const which = contexts.begin(index)
+    if which == offering.MOST_CONTEXTS { return native(Status.too_many) }
+    const opened = work.open(&w, which, PROCESS)
+    if opened < 0 {
+        contexts.release(which)
+        return native(opened)
+    }
+    return handOut(CONTEXT, which)
+}
+
+fn describeContext(context: u32, into: *gpucard.Device) -> isize {
+    const which = objectOf(context, CONTEXT)
+    if which < 0 { return which }
+    return describe(contexts.cardOf(@bitCast(usize, which)), into)
+}
+
+// A handle closed (handle_close): the last of a context ends it; a memory
+// object's or a fence's, one holder less.
+fn close(handle: u32) -> isize {
+    const k = slotOf(handle)
+    if k < 0 { return k }
+    const slot = &slots[@bitCast(usize, k)]
+    if slot.*.kind == CONTEXT {
+        contexts.release(slot.*.index)
+        if !contexts.used[slot.*.index] {
+            work.end(&w, slot.*.index)
+            if work.inUse(&w, slot.*.index) { contexts.keep(slot.*.index) }
+        }
+    } else if slot.*.kind == MEMORY {
+        work.releaseMemory(&w, slot.*.index)
+    } else {
+        work.releaseFence(&w, slot.*.index)
+    }
+    slot.*.used = false
+    slot.*.generation = if slot.*.generation >= 0xFFFFF { 1 } else { slot.*.generation + 1 }
+    return 0
+}
+
+fn contextOf(handle: u32) -> isize { return objectOf(handle, CONTEXT) }
+
+fn memory(context: u32, size: usize, flags: usize) -> isize {
+    const k = contextOf(context)
+    if k < 0 { return k }
+    const made = work.memory(&w, @bitCast(usize, k), size, flags)
+    if made < 0 { return native(made) }
+    return handOut(MEMORY, @bitCast(usize, made))
+}
+
+fn memoryOf(context: u32, address: usize, size: usize) -> isize {
+    const k = contextOf(context)
+    if k < 0 { return k }
+    const made = work.memoryOf(&w, @bitCast(usize, k), pin, PROCESS, address, size)
+    if made < 0 { return native(made) }
+    return handOut(MEMORY, @bitCast(usize, made))
+}
+
+fn map(context: u32, memory_handle: u32, offset: usize, size: usize, address: usize, flags: usize) -> isize {
+    const k = contextOf(context)
+    if k < 0 { return k }
+    const m = objectOf(memory_handle, MEMORY)
+    if m < 0 { return m }
+    return native(work.map(&w, @bitCast(usize, k), @bitCast(usize, m), offset, size, address, flags))
+}
+
+fn unmap(context: u32, address: usize, size: usize) -> isize {
+    const k = contextOf(context)
+    if k < 0 { return k }
+    return native(work.unmap(&w, @bitCast(usize, k), address, size))
+}
+
+var streams: [work.MOST_STREAMS]work.Stream = undefined // (per run)
+
+fn submit(context: u32, records: usize, count_of_streams: usize, fence_handle: u32) -> isize {
+    const k = contextOf(context)
+    if k < 0 { return k }
+    const which = @bitCast(usize, k)
+    if count_of_streams == 0 || count_of_streams > work.MOST_STREAMS || records == 0 { return native(work.submit(&w, which, &streams, 0, work.NONE)) }
+    // The records' bytes as the kernel reads them.
+    const bytes: [*]const u8 = unsafe { @ptrFromInt([*]const u8, records) }
+    var n: usize = 0
+    while n < count_of_streams {
+        streams[n] = work.streamOf(bytes, n)
+        n += 1
+    }
+    var fence = work.NONE
+    if fence_handle != 0 {
+        const got = objectOf(fence_handle, FENCE)
+        if got < 0 { return got }
+        fence = @bitCast(usize, got)
+    }
+    return native(work.submit(&w, which, &streams, count_of_streams, fence))
+}
+
+fn fence(context: u32) -> isize {
+    const k = contextOf(context)
+    if k < 0 { return k }
+    const made = work.fence(&w, @bitCast(usize, k))
+    if made < 0 { return native(made) }
+    return handOut(FENCE, @bitCast(usize, made))
+}
+
+// memory_map_object of a memory handle, writable, from its start: the
+// checks of gpucalls.mlx's mapMemory, then its frames' bytes.
+fn mapMemory(memory_handle: u32, size: usize) -> isize {
+    const got = objectOf(memory_handle, MEMORY)
+    if got < 0 { return got }
+    const m = @bitCast(usize, got)
+    if !work.mappable(&w, m) || work.flagsOf(&w, m) & work.PROCESSOR == 0 { return native(Status.no_right) }
+    if size == 0 || (size + 4095) / 4096 * 4096 > work.sizeOf(&w, m) { return native(Status.invalid) }
+    const start = work.pageOf(&w, m, 0)
+    var page: usize = 1
+    while page < (size + 4095) / 4096 {
+        if work.pageOf(&w, m, page) != start + page * 4096 { return native(Status.no_memory) }
+        page += 1
+    }
+    return @bitCast(isize, viewOf(start))
+}
+
+fn unmapMemory(address: usize, size: usize) -> isize { return 0 }
+
+fn release(handle: u32) -> isize { return close(handle) }
+
+// The state of the object `handle` names for the one wait.
+fn stateOf(handle: u32, into: *u32) -> isize {
+    const k = slotOf(handle)
+    if k < 0 { return k }
+    const slot = &slots[@bitCast(usize, k)]
+    into.* = if slot.*.kind == FENCE { work.fenceState(&w, slot.*.index) } else { 0 }
+    return 0
+}
+
+fn wait(items: usize, count_of_items: usize, timeout: u64) -> isize {
+    const list: [*]WaitItem = unsafe { @ptrFromInt([*]WaitItem, items) }
+    var waited: usize = 0
+    while true {
+        work.interrupted(&w)
+        var ready: isize = 0
+        var k: usize = 0
+        while k < count_of_items {
+            const got = stateOf(list[k].handle, &list[k].seen)
+            if got < 0 { return got }
+            if (list[k].seen & list[k].want) != 0 { ready += 1 }
+            k += 1
+        }
+        if ready > 0 { return ready }
+        // (A wait with nothing to wait for ends at its deadline; the
+        // card's time here goes no further than a minute.)
+        if @intCast(u64, waited) >= timeout || waited >= 60000000000 { return native(Status.timed_out) }
+        engine.clock += TICK
+        waited += TICK
+        work.tick(&w)
+    }
+    return native(Status.timed_out)
+}
+
+// The kernel's calls as the driver's interface.
+pub fn interface() -> card.Card {
+    return card.Card.{ .count = count, .describe = describe, .open = open, .describeContext = describeContext, .close = close, .memory = memory, .memoryOf = memoryOf, .map = map, .unmap = unmap, .submit = submit, .fence = fence, .mapMemory = mapMemory, .unmapMemory = unmapMemory, .release = release, .wait = wait }
+}

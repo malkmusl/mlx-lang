@@ -1511,7 +1511,42 @@ the word Info.STAGE):
   fault), and a third shows the ring went on. The address space is given
   back afterwards; if a program in it did not end, it is emptied and kept
   until the machine stops instead. This is what the Vulkan driver's
-  programs will run in (kernel/gpu_space.mlx).
+  programs run in (kernel/gpu_space.mlx).
+At a boot of stage 7 whose V1 passed, the kernel serves programs the
+native calls 80 to 85 on the card (kernel/gpu_work.mlx; spec/04-stdlib/
+os/brix.xml, GpuDevices), and says so in one line ("gpu: programs' work
+on compute ring 0: 7936 MiB of the card's memory and ... MiB of the
+system's for programs, address spaces 1 to 7, streams checked and
+copied"); the card's record (/devices/gpu0) lists compute ring 0 then,
+and at no other boot. A program opens /devices/gpu0 (its owner is the
+person logged in at the seat, and root) and gets memory of the card
+(beyond the part the processor reaches, cleared by the card) or of the
+system (frames the processor maps), maps it into its own address space
+of the card, and submits streams: the kernel copies every stream into
+its own pages, checks each packet on that copy (only those a compute
+stream of our driver has; what was checked is what runs), and runs the
+copy on compute ring 0 in the program's address space; a fence says
+when it is done. A process may have 4 contexts, 64 fences and 256
+mappings; the seven address spaces bound the contexts in all. A fault
+in a program's address space, a privileged register or instruction (told
+to the program whose stream it came in), or a ring that
+hangs loses that program's context ("gpu: context 0 (process 41) lost:
+..."), and the others go on. A ring that does not move for 10 seconds
+is left down until the next boot, said in one line ("gpu: compute ring 0
+has not moved for 10 s ...: it stays down until the next boot; ..."):
+Linux's way back for it writes words whose reach on the display its
+sources do not say.
+
+So with 7 held, vkinfo says "a device = made (its self-test passed) and
+given back" (the self-test, a doubler and a division, runs on the card);
+without it, "not yet: no engine of the card takes commands (the system
+does not start the card's engines for programs at this boot)". The
+desktop composes on the card when its device opens and its first frame
+is the processor's pixel for pixel, else on the processor; its log says
+which in one line ("renderer: the Vulkan device ... composes the
+desktop: ..." or "renderer: ... composing on the processor"). tests/517
+and 518 hold the calls and the driver on them on a card that is a
+table.
 The rings are stopped again when the machine restarts or powers off.
 
 On the machine: hold 6 while it starts and look for the line "gpu: step
