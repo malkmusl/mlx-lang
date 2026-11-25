@@ -100,14 +100,33 @@ are made so.
 
 Nebula is not finished. What is known to be open:
 
-- [ ] **Tests with the new compiler.** mlx4 now traps narrow integer
-      overflow and keeps constant tables as one image. With it, 42_io_formats,
-      50_kit (does not build for brixOS), 54_menus, 57_chrome and
-      58_settings fail; most likely arithmetic that overflowed silently
-      before. To be fixed one by one.
-- [ ] **54_menus check 212 and 57_chrome check 51** (the history docker's
-      rows) fail since the menus are filled with the real actions and the
-      file actions exist; the tests are to follow the program.
+- [ ] **Tests with the new compiler.** The working tree builds with the
+      mlx4 that traps narrow integer overflow, tags optional floats and
+      keeps constant tables as one image. With it 42 of the 54 tests pass;
+      these fail: 42_io_formats (97), 54_menus (212), 55_dialogs (10),
+      56_filedialog (crashes, signal 11, no crash report printed),
+      57_chrome (51, the history docker's rows), 58_settings (64),
+      63_tools_transform (235), 66_docker_layers (133), 67_docker_color
+      (237, the palette's scrolling), 68_docker_brushes (122),
+      69_dockers_misc (124), and 50_kit does not compile for brixOS.
+      Most are likely arithmetic that overflowed silently before, or
+      tests that still assume the opaque dock and the menus before the
+      real actions; to be fixed one by one.
+- [ ] **Compiler: 50_kit for brixOS.** With the new mlx4,
+      `--target=x86_64-brixos` refuses std/src/demangle.mlx:238 ("return
+      value does not match function type", then std/src/crash.mlx:1210)
+      when building tests/50_kit.mlx, while nebula itself and the other
+      tests build for brixOS; the old mlx4 built it. A regression of one
+      of the four fixes, to be found.
+- [ ] **std.crash** prints no report for 56_filedialog's crash.
+- [ ] **The colour body**: the colour panel to grow in the 3D shape (or a
+      large view on a double click); drawing sharp takes some hundred
+      milliseconds (coarse first, sharper while idle; analytic faces for
+      the cubes; a GPU path once brixOS has Vulkan); the switch between
+      OKLab and sRGB animated; tests for the Shift pick and the cut that
+      follows the colour.
+- [ ] **OKLab further**: the palette's nearest colour, the smudge engine's
+      mixing and soft brush edges in OKLab.
 - [ ] **Reviews of wave 4.** The tools, dockers, actions, layered formats,
       the further brush engines, the assistants and the animation are
       written; their adversarial reviews were stopped part way. Each
