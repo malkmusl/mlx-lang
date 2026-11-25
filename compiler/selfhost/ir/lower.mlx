@@ -4871,6 +4871,20 @@ fn wrapInteger(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
     return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, type_id, raised, shift))
 }
 
+// An integer narrower than 64 bits is held in its 64-bit register as its
+// type extends it (zeros above an unsigned one, copies of the sign above a
+// signed one), and an operation on two such values is done on the whole
+// register. So + - * of an 8-, 16- or 32-bit type (and / of a signed one)
+// give the exact result, and it overflows when that is outside the type:
+// above its largest value, or for a signed type not what its low bits
+// extended as the type extends them say (a sum of two i32 near the top
+// kept its 33rd bit, a register above the i32 maximum). The checked
+// operators trap then (a compare and a branch, as the u8 one did: no
+// call), the saturating ones take the bound, the wrapping ones keep the
+// low bits extended (wrapInteger); every result is in range again. A
+// product of types wider than 32 bits may not fit the register at all:
+// it is also checked by dividing it by one factor (wrappedProduct).
+// (tests/484_narrow_overflow_runtime.mlx, tests/run_narrow_overflow.sh.)
 fn emitArithmeticPolicy(builder: *LirBuilder, kind: lexer.Kind, opcode: lir.Opcode, lhs: usize, rhs: usize, type_id: usize) -> usize {
     const raw = lir.addInst(builder.*.lir, lir.binary(opcode, type_id, lhs, rhs))
     const wrapping = kind == lexer.Kind.plus_percent || kind == lexer.Kind.minus_percent || kind == lexer.Kind.asterisk_percent
@@ -4878,14 +4892,21 @@ fn emitArithmeticPolicy(builder: *LirBuilder, kind: lexer.Kind, opcode: lir.Opco
 
     const saturating = kind == lexer.Kind.plus_pipe || kind == lexer.Kind.minus_pipe || kind == lexer.Kind.asterisk_pipe
     const bits = integerBitWidth(builder, type_id)
-    if !isUnsignedIntegerType(builder, type_id) || bits >= 64 { return raw }
+    if !isIntegerKind(builder, type_id) || bits >= 64 { return raw }
+    if isSignedIntegerType(builder, type_id) { return checkSignedResult(builder, opcode, lhs, rhs, raw, type_id, saturating) }
 
     const max = lir.addInst(builder.*.lir, lir.constI(type_id, integerMask(builder, type_id)))
     var overflow = lir.NONE
     if opcode == lir.Opcode.sub {
         overflow = emitComparison(builder, lir.CmpPredicate.ult, lhs, rhs)
-    } else if opcode == lir.Opcode.add || opcode == lir.Opcode.mul || opcode == lir.Opcode.shl {
+    } else if opcode == lir.Opcode.add {
         overflow = emitComparison(builder, lir.CmpPredicate.ugt, raw, max)
+    } else if opcode == lir.Opcode.mul {
+        overflow = emitComparison(builder, lir.CmpPredicate.ugt, raw, max)
+        if bits > 32 { overflow = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, overflow, wrappedProduct(builder, lhs, rhs, raw, false))) }
+    } else if opcode == lir.Opcode.shl {
+        overflow = emitComparison(builder, lir.CmpPredicate.ugt, raw, max)
+        if bits > 32 { overflow = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, overflow, shiftedOut(builder, lhs, rhs, raw, type_id))) }
     }
     if overflow == lir.NONE { return raw }
     if !saturating {
@@ -4894,6 +4915,102 @@ fn emitArithmeticPolicy(builder: *LirBuilder, kind: lexer.Kind, opcode: lir.Opco
     }
     const bound = if opcode == lir.Opcode.sub { lir.addInst(builder.*.lir, lir.constI(type_id, 0)) } else { max }
     return selectInteger(builder, overflow, raw, bound)
+}
+
+// The result of a checked or saturating operation on a signed type
+// narrower than 64 bits (emitArithmeticPolicy): `raw` when it is in the
+// type's range, else a trap (checked) or the bound on the side of the
+// exact result (saturating).
+fn checkSignedResult(builder: *LirBuilder, opcode: lir.Opcode, lhs: usize, rhs: usize, raw: usize, type_id: usize, saturating: bool) -> usize {
+    const bits = integerBitWidth(builder, type_id)
+    const checked = opcode == lir.Opcode.add || opcode == lir.Opcode.sub || opcode == lir.Opcode.mul || opcode == lir.Opcode.div || opcode == lir.Opcode.shl
+    if !checked || (!saturating && !builder.*.runtimeSafety) { return raw }
+    // Out of range: not its own low bits sign-extended.
+    var overflow = emitComparison(builder, lir.CmpPredicate.ne, raw, extendedAs(builder, raw, type_id))
+    // The side of the exact result: the sign of the register while that
+    // holds it, else the product's sign from its factors', or the shifted
+    // value's own.
+    var side = raw
+    if opcode == lir.Opcode.mul && bits > 32 {
+        overflow = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, overflow, wrappedProduct(builder, lhs, rhs, raw, true)))
+        side = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_xor, type_id, lhs, rhs))
+    }
+    if opcode == lir.Opcode.shl {
+        if bits > 32 { overflow = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, overflow, shiftedOut(builder, lhs, rhs, raw, type_id))) }
+        side = lhs
+    }
+    if !saturating {
+        emitTrapIf(builder, overflow)
+        return raw
+    }
+    // The largest value, or past it the smallest: the largest with every
+    // bit flipped when the side is negative (its sign spread over the word).
+    const max = lir.addInst(builder.*.lir, lir.constI(type_id, integerMask(builder, type_id) >> 1))
+    const sign_shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 63))
+    const sign = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, type_id, side, sign_shift))
+    const bound = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_xor, type_id, max, sign))
+    return selectInteger(builder, overflow, raw, bound)
+}
+
+// `value`'s low bits extended as `type_id` (an integer narrower than 64
+// bits) extends them, in one instruction (movsx or movzx; SBFM or UBFM),
+// for a range check to compare `value` with. (Only a comparison reads it.
+// wrapInteger, whose result is stored and passed on, keeps its shifts:
+// optimize.dropExtends, where narrowArithmetic is set, makes a 32-bit
+// extend read for its low bits alone a copy.)
+fn extendedAs(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
+    var inst = lir.initInst(lir.Opcode.extend, type_id)
+    inst.arg0 = value
+    inst.arg1 = integerBitWidth(builder, type_id)
+    inst.arg2 = if isSignedIntegerType(builder, type_id) { 1 } else { 0 }
+    return lir.addInst(builder.*.lir, inst)
+}
+
+// Whether the 64-bit product `raw` of `lhs` and `rhs` lost bits above the
+// word (only factors wider than 32 bits can): it divided by a nonzero
+// `lhs` is not `rhs`. 1 or 0.
+fn wrappedProduct(builder: *LirBuilder, lhs: usize, rhs: usize, raw: usize, signed: bool) -> usize {
+    const zero = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+    const one = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 1))
+    const nonzero = emitComparison(builder, lir.CmpPredicate.ne, lhs, zero)
+    // (Divided by 1 where lhs is 0, which no division may be by.)
+    const divisor = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, lhs, lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_xor, lir.NONE, nonzero, one))))
+    const quotient = lir.addInst(builder.*.lir, lir.binary(if signed { lir.Opcode.div } else { lir.Opcode.udiv }, lir.NONE, raw, divisor))
+    const differs = emitComparison(builder, lir.CmpPredicate.ne, quotient, rhs)
+    return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, lir.NONE, nonzero, differs))
+}
+
+// Whether the left shift `raw` of `lhs` by `count` (below the type's
+// width) lost bits above the word: shifted back, it is not `lhs`. 1 or 0.
+fn shiftedOut(builder: *LirBuilder, lhs: usize, count: usize, raw: usize, type_id: usize) -> usize {
+    const back = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, type_id, raw, count))
+    return emitComparison(builder, lir.CmpPredicate.ne, back, lhs)
+}
+
+// `-x` of an integer narrower than 64 bits, `0 - x` on the whole register,
+// checked as that subtraction is (emitArithmeticPolicy): it overflows for
+// the smallest value of a signed type and for every value but 0 of an
+// unsigned one; `0 -% x` wraps.
+fn checkNegation(builder: *LirBuilder, operand: usize, negated: usize, type_id: usize) -> usize {
+    const bits = integerBitWidth(builder, type_id)
+    if !isIntegerKind(builder, type_id) || bits >= 64 || !builder.*.runtimeSafety { return negated }
+    const signed = isSignedIntegerType(builder, type_id)
+    // A constant whose negation fits (a negative literal, 0 - 5): nothing
+    // to check.
+    const operand_inst = lir.getInst(builder.*.lir, operand)
+    if operand_inst.opcode == lir.Opcode.const_i {
+        if !signed && operand_inst.arg0 == 0 { return negated }
+        const largest = @bitCast(isize, integerMask(builder, type_id) >> 1)
+        const value = @bitCast(isize, operand_inst.arg0)
+        if signed && value >= 0 - largest && value <= largest { return negated }
+    }
+    if signed {
+        emitTrapIf(builder, emitComparison(builder, lir.CmpPredicate.ne, negated, extendedAs(builder, negated, type_id)))
+    } else {
+        const zero = lir.addInst(builder.*.lir, lir.constI(type_id, 0))
+        emitTrapIf(builder, emitComparison(builder, lir.CmpPredicate.ne, operand, zero))
+    }
+    return negated
 }
 
 fn isShiftOperator(kind: lexer.Kind) -> bool {
@@ -5365,6 +5482,10 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
             var load = lir.initInst(lir.Opcode.load, lir.NONE)
             load.arg0 = address
             load.arg1 = width
+            // `x op= y` of a narrow signed x: its value sign-extended, as
+            // any load of it (zero-extended, -5 of an i32 was 4294967291
+            // to the operation and its overflow check).
+            if loadsSigned(builder, target_type) { load.arg2 = 1 }
             const current = lir.addInst(builder.*.lir, load)
             result = lowerValueOperator(builder, assignmentOperator(kind), current, rhs_value, target_type)
         }
@@ -6693,6 +6814,7 @@ fn lowerUnary(builder: *LirBuilder, node_index: usize) -> usize {
     if kind == lexer.Kind.keyword_try { return lowerTry(builder, node_index, operand) }
     if kind == lexer.Kind.dot_asterisk { return lowerDereference(builder, n.lhs, operand) }
     const value = lowerUnaryValue(builder, kind, operand)
+    if kind == lexer.Kind.minus && operand != lir.NONE { return checkNegation(builder, operand, value, expressionType(builder, n.lhs)) }
     // `~x` of a narrow integer: the complement within the type's width.
     if kind == lexer.Kind.tilde {
         const operand_type = expressionType(builder, n.lhs)
