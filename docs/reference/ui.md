@@ -135,11 +135,14 @@ characters in its `std.ui.terminal.View`, and the file chooser a row's
 note in its `Chooser`; an image is scaled 256 columns at a time (three
 arrays of 1 KiB, what a function's frame takes); `view.region`,
 `view.pushClip` and `ui.next` hand rectangles on without a variable
-given another value. drawText and drawCells took 4128 bytes of the
-arena a call, `drawImageRect` 6 KiB, a widget 16 bytes, a terminal's
-frame 20 KiB and a KiB a row drawn
-(`tests/485_std_drawing_arena_runtime.mlx` measures each with
-`std.turns` and compares what is drawn with the code it replaced).
+given another value, and `std.ui.scheme.glass` (which `theme.at`, the
+look an app takes every frame, calls with the desktop's colours) hands
+on the scheme it reads without a scheme variable. drawText and
+drawCells took 4128 bytes of the arena a call, `drawImageRect` 6 KiB, a
+widget 16 bytes, a terminal's frame 20 KiB and a KiB a row drawn,
+`theme.at` 48 bytes (`tests/485_std_drawing_arena_runtime.mlx` measures
+each with `std.turns` and compares what is drawn, and the colours, with
+the code it replaced).
 
 ## Frames in part
 

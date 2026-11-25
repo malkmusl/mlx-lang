@@ -346,7 +346,8 @@ of a loop, then no longer grows the arena
 or handed to a callee as a slice (`digits[0..count]`, even to one that
 only reads it), an array stays in the arena, and so does a struct
 `var` given another value or a struct an `if` expression chooses: what
-std runs every frame (text, images, widgets, a terminal's frame) and
+std runs every frame (text, images, widgets, a terminal's frame, an
+app's look) and
 `std.text`'s numbers keep clear of these, with their working memory in
 the records they serve and digits written straight into the caller's
 line (`tests/485_std_drawing_arena_runtime.mlx`). A `const` local's copy is a region of the function's frame
