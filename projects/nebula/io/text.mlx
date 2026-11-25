@@ -1,0 +1,1094 @@
+// nebula io: the text the file formats need and std does not have.
+//
+// Numbers. A file says opacity="0.35": formatFloat() writes a double in
+// plain decimal notation with as few digits as say it (no trailing
+// zeros, no exponent), parseFloat() reads decimal text, exponents too,
+// and gives the double nearest to it, to the last bit, however many
+// digits the text has (both count exactly, in whole numbers). What was
+// written with formatFloat(value, 9, ...) from a value of up to 15
+// significant digits reads back as the same value.
+//
+//     var digits: [text.FLOAT_ROOM]u8 = undefined
+//     const length = text.formatFloat(0.35, 6, &digits, text.FLOAT_ROOM)    // "0.35"
+//     var value: f64 = 0.0
+//     if text.parseFloat(" -12.50e2 ", &value) { ... }                      // -1250.0
+//
+// (Not `?f64`: this compiler's optional of a float takes 0.0 for null.)
+//
+// XML. std.xml reads (a pull tokenizer); here is the writer, onto a
+// std.ArrayList(u8), which indents, closes what was opened and escapes
+// what must be:
+//
+//     var writer: text.XmlWriter = undefined
+//     text.xmlBegin(&writer, &list, 2)
+//     text.xmlDeclaration(&writer)
+//     text.xmlOpen(&writer, "image")
+//     text.xmlAttributeInt(&writer, "w", 640)
+//     text.xmlOpen(&writer, "layer")
+//     text.xmlAttribute(&writer, "name", "a < b")
+//     text.xmlClose(&writer)                       // <layer name="a &lt; b"/>
+//     if !text.xmlEnd(&writer) { ... no memory ... }
+//
+// and what a reader of std.xml's tokens wants at an element: one of its
+// attributes by name, as text with the entities expanded or as a number:
+//
+//     if token.kind == xml.TokenKind.elementStart && xml.equals(token.name, "layer") {
+//         const opacity = text.attributeFloatOr(document, token.offset, "opacity", 1.0)
+//     }
+//
+// Paths: the parts of one (baseName, directory, extension) and new ones
+// made of them (withExtension, join), all with "/" between folders.
+//
+// Files: a whole file read into memory of an allocator (readFile) and one
+// written whole or not at all (writeFile: beside it first, then renamed
+// over it), through std.fs on both systems; the paths are slices, their
+// NUL-terminated copies for std.fs are made here and nowhere else.
+const std = @import("std")
+const xml = @import("std.xml")
+
+pub const Allocator = std.allocator.Allocator
+
+// ---------------------------------------------------------------------------
+// Whole numbers too long for a word: what a double is made of (53 bits
+// times a power of two) and what decimal text says (digits times a power
+// of ten) are brought together exactly here, a u32 at a time.
+
+// (Room for the longest that is needed: 770 decimal digits times 5^309.)
+const LIMBS: usize = 112
+
+const Big = struct {
+    // The least significant first; `used` of them count.
+    limbs: [112]u32
+    used: usize
+}
+
+fn bigSet(big: *Big, value: u64) -> void {
+    big.*.limbs[0] = @intCast(u32, value & 0xFFFFFFFF)
+    big.*.limbs[1] = @intCast(u32, value >> 32)
+    big.*.used = if value >> 32 != 0 { 2 } else if value != 0 { 1 } else { 0 }
+}
+
+// Times `factor`. (The numbers here never outgrow the limbs: the callers
+// bound their exponents.)
+fn bigMultiply(big: *Big, factor: u32) -> void {
+    var carry: u64 = 0
+    var index: usize = 0
+    while index < big.*.used {
+        const product = @intCast(u64, big.*.limbs[index]) * @intCast(u64, factor) + carry
+        big.*.limbs[index] = @intCast(u32, product & 0xFFFFFFFF)
+        carry = product >> 32
+        index += 1
+    }
+    if carry != 0 && big.*.used < LIMBS {
+        big.*.limbs[big.*.used] = @intCast(u32, carry)
+        big.*.used += 1
+    }
+}
+
+// Plus `value`.
+fn bigAdd(big: *Big, value: u32) -> void {
+    var carry = @intCast(u64, value)
+    var index: usize = 0
+    while carry != 0 && index < big.*.used {
+        const sum = @intCast(u64, big.*.limbs[index]) + carry
+        big.*.limbs[index] = @intCast(u32, sum & 0xFFFFFFFF)
+        carry = sum >> 32
+        index += 1
+    }
+    if carry != 0 && big.*.used < LIMBS {
+        big.*.limbs[big.*.used] = @intCast(u32, carry)
+        big.*.used += 1
+    }
+}
+
+// Divided by `divisor`, rounded down; what is left over.
+fn bigDivide(big: *Big, divisor: u32) -> u32 {
+    var rest: u64 = 0
+    var index = big.*.used
+    while index > 0 {
+        index -= 1
+        const part = (rest << 32) | @intCast(u64, big.*.limbs[index])
+        big.*.limbs[index] = @intCast(u32, part / @intCast(u64, divisor))
+        rest = part % @intCast(u64, divisor)
+    }
+    while big.*.used > 0 && big.*.limbs[big.*.used - 1] == 0 { big.*.used -= 1 }
+    return @intCast(u32, rest)
+}
+
+// Times two to the `bits`.
+fn bigShiftLeft(big: *Big, bits: usize) -> void {
+    if big.*.used == 0 { return }
+    const whole = bits / 32
+    const part = @intCast(u32, bits % 32)
+    if whole + big.*.used + 1 > LIMBS { return }
+    var index = big.*.used
+    big.*.limbs[big.*.used + whole] = 0
+    while index > 0 {
+        index -= 1
+        const limb = @intCast(u64, big.*.limbs[index]) << part
+        big.*.limbs[index + whole + 1] = big.*.limbs[index + whole + 1] | @intCast(u32, limb >> 32)
+        big.*.limbs[index + whole] = @intCast(u32, limb & 0xFFFFFFFF)
+    }
+    index = 0
+    while index < whole {
+        big.*.limbs[index] = 0
+        index += 1
+    }
+    big.*.used += whole + 1
+    while big.*.used > 0 && big.*.limbs[big.*.used - 1] == 0 { big.*.used -= 1 }
+}
+
+// How many bits the number takes (0 for 0).
+fn bigBits(big: *const Big) -> usize {
+    if big.*.used == 0 { return 0 }
+    var top = big.*.limbs[big.*.used - 1]
+    var bits: usize = (big.*.used - 1) * 32
+    while top != 0 {
+        bits += 1
+        top = top >> 1
+    }
+    return bits
+}
+
+fn bigBit(big: *const Big, position: usize) -> bool {
+    const limb = position / 32
+    if limb >= big.*.used { return false }
+    return (big.*.limbs[limb] >> @intCast(u32, position % 32)) & 1 != 0
+}
+
+// Whether any bit below `position` is set.
+fn bigAnyBelow(big: *const Big, position: usize) -> bool {
+    const whole = position / 32
+    var index: usize = 0
+    while index < whole && index < big.*.used {
+        if big.*.limbs[index] != 0 { return true }
+        index += 1
+    }
+    if whole >= big.*.used || position % 32 == 0 { return false }
+    const mask = (@intCast(u32, 1) << @intCast(u32, position % 32)) - 1
+    return big.*.limbs[whole] & mask != 0
+}
+
+// The `count` (at most 64) bits from `position` up.
+fn bigField(big: *const Big, position: usize, count: usize) -> u64 {
+    var value: u64 = 0
+    var index = count
+    while index > 0 {
+        index -= 1
+        value = (value << 1) | (if bigBit(big, position + index) { 1 } else { 0 })
+    }
+    return value
+}
+
+const FIVE_13: u32 = 1220703125
+const TEN_9: u32 = 1000000000
+
+fn fiveTo(exponent: usize) -> u32 {
+    var value: u32 = 1
+    var index: usize = 0
+    while index < exponent {
+        value = value * 5
+        index += 1
+    }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// Numbers to text
+
+// Room that formatFloat() never needs more than.
+pub const FLOAT_ROOM: usize = 336
+
+// The most decimals formatFloat() writes.
+pub const MOST_DECIMALS: usize = 18
+
+const TEN_TO = [20]u64{ 1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000, 10000000000, 100000000000, 1000000000000, 10000000000000, 100000000000000, 1000000000000000, 10000000000000000, 100000000000000000, 1000000000000000000, 10000000000000000000 }
+
+fn digitsOf(value: u64) -> usize {
+    var count: usize = 0
+    var rest = value
+    while rest != 0 {
+        count += 1
+        rest = rest / 10
+    }
+    return count
+}
+
+// `value` in decimal into `into`, at least `least` digits (zeros in
+// front): how many were written.
+fn putDigits(into: [*]u8, value: u64, least: usize) -> usize {
+    var count = digitsOf(value)
+    if count < least { count = least }
+    var rest = value
+    var index = count
+    while index > 0 {
+        index -= 1
+        into[index] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+    }
+    return count
+}
+
+// mantissa * 10^places / 2^down, rounded to the nearest whole number
+// (halves up): exactly, the product being below 2^113 (so that from
+// 2^114 on nothing is left of it).
+fn scaled(mantissa: u64, down: usize, places: usize) -> u64 {
+    if down > 114 { return 0 }
+    const product = @intCast(u128, mantissa) * @intCast(u128, TEN_TO[places])
+    const one: u128 = 1
+    const rounded = (product + (one << @intCast(u7, down - 1))) >> @intCast(u7, down)
+    return @intCast(u64, rounded)
+}
+
+// A double of 2^64 and more (`mantissa` times two to the `shift`): all
+// its digits, the first 17 as they round, zeros for the rest.
+fn formatHuge(mantissa: u64, shift: usize, negative: bool, into: [*]u8, capacity: usize) -> usize {
+    var big: Big = undefined
+    bigSet(&big, mantissa)
+    bigShiftLeft(&big, shift)
+    // Nine digits at a time, the last ones first.
+    var digits: [320]u8 = undefined
+    var count: usize = 0
+    while big.used > 0 && count + 9 <= 320 {
+        var chunk = bigDivide(&big, TEN_9)
+        var index: usize = 0
+        while index < 9 {
+            digits[count] = @intCast(u8, chunk % 10)
+            chunk = chunk / 10
+            count += 1
+            index += 1
+        }
+    }
+    while count > 1 && digits[count - 1] == 0 { count -= 1 }
+    if count > 17 {
+        // Rounded at the 17th digit from the top; the carry may run up.
+        const cut = count - 17
+        var up = digits[cut - 1] >= 5
+        var index: usize = 0
+        while index < cut {
+            digits[index] = 0
+            index += 1
+        }
+        while up && index < count {
+            if digits[index] == 9 {
+                digits[index] = 0
+            } else {
+                digits[index] += 1
+                up = false
+            }
+            index += 1
+        }
+        if up {
+            digits[count] = 1
+            count += 1
+        }
+    }
+    const sign: usize = if negative { 1 } else { 0 }
+    if count + sign > capacity { return 0 }
+    if negative { into[0] = 45 }
+    var index: usize = 0
+    while index < count {
+        into[sign + index] = 48 + digits[count - 1 - index]
+        index += 1
+    }
+    return count + sign
+}
+
+// `value` as decimal text into `into` (`capacity` bytes; FLOAT_ROOM is
+// always enough, 32 for everything below 2^64): at most `decimals`
+// digits behind the point (at most MOST_DECIMALS, and no more than make
+// 17 digits that count), rounded to the nearest (halves away from zero),
+// zeros at the end left out and the point with them: "0.35", "-12", "0".
+// No exponents: a large number is written out. Neither zero has a sign;
+// what is not a number is written "0", an infinity as the largest double.
+// The length written, 0 when it does not fit.
+pub fn formatFloat(value: f64, decimals: usize, into: [*]u8, capacity: usize) -> usize {
+    var bits = @bitCast(u64, value)
+    const negative = bits >> 63 != 0
+    bits = bits & 0x7FFFFFFFFFFFFFFF
+    if bits > 0x7FF0000000000000 { bits = 0 }
+    if bits == 0x7FF0000000000000 { bits = 0x7FEFFFFFFFFFFFFF }
+    const field = @intCast(usize, bits >> 52)
+    var mantissa = bits & 0xFFFFFFFFFFFFF
+    // The value is mantissa * 2^(power - 1075).
+    var power: usize = 1
+    if field != 0 {
+        mantissa = mantissa | 0x10000000000000
+        power = field
+    }
+    if power > 1075 + 11 { return formatHuge(mantissa, power - 1075, negative, into, capacity) }
+    var number: u64 = 0
+    var places: usize = 0
+    if power >= 1075 {
+        // A whole number below 2^64.
+        number = mantissa << @intCast(u6, power - 1075)
+    } else {
+        const down = 1075 - power
+        const whole: u64 = if down >= 64 { 0 } else { mantissa >> @intCast(u6, down) }
+        places = if decimals > MOST_DECIMALS { MOST_DECIMALS } else { decimals }
+        const before = digitsOf(whole)
+        if before + places > 17 && before > 0 { places = if before >= 17 { 0 } else { 17 - before } }
+        number = scaled(mantissa, down, places)
+        // Below one, the zeros behind the point do not count: 17 digits
+        // from the first that does (rounded anew, not a second time).
+        const counting = digitsOf(number)
+        if before == 0 && counting > 17 {
+            places -= counting - 17
+            number = scaled(mantissa, down, places)
+        }
+    }
+    var digits: [40]u8 = undefined
+    const bytes: [*]u8 = &digits
+    var count = putDigits(bytes, number, places + 1)
+    // The point goes before the last `places` digits; zeros at the end of
+    // those are left out.
+    var kept = places
+    while kept > 0 && digits[count - places + kept - 1] == 48 { kept -= 1 }
+    const front = count - places
+    const sign: usize = if negative && number != 0 { 1 } else { 0 }
+    const length = sign + front + (if kept > 0 { kept + 1 } else { 0 })
+    if length > capacity { return 0 }
+    var at: usize = 0
+    if sign == 1 {
+        into[0] = 45
+        at = 1
+    }
+    var index: usize = 0
+    while index < front {
+        into[at] = digits[index]
+        at += 1
+        index += 1
+    }
+    if kept > 0 {
+        into[at] = 46
+        at += 1
+        index = 0
+        while index < kept {
+            into[at] = digits[front + index]
+            at += 1
+            index += 1
+        }
+    }
+    count = at
+    return count
+}
+
+// `value` in decimal into `into`: the length written, 0 when it does not
+// fit (20 bytes always do).
+pub fn formatInt(value: i64, into: [*]u8, capacity: usize) -> usize {
+    var digits: [24]u8 = undefined
+    const bytes: [*]u8 = &digits
+    const negative = value < 0
+    // (The lowest number has no positive twin: its size is counted without a sign.)
+    const size: u64 = if negative { 0 -% @bitCast(u64, value) } else { @bitCast(u64, value) }
+    const count = putDigits(bytes, size, 1)
+    const sign: usize = if negative { 1 } else { 0 }
+    if count + sign > capacity { return 0 }
+    if negative { into[0] = 45 }
+    var index: usize = 0
+    while index < count {
+        into[sign + index] = digits[index]
+        index += 1
+    }
+    return count + sign
+}
+
+// ---------------------------------------------------------------------------
+// Text to numbers
+
+fn isBlank(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 10 || byte == 13 }
+
+// `value` without the blanks (spaces, tabs, line ends) around it.
+pub fn trimmed(value: []const u8) -> []const u8 {
+    var start: usize = 0
+    var end = value.length
+    while start < end && isBlank(value[start]) { start += 1 }
+    while end > start && isBlank(value[end - 1]) { end -= 1 }
+    return value[start..end]
+}
+
+// The powers of ten a double holds exactly.
+const EXACT_TENS = [23]f64{ 1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0, 10000000000000.0, 100000000000000.0, 1000000000000000.0, 10000000000000000.0, 100000000000000000.0, 1000000000000000000.0, 10000000000000000000.0, 100000000000000000000.0, 1000000000000000000000.0, 10000000000000000000000.0 }
+
+// The double nearest to big * 2^power (and a little more when `more`:
+// then something was cut off below the number's last digit), halves to
+// the even neighbour.
+fn roundedDouble(big: *const Big, power: i64, more: bool) -> u64 {
+    const length = bigBits(big)
+    if length == 0 { return 0 }
+    // The value lies in [2^top, 2^(top + 1)).
+    const top = @intCast(i64, length) - 1 + power
+    if top > 1023 { return 0x7FF0000000000000 }
+    // The bits a double keeps of it: 53, fewer below the normal numbers.
+    var keep: i64 = 53
+    if top < -1022 { keep = top + 1075 }
+    if keep < 0 { return 0 }
+    const drop = @intCast(i64, length) - keep
+    var mantissa: u64 = 0
+    var half = false
+    var below = more
+    if drop <= 0 {
+        mantissa = bigField(big, 0, length) << @intCast(u6, 0 - drop)
+    } else {
+        const cut = @intCast(usize, drop)
+        mantissa = bigField(big, cut, @intCast(usize, keep))
+        half = bigBit(big, cut - 1)
+        below = below || bigAnyBelow(big, cut - 1)
+    }
+    if half && (below || mantissa & 1 != 0) { mantissa += 1 }
+    if top < -1022 {
+        // Below the normal numbers the bits are the number (and a carry
+        // out of them is the smallest normal one).
+        return mantissa
+    }
+    var exponent = top + 1023
+    if mantissa >> 53 != 0 {
+        mantissa = mantissa >> 1
+        exponent += 1
+        if exponent > 2046 { return 0x7FF0000000000000 }
+    }
+    return (@intCast(u64, exponent) << 52) | (mantissa & 0xFFFFFFFFFFFFF)
+}
+
+// No double lies halfway between two others with more decimal digits
+// than this: a text's digits beyond it only say "and a little more".
+const MOST_DIGITS: usize = 770
+
+// big * 10^power (`more`: and a little more), `count` decimal digits in
+// `big`, as the nearest double's bits. `big` is used up.
+fn decimalToDouble(big: *Big, count: usize, power: i64, more: bool) -> u64 {
+    if big.*.used == 0 { return 0 }
+    // The number is at least 10^(count - 1 + power) and below
+    // 10^(count + power): past these nothing but infinity and zero is left.
+    const order = @intCast(i64, count) + power
+    if order > 310 { return 0x7FF0000000000000 }
+    if order <= -324 { return 0 }
+    var sticky = more
+    if power >= 0 {
+        // big * 5^power * 2^power.
+        var left = @intCast(usize, power)
+        while left >= 13 {
+            bigMultiply(big, FIVE_13)
+            left -= 13
+        }
+        if left > 0 { bigMultiply(big, fiveTo(left)) }
+        return roundedDouble(big, power, sticky)
+    }
+    // big / (5^down * 2^down): shifted up first so far that 64 bits and
+    // more are left after the division, whose remainders say whether the
+    // quotient was cut.
+    const down = @intCast(usize, 0 - power)
+    const wanted = 67 + down * 2322 / 1000
+    const have = bigBits(big)
+    const up = if wanted > have { wanted - have } else { 0 }
+    bigShiftLeft(big, up)
+    var left = down
+    while left >= 13 {
+        if bigDivide(big, FIVE_13) != 0 { sticky = true }
+        left -= 13
+    }
+    if left > 0 {
+        if bigDivide(big, fiveTo(left)) != 0 { sticky = true }
+    }
+    return roundedDouble(big, 0 - @intCast(i64, up) - @intCast(i64, down), sticky)
+}
+
+// The number `text` says into `into`: blanks around it, a sign, digits
+// with or without a point (".5" and "5." are numbers, "." is none), an
+// exponent ("e" or "E", a sign, digits). The double nearest to it (an
+// infinity for what is too large, zero for what is too small). False for
+// anything else, "inf" and "nan" too (`into` is not written then).
+pub fn parseFloat(text: []const u8, into: *f64) -> bool {
+    const body = trimmed(text)
+    var at: usize = 0
+    var negative = false
+    if at < body.length && (body[at] == 45 || body[at] == 43) {
+        negative = body[at] == 45
+        at += 1
+    }
+    // The digits that count (not the zeros in front): 19 fit a u64, more
+    // go into a long number, and those beyond the most that can matter
+    // only move the point and say that there was more.
+    var digits: u64 = 0
+    var kept: usize = 0
+    var big: Big = undefined
+    var wide = false
+    var power: i64 = 0
+    var more = false
+    var any = false
+    var after_point = false
+    while at < body.length {
+        const byte = body[at]
+        if byte == 46 && !after_point {
+            after_point = true
+        } else if byte >= 48 && byte <= 57 {
+            any = true
+            if kept < 19 {
+                digits = digits * 10 + @intCast(u64, byte - 48)
+                if digits != 0 { kept += 1 }
+                if after_point { power -= 1 }
+            } else if kept < MOST_DIGITS {
+                if !wide {
+                    bigSet(&big, digits)
+                    wide = true
+                }
+                bigMultiply(&big, 10)
+                bigAdd(&big, @intCast(u32, byte - 48))
+                kept += 1
+                if after_point { power -= 1 }
+            } else {
+                if byte != 48 { more = true }
+                if !after_point && power < 100000 { power += 1 }
+            }
+        } else {
+            break
+        }
+        at += 1
+    }
+    if !any { return false }
+    if at < body.length && (body[at] == 101 || body[at] == 69) {
+        at += 1
+        var down = false
+        if at < body.length && (body[at] == 45 || body[at] == 43) {
+            down = body[at] == 45
+            at += 1
+        }
+        if at >= body.length || body[at] < 48 || body[at] > 57 { return false }
+        var exponent: i64 = 0
+        while at < body.length && body[at] >= 48 && body[at] <= 57 {
+            if exponent < 100000 { exponent = exponent * 10 + @intCast(i64, body[at] - 48) }
+            at += 1
+        }
+        power += if down { 0 - exponent } else { exponent }
+    }
+    if at != body.length { return false }
+    var result: f64 = 0.0
+    if !wide && digits < 9007199254740992 && power >= -22 && power <= 22 {
+        // Both parts are doubles exactly: one rounding, the right one.
+        const whole = @floatFromInt(f64, digits)
+        result = if power < 0 { whole / EXACT_TENS[@intCast(usize, 0 - power)] } else { whole * EXACT_TENS[@intCast(usize, power)] }
+    } else {
+        if !wide { bigSet(&big, digits) }
+        result = @bitCast(f64, decimalToDouble(&big, kept, power, more))
+    }
+    into.* = if negative { -result } else { result }
+    return true
+}
+
+// The whole number `text` says into `into`: blanks around it, a sign,
+// digits. False for anything else and for what an i64 does not hold
+// (`into` is not written then).
+pub fn parseInt(text: []const u8, into: *i64) -> bool {
+    const body = trimmed(text)
+    var at: usize = 0
+    var negative = false
+    if at < body.length && (body[at] == 45 || body[at] == 43) {
+        negative = body[at] == 45
+        at += 1
+    }
+    if at >= body.length { return false }
+    const limit: u64 = if negative { 9223372036854775808 } else { 9223372036854775807 }
+    var size: u64 = 0
+    while at < body.length {
+        const byte = body[at]
+        if byte < 48 || byte > 57 { return false }
+        const digit = @intCast(u64, byte - 48)
+        if size > (limit - digit) / 10 { return false }
+        size = size * 10 + digit
+        at += 1
+    }
+    into.* = @bitCast(i64, if negative { 0 -% size } else { size })
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Writing XML
+
+// How deep elements may nest (as deep as std.xml reads them).
+pub const XML_DEPTH: usize = 64
+
+pub const XmlWriter = struct {
+    out: *std.ArrayList(u8)
+    // Spaces a level.
+    indent: usize
+    depth: usize
+    // Where each open element's name is in `out` (its closing tag is
+    // copied from there).
+    nameAt: [64]usize
+    nameLength: [64]usize
+    // Whether each open element has text in it: what follows the text is
+    // written right behind it, not on lines of its own.
+    hasText: [64]bool
+    // The innermost element's start tag is still open: attributes go in.
+    tagOpen: bool
+    // Memory ran out, or something was asked for that cannot be written
+    // (an attribute outside a start tag, a 65th level, a close too many).
+    failed: bool
+}
+
+// Starts writing at the end of `out`, each level `indent` spaces in.
+pub fn xmlBegin(writer: *XmlWriter, out: *std.ArrayList(u8), indent: usize) -> void {
+    writer.*.out = out
+    writer.*.indent = indent
+    writer.*.depth = 0
+    writer.*.tagOpen = false
+    writer.*.failed = false
+}
+
+fn put(writer: *XmlWriter, text: []const u8) -> void {
+    if writer.*.failed { return }
+    if !writer.*.out.*.appendSlice(text) { writer.*.failed = true }
+}
+
+fn putByte(writer: *XmlWriter, byte: u8) -> void {
+    if writer.*.failed { return }
+    if !writer.*.out.*.append(byte) { writer.*.failed = true }
+}
+
+// `text` with what XML keeps for itself replaced: & < > always, the
+// double quote in an attribute, and control characters (as &#N;: in an
+// attribute all of them, a reader would turn a line end into a space; in
+// text all but tab and line feed). A NUL byte cannot be written at all
+// and is left out.
+fn putEscaped(writer: *XmlWriter, text: []const u8, attribute: bool) -> void {
+    for byte in text {
+        if byte == 38 {
+            put(writer, "&amp;")
+        } else if byte == 60 {
+            put(writer, "&lt;")
+        } else if byte == 62 {
+            put(writer, "&gt;")
+        } else if byte == 34 && attribute {
+            put(writer, "&quot;")
+        } else if byte < 32 && (attribute || (byte != 9 && byte != 10)) {
+            if byte != 0 {
+                put(writer, "&#")
+                if byte >= 10 { putByte(writer, 48 + byte / 10) }
+                putByte(writer, 48 + byte % 10)
+                putByte(writer, 59)
+            }
+        } else {
+            putByte(writer, byte)
+        }
+    }
+}
+
+// Whether what comes next stands on a line of its own.
+fn onOwnLine(writer: *const XmlWriter) -> bool {
+    return writer.*.depth == 0 || !writer.*.hasText[writer.*.depth - 1]
+}
+
+fn putIndent(writer: *XmlWriter, levels: usize) -> void {
+    var index: usize = 0
+    while index < levels * writer.*.indent {
+        putByte(writer, 32)
+        index += 1
+    }
+}
+
+// Ends the start tag that is still open: its element has content.
+fn closeTag(writer: *XmlWriter, with_children: bool) -> void {
+    if !writer.*.tagOpen { return }
+    writer.*.tagOpen = false
+    putByte(writer, 62)
+    if with_children { putByte(writer, 10) }
+}
+
+// The line every XML file starts with.
+pub fn xmlDeclaration(writer: *XmlWriter) -> void {
+    put(writer, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+}
+
+// `line` as it is, on a line of its own: a DOCTYPE, a comment.
+pub fn xmlRaw(writer: *XmlWriter, line: []const u8) -> void {
+    closeTag(writer, true)
+    putIndent(writer, writer.*.depth)
+    put(writer, line)
+    putByte(writer, 10)
+}
+
+// Opens the element `name` (inside the one open now): attributes may
+// follow, then text or other elements, then xmlClose().
+pub fn xmlOpen(writer: *XmlWriter, name: []const u8) -> void {
+    if writer.*.depth >= XML_DEPTH {
+        writer.*.failed = true
+        return
+    }
+    closeTag(writer, true)
+    if onOwnLine(writer) { putIndent(writer, writer.*.depth) }
+    putByte(writer, 60)
+    writer.*.nameAt[writer.*.depth] = writer.*.out.*.count()
+    writer.*.nameLength[writer.*.depth] = name.length
+    writer.*.hasText[writer.*.depth] = false
+    put(writer, name)
+    writer.*.depth += 1
+    writer.*.tagOpen = true
+}
+
+// An attribute of the element just opened: name="value", the value
+// escaped.
+pub fn xmlAttribute(writer: *XmlWriter, name: []const u8, value: []const u8) -> void {
+    if !writer.*.tagOpen {
+        writer.*.failed = true
+        return
+    }
+    putByte(writer, 32)
+    put(writer, name)
+    put(writer, "=\"")
+    putEscaped(writer, value, true)
+    putByte(writer, 34)
+}
+
+pub fn xmlAttributeInt(writer: *XmlWriter, name: []const u8, value: i64) -> void {
+    var digits: [24]u8 = undefined
+    const bytes: [*]u8 = &digits
+    const length = formatInt(value, bytes, 24)
+    xmlAttribute(writer, name, bytes[0..length])
+}
+
+// A number with at most `decimals` digits behind the point (formatFloat).
+pub fn xmlAttributeFloat(writer: *XmlWriter, name: []const u8, value: f64, decimals: usize) -> void {
+    var digits: [336]u8 = undefined
+    const bytes: [*]u8 = &digits
+    const length = formatFloat(value, decimals, bytes, FLOAT_ROOM)
+    xmlAttribute(writer, name, bytes[0..length])
+}
+
+// Text in the element open now, escaped. What follows it in the element
+// is written right behind it.
+pub fn xmlText(writer: *XmlWriter, text: []const u8) -> void {
+    if writer.*.depth == 0 {
+        writer.*.failed = true
+        return
+    }
+    closeTag(writer, false)
+    writer.*.hasText[writer.*.depth - 1] = true
+    putEscaped(writer, text, false)
+}
+
+// Closes the element opened last: "/>" when nothing is in it.
+pub fn xmlClose(writer: *XmlWriter) -> void {
+    if writer.*.depth == 0 {
+        writer.*.failed = true
+        return
+    }
+    writer.*.depth -= 1
+    const level = writer.*.depth
+    if writer.*.tagOpen {
+        writer.*.tagOpen = false
+        put(writer, "/>")
+    } else {
+        if !writer.*.hasText[level] { putIndent(writer, level) }
+        put(writer, "</")
+        // (Byte by byte: the list may move while it grows.)
+        var index: usize = 0
+        while index < writer.*.nameLength[level] && !writer.*.failed {
+            putByte(writer, writer.*.out.*.items()[writer.*.nameAt[level] + index])
+            index += 1
+        }
+        putByte(writer, 62)
+    }
+    if onOwnLine(writer) { putByte(writer, 10) }
+}
+
+// <name>text</name>.
+pub fn xmlElement(writer: *XmlWriter, name: []const u8, text: []const u8) -> void {
+    xmlOpen(writer, name)
+    if text.length > 0 { xmlText(writer, text) }
+    xmlClose(writer)
+}
+
+// Closes whatever is still open. Whether everything was written (false:
+// memory ran out on the way, or the calls did not fit together).
+pub fn xmlEnd(writer: *XmlWriter) -> bool {
+    while writer.*.depth > 0 && !writer.*.failed { xmlClose(writer) }
+    return !writer.*.failed
+}
+
+// ---------------------------------------------------------------------------
+// Reading XML: attributes of an element
+
+fn isSpace(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 10 || byte == 13 }
+
+// The value of attribute `name` of the element whose start tag begins at
+// `offset` of `document` (an elementStart token's `offset`), as it stands
+// in the file: entities not expanded (unescape()). Null when the element
+// has no such attribute (or its tag is not well-formed up to there: the
+// tokenizer will say so when it gets to it).
+pub fn attributeOf(document: []const u8, offset: usize, name: []const u8) -> ?[]const u8 {
+    const length = document.length
+    var at = offset
+    if at >= length || document[at] != 60 { return null }
+    at += 1
+    while at < length && !isSpace(document[at]) && document[at] != 62 && document[at] != 47 { at += 1 }
+    while true {
+        while at < length && isSpace(document[at]) { at += 1 }
+        if at >= length || document[at] == 62 || document[at] == 47 { return null }
+        const name_start = at
+        while at < length && document[at] != 61 && !isSpace(document[at]) && document[at] != 62 && document[at] != 47 { at += 1 }
+        const name_end = at
+        while at < length && isSpace(document[at]) { at += 1 }
+        if at >= length || document[at] != 61 { return null }
+        at += 1
+        while at < length && isSpace(document[at]) { at += 1 }
+        if at >= length || (document[at] != 34 && document[at] != 39) { return null }
+        const quote = document[at]
+        at += 1
+        const value_start = at
+        while at < length && document[at] != quote { at += 1 }
+        if at >= length { return null }
+        if std.text.same(document[name_start..name_end], name) { return document[value_start..at] }
+        at += 1
+    }
+}
+
+// `raw` (an attribute's value, an element's text) with its entities
+// expanded (&lt; &gt; &amp; &quot; &apos; &#N; &#xN;) into `into`: the
+// text there (never longer than `raw`). Null for a reference that is
+// none, or when `capacity` is too little.
+pub fn unescape(raw: []const u8, into: [*]u8, capacity: usize) -> ?[]const u8 {
+    const length = xml.decode(std.string.fromSlice(raw), into, capacity)
+    if length < 0 { return null }
+    return into[0..@bitCast(usize, length)]
+}
+
+// The attribute as text, entities expanded, in `into`.
+pub fn attributeText(document: []const u8, offset: usize, name: []const u8, into: [*]u8, capacity: usize) -> ?[]const u8 {
+    const raw = attributeOf(document, offset, name)
+    if raw == null { return null }
+    return unescape(raw.?, into, capacity)
+}
+
+// The attribute as a number into `into` (false: not there, or not a
+// number; `into` is not written then).
+pub fn attributeFloat(document: []const u8, offset: usize, name: []const u8, into: *f64) -> bool {
+    const raw = attributeOf(document, offset, name)
+    return raw != null && parseFloat(raw.?, into)
+}
+
+pub fn attributeInt(document: []const u8, offset: usize, name: []const u8, into: *i64) -> bool {
+    const raw = attributeOf(document, offset, name)
+    return raw != null && parseInt(raw.?, into)
+}
+
+// The attribute as a number, `fallback` when it is not there or no number.
+pub fn attributeFloatOr(document: []const u8, offset: usize, name: []const u8, fallback: f64) -> f64 {
+    var value = fallback
+    _ = attributeFloat(document, offset, name, &value)
+    return value
+}
+
+pub fn attributeIntOr(document: []const u8, offset: usize, name: []const u8, fallback: i64) -> i64 {
+    var value = fallback
+    _ = attributeInt(document, offset, name, &value)
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+
+fn lowered(byte: u8) -> u8 { return if byte >= 65 && byte <= 90 { byte + 32 } else { byte } }
+
+// Whether two texts are the same but for the case of A to Z.
+pub fn sameIgnoringCase(left: []const u8, right: []const u8) -> bool {
+    if left.length != right.length { return false }
+    var index: usize = 0
+    while index < left.length {
+        if lowered(left[index]) != lowered(right[index]) { return false }
+        index += 1
+    }
+    return true
+}
+
+// What is behind the last "/" of `path` (all of it without one).
+pub fn baseName(path: []const u8) -> []const u8 {
+    var start = path.length
+    while start > 0 && path[start - 1] != 47 { start -= 1 }
+    return path[start..]
+}
+
+// What is before the last "/" of `path`: "" without one, "/" for a file
+// in the root.
+pub fn directory(path: []const u8) -> []const u8 {
+    var end = path.length
+    while end > 0 && path[end - 1] != 47 { end -= 1 }
+    if end == 0 { return path[0..0] }
+    if end == 1 { return path[0..1] }
+    return path[0..end - 1]
+}
+
+// The file name's extension, without its point: "png" of "a/b.tar.png",
+// "" when there is none (".config" has none, "file." neither).
+pub fn extension(path: []const u8) -> []const u8 {
+    const name = baseName(path)
+    var at = name.length
+    while at > 0 && name[at - 1] != 46 { at -= 1 }
+    if at <= 1 { return path[path.length..] }
+    return name[at..]
+}
+
+// Whether the path's extension is `wanted` ("png"), in any case.
+pub fn hasExtension(path: []const u8, wanted: []const u8) -> bool {
+    return sameIgnoringCase(extension(path), wanted)
+}
+
+// `path` with `extension_` ("png") in place of its extension (added when
+// it has none; "": only taken off) into `into`: the length, 0 when it
+// does not fit in `capacity`.
+pub fn withExtension(path: []const u8, extension_: []const u8, into: [*]u8, capacity: usize) -> usize {
+    const old = extension(path)
+    var stem = path.length
+    if old.length > 0 {
+        stem = path.length - old.length - 1
+    } else if baseName(path).length > 1 && path[path.length - 1] == 46 {
+        // "name." has a point to build on.
+        stem = path.length - 1
+    }
+    const added = if extension_.length > 0 { extension_.length + 1 } else { 0 }
+    if stem + added > capacity { return 0 }
+    var length = std.text.append(into, 0, capacity, path[0..stem])
+    if extension_.length > 0 {
+        length = std.text.appendByte(into, length, capacity, 46)
+        length = std.text.append(into, length, capacity, extension_)
+    }
+    return length
+}
+
+// The path of `name` in the folder `folder` into `into`: the length, 0
+// when it does not fit. A `name` that starts at the root stays what it is.
+pub fn join(folder: []const u8, name: []const u8, into: [*]u8, capacity: usize) -> usize {
+    const alone = folder.length == 0 || (name.length > 0 && name[0] == 47)
+    const slash = !alone && folder[folder.length - 1] != 47
+    const total = name.length + (if alone { 0 } else { folder.length }) + (if slash { 1 } else { 0 })
+    if total > capacity || total == 0 { return 0 }
+    var length: usize = 0
+    if !alone { length = std.text.append(into, 0, capacity, folder) }
+    if slash { length = std.text.appendByte(into, length, capacity, 47) }
+    return std.text.append(into, length, capacity, name)
+}
+
+// ---------------------------------------------------------------------------
+// Files
+
+pub const FileStatus = enum(u8) {
+    ok,
+    // There is no such file.
+    notFound,
+    // There is one, but it cannot be read (a folder, no permission, a
+    // read that failed).
+    notReadable,
+    noMemory
+}
+
+// A file's bytes in memory of `allocator`: freeFile() gives them back.
+pub const Contents = struct {
+    bytes: [*]u8
+    length: usize
+    capacity: usize
+    allocator: Allocator
+}
+
+// `path` as std.fs wants it: a copy with a NUL behind it (length + 1
+// bytes, given back with releasePath). Null without memory and for a path
+// std.fs cannot take: empty, 4096 bytes and more, a NUL inside.
+fn terminated(allocator: Allocator, path: []const u8) -> ?[*]u8 {
+    if path.length == 0 || path.length + 1 > std.fs.PATH_MAX { return null }
+    for byte in path {
+        if byte == 0 { return null }
+    }
+    const memory = allocator.alloc(path.length + 1, 1)
+    if memory == null { return null }
+    std.mem.copy(memory.?, path.pointer, path.length)
+    memory.?[path.length] = 0
+    return memory
+}
+
+fn releasePath(allocator: Allocator, name: [*]u8, path: []const u8) -> void {
+    allocator.free(name, path.length + 1, 1)
+}
+
+// The whole file at `path` into `into` (to be given back with freeFile()
+// after FileStatus.ok, and only then).
+pub fn readFile(allocator: Allocator, path: []const u8, into: *Contents) -> FileStatus {
+    into.*.length = 0
+    into.*.capacity = 0
+    into.*.allocator = allocator
+    const name = terminated(allocator, path)
+    if name == null { return FileStatus.notFound }
+    var known: std.fs.Stat = undefined
+    const found = std.fs.status(name.?, &known)
+    var file = std.fs.File.{ .descriptor = -1 }
+    if found == 0 && known.mode & 61440 != 16384 { file = std.fs.open(name.?, std.fs.READ_ONLY, 0) }
+    releasePath(allocator, name.?, path)
+    // (No such file, or no such folder on the way to it.)
+    if found == -2 || found == -20 { return FileStatus.notFound }
+    if !std.fs.isValid(file) { return FileStatus.notReadable }
+    // One byte more than the file is said to have: the read that finds
+    // the end then needs no more room.
+    var capacity: usize = if known.size > 0 { @bitCast(usize, known.size) + 1 } else { 4096 }
+    var memory = allocator.alloc(capacity, 16)
+    var status = FileStatus.ok
+    var length: usize = 0
+    if memory == null { status = FileStatus.noMemory }
+    while status == FileStatus.ok {
+        if length == capacity {
+            const larger = allocator.resize(memory.?, capacity, capacity * 2, 16)
+            if larger == null {
+                status = FileStatus.noMemory
+                break
+            }
+            memory = larger
+            capacity = capacity * 2
+        }
+        const got = std.fs.read(file, memory.? + length, capacity - length)
+        if got == 0 { break }
+        // (-4: interrupted, asked again.)
+        if got < 0 && got != -4 { status = FileStatus.notReadable }
+        if got > 0 { length += @bitCast(usize, got) }
+    }
+    _ = std.fs.close(file)
+    if status != FileStatus.ok {
+        if memory != null { allocator.free(memory.?, capacity, 16) }
+        return status
+    }
+    into.*.bytes = memory.?
+    into.*.length = length
+    into.*.capacity = capacity
+    return FileStatus.ok
+}
+
+pub fn freeFile(contents: *Contents) -> void {
+    if contents.*.capacity != 0 { contents.*.allocator.free(contents.*.bytes, contents.*.capacity, 16) }
+    contents.*.length = 0
+    contents.*.capacity = 0
+}
+
+// Writes `data` as the file at `path`, whole or not at all: it goes to
+// "PATH.new" beside it, which then takes the file's place (who reads the
+// file meanwhile gets the old one or the new one). False when anything
+// failed: the file is then as it was. `allocator` is for the path.
+pub fn writeFile(allocator: Allocator, path: []const u8, data: []const u8) -> bool {
+    const name = terminated(allocator, path)
+    if name == null { return false }
+    const written = std.fs.replaceFile(name.?, data.pointer, data.length, 420)
+    releasePath(allocator, name.?, path)
+    return written
+}
+
+// Whether there is anything at `path`.
+pub fn exists(allocator: Allocator, path: []const u8) -> bool {
+    const name = terminated(allocator, path)
+    if name == null { return false }
+    const found = std.fs.exists(name.?)
+    releasePath(allocator, name.?, path)
+    return found
+}
+
+// Removes the file at `path`. Whether it is gone.
+pub fn deleteFile(allocator: Allocator, path: []const u8) -> bool {
+    const name = terminated(allocator, path)
+    if name == null { return false }
+    const gone = std.fs.delete(name.?)
+    releasePath(allocator, name.?, path)
+    return gone
+}

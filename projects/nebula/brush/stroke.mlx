@@ -1,0 +1,639 @@
+// nebula brush: a stroke: the pen's path turned into dabs. The tool makes
+// one Stroke (create) and uses it for stroke after stroke:
+//
+//     var area = stroke_module.begin(stroke, &target, &settings, &first)   // pen down
+//     area = stroke_module.to(stroke, &point)                              // every motion
+//     area = stroke_module.tick(stroke, now)                               // now and then while the pen is down (airbrush)
+//     area = stroke_module.end(stroke)                                     // pen up
+//
+// Each call returns the image's rectangle it changed (every changed pixel
+// is inside; empty: nothing) and has told the image so already
+// (image.damage), so the canvas only has to draw that part again.
+//
+// Where the dabs go is the tool's choice, by the brush (see Target in
+// brush/types.mlx):
+//
+//     if stroke_module.paintsIndirectly(&settings) {
+//         // wash: on an overlay of the node, merged at the end
+//         const overlay = device.create(allocator, 0).?
+//         node.*.overlay = overlay
+//         node.*.overlayOpacity = 255
+//         node.*.overlayBlend = stroke_module.mergeBlend(&settings)
+//         node.*.overlayMasked = image.*.selected
+//         target.device = overlay
+//         target.direct = false
+//         ... begin, to, end ...
+//         _ = ops.mergeOverlay(image, node, "Brush stroke")
+//     } else {
+//         // build-up: on the layer itself, one undo step
+//         _ = ops.beginPixels(image, node)
+//         target.device = node.*.device.?
+//         target.direct = true
+//         target.selection = the image's selection, or null
+//         target.alphaLock = node.*.alphaLocked
+//         ... begin, to, end ...
+//         _ = ops.endPixels(image, node, "Brush stroke")
+//     }
+//
+// What the framework does for every dab, in this order (random numbers
+// are drawn in this order too, so the same seed and input paint the same
+// pixels):
+//
+//  1. The options are evaluated (brush/dynamics.mlx) and applied: SIZE
+//     scales the diameter, RATIO the tip's ratio, ROTATION adds its value
+//     times a full turn to the tip's angle (clockwise on the screen: with
+//     the drawing angle as its sensor the tip points along the path),
+//     OPACITY and FLOW multiply the brush's, SOFTNESS the tip's fade,
+//     SHARPNESS moves the dab toward whole pixels and hardens its edge,
+//     the MIRROR options flip the tip above one half.
+//  2. The distance to the next dab: the tip's spacing times the dab's
+//     extent along the direction of motion (its diameter for a round
+//     tip), or by auto spacing the coefficient times the square root of
+//     that extent; times the SPACING option; never under half a pixel (a
+//     thinner dab: its diameter, not under a tenth).
+//  3. The colour: the foreground's (or a random one, by the colour
+//     source), MIX toward the background's, DARKEN, HUE, SATURATION and
+//     VALUE (core/color.mlx's HSV).
+//  4. SCATTER moves the dab along and across the direction of motion.
+//  5. The engine paints it: once, again for each mirror image when the
+//     target mirrors (2 or 4 dabs, the tip mirrored with them), and each
+//     of those again where it leaves the image when the target wraps
+//     around.
+//
+// Dabs are placed along the straight piece from the last point to the
+// new one, each at its distance from the dab before; what is left of a
+// piece is carried into the next, so the dabs do not depend on how the
+// pen's path was cut into events. A dab's pen (pressure, tilt, time) is
+// point.between() of the piece's ends. A dab smaller than a hundredth of
+// a pixel, or without opacity or flow, is counted and spaced but not
+// painted.
+//
+// The first dab is painted at begin(), unless an option of the brush
+// listens to the drawing angle: then it waits for the first motion, which
+// gives it its direction (a tap without motion paints it at end(), with
+// direction 0). With fanCorners the dabs of such a brush fan out at each
+// corner of the path, from the old direction to the new.
+//
+// Not done: dabs larger than the image wrap around once, not as often
+// as they would have to.
+const std = @import("std")
+const math = @import("std.math")
+const random = @import("std.random")
+const types = @import("./types.mlx")
+const dynamics = @import("./dynamics.mlx")
+const tip_module = @import("./tip.mlx")
+const engines = @import("./engines.mlx")
+const point_module = @import("./point.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const color_module = @import("../core/color.mlx")
+const blend = @import("../core/blend.mlx")
+const image_module = @import("../core/image.mlx")
+
+pub const Stroke = types.Stroke
+pub const Target = types.Target
+pub const Settings = types.Settings
+pub const Engine = types.Engine
+pub const Point = types.Point
+pub const Rect = geom.Rect
+pub const Allocator = std.allocator.Allocator
+
+const CURVES: usize = types.OPTIONS * types.SENSORS * 256
+
+// A piece longer than this is a jump (no pen moves so far between two
+// events): nothing is painted along it.
+const LONGEST: f64 = 1000000.0
+
+// Dabs one tick of an airbrush paints at most (a tick that comes late
+// does not paint everything it missed).
+const TICK_DABS: usize = 32
+
+// ---------------------------------------------------------------------------
+// Making and ending
+
+// A stroke that paints nothing yet. Null without memory.
+pub fn create(allocator: Allocator) -> ?*Stroke {
+    const memory = allocator.alloc(@sizeOf(Stroke), 16)
+    const settings = allocator.alloc(@sizeOf(Settings), 16)
+    const curves = allocator.alloc(CURVES * 4, 16)
+    if memory == null || settings == null || curves == null {
+        if memory != null { allocator.free(memory.?, @sizeOf(Stroke), 16) }
+        if settings != null { allocator.free(settings.?, @sizeOf(Settings), 16) }
+        if curves != null { allocator.free(curves.?, CURVES * 4, 16) }
+        return null
+    }
+    const stroke: *Stroke = unsafe { @ptrCast(*Stroke, memory.?) }
+    stroke.*.allocator = allocator
+    stroke.*.active = false
+    unsafe { stroke.*.settings = @ptrCast(*Settings, settings.?) }
+    types.defaults(stroke.*.settings)
+    stroke.*.engine = null
+    stroke.*.engineState = 0
+    unsafe { stroke.*.curves = @ptrCast([*]f32, curves.?) }
+    tip_module.initCache(&stroke.*.masks, allocator)
+    stroke.*.sinceDab = 0.0
+    stroke.*.gap = 0.0
+    stroke.*.pendingFirst = false
+    stroke.*.usesDirection = false
+    stroke.*.fanStep = 0.0
+    stroke.*.lastDabTime = 0.0
+    stroke.*.strokeColor = 0
+    stroke.*.dabs = 0
+    stroke.*.clip = geom.empty()
+    stroke.*.clipped = false
+    stroke.*.painted = geom.empty()
+    stroke.*.dirty = geom.empty()
+    return stroke
+}
+
+// Ends the stroke object (a stroke still being drawn is given up as by
+// cancel()).
+pub fn destroy(stroke: *Stroke) -> void {
+    cancel(stroke)
+    tip_module.freeCache(&stroke.*.masks)
+    const allocator = stroke.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, stroke.*.curves), CURVES * 4, 16) }
+    unsafe { allocator.free(@ptrCast([*]u8, stroke.*.settings), @sizeOf(Settings), 16) }
+    unsafe { allocator.free(@ptrCast([*]u8, stroke), @sizeOf(Stroke), 16) }
+}
+
+// Whether a brush wants its strokes on an overlay (wash) rather than on
+// the layer itself: its paint mode says so, unless its engine has to see
+// the layer (types.ENGINE_DIRECT).
+pub fn paintsIndirectly(settings: *const Settings) -> bool {
+    const engine = engines.find(settings.*.engine)
+    if engine != null && engine.?.*.flags & types.ENGINE_DIRECT != 0 { return false }
+    return settings.*.paintMode == types.MODE_WASH
+}
+
+// The blend mode the overlay of a wash stroke is merged with: the
+// brush's, or blend.ERASE for an eraser.
+pub fn mergeBlend(settings: *const Settings) -> u16 {
+    if settings.*.eraser || settings.*.engine == types.ENGINE_ERASER { return blend.ERASE }
+    return settings.*.blend
+}
+
+// ---------------------------------------------------------------------------
+// One dab
+
+// An option's number for the dab being placed (1 when it is off).
+fn optionValue(stroke: *Stroke, option: usize) -> f64 {
+    const record = &stroke.*.settings.*.options[option]
+    if !record.*.on { return 1.0 }
+    return dynamics.evaluate(record, stroke.*.curves + option * types.SENSORS * 256, &stroke.*.state, @intCast(u64, option))
+}
+
+inline fn isOn(stroke: *Stroke, option: usize) -> bool {
+    return stroke.*.settings.*.options[option].on
+}
+
+// Saturation and value by an option's number: one half leaves them, 0
+// takes all away, 1 gives all.
+fn shifted(amount: f64, by: f64) -> f64 {
+    if by < 0.5 { return amount * by * 2.0 }
+    return amount + (1.0 - amount) * (by * 2.0 - 1.0)
+}
+
+fn randomColor(stroke: *Stroke, alpha: u32) -> u32 {
+    return (alpha << 24) | @intCast(u32, random.next(&stroke.*.state.random) >> 40)
+}
+
+// The colour of the dab being placed.
+fn dabColor(stroke: *Stroke) -> u32 {
+    const settings = stroke.*.settings
+    const target = &stroke.*.target
+    var color = target.*.foreground
+    if settings.*.colorSource == types.COLOR_UNIFORM_RANDOM {
+        color = stroke.*.strokeColor
+    } else if settings.*.colorSource == types.COLOR_TOTAL_RANDOM {
+        color = randomColor(stroke, target.*.foreground >> 24)
+    }
+    if isOn(stroke, types.OPTION_MIX) {
+        const part = @intFromFloat(u32, optionValue(stroke, types.OPTION_MIX) * 255.0 + 0.5)
+        color = pixel.mix(target.*.background, color, part)
+    }
+    if isOn(stroke, types.OPTION_DARKEN) {
+        const keep = @intFromFloat(u32, optionValue(stroke, types.OPTION_DARKEN) * 255.0 + 0.5)
+        color = (color & 0xFF000000) | (pixel.mul(pixel.red(color), keep) << 16) | (pixel.mul(pixel.green(color), keep) << 8) | pixel.mul(pixel.blue(color), keep)
+    }
+    if isOn(stroke, types.OPTION_HUE) || isOn(stroke, types.OPTION_SATURATION) || isOn(stroke, types.OPTION_VALUE) {
+        var h: f64 = 0.0
+        var s: f64 = 0.0
+        var v: f64 = 0.0
+        color_module.toHsv(color, &h, &s, &v)
+        if isOn(stroke, types.OPTION_HUE) { h += optionValue(stroke, types.OPTION_HUE) - 0.5 }
+        if isOn(stroke, types.OPTION_SATURATION) { s = shifted(s, optionValue(stroke, types.OPTION_SATURATION)) }
+        if isOn(stroke, types.OPTION_VALUE) { v = shifted(v, optionValue(stroke, types.OPTION_VALUE)) }
+        color = color_module.fromHsv(h, s, v, color >> 24)
+    }
+    return color
+}
+
+// A place on the grid of a tip's precision (eighths of a pixel at 5).
+fn snapped(value: f64, places: f64) -> f64 {
+    return math.round(value * places) / places
+}
+
+fn placesOf(precision: u8) -> f64 {
+    if precision >= 5 { return 8.0 }
+    if precision == 4 { return 4.0 }
+    if precision == 3 { return 2.0 }
+    return 1.0
+}
+
+// (The rectangles of everything painted are united into stroke.painted,
+// a field: collected in locals that are returned they would be taken
+// from the value arena for every dab.)
+
+// The engine paints stroke.dab where it is, and once more for every side
+// of the image it reaches across when the target wraps around.
+fn paintWrapped(stroke: *Stroke, copy: *u8) -> void {
+    const engine = stroke.*.engine.?
+    const dab = &stroke.*.dab
+    if !stroke.*.target.wrap {
+        dab.*.copy = copy.*
+        copy.* +%= 1
+        stroke.*.painted = geom.unite(stroke.*.painted, engine.*.dab(stroke, dab))
+        return
+    }
+    const width = @floatFromInt(f64, stroke.*.target.image.*.width)
+    const height = @floatFromInt(f64, stroke.*.target.image.*.height)
+    // The centre inside the image; whole widths keep its place in the
+    // pixel.
+    const x = dab.*.x - @floor(dab.*.x / width) * width
+    const y = dab.*.y - @floor(dab.*.y / height) * height
+    // No tip reaches further from its centre (a square one, turned).
+    const reach = dab.*.diameter * 0.75 + 3.0
+    var row: i32 = -1
+    while row <= 1 {
+        const cy = y + @floatFromInt(f64, row) * height
+        if cy + reach > 0.0 && cy - reach < height {
+            var column: i32 = -1
+            while column <= 1 {
+                const cx = x + @floatFromInt(f64, column) * width
+                if cx + reach > 0.0 && cx - reach < width {
+                    dab.*.x = cx
+                    dab.*.y = cy
+                    dab.*.copy = copy.*
+                    copy.* +%= 1
+                    stroke.*.painted = geom.unite(stroke.*.painted, engine.*.dab(stroke, dab))
+                }
+                column += 1
+            }
+        }
+        row += 1
+    }
+}
+
+// The engine paints stroke.dab and its mirror images.
+fn paintCopies(stroke: *Stroke) -> void {
+    const target = &stroke.*.target
+    const dab = &stroke.*.dab
+    const places = placesOf(stroke.*.settings.*.tip.precision)
+    const x = dab.*.x
+    const y = dab.*.y
+    const flip_h = dab.*.mirrorHorizontal
+    const flip_v = dab.*.mirrorVertical
+    var copy: u8 = 0
+    const rows: u32 = if target.*.mirrorVertical { 2 } else { 1 }
+    const columns: u32 = if target.*.mirrorHorizontal { 2 } else { 1 }
+    var row: u32 = 0
+    while row < rows {
+        var column: u32 = 0
+        while column < columns {
+            dab.*.x = x
+            dab.*.y = y
+            dab.*.mirrorHorizontal = flip_h
+            dab.*.mirrorVertical = flip_v
+            // (Snapped again: an axis off the grid would take the copy
+            // off it.)
+            if column == 1 {
+                dab.*.x = snapped(2.0 * target.*.axisX - x, places)
+                dab.*.mirrorHorizontal = !flip_h
+            }
+            if row == 1 {
+                dab.*.y = snapped(2.0 * target.*.axisY - y, places)
+                dab.*.mirrorVertical = !flip_v
+            }
+            paintWrapped(stroke, &copy)
+            column += 1
+        }
+        row += 1
+    }
+    dab.*.x = x
+    dab.*.y = y
+    dab.*.mirrorHorizontal = flip_h
+    dab.*.mirrorVertical = flip_v
+    dab.*.copy = 0
+}
+
+// Places a dab at stroke.state.point (dynamics.place() was called for
+// it): works it out, paints it, and sets the distance to the next one.
+fn placeDab(stroke: *Stroke) -> void {
+    const settings = stroke.*.settings
+    const tip = &settings.*.tip
+    const state = &stroke.*.state
+    const dab = &stroke.*.dab
+
+    var diameter = settings.*.size
+    if isOn(stroke, types.OPTION_SIZE) { diameter *= optionValue(stroke, types.OPTION_SIZE) }
+    var ratio: f64 = if tip.*.kind == types.TIP_AUTO { tip.*.ratio } else { 1.0 }
+    if isOn(stroke, types.OPTION_RATIO) { ratio *= optionValue(stroke, types.OPTION_RATIO) }
+    ratio = math.clamp(ratio, 0.01, 1.0)
+    var angle = tip.*.angle * math.pi / 180.0
+    if isOn(stroke, types.OPTION_ROTATION) { angle += math.tau * optionValue(stroke, types.OPTION_ROTATION) }
+    dab.*.opacity = settings.*.opacity * optionValue(stroke, types.OPTION_OPACITY)
+    dab.*.flow = settings.*.flow * optionValue(stroke, types.OPTION_FLOW)
+    dab.*.softness = optionValue(stroke, types.OPTION_SOFTNESS)
+    dab.*.sharpness = if isOn(stroke, types.OPTION_SHARPNESS) { optionValue(stroke, types.OPTION_SHARPNESS) } else { 0.0 }
+    dab.*.mirrorHorizontal = isOn(stroke, types.OPTION_MIRROR_HORIZONTAL) && optionValue(stroke, types.OPTION_MIRROR_HORIZONTAL) > 0.5
+    dab.*.mirrorVertical = isOn(stroke, types.OPTION_MIRROR_VERTICAL) && optionValue(stroke, types.OPTION_MIRROR_VERTICAL) > 0.5
+
+    // The way to the next dab.
+    var extent = diameter
+    if state.*.hasDirection && ratio < 1.0 {
+        const across = angle - state.*.direction
+        extent = diameter * @sqrt(math.cos(across) * math.cos(across) + ratio * ratio * math.sin(across) * math.sin(across))
+    }
+    var gap = tip.*.spacing * extent
+    if tip.*.autoSpacing { gap = tip.*.autoSpacingCoefficient * (if extent < 1.0 { extent } else { @sqrt(extent) }) }
+    if isOn(stroke, types.OPTION_SPACING) { gap *= optionValue(stroke, types.OPTION_SPACING) }
+    const least = math.clamp(diameter, 0.1, 0.5)
+    if !(gap >= least) { gap = least }
+    stroke.*.gap = gap
+
+    dab.*.color = dabColor(stroke)
+
+    var x = state.*.point.x
+    var y = state.*.point.y
+    if isOn(stroke, types.OPTION_SCATTER) {
+        const reach = settings.*.scatterAmount * optionValue(stroke, types.OPTION_SCATTER) * diameter
+        // (Both numbers are drawn whichever axes count: the stroke's
+        // other random numbers do not depend on that setting.)
+        var along = (random.unit(&state.*.random) * 2.0 - 1.0) * reach
+        var across = (random.unit(&state.*.random) * 2.0 - 1.0) * reach
+        if !settings.*.scatterX { along = 0.0 }
+        if !settings.*.scatterY { across = 0.0 }
+        const direction = if state.*.hasDirection { state.*.direction } else { 0.0 }
+        x += along * math.cos(direction) - across * math.sin(direction)
+        y += along * math.sin(direction) + across * math.cos(direction)
+    }
+    if dab.*.sharpness > 0.0 {
+        x = @floor(x) + (x - @floor(x)) * (1.0 - dab.*.sharpness)
+        y = @floor(y) + (y - @floor(y)) * (1.0 - dab.*.sharpness)
+    }
+    const places = placesOf(tip.*.precision)
+    dab.*.x = snapped(x, places)
+    dab.*.y = snapped(y, places)
+    dab.*.diameter = diameter
+    dab.*.ratio = ratio
+    dab.*.angle = angle
+    dab.*.copy = 0
+    dab.*.index = state.*.dabs
+    dab.*.distance = state.*.distance
+    dab.*.point = state.*.point
+    dab.*.speed = dynamics.speed(state)
+    dab.*.drawingAngle = if state.*.hasDirection { state.*.direction } else { 0.0 }
+    dab.*.noise = 0
+    if tip.*.density < 1.0 || tip.*.randomness > 0.0 { dab.*.noise = random.next(&state.*.random) | 1 }
+    var slot: usize = 0
+    while slot < types.ENGINE_VALUES {
+        dab.*.values[slot] = optionValue(stroke, types.OPTION_FIRST_FOR_ENGINES + slot)
+        slot += 1
+    }
+
+    if diameter >= types.SMALLEST_SIZE && dab.*.opacity > 0.0 && dab.*.flow > 0.0 && math.abs(dab.*.x) < 1000000000.0 && math.abs(dab.*.y) < 1000000000.0 {
+        paintCopies(stroke)
+    }
+    dynamics.placed(state)
+    stroke.*.dabs +%= 1
+    stroke.*.lastDabTime = state.*.point.time
+}
+
+// ---------------------------------------------------------------------------
+// The stroke
+
+// What the call being served painted: noted, the image told, returned.
+fn report(stroke: *Stroke) -> Rect {
+    const area = stroke.*.painted
+    stroke.*.painted = geom.empty()
+    if !geom.isEmpty(area) {
+        stroke.*.dirty = geom.unite(stroke.*.dirty, area)
+        image_module.damage(stroke.*.target.image, area)
+    }
+    return area
+}
+
+// Whether the pen is down: between begin() and end().
+pub fn isActive(stroke: *Stroke) -> bool { return stroke.*.active }
+
+// Begins a stroke on `target` with the brush `settings` (both are copied:
+// the caller's may change or go) at `first`, painted by the engine the
+// settings name. A stroke still being drawn is ended first. The image's
+// rectangle the first dab changed (empty when it waits for its direction,
+// see the header, or when nothing can be painted: no such engine, no
+// memory).
+pub fn begin(stroke: *Stroke, target: *const Target, settings: *const Settings, first: *const Point) -> Rect {
+    const engine = engines.find(settings.*.engine)
+    if engine == null {
+        _ = end(stroke)
+        return geom.empty()
+    }
+    return beginWith(stroke, engine.?, target, settings, first)
+}
+
+// The same, painted by `engine` whatever the settings name (an engine
+// that is not in the list: a test's, a tool's own).
+pub fn beginWith(stroke: *Stroke, engine: *const Engine, target: *const Target, settings: *const Settings, first: *const Point) -> Rect {
+    _ = end(stroke)
+    stroke.*.target = target.*
+    // (Byte by byte: assigning a record of this size would go through
+    // the value arena.)
+    unsafe { std.mem.copy(@ptrCast([*]u8, stroke.*.settings), @ptrCast([*]const u8, settings), @sizeOf(Settings)) }
+    types.sanitize(stroke.*.settings)
+    stroke.*.engine = engine
+    stroke.*.engineState = 0
+    stroke.*.dirty = geom.empty()
+    stroke.*.painted = geom.empty()
+    stroke.*.dabs = 0
+    stroke.*.sinceDab = 0.0
+    stroke.*.gap = 0.0
+    stroke.*.last = first.*
+    stroke.*.lastDabTime = first.*.time
+    stroke.*.clipped = target.*.wrap
+    stroke.*.clip = if target.*.wrap { image_module.bounds(target.*.image) } else { geom.empty() }
+    dynamics.start(&stroke.*.state, target.*.seed, first)
+    stroke.*.strokeColor = 0
+    if stroke.*.settings.*.colorSource == types.COLOR_UNIFORM_RANDOM { stroke.*.strokeColor = randomColor(stroke, target.*.foreground >> 24) }
+
+    // The curves of what is on, and what the drawing angle asks for.
+    stroke.*.usesDirection = false
+    stroke.*.fanStep = 0.0
+    var option: usize = 0
+    while option < types.OPTIONS {
+        const record = &stroke.*.settings.*.options[option]
+        if record.*.on {
+            dynamics.bake(record, stroke.*.curves + option * types.SENSORS * 256)
+            var slot: usize = 0
+            while slot < @intCast(usize, record.*.count) {
+                const sensor = &record.*.sensors[slot]
+                if sensor.*.kind == types.SENSOR_DRAWING_ANGLE {
+                    stroke.*.usesDirection = true
+                    if sensor.*.fanCorners && (stroke.*.fanStep == 0.0 || sensor.*.fanStep < stroke.*.fanStep) { stroke.*.fanStep = sensor.*.fanStep }
+                }
+                slot += 1
+            }
+        }
+        option += 1
+    }
+
+    if engine.*.begin != null {
+        if !engine.*.begin.?(stroke) {
+            if engine.*.free != null { engine.*.free.?(stroke) }
+            stroke.*.engine = null
+            return geom.empty()
+        }
+    }
+    stroke.*.active = true
+    stroke.*.pendingFirst = stroke.*.usesDirection
+    if stroke.*.pendingFirst { return geom.empty() }
+    dynamics.place(&stroke.*.state, 0.0, 0.0)
+    placeDab(stroke)
+    return report(stroke)
+}
+
+fn turnBetween(from: f64, to: f64) -> f64 {
+    var turn = math.fmod(to - from, math.tau)
+    if turn > math.pi { turn -= math.tau }
+    if turn < 0.0 - math.pi { turn += math.tau }
+    return turn
+}
+
+// The pen moved to `point`: the dabs along the way from where it was.
+// The image's rectangle they changed. (Nothing outside begin() ... end(),
+// and nothing for a point that is no place.)
+pub fn to(stroke: *Stroke, point: *const Point) -> Rect {
+    if !stroke.*.active { return geom.empty() }
+    const state = &stroke.*.state
+    const length = math.hypot(point.*.x - stroke.*.last.x, point.*.y - stroke.*.last.y)
+    if !(length <= LONGEST) {
+        // A jump or no number: the pen is there now (if anywhere).
+        if length == length && math.abs(point.*.x) < 1000000000.0 && math.abs(point.*.y) < 1000000000.0 { stroke.*.last = point.* }
+        return geom.empty()
+    }
+    if length == 0.0 {
+        // Pressed harder or lifted a little, on the spot.
+        stroke.*.last = point.*
+        return geom.empty()
+    }
+    const turned = state.*.hasDirection
+    const before = state.*.direction
+    dynamics.segment(state, &stroke.*.last, point)
+
+    if stroke.*.pendingFirst {
+        stroke.*.pendingFirst = false
+        state.*.point = stroke.*.last
+        dynamics.place(state, 0.0, 0.0)
+        placeDab(stroke)
+        stroke.*.sinceDab = 0.0
+    } else if turned && stroke.*.fanStep > 0.0 {
+        // A corner: dabs on the spot, turning from the old direction to
+        // the new one step by step.
+        const direction = state.*.direction
+        const turn = turnBetween(before, direction)
+        const step = stroke.*.fanStep * math.pi / 180.0
+        var fan: f64 = step
+        while fan < math.abs(turn) {
+            state.*.direction = before + (if turn < 0.0 { 0.0 - fan } else { fan })
+            state.*.point = stroke.*.last
+            dynamics.place(state, 0.0, 0.0)
+            const keep = stroke.*.gap
+            placeDab(stroke)
+            stroke.*.gap = keep
+            fan += step
+        }
+        state.*.direction = direction
+    }
+
+    var gone: f64 = 0.0
+    while true {
+        var need = stroke.*.gap - stroke.*.sinceDab
+        if !(need > 0.0) { need = 0.0 }
+        if gone + need > length { break }
+        gone += need
+        const along = gone / length
+        state.*.point = point_module.between(&stroke.*.last, point, along)
+        dynamics.place(state, along, gone)
+        placeDab(stroke)
+        stroke.*.sinceDab = 0.0
+    }
+    stroke.*.sinceDab += length - gone
+    dynamics.finish(state)
+    stroke.*.last = point.*
+    return report(stroke)
+}
+
+// Time passes with the pen down: at `time` (milliseconds, the clock of
+// the points' times) an airbrush paints the dabs that became due since
+// its last one, where the pen is, Settings.airbrushRate a second (times
+// OPTION_AIRBRUSH_RATE). Nothing for a brush that is no airbrush. The
+// image's rectangle that changed.
+pub fn tick(stroke: *Stroke, time: f64) -> Rect {
+    if !stroke.*.active || !stroke.*.settings.*.airbrush { return geom.empty() }
+    const state = &stroke.*.state
+    var painted: usize = 0
+    while painted < TICK_DABS {
+        state.*.point = stroke.*.last
+        var rate = stroke.*.settings.*.airbrushRate * optionValue(stroke, types.OPTION_AIRBRUSH_RATE)
+        if !(rate >= 1.0) { rate = 1.0 }
+        const interval = 1000.0 / rate
+        if !(time - stroke.*.lastDabTime >= interval) { break }
+        const due = stroke.*.lastDabTime + interval
+        dynamics.rest(state, interval)
+        if due > stroke.*.last.time { stroke.*.last.time = due }
+        state.*.point = stroke.*.last
+        state.*.point.time = due
+        dynamics.place(state, 0.0, 0.0)
+        stroke.*.pendingFirst = false
+        const keep = stroke.*.gap
+        placeDab(stroke)
+        // (A dab by time does not move the next dab by distance.)
+        if keep > 0.0 { stroke.*.gap = keep }
+        stroke.*.lastDabTime = due
+        painted += 1
+    }
+    // What a late tick missed is not painted afterwards.
+    if painted == TICK_DABS && time > stroke.*.lastDabTime { stroke.*.lastDabTime = time }
+    return report(stroke)
+}
+
+// The pen is lifted: the first dab if it still waits, what the engine
+// has left to paint, and the stroke is over. The image's rectangle that
+// changed (empty outside a stroke).
+pub fn end(stroke: *Stroke) -> Rect {
+    if !stroke.*.active { return geom.empty() }
+    if stroke.*.pendingFirst {
+        stroke.*.pendingFirst = false
+        stroke.*.state.point = stroke.*.last
+        dynamics.place(&stroke.*.state, 0.0, 0.0)
+        placeDab(stroke)
+    }
+    const engine = stroke.*.engine.?
+    if engine.*.end != null { stroke.*.painted = geom.unite(stroke.*.painted, engine.*.end.?(stroke)) }
+    if engine.*.free != null { engine.*.free.?(stroke) }
+    stroke.*.active = false
+    stroke.*.engine = null
+    return report(stroke)
+}
+
+// Gives the stroke up where it is: nothing more is painted (what was
+// painted stays: the tool puts it back, ops.cancelPixels or
+// ops.dropOverlay).
+pub fn cancel(stroke: *Stroke) -> void {
+    if !stroke.*.active { return }
+    const engine = stroke.*.engine.?
+    if engine.*.free != null { engine.*.free.?(stroke) }
+    stroke.*.active = false
+    stroke.*.pendingFirst = false
+    stroke.*.engine = null
+}

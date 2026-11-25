@@ -1,0 +1,286 @@
+// nebula brush: the pixel engine: every dab stamps the tip's mask with
+// the dab's colour. It is two engines of the list: "paintbrush" and
+// "eraser" (the same with Settings.eraser forced on).
+//
+// On an indirect target (wash; Target.direct false: the node's overlay)
+// a dab does not mix, it raises: within one stroke the overlay never
+// gets more opaque than the dab's opacity, however many dabs overlap
+// (Krita calls this "alpha darken"). For every pixel, with all numbers
+// 0..255 and mul(a, b) = a b / 255 rounded (core/pixel.mlx):
+//
+//     cap    = mul(round(dab.opacity 255), alpha of dab.color)
+//     weight = mul(mask, round(dab.flow 255))
+//     alpha' = alpha + mul(cap - alpha, weight)      where alpha < cap
+//              alpha                                 otherwise
+//     colour' = the dab's                            where alpha was 0
+//               lerp(colour, the dab's, weight)      otherwise
+//
+// So one dab on an empty overlay leaves alpha mul(cap, weight): its
+// coverage times flow times opacity; every further dab takes the pixel
+// `weight` of the rest of the way to the cap; and a pixel at the cap
+// stays there, whatever crosses it. (The steps being whole numbers, a
+// low flow stops short of the cap once weight times the rest is under
+// one half: with flow 0.1 at 4 below it.) What the overlay then does to
+// the layer (the blend mode, erasing, the selection, alpha lock) is
+// ops.mergeOverlay's, set up by the tool.
+//
+// On a direct target (build-up) every dab is mixed into the layer at
+// once: blend.compositeSpan in Settings.blend (blend.ERASE for an
+// eraser) at opacity times flow, through the mask times the selection's
+// amounts where the target has a selection, keeping alpha where it is
+// locked. Dabs add up without limit.
+//
+// Both work on the device's tiles row by row (a 60 pixel dab touches 1
+// to 4 tiles) and skip tiles the mask leaves empty.
+const std = @import("std")
+const types = @import("./types.mlx")
+const tip = @import("./tip.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const device_module = @import("../core/device.mlx")
+const mask_module = @import("../core/mask.mlx")
+const scratch = @import("../core/scratch.mlx")
+const blend = @import("../core/blend.mlx")
+
+pub const Rect = geom.Rect
+
+// What the engine keeps for a stroke: a tile's row of the colour being
+// painted (blend.compositeSpan mixes pixels, not one colour).
+const Own = struct {
+    filled: bool
+    color: u32
+    row: [64]u32
+}
+
+fn ownOf(stroke: *types.Stroke) -> *Own {
+    unsafe { return @ptrFromInt(*Own, stroke.*.engineState) }
+}
+
+fn begin(stroke: *types.Stroke) -> bool {
+    const memory = stroke.*.allocator.alloc(@sizeOf(Own), 16)
+    if memory == null { return false }
+    const own: *Own = unsafe { @ptrCast(*Own, memory.?) }
+    own.*.filled = false
+    own.*.color = 0
+    stroke.*.engineState = @intFromPtr(own)
+    return true
+}
+
+fn beginEraser(stroke: *types.Stroke) -> bool {
+    stroke.*.settings.*.eraser = true
+    return begin(stroke)
+}
+
+fn free(stroke: *types.Stroke) -> void {
+    if stroke.*.engineState == 0 { return }
+    unsafe { stroke.*.allocator.free(@ptrFromInt([*]u8, stroke.*.engineState), @sizeOf(Own), 16) }
+    stroke.*.engineState = 0
+}
+
+inline fn larger(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+inline fn smaller(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+
+// 0..1 as 0..255.
+fn level(value: f64) -> u32 {
+    if !(value > 0.0) { return 0 }
+    if value >= 1.0 { return 255 }
+    return @intFromFloat(u32, value * 255.0 + 0.5)
+}
+
+// Whether any of `height` rows of `width` bytes is not 0.
+fn covers(bytes: [*]const u8, stride: usize, width: usize, height: usize) -> bool {
+    var y: usize = 0
+    while y < height {
+        const row = bytes + y * stride
+        var x: usize = 0
+        while x < width {
+            if row[x] != 0 { return true }
+            x += 1
+        }
+        y += 1
+    }
+    return false
+}
+
+// The wash rule of the header for `count` pixels of one row.
+fn raise(under: [*]u32, cover: [*]const u8, count: usize, rgb: u32, cap: u32, flow: u32) -> void {
+    const r = (rgb >> 16) & 255
+    const g = (rgb >> 8) & 255
+    const b = rgb & 255
+    var index: usize = 0
+    while index < count {
+        var weight = @intCast(u32, cover[index])
+        if weight != 0 {
+            if flow != 255 { weight = pixel.mul(weight, flow) }
+            const before = under[index]
+            const alpha = before >> 24
+            if alpha == 0 {
+                const raised = pixel.mul(cap, weight)
+                if raised != 0 { under[index] = (raised << 24) | rgb }
+            } else if weight != 0 {
+                var raised = alpha
+                if alpha < cap { raised = alpha + pixel.mul(cap - alpha, weight) }
+                var colour = before & 0x00FFFFFF
+                if colour != rgb {
+                    colour = (pixel.lerp((before >> 16) & 255, r, weight) << 16) | (pixel.lerp((before >> 8) & 255, g, weight) << 8) | pixel.lerp(before & 255, b, weight)
+                }
+                under[index] = (raised << 24) | colour
+            }
+        }
+        index += 1
+    }
+}
+
+// The dab's mask into the overlay (see the header): the part of it from
+// (x0, y0) up to (x1, y1) in the image's coordinates.
+fn wash(stroke: *types.Stroke, dab: *const types.Dab, mask: *const types.Mask, x0: i32, y0: i32, x1: i32, y1: i32) -> void {
+    const cap = pixel.mul(level(dab.*.opacity), dab.*.color >> 24)
+    const flow = level(dab.*.flow)
+    if cap == 0 || flow == 0 { return }
+    const device = stroke.*.target.device
+    const rgb = dab.*.color & 0x00FFFFFF
+    const stride = @intCast(usize, mask.*.width)
+    // Device-local: where its tiles are.
+    const left = x0 - device.*.x
+    const top = y0 - device.*.y
+    const right = x1 - device.*.x
+    const bottom = y1 - device.*.y
+    // From a device-local place to the mask's.
+    const shift_x = device.*.x - mask.*.x
+    const shift_y = device.*.y - mask.*.y
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * 64)
+        const row1 = smaller(bottom, ty * 64 + 64)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * 64)
+            const col1 = smaller(right, tx * 64 + 64)
+            const span = @intCast(usize, col1 - col0)
+            const first = mask.*.bytes + (@intCast(usize, row0 + shift_y) * stride + @intCast(usize, col0 + shift_x))
+            if covers(first, stride, span, @intCast(usize, row1 - row0)) {
+                const pixels = device_module.tileWrite(device, tx, ty)
+                if pixels != null {
+                    var row = row0
+                    while row < row1 {
+                        raise(pixels.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63)), first + @intCast(usize, row - row0) * stride, span, rgb, cap, flow)
+                        row += 1
+                    }
+                }
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+}
+
+// The dab mixed into the layer itself (see the header): the part of its
+// mask from (x0, y0) up to (x1, y1) in the image's coordinates.
+fn direct(stroke: *types.Stroke, dab: *const types.Dab, mask: *const types.Mask, x0: i32, y0: i32, x1: i32, y1: i32) -> void {
+    const settings = stroke.*.settings
+    const target = &stroke.*.target
+    const opacity = level(dab.*.opacity * dab.*.flow)
+    if opacity == 0 { return }
+    const mode = if settings.*.eraser { blend.ERASE } else { settings.*.blend }
+    const flags: u32 = if target.*.alphaLock { blend.FLAG_ALPHA_LOCK } else { 0 }
+    // An eraser takes away by the mask alone: its colour is no matter.
+    const color = if settings.*.eraser { pixel.BLACK } else { dab.*.color }
+    const own = ownOf(stroke)
+    if !own.*.filled || own.*.color != color {
+        device_module.fillWords(&own.*.row, 64, color)
+        own.*.color = color
+        own.*.filled = true
+    }
+    const device = target.*.device
+    const width = @intCast(usize, x1 - x0)
+    const height = @intCast(usize, y1 - y0)
+    var stride = @intCast(usize, mask.*.width)
+    // The mask's byte of the part's first pixel.
+    var amounts: [*]const u8 = mask.*.bytes + (@intCast(usize, y0 - mask.*.y) * stride + @intCast(usize, x0 - mask.*.x))
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    if target.*.selection != null {
+        // The mask times the selection, in working memory of the part's
+        // own size.
+        const selected = scratch.bytes(pool, width * height)
+        if selected == null {
+            scratch.release(pool, mark)
+            return
+        }
+        mask_module.readBytes(target.*.selection.?, geom.rect(x0, y0, x1 - x0, y1 - y0), selected.?, width)
+        var y: usize = 0
+        while y < height {
+            const from = amounts + y * stride
+            const into = selected.? + y * width
+            var x: usize = 0
+            while x < width {
+                into[x] = @intCast(u8, pixel.mul(@intCast(u32, into[x]), @intCast(u32, from[x])))
+                x += 1
+            }
+            y += 1
+        }
+        amounts = selected.?
+        stride = width
+    }
+    const left = x0 - device.*.x
+    const top = y0 - device.*.y
+    const right = x1 - device.*.x
+    const bottom = y1 - device.*.y
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * 64)
+        const row1 = smaller(bottom, ty * 64 + 64)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * 64)
+            const col1 = smaller(right, tx * 64 + 64)
+            const span = @intCast(usize, col1 - col0)
+            const first = amounts + (@intCast(usize, row0 - top) * stride + @intCast(usize, col0 - left))
+            if covers(first, stride, span, @intCast(usize, row1 - row0)) {
+                const pixels = device_module.tileWrite(device, tx, ty)
+                if pixels != null {
+                    var row = row0
+                    while row < row1 {
+                        blend.compositeSpan(mode, pixels.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63)), &own.*.row, span, opacity, first + @intCast(usize, row - row0) * stride, flags)
+                        row += 1
+                    }
+                }
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+    scratch.release(pool, mark)
+}
+
+// (The mask is the stroke's own slot and the part to paint goes on as
+// four numbers: records made here for every dab would be taken from the
+// value arena, this function being called through the engine's record.)
+fn paint(stroke: *types.Stroke, dab: *const types.Dab) -> Rect {
+    const mask = &stroke.*.mask
+    if !tip.forDab(&stroke.*.masks, &stroke.*.settings.*.tip, dab, mask) { return geom.empty() }
+    var x0 = mask.*.x
+    var y0 = mask.*.y
+    var x1 = x0 + mask.*.width
+    var y1 = y0 + mask.*.height
+    if stroke.*.clipped {
+        x0 = larger(x0, stroke.*.clip.x)
+        y0 = larger(y0, stroke.*.clip.y)
+        x1 = smaller(x1, stroke.*.clip.x + stroke.*.clip.width)
+        y1 = smaller(y1, stroke.*.clip.y + stroke.*.clip.height)
+    }
+    if x1 <= x0 || y1 <= y0 { return geom.empty() }
+    if stroke.*.target.direct {
+        direct(stroke, dab, mask, x0, y0, x1, y1)
+    } else {
+        wash(stroke, dab, mask, x0, y0, x1, y1)
+    }
+    return geom.rect(x0, y0, x1 - x0, y1 - y0)
+}
+
+const ENGINES = [2]types.Engine{
+    types.Engine.{ .id = types.ENGINE_PAINTBRUSH, .key = "paintbrush", .name = "Pixel brush", .german = "Pixelpinsel", .flags = 0, .begin = begin, .dab = paint, .end = null, .free = free },
+    types.Engine.{ .id = types.ENGINE_ERASER, .key = "eraser", .name = "Eraser", .german = "Radierer", .flags = 0, .begin = beginEraser, .dab = paint, .end = null, .free = free },
+}
+
+pub fn list() -> []const types.Engine { return ENGINES[0..] }

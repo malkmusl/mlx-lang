@@ -1,0 +1,395 @@
+// nebula io: ZIP archives held in memory, as OpenRaster (.ora) and Krita
+// (.kra) files are: a Reader over a whole file's bytes and a Writer that
+// builds an archive at the end of a std.ArrayList(u8).
+//
+//     var reader: zip.Reader = undefined
+//     if !zip.open(&reader, bytes, allocator) { ... not an archive ... }
+//     const index = zip.find(&reader, "stack.xml")
+//     if index != null {
+//         const block = zip.read(&reader, index.?, allocator)       // null: damaged
+//         ... block.?[0..zip.size(&reader, index.?)] ...
+//         zip.free(allocator, block.?, zip.size(&reader, index.?))
+//     }
+//     zip.close(&reader)
+//
+//     var writer: zip.Writer = undefined
+//     zip.begin(&writer, &list, allocator)
+//     _ = zip.add(&writer, "mimetype", "image/openraster", zip.STORED, 0)
+//     _ = zip.add(&writer, "stack.xml", text, zip.DEFLATED, 6)
+//     if !zip.finish(&writer) { ... no memory ... }
+//
+// The reader trusts nothing: a file comes from anywhere, so every offset
+// and length is checked against the buffer before it is used, and what is
+// damaged, encrypted, split over several files or ZIP64 (4 GiB and more,
+// 65535 entries and more) gives false or null, never a trap. Sizes are
+// taken from the central directory, so entries written with a data
+// descriptor (sizes after the data) read like any other. The methods are
+// "stored" and "deflated" (std.flate), each entry's CRC-32 is checked
+// (std.crc).
+//
+// The writer writes what the two formats ask for: entries in the order
+// they are added (their "mimetype" first and stored: add it first), no
+// extra fields (so the first entry's name is at byte 30 and its data
+// right after it), names in UTF-8 (the flag for it set when a name is not
+// plain ASCII), no data descriptors, and one fixed time (1 January 1980),
+// so the same entries give the same bytes.
+const std = @import("std")
+const flate = @import("std.flate")
+const crc = @import("std.crc")
+
+pub const Allocator = std.allocator.Allocator
+
+// An entry's method: as it is, or compressed.
+pub const STORED: u16 = 0
+pub const DEFLATED: u16 = 8
+
+const LOCAL_SIGNATURE: u32 = 0x04034b50
+const CENTRAL_SIGNATURE: u32 = 0x02014b50
+const END_SIGNATURE: u32 = 0x06054b50
+const LOCAL_HEADER: usize = 30
+const CENTRAL_HEADER: usize = 46
+const END_RECORD: usize = 22
+// What a 32-bit field holds when the real number is in a ZIP64 record.
+const ESCAPED: usize = 0xFFFFFFFF
+// Encrypted (bit 0), compressed patch data (5), strong encryption (6),
+// the central directory encrypted (13).
+const FLAGS_UNREADABLE: usize = 0x2061
+const FLAG_UTF8: usize = 0x0800
+// 1 January 1980, midnight, as MS-DOS counts.
+const DOS_DATE: usize = 33
+const DOS_TIME: usize = 0
+// DEFLATE makes at most 1032 bytes of one: an entry that claims more is
+// damaged (and must not be given the memory it asks for).
+const LARGEST_RATIO: usize = 1032
+
+fn get16(data: [*]const u8, at: usize) -> usize { return @intCast(usize, std.mem.readU16Little(data, at)) }
+fn get32(data: [*]const u8, at: usize) -> usize { return @intCast(usize, std.mem.readU32Little(data, at)) }
+
+// ---------------------------------------------------------------------------
+// Reading
+
+pub const Reader = struct {
+    // The archive: it must stay where it is while the reader is used.
+    data: [*]const u8
+    length: usize
+    allocator: Allocator
+    // Where each entry's record of the central directory starts.
+    offsets: [*]u32
+    count: usize
+}
+
+// Reads the end record and the central directory of the archive `bytes`.
+// False when it is none, is damaged, is ZIP64 or split, or memory ran out
+// (nothing is to be closed then; close() does no harm either).
+pub fn open(reader: *Reader, bytes: []const u8, allocator: Allocator) -> bool {
+    reader.*.data = bytes.pointer
+    reader.*.length = bytes.length
+    reader.*.allocator = allocator
+    reader.*.count = 0
+    const data = bytes.pointer
+    const length = bytes.length
+    if length < END_RECORD { return false }
+    // The end record is the last thing but a comment of up to 65535 bytes.
+    var end = length - END_RECORD
+    const lowest = if end > 65535 { end - 65535 } else { 0 }
+    var found = false
+    while true {
+        if get32(data, end) == @intCast(usize, END_SIGNATURE) && end + END_RECORD + get16(data, end + 20) <= length {
+            found = true
+            break
+        }
+        if end == lowest { break }
+        end -= 1
+    }
+    if !found { return false }
+    const total = get16(data, end + 10)
+    const directory_size = get32(data, end + 12)
+    const directory = get32(data, end + 16)
+    if get16(data, end + 4) != 0 || get16(data, end + 6) != 0 || get16(data, end + 8) != total { return false }
+    if total == 65535 || directory_size == ESCAPED || directory == ESCAPED { return false }
+    if directory + directory_size > end { return false }
+    if total == 0 { return true }
+    if total * CENTRAL_HEADER > directory_size { return false }
+    const memory = allocator.alloc(total * 4, 4)
+    if memory == null { return false }
+    const offsets: [*]u32 = unsafe { @ptrCast([*]u32, memory.?) }
+    const directory_end = directory + directory_size
+    var at = directory
+    var index: usize = 0
+    while index < total {
+        var whole = at + CENTRAL_HEADER <= directory_end && get32(data, at) == @intCast(usize, CENTRAL_SIGNATURE)
+        var next = at
+        if whole {
+            next = at + CENTRAL_HEADER + get16(data, at + 28) + get16(data, at + 30) + get16(data, at + 32)
+            whole = next <= directory_end
+        }
+        if !whole {
+            allocator.free(memory.?, total * 4, 4)
+            return false
+        }
+        offsets[index] = @intCast(u32, at)
+        at = next
+        index += 1
+    }
+    reader.*.offsets = offsets
+    reader.*.count = total
+    return true
+}
+
+// Gives back what open() took. The reader has no entries afterwards.
+pub fn close(reader: *Reader) -> void {
+    if reader.*.count == 0 { return }
+    unsafe { reader.*.allocator.free(@ptrCast([*]u8, reader.*.offsets), reader.*.count * 4, 4) }
+    reader.*.count = 0
+}
+
+// How many entries the archive has.
+pub fn count(reader: *const Reader) -> usize { return reader.*.count }
+
+// The name of entry `index` (a slice of the archive, UTF-8 as a rule;
+// folders end in "/"). Empty for an index past the last.
+pub fn name(reader: *const Reader, index: usize) -> []const u8 {
+    if index >= reader.*.count { return "" }
+    const at = @intCast(usize, reader.*.offsets[index])
+    return reader.*.data[at + CENTRAL_HEADER..at + CENTRAL_HEADER + get16(reader.*.data, at + 28)]
+}
+
+// The entry named `wanted` exactly (the first, should there be several).
+pub fn find(reader: *const Reader, wanted: []const u8) -> ?usize {
+    var index: usize = 0
+    while index < reader.*.count {
+        if std.text.same(name(reader, index), wanted) { return index }
+        index += 1
+    }
+    return null
+}
+
+// The bytes entry `index` unpacks to (0 past the last).
+pub fn size(reader: *const Reader, index: usize) -> usize {
+    if index >= reader.*.count { return 0 }
+    return get32(reader.*.data, @intCast(usize, reader.*.offsets[index]) + 24)
+}
+
+// Where entry `index`'s data is in the archive, once everything about it
+// was checked: `start` and `stored` bytes from there, all inside the
+// buffer. False for what cannot be read.
+const Place = struct {
+    start: usize
+    stored: usize
+    size: usize
+    method: usize
+    sum: u32
+}
+
+fn locate(reader: *const Reader, index: usize, place: *Place) -> bool {
+    if index >= reader.*.count { return false }
+    const data = reader.*.data
+    const at = @intCast(usize, reader.*.offsets[index])
+    const flags = get16(data, at + 8)
+    const method = get16(data, at + 10)
+    const stored = get32(data, at + 20)
+    const unpacked = get32(data, at + 24)
+    const local = get32(data, at + 42)
+    if flags & FLAGS_UNREADABLE != 0 { return false }
+    if method != @intCast(usize, STORED) && method != @intCast(usize, DEFLATED) { return false }
+    if stored == ESCAPED || unpacked == ESCAPED || local == ESCAPED || get16(data, at + 34) != 0 { return false }
+    if method == @intCast(usize, STORED) && stored != unpacked { return false }
+    if method == @intCast(usize, DEFLATED) && unpacked / LARGEST_RATIO > stored { return false }
+    // The local header has name and extra lengths of its own.
+    if local + LOCAL_HEADER > reader.*.length || get32(data, local) != @intCast(usize, LOCAL_SIGNATURE) { return false }
+    const start = local + LOCAL_HEADER + get16(data, local + 26) + get16(data, local + 28)
+    if start + stored > reader.*.length { return false }
+    place.*.start = start
+    place.*.stored = stored
+    place.*.size = unpacked
+    place.*.method = method
+    place.*.sum = std.mem.readU32Little(data, at + 16)
+    return true
+}
+
+// Unpacks `stored` deflated bytes at `from` into exactly `wanted` bytes.
+fn inflate(allocator: Allocator, from: [*]const u8, stored: usize, into: [*]u8, wanted: usize) -> bool {
+    var inflater: flate.Inflater = undefined
+    if flate.inflaterInit(&inflater, allocator, flate.Format.raw) != flate.Status.ok { return false }
+    var consumed: usize = 0
+    var produced: usize = 0
+    var done = false
+    while true {
+        var progress: flate.Progress = undefined
+        const status = flate.inflaterRun(&inflater, from + consumed, stored - consumed, into + produced, wanted - produced, &progress)
+        consumed += progress.consumed
+        produced += progress.produced
+        if status == flate.Status.done {
+            done = true
+            break
+        }
+        // Damaged, or it stands still: out of input before its end, or
+        // more to come than the entry says.
+        if status != flate.Status.ok || (progress.consumed == 0 && progress.produced == 0) { break }
+    }
+    flate.inflaterEnd(&inflater)
+    return done && produced == wanted
+}
+
+// Entry `index` unpacked into `into` (`capacity` bytes, at least its
+// size()) and its CRC checked. False for an entry that is damaged,
+// encrypted, ZIP64, of another method than stored and deflated, or does
+// not fit (`into` may have been written all the same).
+pub fn readInto(reader: *const Reader, index: usize, into: [*]u8, capacity: usize) -> bool {
+    var place: Place = undefined
+    if !locate(reader, index, &place) || place.size > capacity { return false }
+    const from = reader.*.data + place.start
+    if place.method == @intCast(usize, STORED) {
+        std.mem.copy(into, from, place.size)
+    } else if place.size != 0 {
+        if !inflate(reader.*.allocator, from, place.stored, into, place.size) { return false }
+    }
+    return crc.crc32(0, into, place.size) == place.sum
+}
+
+// Entry `index` unpacked into a block of `allocator`: size(index) bytes
+// (one byte for an empty entry), to be given back with free(). Null for
+// what readInto() cannot read, and without memory.
+pub fn read(reader: *const Reader, index: usize, allocator: Allocator) -> ?[*]u8 {
+    var place: Place = undefined
+    if !locate(reader, index, &place) { return null }
+    const memory = allocator.alloc(if place.size == 0 { 1 } else { place.size }, 16)
+    if memory == null { return null }
+    if !readInto(reader, index, memory.?, place.size) {
+        free(allocator, memory.?, place.size)
+        return null
+    }
+    return memory
+}
+
+// Gives back a block of read(): `length` is the entry's size().
+pub fn free(allocator: Allocator, block: [*]u8, length: usize) -> void {
+    allocator.free(block, if length == 0 { 1 } else { length }, 16)
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+pub const Writer = struct {
+    // The archive grows at the end of this list of the caller's.
+    out: *std.ArrayList(u8)
+    allocator: Allocator
+    // Where the archive starts in the list: the offsets in it count from
+    // there (0 for a list that was empty).
+    base: usize
+    count: usize
+    finished: bool
+}
+
+// Starts an archive at the end of `out`; `allocator` is for the
+// compressor's working memory.
+pub fn begin(writer: *Writer, out: *std.ArrayList(u8), allocator: Allocator) -> void {
+    writer.*.out = out
+    writer.*.allocator = allocator
+    writer.*.base = out.*.count()
+    writer.*.count = 0
+    writer.*.finished = false
+}
+
+fn put16(out: *std.ArrayList(u8), value: usize) -> bool {
+    return out.*.append(@intCast(u8, value & 255)) && out.*.append(@intCast(u8, (value >> 8) & 255))
+}
+
+fn put32(out: *std.ArrayList(u8), value: usize) -> bool {
+    return put16(out, value & 65535) && put16(out, (value >> 16) & 65535)
+}
+
+fn isAscii(text: []const u8) -> bool {
+    for byte in text {
+        if byte >= 128 { return false }
+    }
+    return true
+}
+
+// Adds the entry `name` holding `data`: as it is (STORED), or compressed
+// at `level` (DEFLATED; 0 to 9, -1 for the usual 6), unless that makes it
+// no smaller. False when the entry cannot be written: no memory, a name
+// that is empty or longer than 65535 bytes, 4 GiB reached, 65534 entries
+// there already, the archive finished. The archive is then as it was.
+pub fn add(writer: *Writer, name_: []const u8, data: []const u8, method: u16, level: i32) -> bool {
+    const out = writer.*.out
+    if writer.*.finished || writer.*.count >= 65534 { return false }
+    if name_.length == 0 || name_.length > 65535 || data.length >= ESCAPED { return false }
+    if method != STORED && method != DEFLATED { return false }
+    const start = out.*.count()
+    const head = LOCAL_HEADER + name_.length
+    if start - writer.*.base + head + data.length >= ESCAPED { return false }
+    var used = @intCast(usize, STORED)
+    var stored = data.length
+    if method == DEFLATED && data.length > 0 {
+        // Compressed straight into the list, behind where the header goes.
+        const room = flate.compressBound(data.length, flate.Format.raw)
+        if !out.*.resize(start + head + room) { return false }
+        const made = flate.compress(data.pointer, data.length, out.*.items().pointer + (start + head), room, level, flate.Format.raw, writer.*.allocator)
+        if made != 0 && made < data.length {
+            used = @intCast(usize, DEFLATED)
+            stored = made
+        }
+    }
+    if !out.*.resize(start + head + stored) {
+        _ = out.*.resize(start)
+        return false
+    }
+    const bytes = out.*.items().pointer + start
+    if used == @intCast(usize, STORED) && data.length > 0 { std.mem.copy(bytes + head, data.pointer, data.length) }
+    std.mem.writeU32Little(bytes, 0, LOCAL_SIGNATURE)
+    std.mem.writeU16Little(bytes, 4, if used == @intCast(usize, DEFLATED) { 20 } else { 10 })
+    std.mem.writeU16Little(bytes, 6, @intCast(u16, if isAscii(name_) { 0 } else { FLAG_UTF8 }))
+    std.mem.writeU16Little(bytes, 8, @intCast(u16, used))
+    std.mem.writeU16Little(bytes, 10, @intCast(u16, DOS_TIME))
+    std.mem.writeU16Little(bytes, 12, @intCast(u16, DOS_DATE))
+    std.mem.writeU32Little(bytes, 14, crc.crc32(0, data.pointer, data.length))
+    std.mem.writeU32Little(bytes, 18, @intCast(u32, stored))
+    std.mem.writeU32Little(bytes, 22, @intCast(u32, data.length))
+    std.mem.writeU16Little(bytes, 26, @intCast(u16, name_.length))
+    std.mem.writeU16Little(bytes, 28, 0)
+    std.mem.copy(bytes + LOCAL_HEADER, name_.pointer, name_.length)
+    writer.*.count += 1
+    return true
+}
+
+// Writes the central directory and the end record: the archive is whole,
+// from where the list was at begin() to its end. False without memory or
+// at 4 GiB (the list is then as it was before the call), and for an
+// archive finished already.
+pub fn finish(writer: *Writer) -> bool {
+    const out = writer.*.out
+    if writer.*.finished { return false }
+    const directory = out.*.count()
+    if directory - writer.*.base >= ESCAPED { return false }
+    // The directory is the local headers once more, each with where it is:
+    // read back from the list, which holds nothing else from `base` on.
+    var at = writer.*.base
+    var index: usize = 0
+    var ok = true
+    while index < writer.*.count && ok {
+        // (The list moves when it grows: its bytes are asked for anew.)
+        const local = out.*.items().pointer + at
+        const name_length = get16(local, 26)
+        const stored = get32(local, 18)
+        ok = out.*.ensureUnusedCapacity(CENTRAL_HEADER + name_length)
+        if ok {
+            const header = out.*.items().pointer + at
+            ok = put32(out, @intCast(usize, CENTRAL_SIGNATURE)) && put16(out, 20) && put16(out, get16(header, 4)) && put16(out, get16(header, 6)) && put16(out, get16(header, 8))
+            ok = ok && put16(out, DOS_TIME) && put16(out, DOS_DATE) && put32(out, get32(header, 14)) && put32(out, stored) && put32(out, get32(header, 22))
+            ok = ok && put16(out, name_length) && put16(out, 0) && put16(out, 0) && put16(out, 0) && put16(out, 0) && put32(out, 0) && put32(out, at - writer.*.base)
+            ok = ok && out.*.appendSlice((out.*.items().pointer + (at + LOCAL_HEADER))[0..name_length])
+        }
+        at += LOCAL_HEADER + name_length + stored
+        index += 1
+    }
+    const length = out.*.count() - directory
+    ok = ok && put32(out, @intCast(usize, END_SIGNATURE)) && put16(out, 0) && put16(out, 0) && put16(out, writer.*.count) && put16(out, writer.*.count)
+    ok = ok && put32(out, length) && put32(out, directory - writer.*.base) && put16(out, 0)
+    if !ok {
+        _ = out.*.resize(directory)
+        return false
+    }
+    writer.*.finished = true
+    return true
+}
