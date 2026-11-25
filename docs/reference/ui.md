@@ -126,6 +126,21 @@ it pixel by pixel would (`tests/470_canvas_loops_runtime.mlx` compares
 them with such loops, bit for bit). `tools/draw-bench` times them on a
 canvas in memory.
 
+What runs every frame takes none of the compiler's value arena, which a
+window's loop gives back only where it turns (`std.turns`): a call that
+took some made every frame larger. Text keeps what its drawing works in
+(a row's coverage, what the colour gave over a pixel) in its `Text`, a
+terminal's frame its row of cells, the rows' sums and a run's
+characters in its `std.ui.terminal.View`, and the file chooser a row's
+note in its `Chooser`; an image is scaled 256 columns at a time (three
+arrays of 1 KiB, what a function's frame takes); `view.region`,
+`view.pushClip` and `ui.next` hand rectangles on without a variable
+given another value. drawText and drawCells took 4128 bytes of the
+arena a call, `drawImageRect` 6 KiB, a widget 16 bytes, a terminal's
+frame 20 KiB and a KiB a row drawn
+(`tests/485_std_drawing_arena_runtime.mlx` measures each with
+`std.turns` and compares what is drawn with the code it replaced).
+
 ## Frames in part
 
 A window's frame costs what it changes. A `std.ui.host` app that draws

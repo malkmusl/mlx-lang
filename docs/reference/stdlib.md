@@ -1755,6 +1755,16 @@ recognized as specifier characters but return
 no `@hasDecl(T, "format")` custom-formatting hook yet; `{any}` always uses
 the built-in aggregate representation.
 
+`std.text` (`std/bootstrap/text.mlx`) builds a line in a fixed buffer
+without allocating: `append`, `appendByte`, `appendUnsigned`,
+`appendSigned` and `appendHex` each add after `at` and return the new
+length, leaving out what does not fit `capacity` (a number's leading
+digits are kept). A number's digits are written straight into the line,
+last first, so none of them takes the compiler's value arena either
+(an array of digits of their own, handed to `append` as a slice, took
+24 bytes of it a number; `tests/485_std_drawing_arena_runtime.mlx`
+compares every length at every capacity with that code).
+
 Two argument-passing surfaces coexist: an explicit `Argument` (tagged
 two-word struct, `printArguments`) used directly in bootstrap code before
 Mlx1's reflection is ready to specialize `anytype`,
