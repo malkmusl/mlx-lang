@@ -1,11 +1,1464 @@
-// nebula actions: placeholder until the module is written.
+// nebula actions: the Layer menu: new layers of every kind and masks on
+// them, duplicating and deleting, cutting or copying the selection to a
+// layer of its own, merging a layer down, flattening a group or a layer
+// with masks, ungrouping, converting to a paint layer, splitting alpha
+// into a mask, turning, mirroring, scaling and wrapping a layer, its
+// place among the others, its flags, Select Opaque and its properties.
+// Each is one step of the history.
+//
+// A filter layer, a fill layer and a filter mask are asked for in two
+// dialogs: which filter (or generator) and the name, then its numbers in
+// a form (ui/forms.mlx) made from the filter's own Param table; one
+// without numbers is made at once. What the second dialog edits lives in
+// the module's slot (state.SLOT_ACTIONS + 4) until it is answered:
+//
+//     api.run(app, "layer_new_filter")      the two dialogs, then the layer
+//     layer_actions.newFilterLayer(app, &params, "Invert")    without them
+//
+// New nodes take the selection where it means something: a filter layer
+// or a filter mask filters only what is selected, a fill layer fills it
+// (through a transparency mask of it), a transparency mask or a local
+// selection is the selection. The geometry of a layer (mirror, turns,
+// Scale Layer, Offset Layer) is actions/image.mlx's, done to the active
+// node and everything under it.
+//
+// Merge Down mixes the active layer into the one below it as the
+// compositor would (its blend mode, opacity and masks, a filter layer's
+// filter where its mask says) into one paint layer with the lower one's
+// name and properties; Flatten Layer and Convert to Paint Layer keep what
+// a node shows (with its masks applied, or the masks moved over to the
+// new layer). Raise and Lower step past one layer at a time and out of a
+// group at its ends; masks step among the masks of their layer.
+//
+// Not done: colorize, transform and selection masks are made and kept
+// (the files and the layer list know them) but the compositor draws none
+// of them yet, and the status bar says so; there is no preview of a
+// filter or fill layer while its numbers are asked; Merge Down of a layer
+// that inherits alpha takes only the layer below as what it inherits
+// from, and a pass-through group is merged or flattened as an isolated
+// one.
+const std = @import("std")
+const ui = @import("std.ui")
 const state = @import("../app/state.mlx")
+const api = @import("../app/api.mlx")
 const table = @import("../core/table.mlx")
+const dialogs = @import("../ui/dialogs.mlx")
+const forms = @import("../ui/forms.mlx")
+const kit_module = @import("../ui/kit.mlx")
+const image_actions = @import("./image.mlx")
+const image_module = @import("../core/image.mlx")
+const node_module = @import("../core/node.mlx")
+const device_module = @import("../core/device.mlx")
+const mask_module = @import("../core/mask.mlx")
+const history_module = @import("../core/history.mlx")
+const ops = @import("../core/ops.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const blend = @import("../core/blend.mlx")
+const render = @import("../core/render.mlx")
+const scratch = @import("../core/scratch.mlx")
+const selection_module = @import("../core/selection.mlx")
+const filters = @import("../filters/registry.mlx")
+const filter_types = @import("../filters/types.mlx")
+const generators = @import("../generators/registry.mlx")
 
-const ACTIONS = [0]state.Action{}
+pub const App = state.App
+pub const Image = image_module.Image
+pub const Node = node_module.Node
+pub const Device = device_module.Device
+pub const Params = node_module.Params
+pub const Rect = geom.Rect
+
+// Pixels mixed at a time (a square of this side).
+const BLOCK: i32 = 256
+
+// ---------------------------------------------------------------------------
+// Names
+
+// The largest n of the names "`prefix` n" under `node`.
+fn highestNumber(node: *Node, prefix: []const u8) -> usize {
+    var most: usize = 0
+    for child in node.*.children.items() {
+        const name = node_module.nameOf(child)
+        if name.length > prefix.length + 1 && std.text.startsWith(name, prefix) && name[prefix.length] == 32 {
+            var value: usize = 0
+            var index = prefix.length + 1
+            var digits = true
+            while index < name.length && digits {
+                const byte = name[index]
+                if byte < 48 || byte > 57 || value > 100000000 {
+                    digits = false
+                } else {
+                    value = value * 10 + @intCast(usize, byte - 48)
+                }
+                index += 1
+            }
+            if digits && value > most { most = value }
+        }
+        const below = highestNumber(child, prefix)
+        if below > most { most = below }
+    }
+    return most
+}
+
+// "`prefix` n" with an n no node of the image has yet, written to `into`
+// (128 bytes).
+fn freshName(image: *Image, prefix: []const u8, into: [*]u8) -> []const u8 {
+    var length = std.text.append(into, 0, 128, prefix)
+    length = std.text.append(into, length, 128, " ")
+    length = std.text.appendUnsigned(into, length, 128, highestNumber(image.*.root, prefix) + 1)
+    return into[0..length]
+}
+
+// `name` and `suffix` written to `into` (128 bytes; whole characters).
+fn suffixed(name: []const u8, suffix: []const u8, into: [*]u8) -> []const u8 {
+    var keep = name.length
+    if keep + suffix.length > node_module.NAME {
+        keep = if suffix.length < node_module.NAME { node_module.NAME - suffix.length } else { 0 }
+        while keep > 0 && name[keep] & 192 == 128 { keep -= 1 }
+    }
+    var length = std.text.append(into, 0, 128, name[0..keep])
+    length = std.text.append(into, length, 128, suffix)
+    return into[0..length]
+}
+
+// ---------------------------------------------------------------------------
+// Pieces
+
+fn ready(app: *App) -> ?*Image { return image_actions.imageReady(app) }
+
+// The layer below `node` in its group (masks skipped; null: none).
+fn belowOf(node: *Node) -> ?*Node {
+    if node.*.parent == null { return null }
+    const parent = node.*.parent.?
+    const found = node_module.indexIn(parent, node)
+    if found == null { return null }
+    var index = found.?
+    while index > 0 {
+        index -= 1
+        const child = node_module.childAt(parent, index)
+        if node_module.isMask(child.*.kind) == node_module.isMask(node.*.kind) { return child }
+    }
+    return null
+}
+
+// The next of its kind (a layer, or a mask) above `node`; null: none.
+fn aboveOf(node: *Node) -> ?*Node {
+    if node.*.parent == null { return null }
+    const parent = node.*.parent.?
+    const found = node_module.indexIn(parent, node)
+    if found == null { return null }
+    var index = found.? + 1
+    while index < node_module.childCount(parent) {
+        const child = node_module.childAt(parent, index)
+        if node_module.isMask(child.*.kind) == node_module.isMask(node.*.kind) { return child }
+        index += 1
+    }
+    return null
+}
+
+fn hasMasks(node: *Node) -> bool {
+    for child in node.*.children.items() {
+        if node_module.isMask(child.*.kind) { return true }
+    }
+    return false
+}
+
+fn isLayer(node: *Node) -> bool { return !node_module.isMask(node.*.kind) }
+
+// Whether a block of pixels is all transparent.
+fn blank(pixels: [*]const u32, count: usize) -> bool {
+    var index: usize = 0
+    while index < count {
+        if pixels[index] != 0 { return false }
+        index += 1
+    }
+    return true
+}
+
+// What `node` shows in `area` (render.content: its pixels and masks, not
+// its opacity and blend mode) as a new device of its own, transparent
+// elsewhere. Null without memory.
+pub fn rasterize(image: *Image, node: *Node, area: Rect) -> ?*Device {
+    const made = device_module.create(image.*.allocator, 0)
+    if made == null { return null }
+    if geom.isEmpty(area) { return made }
+    // What a filter under the node reads around a pixel is read with it.
+    const margin = render.margin(node)
+    const pool = scratch.common()
+    var y = area.y
+    while y < geom.bottom(area) {
+        const height = if geom.bottom(area) - y < BLOCK { geom.bottom(area) - y } else { BLOCK }
+        var x = area.x
+        while x < geom.right(area) {
+            const width = if geom.right(area) - x < BLOCK { geom.right(area) - x } else { BLOCK }
+            const block = geom.rect(x, y, width, height)
+            const wide = geom.grown(block, margin)
+            const stride = @intCast(usize, wide.width)
+            const mark = scratch.mark(pool)
+            const buffer = scratch.words(pool, stride * @intCast(usize, wide.height))
+            var whole = buffer != null
+            if whole && render.content(image, node, wide, buffer.?, pool, 0) {
+                const inner = buffer.? + (@intCast(usize, margin) * stride + @intCast(usize, margin))
+                if !blankBlock(inner, stride, width, height) { whole = device_module.writeRect(made.?, block, inner, stride) }
+            }
+            scratch.release(pool, mark)
+            if !whole {
+                device_module.destroy(made.?)
+                return null
+            }
+            x += width
+        }
+        y += height
+    }
+    return made
+}
+
+fn blankBlock(pixels: [*]const u32, stride: usize, width: i32, height: i32) -> bool {
+    var row: usize = 0
+    while row < @intCast(usize, height) {
+        if !blank(pixels + row * stride, @intCast(usize, width)) { return false }
+        row += 1
+    }
+    return true
+}
+
+// A paint layer with `device` as its pixels and the properties of
+// `like` (its name, flags, opacity, blend mode), in no tree. Null without
+// memory (the device is ended then).
+fn paintLike(image: *Image, like: *Node, device: *Device) -> ?*Node {
+    const made = node_module.create(image.*.allocator, node_module.PAINT, image_module.newId(image), node_module.nameOf(like))
+    if made == null {
+        device_module.destroy(device)
+        return null
+    }
+    const kept = node_module.props(like)
+    node_module.setProps(made.?, &kept)
+    node_module.clearParams(&made.?.*.params)
+    made.?.*.cloneOf = 0
+    made.?.*.passThrough = false
+    made.?.*.collapsed = false
+    device_module.destroy(made.?.*.device.?)
+    made.?.*.device = device
+    return made
+}
+
+// `made` (in no tree) takes the place of `node`: one step `name`. False
+// when it could not be put there (`made` is ended then).
+fn replaceWith(app: *App, image: *Image, node: *Node, made: *Node, name: []const u8) -> bool {
+    const parent = node.*.parent.?
+    const index = node_module.indexIn(parent, node).?
+    const before = image_actions.beginStep(image, name)
+    ops.remove(image, node, name)
+    const added = ops.add(image, made, parent, index, name)
+    if !added { node_module.destroy(made) }
+    if !image_actions.endStep(app, image, before, added) { return false }
+    api.layersChanged(app)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// New layers
+
+// A new layer of `kind` called `title` above the active one (into a
+// group that is active and open), active itself, one step `name`;
+// `params` say what a filter or fill layer shows, `clone_of` what a
+// clone shows. With a selection a filter layer filters only what is
+// selected, and a fill layer fills it (a transparency mask of it). Null
+// when it could not be made.
+fn addLayer(app: *App, kind: u8, title: []const u8, params: ?*const Params, clone_of: u32, name: []const u8) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const made = node_module.create(image.*.allocator, kind, image_module.newId(image), title)
+    if made == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    const node = made.?
+    if params != null { node.*.params = params.?.* }
+    node.*.cloneOf = clone_of
+    if kind == node_module.FILTER && image.*.selected {
+        if !device_module.assign(node.*.device.?, image.*.selection) {
+            node_module.destroy(node)
+            _ = image_actions.noMemory(app)
+            return null
+        }
+    }
+    const place = ops.placeForNew(image)
+    const before = image_actions.beginStep(image, name)
+    var done = ops.add(image, node, place.parent, place.index, name)
+    if !done { node_module.destroy(node) }
+    if done && kind == node_module.FILL && image.*.selected {
+        done = addMask(image, node, node_module.TRANSPARENCY_MASK, state.tr(app, "Transparency Mask", "Transparenzmaske"), null, true, name) != null
+    }
+    if !image_actions.endStep(app, image, before, done) { return null }
+    api.layersChanged(app)
+    return node
+}
+
+// A mask of `kind` on `layer` (after its other masks), its amounts the
+// selection's when `from_selection` and there is one; part of the open
+// step. Null without memory.
+fn addMask(image: *Image, layer: *Node, kind: u8, title: []const u8, params: ?*const Params, from_selection: bool, name: []const u8) -> ?*Node {
+    const made = node_module.create(image.*.allocator, kind, image_module.newId(image), title)
+    if made == null { return null }
+    const mask = made.?
+    if params != null { mask.*.params = params.?.* }
+    var done = true
+    if from_selection && image.*.selected {
+        done = device_module.assign(mask.*.device.?, image.*.selection)
+    } else if kind == node_module.SELECTION_MASK {
+        // A local selection of nothing (not of everything) to start from.
+        device_module.setDefault(mask.*.device.?, mask_module.NOTHING)
+    }
+    if done { done = ops.add(image, mask, layer, node_module.childCount(layer), name) }
+    if !done {
+        node_module.destroy(mask)
+        return null
+    }
+    return mask
+}
+
+// A new paint layer (Insert).
+pub fn newPaintLayer(app: *App) -> ?*Node {
+    const image = api.image(app)
+    if image == null { return null }
+    var name: [128]u8 = undefined
+    const title = freshName(image.?, state.tr(app, "Layer", "Ebene"), &name)
+    return addLayer(app, node_module.PAINT, title, null, 0, state.tr(app, "New layer", "Neue Ebene"))
+}
+
+// A new filter layer showing what is below it through the filter
+// `params` names, called `title` ("": the filter's name).
+pub fn newFilterLayer(app: *App, params: *const Params, title: []const u8) -> ?*Node {
+    const info = filters.find(params.*.id)
+    if info == null { return null }
+    const called = if title.length > 0 { title } else { if app.*.german { info.?.*.german } else { info.?.*.name } }
+    return addLayer(app, node_module.FILTER, called, params, 0, state.tr(app, "New filter layer", "Neue Filterebene"))
+}
+
+// A new fill layer showing what the generator `params` names makes,
+// called `title` ("": the generator's name).
+pub fn newFillLayer(app: *App, params: *const Params, title: []const u8) -> ?*Node {
+    const info = generators.find(params.*.id)
+    if info == null { return null }
+    const called = if title.length > 0 { title } else { if app.*.german { info.?.*.german } else { info.?.*.name } }
+    return addLayer(app, node_module.FILL, called, params, 0, state.tr(app, "New fill layer", "Neue Füllebene"))
+}
+
+// A new mask of `kind` on the active layer (the layer of an active mask),
+// with `params` for a filter mask. Null when it could not be made.
+pub fn newMask(app: *App, kind: u8, params: ?*const Params, title: []const u8) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null { return null }
+    const layer = node_module.layerOf(node.?)
+    const name = state.tr(app, "New mask", "Neue Maske")
+    const before = image_actions.beginStep(image, name)
+    // A transform mask transforms all of its layer; a colorize mask
+    // starts from nothing painted.
+    const from_selection = kind != node_module.TRANSFORM_MASK && kind != node_module.COLORIZE_MASK
+    const made = addMask(image, layer, kind, title, params, from_selection, name)
+    if !image_actions.endStep(app, image, before, made != null) { return null }
+    if kind == node_module.COLORIZE_MASK || kind == node_module.TRANSFORM_MASK || kind == node_module.SELECTION_MASK {
+        api.say(app, state.tr(app, "The mask is kept, but nothing is drawn by masks of this kind yet", "Die Maske bleibt erhalten, doch Masken dieser Art zeichnen noch nichts"), false)
+    }
+    api.layersChanged(app)
+    return made
+}
+
+// Ctrl+G: the active layer put into a new group in its place (with no
+// active layer: an empty group on top). The group, or null.
+pub fn groupActive(app: *App) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    var buffer: [128]u8 = undefined
+    const title = freshName(image, state.tr(app, "Group", "Gruppe"), &buffer)
+    const name = state.tr(app, "Group layer", "Ebene gruppieren")
+    const node = api.activeNode(app)
+    if node == null { return addLayer(app, node_module.GROUP, title, null, 0, name) }
+    const layer = node_module.layerOf(node.?)
+    if layer.*.parent == null { return null }
+    const parent = layer.*.parent.?
+    const index = node_module.indexIn(parent, layer).?
+    const made = node_module.create(image.*.allocator, node_module.GROUP, image_module.newId(image), title)
+    if made == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    const before = image_actions.beginStep(image, name)
+    var done = ops.add(image, made.?, parent, index + 1, name)
+    if !done { node_module.destroy(made.?) }
+    if done { done = ops.move(image, layer, made.?, 0, name) }
+    if !image_actions.endStep(app, image, before, done) { return null }
+    image.*.active = made
+    api.layersChanged(app)
+    return made
+}
+
+// A clone of the active layer above it: it shows what that layer shows,
+// wherever it is.
+pub fn newClone(app: *App) -> ?*Node {
+    const node = api.activeNode(app)
+    if node == null { return null }
+    const source = node_module.layerOf(node.?)
+    var buffer: [128]u8 = undefined
+    const title = suffixed(node_module.nameOf(source), state.tr(app, " (clone)", " (Klon)"), &buffer)
+    return addLayer(app, node_module.CLONE, title, null, source.*.id, state.tr(app, "New clone layer", "Neue Klonebene"))
+}
+
+// A new paint layer holding what the whole image shows now.
+pub fn newFromVisible(app: *App) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    _ = render.update(image)
+    const copied = device_module.copy(image.*.projection)
+    if copied == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    var buffer: [128]u8 = undefined
+    const title = freshName(image, state.tr(app, "Visible", "Sichtbar"), &buffer)
+    const made = node_module.create(image.*.allocator, node_module.PAINT, image_module.newId(image), title)
+    if made == null {
+        device_module.destroy(copied.?)
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    device_module.destroy(made.?.*.device.?)
+    made.?.*.device = copied
+    const place = ops.placeForNew(image)
+    if !ops.add(image, made.?, place.parent, place.index, state.tr(app, "New layer from visible", "Neue Ebene aus Sichtbarem")) {
+        node_module.destroy(made.?)
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    api.layersChanged(app)
+    return made
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate, delete, the selection to a new layer
+
+// The active node copied above itself (its pixels shared with it until
+// one of the two is painted on), active itself.
+pub fn duplicateActive(app: *App) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null || node.?.*.parent == null { return null }
+    const copy = node_module.duplicate(node.?, &image.*.nextId)
+    if copy == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    var buffer: [128]u8 = undefined
+    node_module.setName(copy.?, suffixed(node_module.nameOf(node.?), state.tr(app, " copy", " Kopie"), &buffer))
+    const parent = node.?.*.parent.?
+    const index = node_module.indexIn(parent, node.?).?
+    if !ops.add(image, copy.?, parent, index + 1, state.tr(app, "Duplicate layer", "Ebene duplizieren")) {
+        node_module.destroy(copy.?)
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    image.*.active = copy
+    api.layersChanged(app)
+    return copy
+}
+
+// The active node taken out (undo puts it back).
+pub fn deleteActive(app: *App) -> bool {
+    const found = ready(app)
+    if found == null { return false }
+    const node = api.activeNode(app)
+    if node == null { return false }
+    ops.remove(found.?, node.?, state.tr(app, "Delete layer", "Ebene löschen"))
+    api.layersChanged(app)
+    return true
+}
+
+// What is selected of the active layer (all of it with no selection) as
+// a new paint layer above it, taken out of the active one when `cut`.
+// The new layer, or null.
+pub fn selectionToLayer(app: *App, cut: bool) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null { return null }
+    const layer = node_module.layerOf(node.?)
+    if cut && (layer.*.kind != node_module.PAINT || layer.*.device == null) {
+        api.say(app, state.tr(app, "Only a paint layer's pixels can be cut", "Nur die Pixel einer Malebene lassen sich ausschneiden"), true)
+        return null
+    }
+    if cut && layer.*.locked {
+        api.say(app, state.tr(app, "The layer is locked", "Die Ebene ist gesperrt"), true)
+        return null
+    }
+    // A layer that makes its pixels (a fill, a group) gives what it shows.
+    var source: ?*Device = layer.*.device
+    var temporary: ?*Device = null
+    if layer.*.kind != node_module.PAINT || layer.*.device == null {
+        temporary = rasterize(image, layer, history_module.footprint(image, layer))
+        if temporary == null { return null }
+        source = temporary
+    }
+    var chosen: ?*Device = null
+    if image.*.selected { chosen = image.*.selection }
+    const area = geom.unite(device_module.extent(source.?), image_module.bounds(image))
+    const copied = selection_module.copySelected(source.?, chosen, area)
+    if temporary != null { device_module.destroy(temporary.?) }
+    if copied == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    var buffer: [128]u8 = undefined
+    const title = freshName(image, state.tr(app, "Layer", "Ebene"), &buffer)
+    const made = node_module.create(image.*.allocator, node_module.PAINT, image_module.newId(image), title)
+    if made == null {
+        device_module.destroy(copied.?)
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    device_module.destroy(made.?.*.device.?)
+    made.?.*.device = copied
+    const name = if cut { state.tr(app, "Cut selection to new layer", "Auswahl in neue Ebene ausschneiden") } else { state.tr(app, "Copy selection to new layer", "Auswahl in neue Ebene kopieren") }
+    const parent = layer.*.parent.?
+    const index = node_module.indexIn(parent, layer).?
+    const before = image_actions.beginStep(image, name)
+    var done = true
+    if cut {
+        _ = ops.beginPixels(image, layer)
+        done = selection_module.clearSelected(layer.*.device.?, chosen, area)
+        if done {
+            _ = ops.endPixels(image, layer, name)
+        } else {
+            _ = ops.cancelPixels(image, layer)
+        }
+    }
+    if done {
+        done = ops.add(image, made.?, parent, index + 1, name)
+        if !done { node_module.destroy(made.?) }
+    } else {
+        node_module.destroy(made.?)
+    }
+    if !image_actions.endStep(app, image, before, done) { return null }
+    api.layersChanged(app)
+    return made
+}
+
+// ---------------------------------------------------------------------------
+// Merging and flattening
+
+// The active layer and the one below it mixed as the compositor mixes
+// them into one paint layer (blend mode, opacity, masks, a filter
+// layer's filter), with the lower one's name and properties, in its
+// place. The new layer, or null.
+pub fn mergeDown(app: *App) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null || !isLayer(node.?) { return null }
+    const top = node.?
+    const below = belowOf(top)
+    if below == null || below.?.*.kind == node_module.FILTER {
+        // (A filter layer has no pixels of its own to take the layer's.)
+        api.say(app, state.tr(app, "There is no layer below to merge into", "Darunter liegt keine Ebene zum Vereinen"), true)
+        return null
+    }
+    if top.*.locked || below.?.*.locked {
+        api.say(app, state.tr(app, "The layer is locked", "Die Ebene ist gesperrt"), true)
+        return null
+    }
+    const area = geom.unite(history_module.footprint(image, top), history_module.footprint(image, below.?))
+    const device = device_module.create(image.*.allocator, 0)
+    if device == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    if !mixInto(image, device.?, below.?, top, area) {
+        device_module.destroy(device.?)
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    const made = paintLike(image, below.?, device.?)
+    if made == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    const parent = below.?.*.parent.?
+    const index = node_module.indexIn(parent, below.?).?
+    const name = state.tr(app, "Merge down", "Nach unten vereinen")
+    const before = image_actions.beginStep(image, name)
+    ops.remove(image, top, name)
+    ops.remove(image, below.?, name)
+    const added = ops.add(image, made.?, parent, index, name)
+    if !added { node_module.destroy(made.?) }
+    if !image_actions.endStep(app, image, before, added) { return null }
+    api.layersChanged(app)
+    return made
+}
+
+// `top` mixed over what `below` shows, in `area`, into `into` (block by
+// block, with the margin the filters of both read around a pixel).
+// False without memory.
+fn mixInto(image: *Image, into: *Device, below: *Node, top: *Node, area: Rect) -> bool {
+    if geom.isEmpty(area) { return true }
+    var margin = render.margin(below) + render.margin(top)
+    if top.*.kind == node_module.FILTER { margin += filters.margin(&top.*.params) }
+    const shown = top.*.visible && top.*.opacity > 0
+    const opacity = @intCast(u32, top.*.opacity)
+    const pool = scratch.common()
+    var y = area.y
+    while y < geom.bottom(area) {
+        const height = if geom.bottom(area) - y < BLOCK { geom.bottom(area) - y } else { BLOCK }
+        var x = area.x
+        while x < geom.right(area) {
+            const width = if geom.right(area) - x < BLOCK { geom.right(area) - x } else { BLOCK }
+            const block = geom.rect(x, y, width, height)
+            const wide = geom.grown(block, margin)
+            const stride = @intCast(usize, wide.width)
+            const rows = @intCast(usize, wide.height)
+            const count = stride * rows
+            const mark = scratch.mark(pool)
+            const under = scratch.words(pool, count)
+            const over = scratch.words(pool, count)
+            const amounts = scratch.bytes(pool, count)
+            var whole = under != null && over != null && amounts != null
+            if whole {
+                if !render.content(image, below, wide, under.?, pool, 0) { device_module.fillWords(under.?, count, 0) }
+                if shown && top.*.kind == node_module.FILTER {
+                    // What is below, filtered, where the layer's mask says.
+                    device_module.copyWords(over.?, under.?, count)
+                    if top.*.device != null && filters.apply(&top.*.params, over.?, stride, rows, stride) {
+                        mask_module.readBytes(top.*.device.?, wide, amounts.?, stride)
+                        if top.*.blend == blend.NORMAL {
+                            var index: usize = 0
+                            while index < count {
+                                const amount = pixel.mul(@intCast(u32, amounts.?[index]), opacity)
+                                if amount != 0 { under.?[index] = pixel.mix(under.?[index], over.?[index], amount) }
+                                index += 1
+                            }
+                        } else {
+                            var row: usize = 0
+                            while row < rows {
+                                blend.compositeSpan(top.*.blend, under.? + row * stride, over.? + row * stride, stride, opacity, amounts.? + row * stride, blend.FLAG_ALPHA_LOCK)
+                                row += 1
+                            }
+                        }
+                    }
+                } else if shown && render.content(image, top, wide, over.?, pool, 0) {
+                    const flags: u32 = if top.*.inheritAlpha { blend.FLAG_ALPHA_LOCK } else { 0 }
+                    var row: usize = 0
+                    while row < rows {
+                        blend.compositeSpan(top.*.blend, under.? + row * stride, over.? + row * stride, stride, opacity, null, flags)
+                        row += 1
+                    }
+                }
+                const inner = under.? + (@intCast(usize, margin) * stride + @intCast(usize, margin))
+                if !blankBlock(inner, stride, width, height) { whole = device_module.writeRect(into, block, inner, stride) }
+            }
+            scratch.release(pool, mark)
+            if !whole { return false }
+            x += width
+        }
+        y += height
+    }
+    return true
+}
+
+// A group, or a layer with masks, becomes one paint layer showing what
+// it showed (masks applied), with its properties. The new layer, or null.
+pub fn flattenActive(app: *App) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null { return null }
+    const layer = node_module.layerOf(node.?)
+    if layer.*.kind == node_module.FILTER || (layer.*.kind != node_module.GROUP && !hasMasks(layer)) { return null }
+    const device = rasterize(image, layer, history_module.footprint(image, layer))
+    if device == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    const made = paintLike(image, layer, device.?)
+    if made == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    if !replaceWith(app, image, layer, made.?, state.tr(app, "Flatten layer", "Ebene verflachen")) { return null }
+    return made
+}
+
+// A fill, clone, vector or file layer becomes a paint layer holding what
+// it shows; its masks move over to the new layer, unapplied. The new
+// layer, or null.
+pub fn convertToPaint(app: *App) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null { return null }
+    const layer = node_module.layerOf(node.?)
+    if !convertible(layer) { return null }
+    // What the layer shows without its masks: they are hidden for the
+    // moment of the drawing (one thread: nothing else draws meanwhile).
+    var hidden: [32]u32 = undefined
+    var count: usize = 0
+    for child in layer.*.children.items() {
+        if node_module.isMask(child.*.kind) && child.*.visible && count < 32 {
+            child.*.visible = false
+            hidden[count] = child.*.id
+            count += 1
+        }
+    }
+    const device = rasterize(image, layer, history_module.footprint(image, layer))
+    var index: usize = 0
+    while index < count {
+        const mask = node_module.find(layer, hidden[index])
+        if mask != null { mask.?.*.visible = true }
+        index += 1
+    }
+    if device == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    const made = paintLike(image, layer, device.?)
+    if made == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    const parent = layer.*.parent.?
+    const place = node_module.indexIn(parent, layer).?
+    const name = state.tr(app, "Convert to paint layer", "In Malebene umwandeln")
+    const before = image_actions.beginStep(image, name)
+    var done = ops.add(image, made.?, parent, place + 1, name)
+    if !done { node_module.destroy(made.?) }
+    while done && hasMasks(layer) {
+        var first: ?*Node = null
+        for child in layer.*.children.items() {
+            if first == null && node_module.isMask(child.*.kind) { first = child }
+        }
+        done = ops.move(image, first.?, made.?, node_module.childCount(made.?), name)
+    }
+    if done { ops.remove(image, layer, name) }
+    if !image_actions.endStep(app, image, before, done) { return null }
+    image.*.active = made
+    api.layersChanged(app)
+    return made
+}
+
+fn convertible(node: *Node) -> bool {
+    const kind = node.*.kind
+    return kind == node_module.FILL || kind == node_module.CLONE || kind == node_module.VECTOR || kind == node_module.FILE
+}
+
+// The active group's layers put where the group was (in their order),
+// the group taken away. The topmost of them, or null.
+pub fn ungroupActive(app: *App) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null || node.?.*.kind != node_module.GROUP || node.?.*.parent == null { return null }
+    const group = node.?
+    const parent = group.*.parent.?
+    const name = state.tr(app, "Ungroup", "Gruppierung aufheben")
+    const before = image_actions.beginStep(image, name)
+    var done = true
+    var last: ?*Node = null
+    while done {
+        var first: ?*Node = null
+        for child in group.*.children.items() {
+            if first == null && isLayer(child) { first = child }
+        }
+        if first == null { break }
+        // Each goes right below the group: the first (lowest) first.
+        done = ops.move(image, first.?, parent, node_module.indexIn(parent, group).?, name)
+        last = first
+    }
+    if done { ops.remove(image, group, name) }
+    if !image_actions.endStep(app, image, before, done) { return null }
+    if last != null { image.*.active = last }
+    api.layersChanged(app)
+    return last
+}
+
+// The active paint layer's alpha becomes a transparency mask on it, and
+// the layer itself opaque (its colours as they were): what it shows
+// stays the same.
+pub fn alphaToMask(app: *App) -> ?*Node {
+    const found = ready(app)
+    if found == null { return null }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null { return null }
+    const layer = node_module.layerOf(node.?)
+    if layer.*.kind != node_module.PAINT || layer.*.device == null { return null }
+    if layer.*.locked {
+        api.say(app, state.tr(app, "The layer is locked", "Die Ebene ist gesperrt"), true)
+        return null
+    }
+    const device = layer.*.device.?
+    const made = node_module.create(image.*.allocator, node_module.TRANSPARENCY_MASK, image_module.newId(image), state.tr(app, "Transparency Mask", "Transparenzmaske"))
+    if made == null {
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    var keys = std.ArrayList(u64).init(image.*.allocator)
+    defer keys.deinit()
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const amounts = scratch.bytes(pool, device_module.TILE_PIXELS)
+    var done = amounts != null && device_module.keys(device, &keys)
+    // The mask first, from the alpha as it is.
+    for key in keys.items() {
+        if !done { break }
+        const tx = device_module.keyX(key)
+        const ty = device_module.keyY(key)
+        const pixels = device_module.tileRead(device, tx, ty)
+        if pixels != null {
+            var index: usize = 0
+            while index < device_module.TILE_PIXELS {
+                amounts.?[index] = @intCast(u8, pixels.?[index] >> 24)
+                index += 1
+            }
+            done = mask_module.writeBytes(made.?.*.device.?, device_module.tileArea(device, tx, ty), amounts.?, 64)
+        }
+    }
+    scratch.release(pool, mark)
+    if !done {
+        node_module.destroy(made.?)
+        _ = image_actions.noMemory(app)
+        return null
+    }
+    const name = state.tr(app, "Split alpha into mask", "Alpha in Maske aufteilen")
+    const before = image_actions.beginStep(image, name)
+    _ = ops.beginPixels(image, layer)
+    for key in keys.items() {
+        if !done { break }
+        const pixels = device_module.tileWrite(device, device_module.keyX(key), device_module.keyY(key))
+        if pixels == null {
+            done = false
+        } else {
+            var index: usize = 0
+            while index < device_module.TILE_PIXELS {
+                pixels.?[index] |= 0xFF000000
+                index += 1
+            }
+        }
+    }
+    if done {
+        _ = ops.endPixels(image, layer, name)
+        done = ops.add(image, made.?, layer, node_module.childCount(layer), name)
+    } else {
+        _ = ops.cancelPixels(image, layer)
+    }
+    if !done { node_module.destroy(made.?) }
+    if !image_actions.endStep(app, image, before, done) { return null }
+    api.layersChanged(app)
+    return made
+}
+
+// ---------------------------------------------------------------------------
+// Order
+
+// Moves `node` among its parent's children (a layer past the next layer,
+// a mask past the next mask): `up` toward the top; `far` to the very top
+// or bottom of its group. A layer at the end of a group steps out of it.
+// True when it moved.
+pub fn moveActive(app: *App, up: bool, far: bool) -> bool {
+    const found = ready(app)
+    if found == null { return false }
+    const node = api.activeNode(app)
+    if node == null || node.?.*.parent == null { return false }
+    var target: ?*Node = null
+    var index: usize = 0
+    if !placeFor(node.?, up, far, &target, &index) { return false }
+    const name = if up { state.tr(app, "Raise layer", "Ebene anheben") } else { state.tr(app, "Lower layer", "Ebene absenken") }
+    if !ops.move(found.?, node.?, target.?, index, name) { return false }
+    api.layersChanged(app)
+    return true
+}
+
+// Where moveActive puts `node`: its new parent and its number there.
+// False when it cannot go further.
+fn placeFor(node: *Node, up: bool, far: bool, target: *?*Node, index: *usize) -> bool {
+    const parent = node.*.parent.?
+    if far {
+        const next = if up { aboveOf(node) } else { belowOf(node) }
+        if next == null { return false }
+        // Past the last (first) of its kind: its masks or its layers keep
+        // their own order around it.
+        var edge = next.?
+        while true {
+            const further = if up { aboveOf(edge) } else { belowOf(edge) }
+            if further == null { break }
+            edge = further.?
+        }
+        target.* = parent
+        index.* = node_module.indexIn(parent, edge).?
+        return true
+    }
+    const next = if up { aboveOf(node) } else { belowOf(node) }
+    if next != null {
+        target.* = parent
+        index.* = node_module.indexIn(parent, next.?).?
+        return true
+    }
+    // At the end of its group: a layer steps out of it (a mask stays on
+    // its layer).
+    if node_module.isMask(node.*.kind) || parent.*.parent == null { return false }
+    const outer = parent.*.parent.?
+    const group_at = node_module.indexIn(outer, parent).?
+    target.* = outer
+    index.* = if up { group_at + 1 } else { group_at }
+    return true
+}
+
+fn canMove(app: *App, up: bool, far: bool) -> bool {
+    const node = api.activeNode(app)
+    if node == null || node.?.*.parent == null { return false }
+    var target: ?*Node = null
+    var index: usize = 0
+    return placeFor(node.?, up, far, &target, &index)
+}
+
+// ---------------------------------------------------------------------------
+// Flags and Select Opaque
+
+// What a flag of the active node is, and setting it (one step).
+const FLAG_VISIBLE: u8 = 0
+const FLAG_LOCKED: u8 = 1
+const FLAG_ALPHA_LOCKED: u8 = 2
+const FLAG_INHERIT_ALPHA: u8 = 3
+
+fn flagOf(node: *Node, flag: u8) -> bool {
+    if flag == FLAG_VISIBLE { return node.*.visible }
+    if flag == FLAG_LOCKED { return node.*.locked }
+    if flag == FLAG_ALPHA_LOCKED { return node.*.alphaLocked }
+    return node.*.inheritAlpha
+}
+
+// The flag of the active node turned over. True when it was.
+pub fn toggleFlag(app: *App, flag: u8) -> bool {
+    const found = ready(app)
+    if found == null { return false }
+    const node = api.activeNode(app)
+    if node == null { return false }
+    const before = node_module.props(node.?)
+    const on = !flagOf(node.?, flag)
+    var name: []const u8 = ""
+    if flag == FLAG_VISIBLE {
+        node.?.*.visible = on
+        name = if on { state.tr(app, "Show layer", "Ebene einblenden") } else { state.tr(app, "Hide layer", "Ebene ausblenden") }
+    } else if flag == FLAG_LOCKED {
+        node.?.*.locked = on
+        name = if on { state.tr(app, "Lock layer", "Ebene sperren") } else { state.tr(app, "Unlock layer", "Ebene entsperren") }
+    } else if flag == FLAG_ALPHA_LOCKED {
+        node.?.*.alphaLocked = on
+        name = state.tr(app, "Lock alpha", "Alpha sperren")
+    } else {
+        node.?.*.inheritAlpha = on
+        name = state.tr(app, "Inherit alpha", "Alpha erben")
+    }
+    ops.changed(found.?, node.?, &before, name)
+    api.layersChanged(app)
+    return true
+}
+
+// The selection becomes what the active layer shows opaque (its alpha
+// as the amounts), within the image.
+pub fn selectOpaque(app: *App) -> bool {
+    const found = ready(app)
+    if found == null { return false }
+    const image = found.?
+    const node = api.activeNode(app)
+    if node == null { return false }
+    const layer = node_module.layerOf(node.?)
+    var source: ?*Device = layer.*.device
+    var temporary: ?*Device = null
+    if layer.*.kind != node_module.PAINT || layer.*.device == null || hasMasks(layer) {
+        temporary = rasterize(image, layer, history_module.footprint(image, layer))
+        if temporary == null { return image_actions.noMemory(app) }
+        source = temporary
+    }
+    ops.beginSelection(image)
+    var done = selection_module.fromAlpha(image.*.selection, source.?, selection_module.REPLACE)
+    if done { done = selection_module.clip(image.*.selection, image_module.bounds(image)) }
+    if done {
+        ops.endSelection(image, true, state.tr(app, "Select opaque", "Deckendes auswählen"))
+    } else {
+        ops.cancelSelection(image)
+    }
+    if temporary != null { device_module.destroy(temporary.?) }
+    if !done { return image_actions.noMemory(app) }
+    api.redraw(app)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Filter layers, filter masks and fill layers: which one, then its numbers
+
+const MAKING_FILTER_LAYER: u8 = 1
+const MAKING_FILTER_MASK: u8 = 2
+const MAKING_FILL_LAYER: u8 = 3
+
+// dialogs.Hooks.kind of the first dialog.
+const KIND_CHOOSER: u8 = 81
+
+// Its fields, for dialogs.partId.
+pub const CHOOSER_NAME: usize = dialogs.PART_FIELD
+pub const CHOOSER_LIST: usize = dialogs.PART_FIELD + 1
+
+// A row of the list: a filter's or a generator's place in its registry,
+// or with HEADING a group's heading.
+const HEADING: u16 = 32768
+const ROWS: usize = 192
+
+// What the second dialog (the form) edits, and what is made of it: kept
+// in the module's slot while the form is open.
+const Pending = struct {
+    making: u8
+    image: usize
+    // The layer a mask goes on.
+    node: u32
+    params: Params
+    name: [128]u8
+    nameLength: usize
+}
+
+fn pendingOf(app: *App) -> ?*Pending {
+    const memory = state.slot(app, state.SLOT_ACTIONS + 4, @sizeOf(Pending))
+    if memory == null { return null }
+    return unsafe { @ptrCast(*Pending, memory.?) }
+}
+
+const ChooserBody = struct {
+    making: u8
+    image: usize
+    node: u32
+    rows: [192]u16
+    rowCount: usize
+    chosen: usize
+    name: [128]u8
+    nameLength: usize
+    german: bool
+    labels: [2][]const u8
+}
+
+fn chooserBody(app: *App, level: usize) -> *ChooserBody { return unsafe { @ptrCast(*ChooserBody, dialogs.body(app, level)) } }
+
+fn filterCategory(category: u8, german: bool) -> []const u8 {
+    if category == filter_types.ADJUST { return if german { "Anpassen" } else { "Adjust" } }
+    if category == filter_types.ARTISTIC { return if german { "Künstlerisch" } else { "Artistic" } }
+    if category == filter_types.BLUR { return if german { "Weichzeichnen" } else { "Blur" } }
+    if category == filter_types.COLORS { return if german { "Farben" } else { "Colours" } }
+    if category == filter_types.EDGE { return if german { "Kantenerkennung" } else { "Edge Detection" } }
+    if category == filter_types.EMBOSS { return if german { "Relief" } else { "Emboss" } }
+    if category == filter_types.ENHANCE { return if german { "Verbessern" } else { "Enhance" } }
+    if category == filter_types.MAP { return if german { "Abbilden" } else { "Map" } }
+    return if german { "Sonstige" } else { "Other" }
+}
+
+// The name of the filter or generator at a row (not a heading).
+fn itemName(making: u8, row: u16, german: bool) -> []const u8 {
+    if making == MAKING_FILL_LAYER {
+        const info = generators.at(@intCast(usize, row))
+        if info == null { return "" }
+        return if german { info.?.*.german } else { info.?.*.name }
+    }
+    const info = filters.at(@intCast(usize, row))
+    if info == null { return "" }
+    return if german { info.?.*.german } else { info.?.*.name }
+}
+
+fn chooserRowName(context: usize, index: usize) -> []const u8 {
+    const asked: *ChooserBody = unsafe { @ptrFromInt(*ChooserBody, context) }
+    if index >= asked.*.rowCount { return "" }
+    const row = asked.*.rows[index]
+    if row & HEADING != 0 {
+        const category = @intCast(u8, row & 255)
+        if asked.*.making == MAKING_FILL_LAYER { return generators.categoryName(category, asked.*.german) }
+        return filterCategory(category, asked.*.german)
+    }
+    return itemName(asked.*.making, row, asked.*.german)
+}
+
+fn chooserRowKind(context: usize, index: usize) -> u8 {
+    const asked: *ChooserBody = unsafe { @ptrFromInt(*ChooserBody, context) }
+    if index < asked.*.rowCount && asked.*.rows[index] & HEADING != 0 { return kit_module.LIST_HEADING }
+    return kit_module.LIST_ITEM
+}
+
+// The rows of the list, a group after the other, each under its heading;
+// the row of `wanted` (a filter's or generator's number) is chosen.
+fn fillRows(asked: *ChooserBody, wanted: u16) -> void {
+    const fill = asked.*.making == MAKING_FILL_LAYER
+    const total = if fill { generators.count() } else { filters.count() }
+    const categories: u8 = if fill { generators.CATEGORIES } else { @intCast(u8, filter_types.CATEGORIES) }
+    var count: usize = 0
+    asked.*.chosen = 0
+    var category: u8 = 0
+    while category < categories {
+        var headed = false
+        var index: usize = 0
+        while index < total && count + 2 <= ROWS {
+            var of: u8 = 255
+            var id: u16 = 0
+            if fill {
+                const info = generators.at(index)
+                if info != null {
+                    of = info.?.*.category
+                    id = info.?.*.id
+                }
+            } else {
+                const info = filters.at(index)
+                if info != null {
+                    of = info.?.*.category
+                    id = info.?.*.id
+                }
+            }
+            if of == category {
+                if !headed {
+                    asked.*.rows[count] = HEADING | @intCast(u16, category)
+                    count += 1
+                    headed = true
+                }
+                if id == wanted || asked.*.chosen == 0 { asked.*.chosen = count }
+                asked.*.rows[count] = @intCast(u16, index)
+                count += 1
+            }
+            index += 1
+        }
+        category += 1
+    }
+    asked.*.rowCount = count
+}
+
+// Asks which filter (a filter layer or mask) or generator (a fill layer)
+// and the name; then its numbers in a form; then it is made. False when
+// it cannot be asked (no image, no layer for a mask, too many dialogs).
+fn askChooser(app: *App, making: u8) -> bool {
+    const picture = api.image(app)
+    if picture == null { return false }
+    var id: u32 = 0
+    if making == MAKING_FILTER_MASK {
+        const node = api.activeNode(app)
+        if node == null { return false }
+        id = node_module.layerOf(node.?).*.id
+    }
+    const hooks = dialogs.Hooks.{ .kind = KIND_CHOOSER, .draw = drawChooser, .key = null, .finish = finishChooser, .tabs = false, .closable = true }
+    const level = dialogs.host(app, hooks, @sizeOf(ChooserBody))
+    if level == null { return false }
+    const asked = chooserBody(app, level.?)
+    asked.*.making = making
+    asked.*.image = @intFromPtr(picture.?)
+    asked.*.node = id
+    asked.*.nameLength = 0
+    asked.*.german = app.*.german
+    fillRows(asked, if making == MAKING_FILL_LAYER { generators.COLOR } else { filters.INVERT })
+    return true
+}
+
+// The number of the filter or generator chosen (null: a heading).
+fn chosenItem(asked: *ChooserBody) -> ?u16 {
+    if asked.*.chosen >= asked.*.rowCount { return null }
+    const row = asked.*.rows[asked.*.chosen]
+    if row & HEADING != 0 { return null }
+    return row
+}
+
+// The Param table of what row `row` names.
+fn paramsOfRow(making: u8, row: u16) -> []const filter_types.Param {
+    if making == MAKING_FILL_LAYER {
+        const info = generators.at(@intCast(usize, row))
+        if info != null { return info.?.*.params }
+        return generators.paramsOf(65535)
+    }
+    const info = filters.at(@intCast(usize, row))
+    if info != null { return info.?.*.params }
+    return generators.paramsOf(65535)
+}
+
+fn drawChooser(app: *App, level: usize, window: ui.Rect) -> void {
+    const asked = chooserBody(app, level)
+    const kit = api.kit(app)
+    const s = state.themeOf(app).*.scale
+    const row = dialogs.ROW * s
+    asked.*.german = app.*.german
+    const natural = 3 * (dialogs.ROW + dialogs.GAP) * s
+    var title = state.tr(app, "New Filter Layer", "Neue Filterebene")
+    if asked.*.making == MAKING_FILTER_MASK { title = state.tr(app, "New Filter Mask", "Neue Filtermaske") }
+    if asked.*.making == MAKING_FILL_LAYER { title = state.tr(app, "New Fill Layer", "Neue Füllebene") }
+    var content = dialogs.frame(app, window, title, 460 * s, dialogs.framed(app, natural))
+    const item = chosenItem(asked)
+    var settings = false
+    if item != null { settings = paramsOfRow(asked.*.making, item.?).length > 0 }
+    asked.*.labels[0] = if settings { state.tr(app, "Next", "Weiter") } else { state.tr(app, "Create", "Anlegen") }
+    asked.*.labels[1] = state.tr(app, "Cancel", "Abbrechen")
+    const labels: [*][]const u8 = &asked.*.labels
+    const clicked = dialogs.buttons(app, &content, labels[0..2], 0)
+    var rows = dialogs.scrollBegin(app, content, natural)
+    var placeholder: []const u8 = ""
+    if item != null { placeholder = itemName(asked.*.making, item.?, app.*.german) }
+    _ = kit_module.textBox(kit, dialogs.idOf(app, level, CHOOSER_NAME), dialogs.labelled(app, &rows, "Name", row), &asked.*.name, &asked.*.nameLength, 128, placeholder)
+    const which = if asked.*.making == MAKING_FILL_LAYER { state.tr(app, "Generator", "Generator") } else { state.tr(app, "Filter", "Filter") }
+    _ = kit_module.comboBoxKinds(kit, dialogs.idOf(app, level, CHOOSER_LIST), dialogs.labelled(app, &rows, which, row), asked.*.rowCount, chooserRowName, chooserRowKind, @intFromPtr(asked), &asked.*.chosen)
+    const note = if item == null { "" } else if settings { state.tr(app, "Its settings are asked next", "Die Einstellungen folgen") } else { state.tr(app, "It has no settings", "Er hat keine Einstellungen") }
+    kit_module.label(kit, dialogs.labelled(app, &rows, "", row), note, kit_module.TEXT_DIM, kit_module.ALIGN_LEFT)
+    dialogs.scrollEnd(app)
+    if clicked != null {
+        if clicked.? == 0 && item != null {
+            dialogs.close(app, level, 0)
+        } else if clicked.? != 0 {
+            dialogs.close(app, level, dialogs.CANCEL)
+        }
+    }
+}
+
+fn finishChooser(app: *App, level: usize, answer: usize) -> void {
+    if answer != 0 { return }
+    const asked = chooserBody(app, level)
+    const item = chosenItem(asked)
+    const pending = pendingOf(app)
+    if item == null || pending == null { return }
+    const making = asked.*.making
+    pending.?.*.making = making
+    pending.?.*.image = asked.*.image
+    pending.?.*.node = asked.*.node
+    var length: usize = 0
+    while length < asked.*.nameLength && length < 128 {
+        pending.?.*.name[length] = asked.*.name[length]
+        length += 1
+    }
+    pending.?.*.nameLength = length
+    const params = &pending.?.*.params
+    var title: []const u8 = ""
+    if making == MAKING_FILL_LAYER {
+        const info = generators.at(@intCast(usize, item.?))
+        if info == null { return }
+        generators.defaults(info.?.*.id, params)
+        // A colour starts as the foreground colour.
+        if info.?.*.id == generators.COLOR {
+            const color = app.*.foreground
+            params.*.values[0] = @floatFromInt(f64, pixel.red(color))
+            params.*.values[1] = @floatFromInt(f64, pixel.green(color))
+            params.*.values[2] = @floatFromInt(f64, pixel.blue(color))
+            params.*.values[3] = @floatFromInt(f64, pixel.alpha(color))
+        }
+        title = if app.*.german { info.?.*.german } else { info.?.*.name }
+    } else {
+        const info = filters.at(@intCast(usize, item.?))
+        if info == null { return }
+        filters.defaults(info.?.*.id, params)
+        title = if app.*.german { info.?.*.german } else { info.?.*.name }
+    }
+    const table_of = paramsOfRow(making, item.?)
+    if table_of.length == 0 {
+        makePending(app)
+        return
+    }
+    const options = forms.FormOptions.{ .onChange = null, .onAccept = makePending, .onCancel = null, .preview = null, .reset = true }
+    _ = forms.open(app, title, table_of, params, &options)
+}
+
+// What the form was answered for is made.
+fn makePending(app: *App) -> void {
+    const pending = pendingOf(app)
+    if pending == null { return }
+    const picture = api.image(app)
+    if picture == null || @intFromPtr(picture.?) != pending.?.*.image { return }
+    const bytes: [*]const u8 = &pending.?.*.name
+    const name = bytes[0..pending.?.*.nameLength]
+    const making = pending.?.*.making
+    if making == MAKING_FILTER_LAYER {
+        _ = newFilterLayer(app, &pending.?.*.params, name)
+    } else if making == MAKING_FILL_LAYER {
+        _ = newFillLayer(app, &pending.?.*.params, name)
+    } else {
+        // The mask goes on the layer it was asked for, if that is still
+        // the active one.
+        const node = api.activeNode(app)
+        if node == null || node_module.layerOf(node.?).*.id != pending.?.*.node { return }
+        var title = name
+        if title.length == 0 {
+            const info = filters.find(pending.?.*.params.id)
+            if info != null { title = if app.*.german { info.?.*.german } else { info.?.*.name } }
+        }
+        _ = newMask(app, node_module.FILTER_MASK, &pending.?.*.params, title)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The menu
+
+fn runNew(app: *App) -> void { _ = newPaintLayer(app) }
+fn runNewGroup(app: *App) -> void { _ = groupActive(app) }
+fn runNewFilter(app: *App) -> void { _ = askChooser(app, MAKING_FILTER_LAYER) }
+fn runNewFill(app: *App) -> void { _ = askChooser(app, MAKING_FILL_LAYER) }
+fn runNewClone(app: *App) -> void { _ = newClone(app) }
+fn runNewFromVisible(app: *App) -> void { _ = newFromVisible(app) }
+fn runTransparencyMask(app: *App) -> void { _ = newMask(app, node_module.TRANSPARENCY_MASK, null, state.tr(app, "Transparency Mask", "Transparenzmaske")) }
+fn runFilterMask(app: *App) -> void { _ = askChooser(app, MAKING_FILTER_MASK) }
+fn runColorizeMask(app: *App) -> void { _ = newMask(app, node_module.COLORIZE_MASK, null, state.tr(app, "Colorize Mask", "Einfärbemaske")) }
+fn runTransformMask(app: *App) -> void { _ = newMask(app, node_module.TRANSFORM_MASK, null, state.tr(app, "Transform Mask", "Transformationsmaske")) }
+fn runSelectionMask(app: *App) -> void { _ = newMask(app, node_module.SELECTION_MASK, null, state.tr(app, "Local Selection", "Lokale Auswahl")) }
+fn runDuplicate(app: *App) -> void { _ = duplicateActive(app) }
+fn runDelete(app: *App) -> void { _ = deleteActive(app) }
+fn runCutToNew(app: *App) -> void { _ = selectionToLayer(app, true) }
+fn runCopyToNew(app: *App) -> void { _ = selectionToLayer(app, false) }
+fn runMergeDown(app: *App) -> void { _ = mergeDown(app) }
+fn runFlatten(app: *App) -> void { _ = flattenActive(app) }
+fn runUngroup(app: *App) -> void { _ = ungroupActive(app) }
+fn runConvert(app: *App) -> void { _ = convertToPaint(app) }
+fn runAlphaToMask(app: *App) -> void { _ = alphaToMask(app) }
+fn runMirrorHorizontal(app: *App) -> void { _ = image_actions.mirrorLayer(app, true) }
+fn runMirrorVertical(app: *App) -> void { _ = image_actions.mirrorLayer(app, false) }
+fn runRotateClockwise(app: *App) -> void { _ = image_actions.rotateLayer90(app, 1) }
+fn runRotateAnticlockwise(app: *App) -> void { _ = image_actions.rotateLayer90(app, 3) }
+fn runRotateHalf(app: *App) -> void { _ = image_actions.rotateLayer90(app, 2) }
+fn runRotate(app: *App) -> void {
+    const node = image_actions.changeableNode(app)
+    if node != null { _ = image_actions.askRotate(app, node) }
+}
+fn runScale(app: *App) -> void {
+    const node = image_actions.changeableNode(app)
+    if node != null { _ = image_actions.askScale(app, node) }
+}
+fn runOffset(app: *App) -> void {
+    const node = image_actions.changeableNode(app)
+    if node != null { _ = image_actions.askOffset(app, node) }
+}
+fn runRaise(app: *App) -> void { _ = moveActive(app, true, false) }
+fn runLower(app: *App) -> void { _ = moveActive(app, false, false) }
+fn runToTop(app: *App) -> void { _ = moveActive(app, true, true) }
+fn runToBottom(app: *App) -> void { _ = moveActive(app, false, true) }
+fn runVisible(app: *App) -> void { _ = toggleFlag(app, FLAG_VISIBLE) }
+fn runLock(app: *App) -> void { _ = toggleFlag(app, FLAG_LOCKED) }
+fn runAlphaLock(app: *App) -> void { _ = toggleFlag(app, FLAG_ALPHA_LOCKED) }
+fn runInheritAlpha(app: *App) -> void { _ = toggleFlag(app, FLAG_INHERIT_ALPHA) }
+fn runSelectOpaque(app: *App) -> void { _ = selectOpaque(app) }
+fn runProperties(app: *App) -> void {
+    const node = api.activeNode(app)
+    if node != null { _ = dialogs.layerProperties(app, node.?) }
+}
+
+fn activeLayer(app: *App) -> ?*Node {
+    const node = api.activeNode(app)
+    if node == null { return null }
+    return node_module.layerOf(node.?)
+}
+
+fn canMergeDown(app: *App) -> bool {
+    const node = api.activeNode(app)
+    if node == null || !isLayer(node.?) { return false }
+    const below = belowOf(node.?)
+    return below != null && below.?.*.kind != node_module.FILTER
+}
+
+fn canFlatten(app: *App) -> bool {
+    const layer = activeLayer(app)
+    return layer != null && layer.?.*.kind != node_module.FILTER && (layer.?.*.kind == node_module.GROUP || hasMasks(layer.?))
+}
+
+fn canUngroup(app: *App) -> bool {
+    const node = api.activeNode(app)
+    return node != null && node.?.*.kind == node_module.GROUP
+}
+
+fn canConvert(app: *App) -> bool {
+    const layer = activeLayer(app)
+    return layer != null && convertible(layer.?)
+}
+
+fn canSplitAlpha(app: *App) -> bool {
+    const layer = activeLayer(app)
+    return layer != null && layer.?.*.kind == node_module.PAINT
+}
+
+fn canClone(app: *App) -> bool {
+    const layer = activeLayer(app)
+    return layer != null && layer.?.*.kind != node_module.FILTER
+}
+
+fn canRaise(app: *App) -> bool { return canMove(app, true, false) }
+fn canLower(app: *App) -> bool { return canMove(app, false, false) }
+fn canTop(app: *App) -> bool { return canMove(app, true, true) }
+fn canBottom(app: *App) -> bool { return canMove(app, false, true) }
+
+fn flagShown(app: *App, flag: u8) -> bool {
+    const node = api.activeNode(app)
+    return node != null && flagOf(node.?, flag)
+}
+
+fn isVisible(app: *App) -> bool { return flagShown(app, FLAG_VISIBLE) }
+fn isLocked(app: *App) -> bool { return flagShown(app, FLAG_LOCKED) }
+fn isAlphaLocked(app: *App) -> bool { return flagShown(app, FLAG_ALPHA_LOCKED) }
+fn isInheriting(app: *App) -> bool { return flagShown(app, FLAG_INHERIT_ALPHA) }
+
+const DOC: u8 = state.ACTION_NEEDS_DOCUMENT
+const LAYER: u8 = state.ACTION_NEEDS_DOCUMENT | state.ACTION_NEEDS_LAYER
+const SEP: u8 = state.ACTION_SEPARATOR_BEFORE
+const CHECK: u8 = state.ACTION_CHECKABLE
+const NEW_MENU: []const u8 = "New|Neu"
+const MASK_MENU: []const u8 = "New Mask|Neue Maske"
+const TRANSFORM_MENU: []const u8 = "Transform|Transformieren"
+const ARRANGE_MENU: []const u8 = "Arrange|Anordnen"
+const L: u8 = state.MENU_LAYER
+
+const ACTIONS = [38]state.Action{
+    state.Action.{ .key = "layer_new", .name = "Paint Layer", .german = "Malebene", .shortcut = "Insert", .menu = L, .submenu = NEW_MENU, .flags = DOC, .run = runNew, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_group", .name = "Group Layer", .german = "Gruppenebene", .shortcut = "Ctrl+G", .menu = L, .submenu = NEW_MENU, .flags = DOC, .run = runNewGroup, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_filter", .name = "Filter Layer…", .german = "Filterebene …", .shortcut = "", .menu = L, .submenu = NEW_MENU, .flags = DOC, .run = runNewFilter, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_fill", .name = "Fill Layer…", .german = "Füllebene …", .shortcut = "", .menu = L, .submenu = NEW_MENU, .flags = DOC, .run = runNewFill, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_clone", .name = "Clone Layer", .german = "Klonebene", .shortcut = "", .menu = L, .submenu = NEW_MENU, .flags = LAYER, .run = runNewClone, .checked = null, .enabled = canClone },
+    state.Action.{ .key = "layer_new_from_visible", .name = "New Layer from Visible", .german = "Neue Ebene aus Sichtbarem", .shortcut = "", .menu = L, .submenu = NEW_MENU, .flags = SEP | DOC, .run = runNewFromVisible, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_transparency_mask", .name = "Transparency Mask", .german = "Transparenzmaske", .shortcut = "", .menu = L, .submenu = MASK_MENU, .flags = LAYER, .run = runTransparencyMask, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_filter_mask", .name = "Filter Mask…", .german = "Filtermaske …", .shortcut = "", .menu = L, .submenu = MASK_MENU, .flags = LAYER, .run = runFilterMask, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_colorize_mask", .name = "Colorize Mask", .german = "Einfärbemaske", .shortcut = "", .menu = L, .submenu = MASK_MENU, .flags = LAYER, .run = runColorizeMask, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_transform_mask", .name = "Transform Mask", .german = "Transformationsmaske", .shortcut = "", .menu = L, .submenu = MASK_MENU, .flags = LAYER, .run = runTransformMask, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_new_selection_mask", .name = "Local Selection", .german = "Lokale Auswahl", .shortcut = "", .menu = L, .submenu = MASK_MENU, .flags = LAYER, .run = runSelectionMask, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_duplicate", .name = "Duplicate Layer", .german = "Ebene duplizieren", .shortcut = "Ctrl+J", .menu = L, .submenu = "", .flags = SEP | LAYER, .run = runDuplicate, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_delete", .name = "Delete Layer", .german = "Ebene löschen", .shortcut = "Shift+Delete", .menu = L, .submenu = "", .flags = LAYER, .run = runDelete, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_cut_selection_to_new", .name = "Cut Selection to New Layer", .german = "Auswahl in neue Ebene ausschneiden", .shortcut = "Ctrl+Shift+J", .menu = L, .submenu = "", .flags = SEP | LAYER, .run = runCutToNew, .checked = null, .enabled = canSplitAlpha },
+    state.Action.{ .key = "layer_copy_selection_to_new", .name = "Copy Selection to New Layer", .german = "Auswahl in neue Ebene kopieren", .shortcut = "Ctrl+Alt+J", .menu = L, .submenu = "", .flags = LAYER, .run = runCopyToNew, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_merge_down", .name = "Merge Down", .german = "Nach unten vereinen", .shortcut = "Ctrl+E", .menu = L, .submenu = "", .flags = SEP | LAYER, .run = runMergeDown, .checked = null, .enabled = canMergeDown },
+    state.Action.{ .key = "layer_flatten", .name = "Flatten Layer", .german = "Ebene verflachen", .shortcut = "", .menu = L, .submenu = "", .flags = LAYER, .run = runFlatten, .checked = null, .enabled = canFlatten },
+    state.Action.{ .key = "layer_ungroup", .name = "Ungroup", .german = "Gruppierung aufheben", .shortcut = "Ctrl+Alt+G", .menu = L, .submenu = "", .flags = LAYER, .run = runUngroup, .checked = null, .enabled = canUngroup },
+    state.Action.{ .key = "layer_convert_to_paint", .name = "Convert to Paint Layer", .german = "In Malebene umwandeln", .shortcut = "", .menu = L, .submenu = "", .flags = LAYER, .run = runConvert, .checked = null, .enabled = canConvert },
+    state.Action.{ .key = "layer_alpha_to_mask", .name = "Split Alpha into Mask", .german = "Alpha in Maske aufteilen", .shortcut = "", .menu = L, .submenu = "", .flags = LAYER, .run = runAlphaToMask, .checked = null, .enabled = canSplitAlpha },
+    state.Action.{ .key = "layer_mirror_horizontal", .name = "Mirror Layer Horizontally", .german = "Ebene horizontal spiegeln", .shortcut = "", .menu = L, .submenu = TRANSFORM_MENU, .flags = SEP | LAYER, .run = runMirrorHorizontal, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_mirror_vertical", .name = "Mirror Layer Vertically", .german = "Ebene vertikal spiegeln", .shortcut = "", .menu = L, .submenu = TRANSFORM_MENU, .flags = LAYER, .run = runMirrorVertical, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_rotate_90_cw", .name = "Rotate 90° Clockwise", .german = "90° im Uhrzeigersinn drehen", .shortcut = "", .menu = L, .submenu = TRANSFORM_MENU, .flags = SEP | LAYER, .run = runRotateClockwise, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_rotate_90_ccw", .name = "Rotate 90° Counter-clockwise", .german = "90° gegen den Uhrzeigersinn drehen", .shortcut = "", .menu = L, .submenu = TRANSFORM_MENU, .flags = LAYER, .run = runRotateAnticlockwise, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_rotate_180", .name = "Rotate 180°", .german = "180° drehen", .shortcut = "", .menu = L, .submenu = TRANSFORM_MENU, .flags = LAYER, .run = runRotateHalf, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_rotate", .name = "Rotate Layer by Angle…", .german = "Ebene um Winkel drehen …", .shortcut = "", .menu = L, .submenu = TRANSFORM_MENU, .flags = LAYER, .run = runRotate, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_scale", .name = "Scale Layer…", .german = "Ebene skalieren …", .shortcut = "", .menu = L, .submenu = TRANSFORM_MENU, .flags = SEP | LAYER, .run = runScale, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_offset", .name = "Offset Layer…", .german = "Ebene versetzen …", .shortcut = "", .menu = L, .submenu = TRANSFORM_MENU, .flags = LAYER, .run = runOffset, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_raise", .name = "Raise Layer", .german = "Ebene anheben", .shortcut = "Ctrl+PgUp", .menu = L, .submenu = ARRANGE_MENU, .flags = LAYER, .run = runRaise, .checked = null, .enabled = canRaise },
+    state.Action.{ .key = "layer_lower", .name = "Lower Layer", .german = "Ebene absenken", .shortcut = "Ctrl+PgDown", .menu = L, .submenu = ARRANGE_MENU, .flags = LAYER, .run = runLower, .checked = null, .enabled = canLower },
+    state.Action.{ .key = "layer_to_top", .name = "Layer to Top", .german = "Ebene nach ganz oben", .shortcut = "Ctrl+Shift+PgUp", .menu = L, .submenu = ARRANGE_MENU, .flags = LAYER, .run = runToTop, .checked = null, .enabled = canTop },
+    state.Action.{ .key = "layer_to_bottom", .name = "Layer to Bottom", .german = "Ebene nach ganz unten", .shortcut = "Ctrl+Shift+PgDown", .menu = L, .submenu = ARRANGE_MENU, .flags = LAYER, .run = runToBottom, .checked = null, .enabled = canBottom },
+    state.Action.{ .key = "layer_toggle_visible", .name = "Visible", .german = "Sichtbar", .shortcut = "", .menu = L, .submenu = "", .flags = SEP | LAYER | CHECK, .run = runVisible, .checked = isVisible, .enabled = null },
+    state.Action.{ .key = "layer_lock", .name = "Locked", .german = "Gesperrt", .shortcut = "", .menu = L, .submenu = "", .flags = LAYER | CHECK, .run = runLock, .checked = isLocked, .enabled = null },
+    state.Action.{ .key = "layer_alpha_lock", .name = "Alpha Locked", .german = "Alpha gesperrt", .shortcut = "", .menu = L, .submenu = "", .flags = LAYER | CHECK, .run = runAlphaLock, .checked = isAlphaLocked, .enabled = null },
+    state.Action.{ .key = "layer_inherit_alpha", .name = "Inherit Alpha", .german = "Alpha erben", .shortcut = "", .menu = L, .submenu = "", .flags = LAYER | CHECK, .run = runInheritAlpha, .checked = isInheriting, .enabled = null },
+    state.Action.{ .key = "layer_select_opaque", .name = "Select Opaque", .german = "Deckendes auswählen", .shortcut = "", .menu = L, .submenu = "", .flags = SEP | LAYER, .run = runSelectOpaque, .checked = null, .enabled = null },
+    state.Action.{ .key = "layer_properties", .name = "Layer Properties…", .german = "Ebeneneigenschaften …", .shortcut = "F3", .menu = L, .submenu = "", .flags = SEP | LAYER, .run = runProperties, .checked = null, .enabled = null },
+}
 
 var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
 
+// The Layer menu's actions (kept in heap memory: core/table.mlx).
 pub fn list() -> []const state.Action {
     if kept.address != 0 { return table.rows(state.Action, &kept) }
     return table.keep(state.Action, &kept, ACTIONS[0..])
@@ -15,6 +1468,7 @@ const SOURCES = [0]state.MenuSource{}
 
 var keptSources: table.Kept = table.Kept.{ .address = 0, .length = 0 }
 
+// The Layer menu has no entries that come and go.
 pub fn sources() -> []const state.MenuSource {
     if keptSources.address != 0 { return table.rows(state.MenuSource, &keptSources) }
     return table.keep(state.MenuSource, &keptSources, SOURCES[0..])

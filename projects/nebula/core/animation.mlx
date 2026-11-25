@@ -1,0 +1,1202 @@
+// nebula core: animation, frame by frame. An image's animation (one
+// Animation record each, made at the first asking: make(image)) has a
+// frame rate (FPS a second at first), a clip from `start` to `end` (the
+// frames played and exported) and the time shown now. A paint layer
+// becomes animated by its first key: it then has a track, a list of keys
+// by time, each holding a Frame (a Device of its own); a key holds until
+// the next one, and the first one also before it. What the layer shows
+// is the frame of the key that holds at the time shown: setTime() puts
+// that frame's device into the node (node.device is exchanged, the
+// frames live in the track), so everything that paints, renders, saves
+// or reads the layer sees the frame of now and knows nothing of time.
+//
+//     const anim = animation.make(image).?
+//     _ = animation.addBlankKey(anim, image, layer.*.id, 5, "New frame")
+//     ... paint: layer.*.device is the frame at 5 ...
+//     _ = animation.setTime(anim, image, 0)      // the layer shows frame 0
+//
+// The first key of a layer: what it showed so far becomes the key at the
+// clip's start (or at the time asked, when that is earlier); a key asked
+// for at that very time is that one (nothing else is made). addBlankKey()
+// makes an empty frame, addDuplicateKey() a copy of the frame that holds
+// there (its tiles shared until one of the two is painted:
+// core/device.mlx's copy), removeKey() takes one away (never the last: the
+// layer stays animated), moveKey() moves one to another time (one there
+// goes), insertHold() and removeHold() lengthen and shorten the hold after
+// a time by moving the keys after it. Each is one step of the image's
+// history; undoing the first key makes the layer one of its own device
+// again. The time, the frame rate and the clip are not in the history.
+//
+// After a layer came back into the image by an undo, or when a stroke was
+// open on a layer as the time changed, sync() puts the right frames in
+// again (the timeline docker calls it at every frame). Playing is by the
+// clock: play(), playedTime(), untilNext(), advance().
+//
+// Undo. The history keeps a painted change as a command against the
+// node's id, and undoing it puts the tiles back into node.device: the
+// frame shown now, which need not be the frame painted. So before a
+// node's device is exchanged the commands of pixels of that node still
+// in the history (core/history.mlx's PIXELS) are taken over: each
+// becomes a custom command that holds the Frame it was painted on and
+// applies the change to that frame, whatever time is shown (settle()).
+// When one is undone or redone the time goes to the frame's key first,
+// so that what changes is seen. (This writes the history's records from
+// outside: a field in history.mlx's Command for the device a change was
+// made on would make it unnecessary.)
+//
+// Ownership: a frame's device is the node's while it is node.device (the
+// node ends it with itself), the frame's otherwise; a Frame lives while a
+// key, a track or a command of the history holds it.
+//
+// Onion skin: the keys before and after the one shown of the active
+// layer (up to ONION_MOST each way), tinted red before and green after,
+// the nearest at `onionOpacity` and each farther one fainter, laid into a
+// device of its own (onion()) for the canvas to show over the image.
+//
+// Export: the image as it shows at every time of a range as PNG files
+// "base_0001.png", "base_0002.png" ... (exportSequence()).
+//
+// The records live in a table by image number (core/image.mlx's
+// `number`); release() ends one when its document closes (the timeline
+// docker releases those of images no document shows any more).
+//
+// Not done: an animated GIF (io/gif.mlx writes one frame), keeping keys in
+// the document's file (the file formats know nothing of them), keys of
+// masks and groups, opacity keys and curves, audio, a cache of whole
+// frames for playing (each frame shown is mixed again where it differs).
+const std = @import("std")
+const device_module = @import("./device.mlx")
+const node_module = @import("./node.mlx")
+const image_module = @import("./image.mlx")
+const history_module = @import("./history.mlx")
+const render = @import("./render.mlx")
+const geom = @import("./geom.mlx")
+const pixel = @import("./pixel.mlx")
+const scratch = @import("./scratch.mlx")
+const png = @import("../io/png.mlx")
+const text = @import("../io/text.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Device = device_module.Device
+pub const Change = device_module.Change
+pub const Node = node_module.Node
+pub const Image = image_module.Image
+pub const Rect = geom.Rect
+
+// A new animation's frame rate and clip.
+pub const FPS: i32 = 24
+pub const START: i32 = 0
+pub const END: i32 = 23
+// Frame rates and times are held to these.
+pub const FASTEST: i32 = 120
+pub const LAST_TIME: i32 = 99999
+// The most keys an onion skin shows each way.
+pub const ONION_MOST: i32 = 10
+// How strongly a frame of the onion skin takes its tint (of 255).
+pub const TINT: u32 = 180
+pub const TINT_BEFORE: u32 = 0xFFE83030
+pub const TINT_AFTER: u32 = 0xFF30C048
+
+// How many images may have an animation at once (records of closed
+// images stay until release() ends them).
+const RECORDS: usize = 256
+// The longest name exportSequence() makes.
+const NAME_ROOM: usize = 1100
+
+// ---------------------------------------------------------------------------
+// Records
+
+// A frame: a device and who holds it.
+pub const Frame = struct {
+    allocator: Allocator
+    device: *Device
+    refs: usize
+    // The device is a node's device now: the node ends it, not the frame.
+    shown: bool
+}
+
+pub const Key = struct {
+    time: i32
+    frame: *Frame
+}
+
+// An animated layer: its keys, sorted by time, and the frame in its
+// node's device (held by the track too).
+pub const Track = struct {
+    node: u32
+    keys: std.ArrayList(Key)
+    current: *Frame
+}
+
+pub const Animation = struct {
+    allocator: Allocator
+    // The image's number (core/image.mlx's `number`).
+    number: u64
+    fps: i32
+    start: i32
+    end: i32
+    time: i32
+    tracks: std.ArrayList(*Track)
+    // Counted up at every change of a key, the time or a setting: who
+    // shows them draws again.
+    serial: u64
+    // The onion skin: shown or not, how many keys before and after, the
+    // opacity of the nearest; the device it was laid into and for what.
+    onionOn: bool
+    before: i32
+    after: i32
+    onionOpacity: u32
+    onionDevice: ?*Device
+    onionValid: bool
+    onionTime: i32
+    onionNode: u32
+    onionSerial: u64
+    onionHistory: u64
+    // Playing: since when (milliseconds) and from which time.
+    playing: bool
+    playSince: usize
+    playFrom: i32
+    // A node's device could not be exchanged yet (a stroke or a change
+    // was open on it): sync() is to be done again.
+    pending: bool
+    // Room for the keys of a device's tiles (onion skin).
+    tileKeys: std.ArrayList(u64)
+}
+
+const Entry = struct {
+    number: u64
+    record: usize
+}
+
+// The records, by image number. (Zeroed program data: number 0 is no
+// image's.)
+var records: [256]Entry = undefined
+var recordCount: usize = 0
+
+fn recordAt(address: usize) -> *Animation { unsafe { return @ptrFromInt(*Animation, address) } }
+
+// The image's animation; null when it has none yet.
+pub fn find(image: *Image) -> ?*Animation {
+    var index: usize = 0
+    while index < recordCount {
+        if records[index].number == image.*.number && records[index].record != 0 { return recordAt(records[index].record) }
+        index += 1
+    }
+    return null
+}
+
+// The image's animation, made at the first asking: FPS frames a second,
+// the clip START to END, the time 0, nothing animated. Null without
+// memory (or when RECORDS images have one and none was released).
+pub fn make(image: *Image) -> ?*Animation {
+    const found = find(image)
+    if found != null { return found }
+    var slot = recordCount
+    var index: usize = 0
+    while index < recordCount {
+        if records[index].record == 0 {
+            slot = index
+            break
+        }
+        index += 1
+    }
+    if slot >= RECORDS { return null }
+    const allocator = image.*.allocator
+    const memory = allocator.alloc(@sizeOf(Animation), 16)
+    if memory == null { return null }
+    const anim: *Animation = unsafe { @ptrCast(*Animation, memory.?) }
+    anim.*.allocator = allocator
+    anim.*.number = image.*.number
+    anim.*.fps = FPS
+    anim.*.start = START
+    anim.*.end = END
+    anim.*.time = 0
+    anim.*.tracks = std.ArrayList(*Track).init(allocator)
+    anim.*.serial = 1
+    anim.*.onionOn = false
+    anim.*.before = 1
+    anim.*.after = 1
+    anim.*.onionOpacity = 150
+    anim.*.onionDevice = null
+    anim.*.onionValid = false
+    anim.*.onionTime = 0
+    anim.*.onionNode = 0
+    anim.*.onionSerial = 0
+    anim.*.onionHistory = 0
+    anim.*.playing = false
+    anim.*.playSince = 0
+    anim.*.playFrom = 0
+    anim.*.pending = false
+    anim.*.tileKeys = std.ArrayList(u64).init(allocator)
+    records[slot] = Entry.{ .number = image.*.number, .record = @intFromPtr(anim) }
+    if slot == recordCount { recordCount += 1 }
+    return anim
+}
+
+// Ends the image's animation, whether the image is still there or was
+// ended already (call it when a document is closed): the frames that are
+// no node's device are ended with it (and with the history's commands
+// that hold them, whenever those go).
+pub fn release(image: *Image) -> void {
+    releaseNumber(image.*.number)
+}
+
+// The same by the image's number.
+pub fn releaseNumber(number: u64) -> void {
+    var index: usize = 0
+    while index < recordCount {
+        if records[index].number == number && records[index].record != 0 {
+            const anim = recordAt(records[index].record)
+            records[index].record = 0
+            records[index].number = 0
+            for track in anim.*.tracks.items() { dropTrack(track) }
+            anim.*.tracks.deinit()
+            anim.*.tileKeys.deinit()
+            if anim.*.onionDevice != null { device_module.destroy(anim.*.onionDevice.?) }
+            const allocator = anim.*.allocator
+            unsafe { allocator.free(@ptrCast([*]u8, anim), @sizeOf(Animation), 16) }
+            return
+        }
+        index += 1
+    }
+}
+
+// How many images have an animation record, and the number of the image
+// of record `index` (0: a free place): who knows which images are open
+// releases those of the others.
+pub fn recordSlots() -> usize { return recordCount }
+
+pub fn recordNumber(index: usize) -> u64 {
+    if index >= recordCount || records[index].record == 0 { return 0 }
+    return records[index].number
+}
+
+// ---------------------------------------------------------------------------
+// Frames
+
+fn newFrame(allocator: Allocator, device: *Device, shown: bool) -> ?*Frame {
+    const memory = allocator.alloc(@sizeOf(Frame), 16)
+    if memory == null { return null }
+    const frame: *Frame = unsafe { @ptrCast(*Frame, memory.?) }
+    frame.*.allocator = allocator
+    frame.*.device = device
+    frame.*.refs = 0
+    frame.*.shown = shown
+    return frame
+}
+
+fn retain(frame: *Frame) -> void { frame.*.refs += 1 }
+
+// One holder less; with none left the frame ends, and its device too when
+// it is no node's.
+fn releaseFrame(frame: *Frame) -> void {
+    if frame.*.refs > 1 {
+        frame.*.refs -= 1
+        return
+    }
+    if !frame.*.shown { device_module.destroy(frame.*.device) }
+    const allocator = frame.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, frame), @sizeOf(Frame), 16) }
+}
+
+fn dropTrack(track: *Track) -> void {
+    const allocator = track.*.keys.allocator
+    for key in track.*.keys.items() { releaseFrame(key.frame) }
+    track.*.keys.deinit()
+    releaseFrame(track.*.current)
+    unsafe { allocator.free(@ptrCast([*]u8, track), @sizeOf(Track), 16) }
+}
+
+// ---------------------------------------------------------------------------
+// Reading the keys
+
+// The track of node `node` (null: it is not animated).
+pub fn trackOf(anim: *Animation, node: u32) -> ?*Track {
+    for track in anim.*.tracks.items() {
+        if track.*.node == node { return track }
+    }
+    return null
+}
+
+pub fn isAnimated(anim: *Animation, node: u32) -> bool { return trackOf(anim, node) != null }
+
+pub fn keyCount(track: *Track) -> usize { return track.*.keys.count() }
+
+pub fn keyTime(track: *Track, index: usize) -> i32 { return track.*.keys.items()[index].time }
+
+pub fn keyFrame(track: *Track, index: usize) -> *Frame { return track.*.keys.items()[index].frame }
+
+// Whether key `index` holds an empty frame (one without a tile).
+pub fn isBlankKey(track: *Track, index: usize) -> bool {
+    return device_module.tileCount(track.*.keys.items()[index].frame.*.device) == 0
+}
+
+// Whether a key is at `time` exactly; its index into `into`.
+pub fn keyIndexAt(track: *Track, time: i32, into: *usize) -> bool {
+    for key, index in track.*.keys.items() {
+        if key.time == time {
+            into.* = index
+            return true
+        }
+        if key.time > time { return false }
+    }
+    return false
+}
+
+// The index of the key that holds at `time`: the last one at or before
+// it, the first one before every key.
+pub fn shownIndex(track: *Track, time: i32) -> usize {
+    var found: usize = 0
+    for key, index in track.*.keys.items() {
+        if key.time > time { break }
+        found = index
+    }
+    return found
+}
+
+// The device of the frame that holds at `time`.
+pub fn deviceAt(track: *Track, time: i32) -> *Device {
+    return keyFrame(track, shownIndex(track, time)).*.device
+}
+
+// The time of the first key after `time` into `into`; false when there is
+// none.
+pub fn nextKey(track: *Track, time: i32, into: *i32) -> bool {
+    for key in track.*.keys.items() {
+        if key.time > time {
+            into.* = key.time
+            return true
+        }
+    }
+    return false
+}
+
+// The time of the last key before `time` into `into`; false when there
+// is none.
+pub fn previousKey(track: *Track, time: i32, into: *i32) -> bool {
+    var found = false
+    for key in track.*.keys.items() {
+        if key.time >= time { break }
+        into.* = key.time
+        found = true
+    }
+    return found
+}
+
+// The last time any key of the image's tracks is at (-1: none).
+pub fn lastKeyTime(anim: *Animation) -> i32 {
+    var last: i32 = -1
+    for track in anim.*.tracks.items() {
+        const count = track.*.keys.count()
+        if count > 0 && track.*.keys.items()[count - 1].time > last { last = track.*.keys.items()[count - 1].time }
+    }
+    return last
+}
+
+// ---------------------------------------------------------------------------
+// The history's commands of pixels
+
+// A change of pixels painted on a frame, taken over from the history.
+const Painted = struct {
+    allocator: Allocator
+    node: u32
+    frame: *Frame
+    change: *Change
+}
+
+fn paintedAt(context: usize) -> *Painted { unsafe { return @ptrFromInt(*Painted, context) } }
+
+// Every command of the history that still puts a change of node `node`'s
+// pixels into node.device becomes one that puts it into `frame`, the
+// frame that device is. Call before the node's device is exchanged.
+// False when memory ran out (the commands not taken over would then
+// change the frame shown when undone).
+pub fn settle(image: *Image, node: u32, frame: *Frame) -> bool {
+    const list = image.*.history.*.commands.items()
+    var whole = true
+    var index: usize = 0
+    while index < list.length {
+        const command = &list[index]
+        if command.*.kind == history_module.PIXELS && command.*.node == node && command.*.change != null {
+            const memory = frame.*.allocator.alloc(@sizeOf(Painted), 16)
+            if memory == null {
+                whole = false
+            } else {
+                const painted: *Painted = unsafe { @ptrCast(*Painted, memory.?) }
+                painted.*.allocator = frame.*.allocator
+                painted.*.node = node
+                painted.*.frame = frame
+                painted.*.change = command.*.change.?
+                retain(frame)
+                command.*.change = null
+                command.*.kind = history_module.CUSTOM
+                command.*.context = @intFromPtr(painted)
+                command.*.perform = performPainted
+                command.*.discard = discardPainted
+            }
+        }
+        index += 1
+    }
+    return whole
+}
+
+fn performPainted(context: usize, image: *Image, undo: bool) -> Rect {
+    const painted = paintedAt(context)
+    const anim = find(image)
+    if anim != null {
+        // The time goes to the frame's key, so that the change is seen.
+        const track = trackOf(anim.?, painted.*.node)
+        if track != null && @intFromPtr(track.?.*.current) != @intFromPtr(painted.*.frame) {
+            for key in track.?.*.keys.items() {
+                if @intFromPtr(key.frame) == @intFromPtr(painted.*.frame) {
+                    _ = setTime(anim.?, image, key.time)
+                    break
+                }
+            }
+        }
+        anim.?.*.serial += 1
+    }
+    const area = device_module.apply(painted.*.frame.*.device, painted.*.change, undo)
+    const node = image_module.find(image, painted.*.node)
+    if node != null && node.?.*.device != null && @intFromPtr(node.?.*.device.?) == @intFromPtr(painted.*.frame.*.device) { return area }
+    return geom.empty()
+}
+
+fn discardPainted(context: usize) -> void {
+    const painted = paintedAt(context)
+    device_module.destroyChange(painted.*.change)
+    releaseFrame(painted.*.frame)
+    const allocator = painted.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, painted), @sizeOf(Painted), 16) }
+}
+
+// ---------------------------------------------------------------------------
+// The time
+
+fn clampTime(time: i32) -> i32 {
+    return if time < 0 { 0 } else if time > LAST_TIME { LAST_TIME } else { time }
+}
+
+// The node of `track` shows the frame that holds at the animation's time
+// (its device exchanged when it is another). The image's rectangle that
+// looks different.
+fn refresh(anim: *Animation, image: *Image, track: *Track) -> Rect {
+    const node = image_module.find(image, track.*.node)
+    if node == null || node.?.*.device == null { return geom.empty() }
+    const now = node.?.*.device.?
+    const current = track.*.current
+    // Someone else's device: not exchanged.
+    if @intFromPtr(now) != @intFromPtr(current.*.device) { return geom.empty() }
+    const wanted = keyFrame(track, shownIndex(track, anim.*.time))
+    if @intFromPtr(wanted) == @intFromPtr(current) { return geom.empty() }
+    // A stroke or a change open on the device: later.
+    if node.?.*.overlay != null || device_module.isRecording(now) {
+        anim.*.pending = true
+        return geom.empty()
+    }
+    _ = settle(image, track.*.node, current)
+    const area = geom.unite(device_module.extent(now), device_module.extent(wanted.*.device))
+    node.?.*.device = wanted.*.device
+    wanted.*.shown = true
+    current.*.shown = false
+    retain(wanted)
+    track.*.current = wanted
+    releaseFrame(current)
+    image_module.damage(image, area)
+    return area
+}
+
+// Shows `time` (held to 0 .. LAST_TIME): every animated layer's device is
+// the frame that holds then. The image's rectangle that looks different.
+pub fn setTime(anim: *Animation, image: *Image, time: i32) -> Rect {
+    const wanted = clampTime(time)
+    if wanted != anim.*.time { anim.*.serial += 1 }
+    anim.*.time = wanted
+    anim.*.pending = false
+    var area = geom.empty()
+    for track in anim.*.tracks.items() {
+        area = geom.unite(area, refresh(anim, image, track))
+    }
+    return area
+}
+
+// Every animated layer shows the frame of the time shown again: after a
+// layer came back into the image (an undone removal) or a stroke kept its
+// device from being exchanged. The image's rectangle that looks
+// different (empty: all were right).
+pub fn sync(anim: *Animation, image: *Image) -> Rect {
+    anim.*.pending = false
+    var area = geom.empty()
+    for track in anim.*.tracks.items() {
+        area = geom.unite(area, refresh(anim, image, track))
+    }
+    return area
+}
+
+// The frame rate, held to 1 .. FASTEST.
+pub fn setRate(anim: *Animation, fps: i32) -> void {
+    anim.*.fps = if fps < 1 { 1 } else if fps > FASTEST { FASTEST } else { fps }
+    anim.*.serial += 1
+}
+
+// The clip, held to 0 .. LAST_TIME, its end not before its start (the
+// end moves).
+pub fn setRange(anim: *Animation, start: i32, end: i32) -> void {
+    anim.*.start = clampTime(start)
+    anim.*.end = clampTime(end)
+    if anim.*.end < anim.*.start { anim.*.end = anim.*.start }
+    anim.*.serial += 1
+}
+
+// ---------------------------------------------------------------------------
+// Playing
+
+// Plays from the time shown (from the clip's start when that is outside
+// the clip), `now` being the clock's milliseconds.
+pub fn play(anim: *Animation, now: usize) -> void {
+    anim.*.playing = true
+    anim.*.playSince = now
+    anim.*.playFrom = if anim.*.time < anim.*.start || anim.*.time > anim.*.end { anim.*.start } else { anim.*.time }
+    anim.*.serial += 1
+}
+
+pub fn pause(anim: *Animation) -> void {
+    anim.*.playing = false
+    anim.*.serial += 1
+}
+
+// The time playing has come to at `now`: a frame every 1/fps second from
+// where it started, round the clip again and again.
+pub fn playedTime(anim: *Animation, now: usize) -> i32 {
+    if !anim.*.playing { return anim.*.time }
+    const elapsed = if now > anim.*.playSince { now - anim.*.playSince } else { 0 }
+    const frames = @intCast(i64, elapsed * @intCast(usize, anim.*.fps) / 1000)
+    const length = @intCast(i64, anim.*.end - anim.*.start) + 1
+    var from = @intCast(i64, anim.*.playFrom) - @intCast(i64, anim.*.start)
+    // (The clip changed while playing: from its start.)
+    if from < 0 || from >= length { from = 0 }
+    return anim.*.start + @intCast(i32, (from + frames) % length)
+}
+
+// Milliseconds from `now` until the next frame of playing is due.
+pub fn untilNext(anim: *Animation, now: usize) -> usize {
+    const elapsed = if now > anim.*.playSince { now - anim.*.playSince } else { 0 }
+    const fps = @intCast(usize, anim.*.fps)
+    const next = (elapsed * fps / 1000 + 1) * 1000
+    const due = (next + fps - 1) / fps
+    return if due > elapsed { due - elapsed } else { 1 }
+}
+
+// While playing: the time shown is the one played at `now`. The image's
+// rectangle that looks different (empty: the same frame still).
+pub fn advance(anim: *Animation, image: *Image, now: usize) -> Rect {
+    if !anim.*.playing { return geom.empty() }
+    const wanted = playedTime(anim, now)
+    if wanted == anim.*.time && !anim.*.pending { return geom.empty() }
+    return setTime(anim, image, wanted)
+}
+
+// ---------------------------------------------------------------------------
+// Changing the keys: one step of the history each
+
+// A list of keys of a command (heap memory with room for `room`, `count`
+// of them set, each frame held by the list).
+const KeyList = struct {
+    keys: usize
+    count: usize
+    room: usize
+}
+
+// What one key operation changed: node `node`'s keys before and after
+// (none: not animated), and the frame the node showed while it was not
+// animated.
+const Rekeyed = struct {
+    allocator: Allocator
+    node: u32
+    before: KeyList
+    after: KeyList
+    base: ?*Frame
+}
+
+fn rekeyedAt(context: usize) -> *Rekeyed { unsafe { return @ptrFromInt(*Rekeyed, context) } }
+
+fn keysOf(list: KeyList) -> [*]Key { unsafe { return @ptrFromInt([*]Key, list.keys) } }
+
+fn emptyList() -> KeyList { return KeyList.{ .keys = 0, .count = 0, .room = 0 } }
+
+// A list with room for `room` keys, none set yet (false without memory).
+fn makeList(allocator: Allocator, room: usize, into: *KeyList) -> bool {
+    into.*.count = 0
+    into.*.keys = 0
+    into.*.room = 0
+    if room == 0 { return true }
+    const memory = allocator.alloc(room * @sizeOf(Key), 16)
+    if memory == null { return false }
+    into.*.keys = @intFromPtr(memory.?)
+    into.*.room = room
+    return true
+}
+
+// Lets the list's frames go and the list's memory.
+fn freeList(allocator: Allocator, list: KeyList) -> void {
+    if list.room == 0 { return }
+    const keys = keysOf(list)
+    var index: usize = 0
+    while index < list.count {
+        releaseFrame(keys[index].frame)
+        index += 1
+    }
+    unsafe { allocator.free(@ptrFromInt([*]u8, list.keys), list.room * @sizeOf(Key), 16) }
+}
+
+// The keys of `track` as a list (each frame held once more); false
+// without memory.
+fn copyKeys(allocator: Allocator, track: ?*Track, into: *KeyList) -> bool {
+    if track == null { return makeList(allocator, 0, into) }
+    const source = track.?.*.keys.items()
+    if !makeList(allocator, source.length, into) { return false }
+    if source.length == 0 { return true }
+    const keys = keysOf(into.*)
+    for key, index in source {
+        keys[index] = key
+        retain(key.frame)
+    }
+    into.*.count = source.length
+    return true
+}
+
+// The track of node `node` takes the keys of `list` (none: the node is
+// animated no more and shows `base`), and its node shows the frame of the
+// time; the image's rectangle that looks different into `area`. False
+// when memory ran out (the keys are as they were then).
+fn applyKeys(anim: *Animation, image: *Image, node_id: u32, list: KeyList, base: ?*Frame, area: *Rect) -> bool {
+    anim.*.serial += 1
+    anim.*.onionValid = false
+    area.* = geom.empty()
+    var track = trackOf(anim, node_id)
+    const node = image_module.find(image, node_id)
+    if list.count == 0 {
+        if track == null || base == null { return true }
+        const current = track.?.*.current
+        if node != null && node.?.*.device != null && @intFromPtr(node.?.*.device.?) == @intFromPtr(current.*.device) && @intFromPtr(current) != @intFromPtr(base.?) {
+            _ = settle(image, node_id, current)
+            area.* = geom.unite(device_module.extent(current.*.device), device_module.extent(base.?.*.device))
+            node.?.*.device = base.?.*.device
+            current.*.shown = false
+            base.?.*.shown = true
+            image_module.damage(image, area.*)
+        }
+        var index: usize = 0
+        while index < anim.*.tracks.count() {
+            if @intFromPtr(anim.*.tracks.items()[index]) == @intFromPtr(track.?) {
+                _ = anim.*.tracks.orderedRemove(index)
+                break
+            }
+            index += 1
+        }
+        dropTrack(track.?)
+        return true
+    }
+    if track == null {
+        // The node becomes animated: it shows `base` now.
+        if base == null { return true }
+        const memory = anim.*.allocator.alloc(@sizeOf(Track), 16)
+        if memory == null { return false }
+        const made: *Track = unsafe { @ptrCast(*Track, memory.?) }
+        made.*.node = node_id
+        made.*.keys = std.ArrayList(Key).init(anim.*.allocator)
+        made.*.current = base.?
+        retain(base.?)
+        if !made.*.keys.ensureTotalCapacity(list.count) || !anim.*.tracks.append(made) {
+            dropTrack(made)
+            return false
+        }
+        track = made
+    }
+    const held = track.?
+    if !held.*.keys.ensureTotalCapacity(list.count) { return false }
+    // The new keys are held before the old ones are let go.
+    const keys = keysOf(list)
+    var index: usize = 0
+    while index < list.count {
+        retain(keys[index].frame)
+        index += 1
+    }
+    for key in held.*.keys.items() { releaseFrame(key.frame) }
+    held.*.keys.clearRetainingCapacity()
+    index = 0
+    while index < list.count {
+        _ = held.*.keys.append(keys[index])
+        index += 1
+    }
+    area.* = refresh(anim, image, held)
+    return true
+}
+
+fn performRekeyed(context: usize, image: *Image, undo: bool) -> Rect {
+    const rekeyed = rekeyedAt(context)
+    const anim = find(image)
+    var area = geom.empty()
+    if anim != null { _ = applyKeys(anim.?, image, rekeyed.*.node, if undo { rekeyed.*.before } else { rekeyed.*.after }, rekeyed.*.base, &area) }
+    return area
+}
+
+fn discardRekeyed(context: usize) -> void {
+    const rekeyed = rekeyedAt(context)
+    const allocator = rekeyed.*.allocator
+    freeList(allocator, rekeyed.*.before)
+    freeList(allocator, rekeyed.*.after)
+    if rekeyed.*.base != null { releaseFrame(rekeyed.*.base.?) }
+    unsafe { allocator.free(@ptrCast([*]u8, rekeyed), @sizeOf(Rekeyed), 16) }
+}
+
+// A key operation under way: the node, its keys as they will be (made
+// from those it has, with room for one more), and the frame it showed
+// while not animated when this operation makes it animated.
+const Edit = struct {
+    node: *Node
+    track: ?*Track
+    keys: KeyList
+    base: ?*Frame
+}
+
+// Starts an operation on node `node_id`'s keys: false when the node is
+// not in the image, is not a paint layer, or memory ran out. A node that
+// is not animated yet gets its first key: what it shows, at the clip's
+// start (at `time` when that is earlier).
+fn beginEdit(anim: *Animation, image: *Image, node_id: u32, time: i32, edit: *Edit) -> bool {
+    const node = image_module.find(image, node_id)
+    if node == null || node.?.*.kind != node_module.PAINT || node.?.*.device == null { return false }
+    edit.*.node = node.?
+    edit.*.track = trackOf(anim, node_id)
+    edit.*.base = null
+    const count = if edit.*.track == null { 1 } else { edit.*.track.?.*.keys.count() }
+    if !makeList(anim.*.allocator, count + 1, &edit.*.keys) { return false }
+    const keys = keysOf(edit.*.keys)
+    if edit.*.track == null {
+        const base = newFrame(anim.*.allocator, node.?.*.device.?, true)
+        if base == null {
+            cancelEdit(anim, edit)
+            return false
+        }
+        retain(base.?)
+        edit.*.base = base
+        retain(base.?)
+        keys[0] = Key.{ .time = if time < anim.*.start { time } else { anim.*.start }, .frame = base.? }
+        edit.*.keys.count = 1
+        return true
+    }
+    for key, index in edit.*.track.?.*.keys.items() {
+        keys[index] = key
+        retain(key.frame)
+    }
+    edit.*.keys.count = count
+    return true
+}
+
+fn cancelEdit(anim: *Animation, edit: *Edit) -> void {
+    freeList(anim.*.allocator, edit.*.keys)
+    if edit.*.base != null { releaseFrame(edit.*.base.?) }
+    edit.*.keys = emptyList()
+    edit.*.base = null
+}
+
+// Puts `frame` (held by the caller, handed over) as the key at `time`:
+// in place of one there, else in its order.
+fn putKey(edit: *Edit, time: i32, frame: *Frame) -> void {
+    const keys = keysOf(edit.*.keys)
+    var at: usize = 0
+    while at < edit.*.keys.count && keys[at].time < time { at += 1 }
+    if at < edit.*.keys.count && keys[at].time == time {
+        releaseFrame(keys[at].frame)
+        keys[at].frame = frame
+        return
+    }
+    var index = edit.*.keys.count
+    while index > at {
+        keys[index] = keys[index - 1]
+        index -= 1
+    }
+    keys[at] = Key.{ .time = time, .frame = frame }
+    edit.*.keys.count += 1
+}
+
+// Takes key `index` out of the list.
+fn takeKey(edit: *Edit, index: usize) -> void {
+    const keys = keysOf(edit.*.keys)
+    releaseFrame(keys[index].frame)
+    var at = index
+    while at + 1 < edit.*.keys.count {
+        keys[at] = keys[at + 1]
+        at += 1
+    }
+    edit.*.keys.count -= 1
+}
+
+// Whether a key of the list is at `time`; its index into `into`.
+fn editKeyAt(edit: *Edit, time: i32, into: *usize) -> bool {
+    const keys = keysOf(edit.*.keys)
+    var index: usize = 0
+    while index < edit.*.keys.count {
+        if keys[index].time == time {
+            into.* = index
+            return true
+        }
+        index += 1
+    }
+    return false
+}
+
+// Ends an operation: the node takes the keys made, one step `name` of the
+// history. False when memory ran out (nothing changed then).
+fn commitEdit(anim: *Animation, image: *Image, edit: *Edit, name: []const u8) -> bool {
+    const memory = anim.*.allocator.alloc(@sizeOf(Rekeyed), 16)
+    if memory == null {
+        cancelEdit(anim, edit)
+        return false
+    }
+    const rekeyed: *Rekeyed = unsafe { @ptrCast(*Rekeyed, memory.?) }
+    rekeyed.*.allocator = anim.*.allocator
+    rekeyed.*.node = edit.*.node.*.id
+    rekeyed.*.base = edit.*.base
+    rekeyed.*.after = edit.*.keys
+    if !copyKeys(anim.*.allocator, edit.*.track, &rekeyed.*.before) {
+        unsafe { anim.*.allocator.free(@ptrCast([*]u8, rekeyed), @sizeOf(Rekeyed), 16) }
+        cancelEdit(anim, edit)
+        return false
+    }
+    edit.*.keys = emptyList()
+    edit.*.base = null
+    var area = geom.empty()
+    if !applyKeys(anim, image, rekeyed.*.node, rekeyed.*.after, rekeyed.*.base, &area) {
+        discardRekeyed(@intFromPtr(rekeyed))
+        return false
+    }
+    history_module.custom(image.*.history, name, @intFromPtr(rekeyed), performRekeyed, discardRekeyed)
+    image.*.modified = true
+    return true
+}
+
+// An empty frame as the key at `time` of node `node` (a key there gives
+// way; on a layer not animated yet, a key asked for at the clip's start is
+// its first one, what it shows). False when the node is no paint layer,
+// for a time outside 0 .. LAST_TIME and without memory.
+pub fn addBlankKey(anim: *Animation, image: *Image, node: u32, time: i32, name: []const u8) -> bool {
+    if time < 0 || time > LAST_TIME { return false }
+    var edit: Edit = undefined
+    if !beginEdit(anim, image, node, time, &edit) { return false }
+    var at: usize = 0
+    const first = edit.base != null
+    if !(first && editKeyAt(&edit, time, &at)) {
+        const device = device_module.create(anim.*.allocator, 0)
+        if device == null {
+            cancelEdit(anim, &edit)
+            return false
+        }
+        const frame = newFrame(anim.*.allocator, device.?, false)
+        if frame == null {
+            device_module.destroy(device.?)
+            cancelEdit(anim, &edit)
+            return false
+        }
+        retain(frame.?)
+        putKey(&edit, time, frame.?)
+    }
+    return commitEdit(anim, image, &edit, name)
+}
+
+// A copy of the frame that holds at `time` as a key there (its tiles
+// shared with the frame copied until one of them is painted). False when
+// a key is at `time` already (on a layer animated before), for the same
+// reasons as addBlankKey and without memory.
+pub fn addDuplicateKey(anim: *Animation, image: *Image, node: u32, time: i32, name: []const u8) -> bool {
+    if time < 0 || time > LAST_TIME { return false }
+    var edit: Edit = undefined
+    if !beginEdit(anim, image, node, time, &edit) { return false }
+    var at: usize = 0
+    if editKeyAt(&edit, time, &at) {
+        if edit.base == null {
+            cancelEdit(anim, &edit)
+            return false
+        }
+        return commitEdit(anim, image, &edit, name)
+    }
+    // The key that holds at `time` in the list being made.
+    const keys = keysOf(edit.keys)
+    var held: usize = 0
+    var index: usize = 0
+    while index < edit.keys.count {
+        if keys[index].time <= time { held = index }
+        index += 1
+    }
+    const device = device_module.copy(keys[held].frame.*.device)
+    if device == null {
+        cancelEdit(anim, &edit)
+        return false
+    }
+    const frame = newFrame(anim.*.allocator, device.?, false)
+    if frame == null {
+        device_module.destroy(device.?)
+        cancelEdit(anim, &edit)
+        return false
+    }
+    retain(frame.?)
+    putKey(&edit, time, frame.?)
+    return commitEdit(anim, image, &edit, name)
+}
+
+// Takes the key at `time` away (the one before holds on). False when
+// there is none there, when it is the layer's only key, and without
+// memory.
+pub fn removeKey(anim: *Animation, image: *Image, node: u32, time: i32, name: []const u8) -> bool {
+    if time < 0 || time > LAST_TIME { return false }
+    const track = trackOf(anim, node)
+    if track == null || track.?.*.keys.count() < 2 { return false }
+    var edit: Edit = undefined
+    if !beginEdit(anim, image, node, time, &edit) { return false }
+    var at: usize = 0
+    if !editKeyAt(&edit, time, &at) {
+        cancelEdit(anim, &edit)
+        return false
+    }
+    takeKey(&edit, at)
+    return commitEdit(anim, image, &edit, name)
+}
+
+// Moves the key at `from` to `to` (a key there goes). False when there is
+// none at `from`, `to` is `from` or outside 0 .. LAST_TIME, and without
+// memory.
+pub fn moveKey(anim: *Animation, image: *Image, node: u32, from: i32, to: i32, name: []const u8) -> bool {
+    if to == from || to < 0 || to > LAST_TIME || from < 0 || from > LAST_TIME || trackOf(anim, node) == null { return false }
+    var edit: Edit = undefined
+    if !beginEdit(anim, image, node, from, &edit) { return false }
+    var at: usize = 0
+    if !editKeyAt(&edit, from, &at) {
+        cancelEdit(anim, &edit)
+        return false
+    }
+    const keys = keysOf(edit.keys)
+    const frame = keys[at].frame
+    retain(frame)
+    takeKey(&edit, at)
+    putKey(&edit, to, frame)
+    return commitEdit(anim, image, &edit, name)
+}
+
+// The key holding at `time` holds `count` frames longer: every key after
+// `time` moves `count` later. False when there is none after it, a key
+// would go past LAST_TIME, `count` is below 1, and without memory.
+pub fn insertHold(anim: *Animation, image: *Image, node: u32, time: i32, count: i32, name: []const u8) -> bool {
+    const track = trackOf(anim, node)
+    if track == null || count < 1 || count > LAST_TIME || time < 0 || time > LAST_TIME { return false }
+    var next: i32 = 0
+    if !nextKey(track.?, time, &next) { return false }
+    if keyTime(track.?, track.?.*.keys.count() - 1) > LAST_TIME - count { return false }
+    var edit: Edit = undefined
+    if !beginEdit(anim, image, node, time, &edit) { return false }
+    const keys = keysOf(edit.keys)
+    var index: usize = 0
+    while index < edit.keys.count {
+        if keys[index].time > time { keys[index].time += count }
+        index += 1
+    }
+    return commitEdit(anim, image, &edit, name)
+}
+
+// The key holding at `time` holds up to `count` frames shorter: the keys
+// after `time` move earlier by as many frames as lie between `time` and
+// the next key (`count` at most). False when nothing can be taken (the
+// next key is right after `time`, or there is none) and without memory.
+pub fn removeHold(anim: *Animation, image: *Image, node: u32, time: i32, count: i32, name: []const u8) -> bool {
+    const track = trackOf(anim, node)
+    if track == null || count < 1 || time < 0 || time > LAST_TIME { return false }
+    var next: i32 = 0
+    if !nextKey(track.?, time, &next) { return false }
+    const free = next - time - 1
+    const taken = if free < count { free } else { count }
+    if taken < 1 { return false }
+    var edit: Edit = undefined
+    if !beginEdit(anim, image, node, time, &edit) { return false }
+    const keys = keysOf(edit.keys)
+    var index: usize = 0
+    while index < edit.keys.count {
+        if keys[index].time > time { keys[index].time -= taken }
+        index += 1
+    }
+    return commitEdit(anim, image, &edit, name)
+}
+
+// ---------------------------------------------------------------------------
+// Onion skin
+
+// Shows the onion skin or not, with `before` and `after` keys each way
+// (held to 0 .. ONION_MOST).
+pub fn setOnion(anim: *Animation, on: bool, before: i32, after: i32) -> void {
+    anim.*.onionOn = on
+    anim.*.before = if before < 0 { 0 } else if before > ONION_MOST { ONION_MOST } else { before }
+    anim.*.after = if after < 0 { 0 } else if after > ONION_MOST { ONION_MOST } else { after }
+    anim.*.onionValid = false
+    anim.*.serial += 1
+}
+
+// The opacity of the onion skin's frame `distance` keys away of `count`
+// shown that way: the nearest at onionOpacity, each farther one less, the
+// farthest at a `count`th of it.
+pub fn onionOpacityOf(anim: *Animation, distance: i32, count: i32) -> u32 {
+    if distance < 1 || distance > count { return 0 }
+    return anim.*.onionOpacity * @intCast(u32, count - distance + 1) / @intCast(u32, count)
+}
+
+// `source`'s pixels tinted with `tint` (TINT of it) at `opacity`, laid
+// over `target`'s.
+fn layTinted(anim: *Animation, target: *Device, source: *Device, tint: u32, opacity: u32) -> bool {
+    anim.*.tileKeys.clearRetainingCapacity()
+    if !device_module.keys(source, &anim.*.tileKeys) { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const from = scratch.words(pool, device_module.TILE_PIXELS)
+    const into = scratch.words(pool, device_module.TILE_PIXELS)
+    if from == null || into == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    const tr = pixel.red(tint)
+    const tg = pixel.green(tint)
+    const tb = pixel.blue(tint)
+    var whole = true
+    for key in anim.*.tileKeys.items() {
+        const area = device_module.tileArea(source, device_module.keyX(key), device_module.keyY(key))
+        device_module.readRect(source, area, from.?, 64)
+        device_module.readRect(target, area, into.?, 64)
+        var index: usize = 0
+        while index < device_module.TILE_PIXELS {
+            const value = from.?[index]
+            const a = pixel.mul(value >> 24, opacity)
+            if a != 0 {
+                const r = pixel.lerp(pixel.red(value), tr, TINT)
+                const g = pixel.lerp(pixel.green(value), tg, TINT)
+                const b = pixel.lerp(pixel.blue(value), tb, TINT)
+                into.?[index] = pixel.over(into.?[index], pixel.pack(a, r, g, b), 255)
+            }
+            index += 1
+        }
+        if !device_module.writeRect(target, area, into.?, 64) { whole = false }
+    }
+    scratch.release(pool, mark)
+    return whole
+}
+
+// The onion skin of the active layer at the time shown, as a device of
+// straight pixels in the image's place (made again when the time, the
+// layer, its keys or the history changed). Null when it is off, the
+// active layer is not animated, or memory ran out.
+pub fn onion(anim: *Animation, image: *Image) -> ?*Device {
+    if !anim.*.onionOn || image.*.active == null { return null }
+    const node = image.*.active.?
+    const track = trackOf(anim, node.*.id)
+    if track == null { return null }
+    const history_serial = image.*.history.*.serial
+    if anim.*.onionValid && anim.*.onionDevice != null && anim.*.onionTime == anim.*.time && anim.*.onionNode == node.*.id && anim.*.onionSerial == anim.*.serial && anim.*.onionHistory == history_serial {
+        return anim.*.onionDevice
+    }
+    if anim.*.onionDevice == null {
+        anim.*.onionDevice = device_module.create(anim.*.allocator, 0)
+        if anim.*.onionDevice == null { return null }
+    }
+    const target = anim.*.onionDevice.?
+    device_module.clear(target)
+    const shown = shownIndex(track.?, anim.*.time)
+    const count = track.?.*.keys.count()
+    // The farthest first: the nearest lie over them, those before over
+    // those after at the same distance.
+    var distance = if anim.*.before > anim.*.after { anim.*.before } else { anim.*.after }
+    var whole = true
+    while distance >= 1 {
+        const step = @intCast(usize, distance)
+        if distance <= anim.*.after && shown + step < count {
+            if !layTinted(anim, target, keyFrame(track.?, shown + step).*.device, TINT_AFTER, onionOpacityOf(anim, distance, anim.*.after)) { whole = false }
+        }
+        if distance <= anim.*.before && shown >= step {
+            if !layTinted(anim, target, keyFrame(track.?, shown - step).*.device, TINT_BEFORE, onionOpacityOf(anim, distance, anim.*.before)) { whole = false }
+        }
+        distance -= 1
+    }
+    if !whole { return null }
+    anim.*.onionValid = true
+    anim.*.onionTime = anim.*.time
+    anim.*.onionNode = node.*.id
+    anim.*.onionSerial = anim.*.serial
+    anim.*.onionHistory = history_serial
+    return target
+}
+
+// ---------------------------------------------------------------------------
+// Export
+
+pub const Export = enum(u8) {
+    ok,
+    // The range is empty or outside 0 .. LAST_TIME.
+    badRange,
+    // The name with its number does not fit, or a file could not be
+    // written.
+    cannotWrite,
+    noMemory,
+}
+
+// `base` with "_NNNN.png" for `number` (at least four digits) into
+// `into`: the length, 0 when it does not fit in `capacity`.
+pub fn sequenceName(base: []const u8, number: usize, into: [*]u8, capacity: usize) -> usize {
+    var length = std.text.append(into, 0, capacity, base)
+    length = std.text.appendByte(into, length, capacity, 95)
+    var digits: usize = 1
+    var rest = number / 10
+    while rest > 0 {
+        digits += 1
+        rest /= 10
+    }
+    while digits < 4 {
+        length = std.text.appendByte(into, length, capacity, 48)
+        digits += 1
+    }
+    length = std.text.appendUnsigned(into, length, capacity, number)
+    length = std.text.append(into, length, capacity, ".png")
+    if length + 1 >= capacity { return 0 }
+    return length
+}
+
+// What the image shows at every time from `from` to `to` (both in) as PNG
+// files `base`_0001.png, `base`_0002.png ... (the first frame of the range
+// is 1), straight alpha; the time shown is the same afterwards. How many
+// were written goes into `written`.
+pub fn exportSequence(anim: *Animation, image: *Image, base: []const u8, from: i32, to: i32, written: *usize) -> Export {
+    written.* = 0
+    if from < 0 || to < from || to > LAST_TIME { return Export.badRange }
+    const allocator = anim.*.allocator
+    const room = allocator.alloc(NAME_ROOM, 16)
+    if room == null { return Export.noMemory }
+    var bytes = std.ArrayList(u8).init(allocator)
+    defer bytes.deinit()
+    const kept = anim.*.time
+    const options = png.options(true)
+    var result = Export.ok
+    var time = from
+    while time <= to {
+        _ = setTime(anim, image, time)
+        _ = render.update(image)
+        bytes.clearRetainingCapacity()
+        if !png.encodeDevice(image.*.projection, image_module.bounds(image), &options, &bytes) {
+            result = Export.noMemory
+            break
+        }
+        const length = sequenceName(base, @intCast(usize, time - from) + 1, room.?, NAME_ROOM)
+        if length == 0 || !text.writeFile(allocator, room.?[0..length], bytes.items()) {
+            result = Export.cannotWrite
+            break
+        }
+        written.* += 1
+        time += 1
+    }
+    _ = setTime(anim, image, kept)
+    allocator.free(room.?, NAME_ROOM, 16)
+    return result
+}

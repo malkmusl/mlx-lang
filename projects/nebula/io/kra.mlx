@@ -1,0 +1,1113 @@
+// nebula io: Krita documents (.kra) read and written: the whole tree of
+// layers and masks, every device's pixels as they are.
+//
+//     var report: ora.Report = undefined
+//     const status = kra.write(image, &options, &bytes, &report)   // report.lossy: see below
+//     const status = kra.read(allocator, bytes, &result, &report)  // report.skipped, report.space
+//
+// A Krita document is a ZIP: "mimetype" (stored, first) holding
+// "application/x-krita", maindoc.xml (the image and its tree),
+// documentinfo.xml (here only the title), a file for each device under
+// "<image name>/layers/", mergedimage.png (the composite) and
+// preview.png (the composite at most 256 pixels on its longer side).
+//
+// maindoc.xml's IMAGE has the size, the resolution (x-res, y-res: pixels
+// an inch) and the colour space ("RGBA": 8 bits a channel; a document of
+// another one is refused with Status.unsupported, its name in the
+// report's `space`). Its <layers> lists the topmost first; a layer
+// element names its nodetype and carries name, filename, uuid, visible,
+// locked, opacity (0-255), compositeop (blend.name()), x and y (where
+// the device sits), collapsed, colorlabel, channelflags and selected
+// (the active node); a group has <layers> of its own and passthrough, a
+// layer its <masks>. The kinds and their files (N counts the nodes in
+// the order they are written, layers and masks together):
+//
+//   paintlayer       layerN: its pixels; channellockflags "1110" when its
+//                    alpha is locked
+//   grouplayer       none
+//   adjustmentlayer  layerN.pixelselection: where it filters (the node's
+//                    mask), layerN.filterconfig: how; filtername = the
+//                    filter's key (filters/registry.mlx)
+//   generatorlayer   layerN: its device, layerN.filterconfig;
+//                    generatorname = the generator's key
+//   clonelayer       none; clonefrom names the node it shows (and
+//                    clonefromuuid; reading looks for the uuid first)
+//   transparencymask, selectionmask: maskN.pixelselection
+//   filtermask       maskN.pixelselection, maskN.filterconfig, filtername
+//
+// Inheriting alpha is the alpha channel left out of channelflags (as
+// Krita keeps it); the other places of channelflags are the colour
+// channels shown (red, green, blue). A vector or file layer is written as
+// a paint layer of its pixels, a colorize or transform mask is left out:
+// write() sets the report's `lossy` for them.
+//
+// A device's file: "VERSION 2", "TILEWIDTH 64", "TILEHEIGHT 64",
+// "PIXELSIZE 4" (1 for a mask), "DATA n", each line ending in a line
+// feed, then n tiles, each a line "x,y,LZF,size" and size bytes: a flag
+// byte, 1 for the rest being the tile LZF-compressed (io/lzf.mlx) in
+// planes (every pixel's blue, then every green, red, alpha; a mask's one
+// byte each), 0 for the tile as it is (B, G, R, A after each other) where
+// compression does not make it smaller. x and y are the tile's top left
+// corner counted from where the device sits: a device's tiles are 64 x 64
+// as ours are, so tile (tx, ty) of a device is "tx*64,ty*64" and the
+// node's x and y are the device's place; the pixel at (x, y) of the image
+// is at (x - node x, y - node y) of the file's tiles (a moved layer keeps
+// its tiles and its place). FILE.defaultpixel holds the device's default
+// pixel (B, G, R, A; a mask's one byte). A mask's byte is the grey of its
+// pixel.
+//
+// filterconfig: <params version="1"> with a <param name="key">value</param>
+// for each number the filter or generator names (filters/types.mlx's
+// Param): the key is its name in small letters, every run of other bytes
+// than letters and digits one "_" ("Start x" is "start_x", "Anti-alias
+// threshold" "anti_alias_threshold"), the value the number in decimals
+// ("true" and "false" read as 1 and 0), or the text for a TEXT number.
+// What a file names otherwise is passed over; a number it does not name
+// keeps its initial value.
+//
+// Reading also passes over, and sets the report's `skipped` for, a node
+// of a kind not read here (file and vector layers, transform and colorize
+// masks, reference images: with what is in them), a filter or generator
+// not known here (the layer stays and does nothing), a device file that
+// is missing. A device file that is damaged makes the document damaged.
+const std = @import("std")
+const xml = @import("std.xml")
+const zip = @import("./zip.mlx")
+const text = @import("./text.mlx")
+const lzf = @import("./lzf.mlx")
+const ora = @import("./ora.mlx")
+const formats = @import("./formats.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const device_module = @import("../core/device.mlx")
+const node_module = @import("../core/node.mlx")
+const image_module = @import("../core/image.mlx")
+const blend = @import("../core/blend.mlx")
+const scratch = @import("../core/scratch.mlx")
+const filters = @import("../filters/registry.mlx")
+const filter_types = @import("../filters/types.mlx")
+const generators = @import("../generators/registry.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Report = ora.Report
+
+pub const MIME: []const u8 = "application/x-krita"
+// The folder of the device files in a document written here.
+const FOLDER: []const u8 = "image"
+// A tile's bytes at 4 bytes a pixel.
+const TILE_BYTES: usize = 16384
+// The longest name of a device file's path.
+const PATH: usize = 384
+
+// ---------------------------------------------------------------------------
+// Names in files
+
+// What nodetype a kind is written as ("": not written).
+fn nodeType(kind: u8) -> []const u8 {
+    if kind == node_module.PAINT || kind == node_module.VECTOR || kind == node_module.FILE { return "paintlayer" }
+    if kind == node_module.GROUP { return "grouplayer" }
+    if kind == node_module.FILTER { return "adjustmentlayer" }
+    if kind == node_module.FILL { return "generatorlayer" }
+    if kind == node_module.CLONE { return "clonelayer" }
+    if kind == node_module.TRANSPARENCY_MASK { return "transparencymask" }
+    if kind == node_module.FILTER_MASK { return "filtermask" }
+    if kind == node_module.SELECTION_MASK { return "selectionmask" }
+    return ""
+}
+
+// The kind a nodetype is read as; false for one not read here.
+fn kindOf(name: []const u8, kind: *u8) -> bool {
+    if std.text.same(name, "paintlayer") { kind.* = node_module.PAINT } else if std.text.same(name, "grouplayer") {
+        kind.* = node_module.GROUP
+    } else if std.text.same(name, "adjustmentlayer") {
+        kind.* = node_module.FILTER
+    } else if std.text.same(name, "generatorlayer") {
+        kind.* = node_module.FILL
+    } else if std.text.same(name, "clonelayer") {
+        kind.* = node_module.CLONE
+    } else if std.text.same(name, "transparencymask") {
+        kind.* = node_module.TRANSPARENCY_MASK
+    } else if std.text.same(name, "filtermask") {
+        kind.* = node_module.FILTER_MASK
+    } else if std.text.same(name, "selectionmask") {
+        kind.* = node_module.SELECTION_MASK
+    } else {
+        return false
+    }
+    return true
+}
+
+// A parameter's key in a filterconfig (see the header) into `into`
+// (`capacity` bytes); its length.
+pub fn paramKey(name: []const u8, into: [*]u8, capacity: usize) -> usize {
+    var length: usize = 0
+    var gap = false
+    for byte in name {
+        const lower = if byte >= 65 && byte <= 90 { byte + 32 } else { byte }
+        const kept = (lower >= 97 && lower <= 122) || (lower >= 48 && lower <= 57)
+        if kept {
+            if gap && length > 0 && length < capacity {
+                into[length] = 95
+                length += 1
+            }
+            gap = false
+            if length < capacity {
+                into[length] = lower
+                length += 1
+            }
+        } else {
+            gap = true
+        }
+    }
+    return length
+}
+
+// The uuid written for node `id`: "{00000000-0000-4000-8000-0000000000ID}"
+// (the id in hexadecimal at the end), into `into` (38 bytes).
+fn uuidOf(id: u32, into: [*]u8) -> usize {
+    var length = std.text.append(into, 0, 38, "{00000000-0000-4000-8000-")
+    var shift: u32 = 44
+    while true {
+        const digit = @intCast(u8, (@intCast(u64, id) >> @intCast(u6, shift)) & 15)
+        into[length] = if digit < 10 { 48 + digit } else { 87 + digit }
+        length += 1
+        if shift == 0 { break }
+        shift -= 4
+    }
+    into[length] = 125
+    return length + 1
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+const Writing = struct {
+    image: *image_module.Image
+    archive: zip.Writer
+    document: std.ArrayList(u8)
+    xml: text.XmlWriter
+    // One entry's bytes at a time.
+    data: std.ArrayList(u8)
+    keys: std.ArrayList(u64)
+    table: lzf.Table
+    // A tile in planes and compressed (scratch memory).
+    planes: [*]u8
+    squeezed: [*]u8
+    level: i32
+    count: usize
+    failed: bool
+    lossy: bool
+    // The XML of a filterconfig or documentinfo.xml (maindoc.xml's is
+    // open meanwhile).
+    config: text.XmlWriter
+    // Text being made. (Here, not as locals: a buffer whose slice is
+    // handed on is a new value of the arena at every call.)
+    file: [24]u8
+    uuid: [40]u8
+    flags: [4]u8
+    path: [384]u8
+    suffix: [64]u8
+    pixel: [4]u8
+    digits: [336]u8
+    key: [64]u8
+}
+
+// "image/layers/" + file + suffix into `into`; its length.
+fn dataPath(folder: []const u8, file: []const u8, suffix: []const u8, into: [*]u8) -> usize {
+    var length = std.text.append(into, 0, PATH, folder)
+    length = std.text.append(into, length, PATH, "/layers/")
+    length = std.text.append(into, length, PATH, file)
+    return std.text.append(into, length, PATH, suffix)
+}
+
+fn add(w: *Writing, file: []const u8, suffix: []const u8, data: []const u8, method: u16) -> void {
+    if w.*.failed { return }
+    const path: [*]u8 = &w.*.path
+    const length = dataPath(FOLDER, file, suffix, path)
+    if !zip.add(&w.*.archive, path[0..length], data, method, w.*.level) { w.*.failed = true }
+}
+
+fn putText(w: *Writing, value: []const u8) -> void {
+    if !w.*.data.appendSlice(value) { w.*.failed = true }
+}
+
+fn putNumber(w: *Writing, value: i64) -> void {
+    const digits: [*]u8 = &w.*.digits
+    const length = text.formatInt(value, digits, 24)
+    putText(w, digits[0..length])
+}
+
+// The tile at `from` (4096 pixels) in planes of `size` bytes a pixel.
+fn toPlanes(from: [*]const u32, size: usize, planes: [*]u8) -> void {
+    var index: usize = 0
+    while index < 4096 {
+        const value = from[index]
+        if size == 1 {
+            planes[index] = @intCast(u8, value & 255)
+        } else {
+            planes[index] = @intCast(u8, value & 255)
+            planes[4096 + index] = @intCast(u8, (value >> 8) & 255)
+            planes[8192 + index] = @intCast(u8, (value >> 16) & 255)
+            planes[12288 + index] = @intCast(u8, value >> 24)
+        }
+        index += 1
+    }
+}
+
+// `device`'s tiles as a device file (`size` bytes a pixel) in w.data.
+fn tileFile(w: *Writing, device: *device_module.Device, size: usize) -> void {
+    w.*.data.clearRetainingCapacity()
+    w.*.keys.clearRetainingCapacity()
+    if !device_module.keys(device, &w.*.keys) {
+        w.*.failed = true
+        return
+    }
+    // In one order whatever the table's: the same device, the same bytes.
+    const keys = w.*.keys.items()
+    std.mem.sortU64(keys.pointer, keys.length)
+    putText(w, "VERSION 2\nTILEWIDTH 64\nTILEHEIGHT 64\nPIXELSIZE ")
+    putNumber(w, @intCast(i64, size))
+    putText(w, "\nDATA ")
+    putNumber(w, @intCast(i64, keys.length))
+    putText(w, "\n")
+    const bytes = 4096 * size
+    for key in keys {
+        if w.*.failed { return }
+        const tx = device_module.keyX(key)
+        const ty = device_module.keyY(key)
+        const pixels = device_module.tileRead(device, tx, ty)
+        if pixels == null { continue }
+        toPlanes(pixels.?, size, w.*.planes)
+        const made = lzf.compress(&w.*.table, w.*.planes, bytes, w.*.squeezed, bytes - 1)
+        putNumber(w, @intCast(i64, tx) * 64)
+        putText(w, ",")
+        putNumber(w, @intCast(i64, ty) * 64)
+        putText(w, ",LZF,")
+        if made > 0 {
+            putNumber(w, @intCast(i64, made + 1))
+            putText(w, "\n\x01")
+            putText(w, w.*.squeezed[0..made])
+        } else {
+            putNumber(w, @intCast(i64, bytes + 1))
+            putText(w, "\n\x00")
+            if !w.*.data.ensureUnusedCapacity(bytes) {
+                w.*.failed = true
+                return
+            }
+            var index: usize = 0
+            while index < 4096 {
+                const value = pixels.?[index]
+                if size == 1 {
+                    _ = w.*.data.append(@intCast(u8, value & 255))
+                } else {
+                    _ = w.*.data.append(@intCast(u8, value & 255))
+                    _ = w.*.data.append(@intCast(u8, (value >> 8) & 255))
+                    _ = w.*.data.append(@intCast(u8, (value >> 16) & 255))
+                    _ = w.*.data.append(@intCast(u8, value >> 24))
+                }
+                index += 1
+            }
+        }
+    }
+}
+
+// A device as FILE+suffix and FILE+suffix+".defaultpixel".
+fn writeDevice(w: *Writing, device: *device_module.Device, file: []const u8, suffix: []const u8, size: usize) -> void {
+    tileFile(w, device, size)
+    add(w, file, suffix, w.*.data.items(), zip.STORED)
+    const path: [*]u8 = &w.*.suffix
+    const length = std.text.append(path, std.text.append(path, 0, 64, suffix), 64, ".defaultpixel")
+    const value = device.*.defaultPixel
+    w.*.pixel[0] = @intCast(u8, value & 255)
+    w.*.pixel[1] = @intCast(u8, (value >> 8) & 255)
+    w.*.pixel[2] = @intCast(u8, (value >> 16) & 255)
+    w.*.pixel[3] = @intCast(u8, value >> 24)
+    const pixel_bytes: [*]const u8 = &w.*.pixel
+    add(w, file, path[0..length], pixel_bytes[0..size], zip.STORED)
+}
+
+// The numbers of `params` as a filterconfig, as FILE.filterconfig.
+fn writeConfig(w: *Writing, params: *const node_module.Params, names: []const filter_types.Param, file: []const u8) -> void {
+    w.*.data.clearRetainingCapacity()
+    const writer = &w.*.config
+    text.xmlBegin(writer, &w.*.data, 1)
+    text.xmlDeclaration(writer)
+    text.xmlRaw(writer, "<!DOCTYPE params>")
+    text.xmlOpen(writer, "params")
+    text.xmlAttribute(writer, "version", "1")
+    const key: [*]u8 = &w.*.key
+    const digits: [*]u8 = &w.*.digits
+    var index: usize = 0
+    while index < names.length && index < node_module.VALUES {
+        const length = paramKey(names[index].name, key, 64)
+        text.xmlOpen(writer, "param")
+        text.xmlAttribute(writer, "name", key[0..length])
+        if names[index].kind == filter_types.TEXT {
+            text.xmlText(writer, node_module.paramsText(params))
+        } else {
+            const written = text.formatFloat(params.*.values[index], text.MOST_DECIMALS, digits, text.FLOAT_ROOM)
+            text.xmlText(writer, digits[0..written])
+        }
+        text.xmlClose(writer)
+        index += 1
+    }
+    if !text.xmlEnd(writer) { w.*.failed = true }
+    add(w, file, ".filterconfig", w.*.data.items(), zip.DEFLATED)
+}
+
+// "0" or "1".
+fn flag(value: bool) -> []const u8 { return if value { "1" } else { "0" } }
+
+// channelflags: red, green, blue shown, alpha not inherited ("" when all).
+fn channelFlags(node: *node_module.Node, into: [*]u8) -> usize {
+    if node.*.channels & 7 == 7 && !node.*.inheritAlpha { return 0 }
+    into[0] = if node.*.channels & 4 != 0 { 49 } else { 48 }
+    into[1] = if node.*.channels & 2 != 0 { 49 } else { 48 }
+    into[2] = if node.*.channels & 1 != 0 { 49 } else { 48 }
+    into[3] = if node.*.inheritAlpha { 48 } else { 49 }
+    return 4
+}
+
+fn writeNode(w: *Writing, node: *node_module.Node) -> void {
+    const kind = node.*.kind
+    const type_name = nodeType(kind)
+    if type_name.length == 0 {
+        w.*.lossy = true
+        return
+    }
+    if kind == node_module.VECTOR || kind == node_module.FILE { w.*.lossy = true }
+    const is_mask = node_module.isMask(kind)
+    w.*.count += 1
+    const file: [*]u8 = &w.*.file
+    var file_length = std.text.append(file, 0, 24, if is_mask { "mask" } else { "layer" })
+    file_length = std.text.appendUnsigned(file, file_length, 24, w.*.count)
+    const name = file[0..file_length]
+    const x = devicePlace(node, true)
+    const y = devicePlace(node, false)
+    const writer = &w.*.xml
+    text.xmlOpen(writer, if is_mask { "mask" } else { "layer" })
+    text.xmlAttribute(writer, "name", node_module.nameOf(node))
+    text.xmlAttribute(writer, "nodetype", type_name)
+    text.xmlAttribute(writer, "filename", name)
+    const uuid: [*]u8 = &w.*.uuid
+    text.xmlAttribute(writer, "uuid", uuid[0..uuidOf(node.*.id, uuid)])
+    text.xmlAttribute(writer, "visible", flag(node.*.visible))
+    text.xmlAttribute(writer, "locked", flag(node.*.locked))
+    text.xmlAttributeInt(writer, "opacity", @intCast(i64, node.*.opacity))
+    text.xmlAttribute(writer, "compositeop", blend.name(node.*.blend))
+    text.xmlAttributeInt(writer, "x", @intCast(i64, x))
+    text.xmlAttributeInt(writer, "y", @intCast(i64, y))
+    text.xmlAttribute(writer, "collapsed", flag(node.*.collapsed))
+    text.xmlAttributeInt(writer, "colorlabel", @intCast(i64, node.*.label))
+    const channels: [*]u8 = &w.*.flags
+    text.xmlAttribute(writer, "channelflags", channels[0..channelFlags(node, channels)])
+    if kind == node_module.PAINT || kind == node_module.VECTOR || kind == node_module.FILE {
+        text.xmlAttribute(writer, "colorspacename", "RGBA")
+        text.xmlAttribute(writer, "channellockflags", if node.*.alphaLocked { "1110" } else { "1111" })
+    } else if node.*.alphaLocked {
+        text.xmlAttribute(writer, "channellockflags", "1110")
+    }
+    text.xmlAttribute(writer, "intimeline", "0")
+    if w.*.image.*.active != null && @intFromPtr(w.*.image.*.active.?) == @intFromPtr(node) { text.xmlAttribute(writer, "selected", "true") }
+    if kind == node_module.GROUP { text.xmlAttribute(writer, "passthrough", flag(node.*.passThrough)) }
+    if kind == node_module.FILTER || kind == node_module.FILTER_MASK {
+        const info = filters.find(node.*.params.id)
+        text.xmlAttribute(writer, "filtername", if info != null { info.?.*.key } else { "" })
+        text.xmlAttribute(writer, "filterversion", "1")
+        if info != null { writeConfig(w, &node.*.params, info.?.*.params, name) }
+    }
+    if kind == node_module.FILL {
+        const info = generators.find(node.*.params.id)
+        text.xmlAttribute(writer, "generatorname", if info != null { info.?.*.key } else { "" })
+        text.xmlAttribute(writer, "generatorversion", "1")
+        if info != null { writeConfig(w, &node.*.params, info.?.*.params, name) }
+    }
+    if kind == node_module.CLONE {
+        const source = image_module.find(w.*.image, node.*.cloneOf)
+        if source != null {
+            text.xmlAttribute(writer, "clonefrom", node_module.nameOf(source.?))
+            text.xmlAttribute(writer, "clonefromuuid", uuid[0..uuidOf(source.?.*.id, uuid)])
+        }
+        text.xmlAttribute(writer, "clonetype", "0")
+    }
+    if kind == node_module.SELECTION_MASK { text.xmlAttribute(writer, "active", "0") }
+    // The node's pixels.
+    if node.*.device != null {
+        if kind == node_module.PAINT || kind == node_module.VECTOR || kind == node_module.FILE || kind == node_module.FILL {
+            writeDevice(w, node.*.device.?, name, "", 4)
+        } else if kind != node_module.CLONE {
+            writeDevice(w, node.*.device.?, name, ".pixelselection", 1)
+        }
+    }
+    if kind == node_module.GROUP {
+        text.xmlOpen(writer, "layers")
+        writeChildren(w, node, false)
+        text.xmlClose(writer)
+    }
+    if ora.hasMasks(node) {
+        text.xmlOpen(writer, "masks")
+        writeChildren(w, node, true)
+        text.xmlClose(writer)
+    }
+    text.xmlClose(writer)
+}
+
+// Where the node's device sits (0 for a group).
+fn devicePlace(node: *node_module.Node, horizontal: bool) -> i32 {
+    if node.*.device == null { return 0 }
+    return if horizontal { node.*.device.?.*.x } else { node.*.device.?.*.y }
+}
+
+// The children of `node` that are masks (or layers), the topmost first.
+fn writeChildren(w: *Writing, node: *node_module.Node, masks: bool) -> void {
+    var index = node_module.childCount(node)
+    while index > 0 && !w.*.failed {
+        index -= 1
+        const child = node_module.childAt(node, index)
+        if node_module.isMask(child.*.kind) == masks { writeNode(w, child) }
+    }
+}
+
+fn writeInfo(w: *Writing) -> void {
+    w.*.data.clearRetainingCapacity()
+    const writer = &w.*.config
+    text.xmlBegin(writer, &w.*.data, 1)
+    text.xmlDeclaration(writer)
+    text.xmlRaw(writer, "<!DOCTYPE document-info PUBLIC '-//KDE//DTD document-info 1.1//EN' 'http://www.calligra.org/DTD/document-info-1.1.dtd'>")
+    text.xmlOpen(writer, "document-info")
+    text.xmlAttribute(writer, "xmlns", "http://www.calligra.org/DTD/document-info")
+    text.xmlOpen(writer, "about")
+    // The title: the file's name without its extension.
+    const base = text.baseName(image_module.pathOf(w.*.image))
+    const extension = text.extension(base)
+    const title = if extension.length > 0 { base[0..base.length - extension.length - 1] } else { base }
+    text.xmlElement(writer, "title", title)
+    if !text.xmlEnd(writer) { w.*.failed = true }
+    if !w.*.failed && !zip.add(&w.*.archive, "documentinfo.xml", w.*.data.items(), zip.DEFLATED, w.*.level) { w.*.failed = true }
+}
+
+// What a write() takes for itself (on the heap and in scratch memory).
+fn startWriting(w: *Writing, image: *image_module.Image, into: *std.ArrayList(u8), level: i32, pool: *scratch.Pool) -> bool {
+    const allocator = image.*.allocator
+    w.*.image = image
+    w.*.document = std.ArrayList(u8).init(allocator)
+    w.*.data = std.ArrayList(u8).init(allocator)
+    w.*.keys = std.ArrayList(u64).init(allocator)
+    w.*.level = level
+    w.*.count = 0
+    w.*.failed = false
+    w.*.lossy = false
+    zip.begin(&w.*.archive, into, allocator)
+    const slots = scratch.words(pool, lzf.SLOTS)
+    const planes = scratch.bytes(pool, TILE_BYTES)
+    const squeezed = scratch.bytes(pool, lzf.bound(TILE_BYTES))
+    if slots == null || planes == null || squeezed == null { return false }
+    lzf.begin(&w.*.table, slots.?)
+    w.*.planes = planes.?
+    w.*.squeezed = squeezed.?
+    return true
+}
+
+// What `image` holds as a Krita document at the end of `into`, its XML
+// compressed at `options.level` (the device files and PNGs stored as
+// made); `report.lossy` when a node could not be kept as it is (see the
+// header). noMemory when memory ran out (`into` is as it was then).
+pub fn write(image: *image_module.Image, options: *const formats.SaveOptions, into: *std.ArrayList(u8), report: *Report) -> formats.Status {
+    ora.clearReport(report)
+    const allocator = image.*.allocator
+    const memory = allocator.alloc(@sizeOf(Writing), 16)
+    if memory == null { return formats.Status.noMemory }
+    const w: *Writing = unsafe { @ptrCast(*Writing, memory.?) }
+    const begun = into.*.count()
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    w.*.failed = !startWriting(w, image, into, options.*.level, pool)
+    if !w.*.failed { w.*.failed = !zip.add(&w.*.archive, "mimetype", MIME, zip.STORED, 0) }
+    const writer = &w.*.xml
+    text.xmlBegin(writer, &w.*.document, 1)
+    text.xmlDeclaration(writer)
+    text.xmlRaw(writer, "<!DOCTYPE DOC PUBLIC '-//KDE//DTD krita 2.0//EN' 'http://www.calligra.org/DTD/krita-2.0.dtd'>")
+    text.xmlOpen(writer, "DOC")
+    text.xmlAttribute(writer, "xmlns", "http://www.calligra.org/DTD/krita")
+    text.xmlAttribute(writer, "syntaxVersion", "2.0")
+    text.xmlAttribute(writer, "editor", "Nebula")
+    text.xmlAttribute(writer, "kritaVersion", "5.2.2")
+    text.xmlOpen(writer, "IMAGE")
+    text.xmlAttribute(writer, "name", FOLDER)
+    text.xmlAttribute(writer, "mime", "application/x-kra")
+    text.xmlAttributeInt(writer, "width", @intCast(i64, image.*.width))
+    text.xmlAttributeInt(writer, "height", @intCast(i64, image.*.height))
+    text.xmlAttributeFloat(writer, "x-res", image.*.resolution, 6)
+    text.xmlAttributeFloat(writer, "y-res", image.*.resolution, 6)
+    text.xmlAttribute(writer, "colorspacename", "RGBA")
+    text.xmlAttribute(writer, "profile", "sRGB-elle-V2-srgbtrc.icc")
+    text.xmlAttribute(writer, "description", "")
+    text.xmlOpen(writer, "layers")
+    if !w.*.failed { writeChildren(w, image.*.root, false) }
+    if !text.xmlEnd(writer) { w.*.failed = true }
+    if !w.*.failed { w.*.failed = !zip.add(&w.*.archive, "maindoc.xml", w.*.document.items(), zip.DEFLATED, options.*.level) }
+    if !w.*.failed { writeInfo(w) }
+    if !w.*.failed {
+        w.*.data.clearRetainingCapacity()
+        w.*.failed = !ora.writeMerged(image, options.*.level, &w.*.data) || !zip.add(&w.*.archive, "mergedimage.png", w.*.data.items(), zip.STORED, 0)
+    }
+    if !w.*.failed {
+        w.*.data.clearRetainingCapacity()
+        w.*.failed = !ora.writeThumbnail(image, ora.THUMBNAIL, options.*.level, &w.*.data) || !zip.add(&w.*.archive, "preview.png", w.*.data.items(), zip.STORED, 0)
+    }
+    if !w.*.failed { w.*.failed = !zip.finish(&w.*.archive) }
+    scratch.release(pool, mark)
+    report.*.lossy = w.*.lossy
+    const failed = w.*.failed
+    w.*.document.deinit()
+    w.*.data.deinit()
+    w.*.keys.deinit()
+    allocator.free(memory.?, @sizeOf(Writing), 16)
+    if failed {
+        _ = into.*.resize(begun)
+        return formats.Status.noMemory
+    }
+    return formats.Status.ok
+}
+
+// write() as io/formats.mlx's list calls it.
+pub fn writeImage(image: *image_module.Image, options: *const formats.SaveOptions, into: *std.ArrayList(u8)) -> formats.Status {
+    var report: Report = undefined
+    return write(image, options, into, &report)
+}
+
+// ---------------------------------------------------------------------------
+// Reading device files
+
+// The line at `at.*` (without its line feed; at most 80 bytes long) and
+// `at.*` after it. Null at the end or for a longer line.
+fn lineAt(bytes: []const u8, at: *usize) -> ?[]const u8 {
+    const start = at.*
+    var end = start
+    while end < bytes.length && bytes[end] != 10 {
+        if end - start >= 80 { return null }
+        end += 1
+    }
+    if end >= bytes.length { return null }
+    at.* = end + 1
+    return bytes[start..end]
+}
+
+// The number after `word ` in `line`; false when the line is not that.
+fn headerNumber(line: ?[]const u8, word: []const u8, into: *i64) -> bool {
+    if line == null || !std.text.startsWith(line.?, word) || line.?.length <= word.length || line.?[word.length] != 32 { return false }
+    return text.parseInt(line.?[word.length + 1..], into)
+}
+
+// One tile's pixels (4096 words at `into`) from its payload: planar LZF
+// or raw, `size` bytes a pixel (a mask's byte made grey).
+fn tilePixels(payload: []const u8, size: usize, planes: [*]u8, into: [*]u32) -> bool {
+    const bytes = 4096 * size
+    if payload.length < 1 { return false }
+    const raw = payload[0] == 0
+    if payload[0] == 1 {
+        var produced: usize = 0
+        if !lzf.decompress(payload[1..], planes, bytes, &produced) || produced != bytes { return false }
+    } else if !raw || payload.length - 1 != bytes {
+        return false
+    }
+    const data = if raw { payload.pointer + 1 } else { planes }
+    var index: usize = 0
+    while index < 4096 {
+        if size == 1 {
+            into[index] = pixel.gray(@intCast(u32, data[index]))
+        } else if raw {
+            const at = index * 4
+            into[index] = pixel.pack(@intCast(u32, data[at + 3]), @intCast(u32, data[at + 2]), @intCast(u32, data[at + 1]), @intCast(u32, data[at]))
+        } else {
+            into[index] = pixel.pack(@intCast(u32, data[12288 + index]), @intCast(u32, data[8192 + index]), @intCast(u32, data[4096 + index]), @intCast(u32, data[index]))
+        }
+        index += 1
+    }
+    return true
+}
+
+// A device file (`size` bytes a pixel) into `device` (at its place
+// already): damaged for one that is not well formed, of another tile
+// size or pixel size, or cut short; noMemory.
+fn readTiles(bytes: []const u8, device: *device_module.Device, size: usize) -> formats.Status {
+    var at: usize = 0
+    var number: i64 = 0
+    if !headerNumber(lineAt(bytes, &at), "VERSION", &number) || number != 2 { return formats.Status.damaged }
+    if !headerNumber(lineAt(bytes, &at), "TILEWIDTH", &number) || number != 64 { return formats.Status.damaged }
+    if !headerNumber(lineAt(bytes, &at), "TILEHEIGHT", &number) || number != 64 { return formats.Status.damaged }
+    if !headerNumber(lineAt(bytes, &at), "PIXELSIZE", &number) || number != @intCast(i64, size) { return formats.Status.damaged }
+    var count: i64 = 0
+    if !headerNumber(lineAt(bytes, &at), "DATA", &count) || count < 0 { return formats.Status.damaged }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const planes = scratch.bytes(pool, TILE_BYTES)
+    const tile = scratch.words(pool, 4096)
+    var status = formats.Status.ok
+    if planes == null || tile == null { status = formats.Status.noMemory }
+    var left = count
+    while status == formats.Status.ok && left > 0 {
+        status = readTile(bytes, &at, device, size, planes.?, tile.?)
+        left -= 1
+    }
+    scratch.release(pool, mark)
+    return status
+}
+
+fn readTile(bytes: []const u8, at: *usize, device: *device_module.Device, size: usize, planes: [*]u8, tile: [*]u32) -> formats.Status {
+    const line = lineAt(bytes, at)
+    if line == null { return formats.Status.damaged }
+    // "x,y,LZF,size"
+    var fields: [4]usize = undefined
+    var ends: [4]usize = undefined
+    var field: usize = 0
+    var start: usize = 0
+    var index: usize = 0
+    while index <= line.?.length {
+        if index == line.?.length || line.?[index] == 44 {
+            if field >= 4 { return formats.Status.damaged }
+            fields[field] = start
+            ends[field] = index
+            field += 1
+            start = index + 1
+        }
+        index += 1
+    }
+    if field != 4 || !std.text.same(line.?[fields[2]..ends[2]], "LZF") { return formats.Status.damaged }
+    var x: i64 = 0
+    var y: i64 = 0
+    var length: i64 = 0
+    if !text.parseInt(line.?[fields[0]..ends[0]], &x) || !text.parseInt(line.?[fields[1]..ends[1]], &y) || !text.parseInt(line.?[fields[3]..ends[3]], &length) { return formats.Status.damaged }
+    if length < 1 || @intCast(u64, length) > @intCast(u64, bytes.length - at.*) { return formats.Status.damaged }
+    if x < -1073741824 || x > 1073741824 || y < -1073741824 || y > 1073741824 { return formats.Status.damaged }
+    const payload = bytes[at.*..at.* + @intCast(usize, length)]
+    at.* += @intCast(usize, length)
+    if !tilePixels(payload, size, planes, tile) { return formats.Status.damaged }
+    const left = @intCast(i32, x)
+    const top = @intCast(i32, y)
+    // A tile of nothing but the default where there is none yet is not made.
+    if left & 63 == 0 && top & 63 == 0 && device_module.tileRead(device, left >> 6, top >> 6) == null {
+        var plain = true
+        var pixel_index: usize = 0
+        while pixel_index < 4096 && plain {
+            plain = tile[pixel_index] == device.*.defaultPixel
+            pixel_index += 1
+        }
+        if plain { return formats.Status.ok }
+    }
+    const area = geom.rect(device.*.x + left, device.*.y + top, 64, 64)
+    if !device_module.writeRect(device, area, tile, 64) { return formats.Status.noMemory }
+    return formats.Status.ok
+}
+
+// ---------------------------------------------------------------------------
+// Reading the document
+
+// A node every other one may name as what a clone shows: its uuid's and
+// name's hashes.
+const Known = struct {
+    node: *node_module.Node
+    uuid: u64
+    name: u64
+}
+
+const Reading = struct {
+    tokenizer: xml.Tokenizer
+    token: xml.Token
+    reader: zip.Reader
+    // The nodes open now (null: one passed over, with what is in it) and
+    // the depth of their elements.
+    parents: [64]?*node_module.Node
+    depths: [64]usize
+    open: usize
+    known: std.ArrayList(Known)
+    // The clones, and the hashes of the uuid and the name they show.
+    clones: std.ArrayList(Known)
+    folder: [256]u8
+    folderLength: usize
+    // Text read and made (here, not as locals: see Writing).
+    text: [512]u8
+    file: [128]u8
+    names: [128]u8
+    path: [384]u8
+    suffix: [64]u8
+    key: [128]u8
+    value: [256]u8
+    own: [64]u8
+}
+
+fn nameOf(token: *const xml.Token) -> []const u8 {
+    return token.*.name.pointer[0..token.*.name.length]
+}
+
+fn hashOf(r: *Reading, document: []const u8, offset: usize, name: []const u8) -> u64 {
+    const buffer: [*]u8 = &r.*.text
+    const value = text.attributeText(document, offset, name, buffer, 512)
+    if value == null || value.?.length == 0 { return 0 }
+    return std.hash.hashBytes(value.?)
+}
+
+// The entry FOLDER/layers/FILE+suffix, read whole (the caller frees it
+// with zip.free(allocator, block, size)); null when it is not there or
+// cannot be read (`missing` says which).
+fn entry(r: *Reading, allocator: Allocator, file: []const u8, suffix: []const u8, size: *usize, missing: *bool) -> ?[*]u8 {
+    const path: [*]u8 = &r.*.path
+    const folder: [*]const u8 = &r.*.folder
+    const length = dataPath(folder[0..r.*.folderLength], file, suffix, path)
+    missing.* = true
+    size.* = 0
+    if length >= PATH { return null }
+    const index = zip.find(&r.*.reader, path[0..length])
+    if index == null { return null }
+    missing.* = false
+    size.* = zip.size(&r.*.reader, index.?)
+    return zip.read(&r.*.reader, index.?, allocator)
+}
+
+// A device of the node from FILE+suffix (and its .defaultpixel).
+fn readDevice(r: *Reading, allocator: Allocator, device: *device_module.Device, file: []const u8, suffix: []const u8, size: usize, report: *Report) -> formats.Status {
+    const path: [*]u8 = &r.*.suffix
+    const length = std.text.append(path, std.text.append(path, 0, 64, suffix), 64, ".defaultpixel")
+    var bytes: usize = 0
+    var missing = false
+    const default_block = entry(r, allocator, file, path[0..length], &bytes, &missing)
+    if default_block != null {
+        const value = default_block.?
+        if bytes == size {
+            if size == 1 {
+                device.*.defaultPixel = pixel.gray(@intCast(u32, value[0]))
+            } else {
+                device.*.defaultPixel = pixel.pack(@intCast(u32, value[3]), @intCast(u32, value[2]), @intCast(u32, value[1]), @intCast(u32, value[0]))
+            }
+        }
+        zip.free(allocator, value, bytes)
+    }
+    const block = entry(r, allocator, file, suffix, &bytes, &missing)
+    if block == null {
+        if missing {
+            report.*.skipped = true
+            return formats.Status.ok
+        }
+        return formats.Status.damaged
+    }
+    const status = readTiles(block.?[0..bytes], device, size)
+    zip.free(allocator, block.?, bytes)
+    return status
+}
+
+// The parameter of `names` a filterconfig's key means (null: none).
+fn paramIndex(r: *Reading, names: []const filter_types.Param, key: []const u8) -> ?usize {
+    const own: [*]u8 = &r.*.own
+    var index: usize = 0
+    while index < names.length && index < node_module.VALUES {
+        const length = paramKey(names[index].name, own, 64)
+        if std.text.same(own[0..length], key) { return index }
+        index += 1
+    }
+    return null
+}
+
+// A filterconfig's numbers into `params` (set to the defaults before).
+fn readConfig(r: *Reading, allocator: Allocator, file: []const u8, params: *node_module.Params, names: []const filter_types.Param) -> void {
+    var size: usize = 0
+    var missing = false
+    const block = entry(r, allocator, file, ".filterconfig", &size, &missing)
+    if block == null { return }
+    const document = block.?[0..size]
+    // (A tokenizer of its own: the one of maindoc.xml is in the middle of
+    // its document. On the heap: it is 2 KiB.)
+    const memory = allocator.alloc(@sizeOf(xml.Tokenizer) + @sizeOf(xml.Token), 16)
+    if memory != null {
+        const tokenizer: *xml.Tokenizer = unsafe { @ptrCast(*xml.Tokenizer, memory.?) }
+        const token: *xml.Token = unsafe { @ptrCast(*xml.Token, memory.? + @sizeOf(xml.Tokenizer)) }
+        xml.initAt(tokenizer, document.pointer, document.length)
+        var current: ?usize = null
+        while xml.next(tokenizer, token) {
+            if token.*.kind == xml.TokenKind.elementStart {
+                current = null
+                if std.text.same(nameOf(token), "param") {
+                    const key: [*]u8 = &r.*.key
+                    const found = text.attributeText(document, token.*.offset, "name", key, 128)
+                    if found != null { current = paramIndex(r, names, found.?) }
+                }
+            } else if (token.*.kind == xml.TokenKind.text || token.*.kind == xml.TokenKind.cdata) && current != null {
+                const raw = token.*.value.pointer[0..token.*.value.length]
+                const value: [*]u8 = &r.*.value
+                var plain: ?[]const u8 = raw
+                if token.*.kind == xml.TokenKind.text { plain = text.unescape(raw, value, 256) }
+                if plain != null { setParam(params, names, current.?, std.text.trimmed(plain.?)) }
+                current = null
+            }
+        }
+        allocator.free(memory.?, @sizeOf(xml.Tokenizer) + @sizeOf(xml.Token), 16)
+    }
+    zip.free(allocator, block.?, size)
+}
+
+fn setParam(params: *node_module.Params, names: []const filter_types.Param, index: usize, value: []const u8) -> void {
+    if names[index].kind == filter_types.TEXT {
+        node_module.setParamsText(params, value)
+        return
+    }
+    var number: f64 = 0.0
+    if std.text.same(value, "true") {
+        number = 1.0
+    } else if std.text.same(value, "false") {
+        number = 0.0
+    } else if !text.parseFloat(value, &number) {
+        return
+    }
+    params.*.values[index] = number
+}
+
+// What the attributes at `offset` say of a node (not its kind).
+fn readCommon(r: *Reading, document: []const u8, offset: usize, node: *node_module.Node, image: *image_module.Image) -> void {
+    const buffer: [*]u8 = &r.*.text
+    const name = text.attributeText(document, offset, "name", buffer, 512)
+    if name != null { node_module.setName(node, name.?) }
+    const visible = text.attributeOf(document, offset, "visible")
+    node.*.visible = visible == null || !std.text.same(visible.?, "0")
+    const locked = text.attributeOf(document, offset, "locked")
+    node.*.locked = locked != null && std.text.same(locked.?, "1")
+    const collapsed = text.attributeOf(document, offset, "collapsed")
+    node.*.collapsed = collapsed != null && std.text.same(collapsed.?, "1")
+    const opacity = text.attributeIntOr(document, offset, "opacity", 255)
+    node.*.opacity = @intCast(u8, if opacity < 0 { 0 } else if opacity > 255 { 255 } else { opacity })
+    const label = text.attributeIntOr(document, offset, "colorlabel", 0)
+    node.*.label = @intCast(u8, if label < 0 || label > 255 { 0 } else { label })
+    const mode = text.attributeText(document, offset, "compositeop", buffer, 512)
+    if mode != null { node.*.blend = blend.byName(mode.?) }
+    const channels = text.attributeOf(document, offset, "channelflags")
+    if channels != null && channels.?.length == 4 {
+        const shown = channels.?
+        node.*.channels = 8
+        if shown[0] != 48 { node.*.channels |= 4 }
+        if shown[1] != 48 { node.*.channels |= 2 }
+        if shown[2] != 48 { node.*.channels |= 1 }
+        node.*.inheritAlpha = shown[3] == 48
+    }
+    const locks = text.attributeOf(document, offset, "channellockflags")
+    node.*.alphaLocked = locks != null && locks.?.length == 4 && locks.?[3] == 48
+    const passthrough = text.attributeOf(document, offset, "passthrough")
+    node.*.passThrough = node.*.kind == node_module.GROUP && passthrough != null && std.text.same(passthrough.?, "1")
+    const selected = text.attributeOf(document, offset, "selected")
+    if selected != null && std.text.same(selected.?, "true") { image.*.active = node }
+}
+
+// A node of the element at `offset` (nodetype `type_name`) under the
+// open one: made, its attributes and its files read. Null with
+// `status.*` ok for one passed over.
+fn readNode(r: *Reading, allocator: Allocator, document: []const u8, offset: usize, image: *image_module.Image, report: *Report, status: *formats.Status) -> ?*node_module.Node {
+    status.* = formats.Status.ok
+    var kind: u8 = 0
+    const type_name = text.attributeOf(document, offset, "nodetype")
+    if type_name == null || !kindOf(type_name.?, &kind) {
+        report.*.skipped = true
+        return null
+    }
+    // A layer in another colour space than the document's RGBA.
+    const space = text.attributeOf(document, offset, "colorspacename")
+    if space != null && space.?.length > 0 && !std.text.same(space.?, "RGBA") {
+        ora.noteSpace(report, space.?)
+        status.* = formats.Status.unsupported
+        return null
+    }
+    const parent = r.*.parents[r.*.open - 1].?
+    const made = ora.newNode(image, kind, "")
+    if made == null {
+        status.* = formats.Status.noMemory
+        return null
+    }
+    const node = made.?
+    if !ora.putTopFirst(parent, node) {
+        node_module.destroy(node)
+        status.* = formats.Status.noMemory
+        return null
+    }
+    readCommon(r, document, offset, node, image)
+    const file_buffer: [*]u8 = &r.*.file
+    const found = text.attributeText(document, offset, "filename", file_buffer, 128)
+    const file = if found != null { found.? } else { file_buffer[0..0] }
+    if node.*.device != null {
+        device_module.moveTo(node.*.device.?, ora.placeOf(text.attributeIntOr(document, offset, "x", 0)), ora.placeOf(text.attributeIntOr(document, offset, "y", 0)))
+    }
+    const names_buffer: [*]u8 = &r.*.names
+    if kind == node_module.FILTER || kind == node_module.FILTER_MASK {
+        const filter_name = text.attributeText(document, offset, "filtername", names_buffer, 128)
+        const info = if filter_name != null { filters.byKey(filter_name.?) } else { null }
+        if info == null {
+            report.*.skipped = true
+        } else {
+            filters.defaults(info.?.*.id, &node.*.params)
+            readConfig(r, allocator, file, &node.*.params, info.?.*.params)
+        }
+    } else if kind == node_module.FILL {
+        const generator_name = text.attributeText(document, offset, "generatorname", names_buffer, 128)
+        const info = if generator_name != null { generators.byKey(generator_name.?) } else { null }
+        if info == null {
+            report.*.skipped = true
+        } else {
+            generators.defaults(info.?.*.id, &node.*.params)
+            readConfig(r, allocator, file, &node.*.params, info.?.*.params)
+        }
+    }
+    if node.*.device != null && file.length > 0 {
+        if kind == node_module.PAINT || kind == node_module.FILL {
+            status.* = readDevice(r, allocator, node.*.device.?, file, "", 4, report)
+        } else if kind != node_module.CLONE {
+            status.* = readDevice(r, allocator, node.*.device.?, file, ".pixelselection", 1, report)
+        }
+    } else if kind == node_module.PAINT {
+        report.*.skipped = true
+    }
+    const known = Known.{ .node = node, .uuid = hashOf(r, document, offset, "uuid"), .name = std.hash.hashBytes(node_module.nameOf(node)) }
+    if !r.*.known.append(known) { status.* = formats.Status.noMemory }
+    if kind == node_module.CLONE {
+        const wanted = Known.{ .node = node, .uuid = hashOf(r, document, offset, "clonefromuuid"), .name = hashOf(r, document, offset, "clonefrom") }
+        if !r.*.clones.append(wanted) { status.* = formats.Status.noMemory }
+    }
+    return node
+}
+
+// Each clone shows the node of the uuid it names, else the first of the
+// name; one that names neither shows nothing (and is reported).
+fn resolveClones(r: *Reading, report: *Report) -> void {
+    for clone in r.*.clones.items() {
+        var found: ?*node_module.Node = null
+        if clone.uuid != 0 {
+            for known in r.*.known.items() {
+                if found == null && known.uuid == clone.uuid { found = known.node }
+            }
+        }
+        if found == null && clone.name != 0 {
+            for known in r.*.known.items() {
+                if found == null && known.name == clone.name && @intFromPtr(known.node) != @intFromPtr(clone.node) { found = known.node }
+            }
+        }
+        if found == null {
+            report.*.skipped = true
+        } else {
+            clone.node.*.cloneOf = found.?.*.id
+        }
+    }
+}
+
+// The IMAGE element: the size, resolution, colour space and folder.
+fn readImageElement(r: *Reading, document: []const u8, width: *i64, height: *i64, resolution: *f64, report: *Report) -> formats.Status {
+    while xml.next(&r.*.tokenizer, &r.*.token) {
+        if r.*.token.kind != xml.TokenKind.elementStart || !std.text.same(nameOf(&r.*.token), "IMAGE") { continue }
+        const offset = r.*.token.offset
+        const space = text.attributeOf(document, offset, "colorspacename")
+        if space != null && !std.text.same(space.?, "RGBA") {
+            ora.noteSpace(report, space.?)
+            return formats.Status.unsupported
+        }
+        resolution.* = text.attributeFloatOr(document, offset, "x-res", 72.0)
+        const folder: [*]u8 = &r.*.folder
+        const name = text.attributeText(document, offset, "name", folder, 256)
+        r.*.folderLength = if name != null { name.?.length } else { 0 }
+        if !text.attributeInt(document, offset, "width", width) || !text.attributeInt(document, offset, "height", height) { return formats.Status.damaged }
+        return formats.Status.ok
+    }
+    return formats.Status.damaged
+}
+
+// The tree under IMAGE into `image`.
+fn readTree(r: *Reading, allocator: Allocator, document: []const u8, image: *image_module.Image, report: *Report) -> formats.Status {
+    r.*.parents[0] = image.*.root
+    r.*.depths[0] = 0
+    r.*.open = 1
+    var status = formats.Status.ok
+    while status == formats.Status.ok && xml.next(&r.*.tokenizer, &r.*.token) {
+        const kind = r.*.token.kind
+        if kind == xml.TokenKind.elementEnd {
+            if r.*.open > 1 && xml.depth(&r.*.tokenizer) < r.*.depths[r.*.open - 1] { r.*.open -= 1 }
+            continue
+        }
+        if kind != xml.TokenKind.elementStart { continue }
+        const element = nameOf(&r.*.token)
+        if !std.text.same(element, "layer") && !std.text.same(element, "mask") { continue }
+        if r.*.open >= 64 { return formats.Status.damaged }
+        var node: ?*node_module.Node = null
+        if r.*.parents[r.*.open - 1] != null {
+            node = readNode(r, allocator, document, r.*.token.offset, image, report, &status)
+        }
+        r.*.parents[r.*.open] = node
+        r.*.depths[r.*.open] = xml.depth(&r.*.tokenizer)
+        r.*.open += 1
+    }
+    if status != formats.Status.ok { return status }
+    if xml.failed(&r.*.tokenizer) { return formats.Status.damaged }
+    resolveClones(r, report)
+    return formats.Status.ok
+}
+
+// The Krita document `bytes` as an image into `into` (the caller's to
+// destroy after Status.ok; null otherwise). unknownFormat for what is no
+// ZIP of the Krita mimetype with a maindoc.xml, unsupported for another
+// colour space than 8-bit RGBA (its name in `report.space`), damaged for
+// a maindoc.xml that is not well formed or a device file that is damaged,
+// tooLarge, noMemory; `report.skipped` when something was passed over
+// (see the header).
+pub fn read(allocator: Allocator, bytes: []const u8, into: *formats.LoadResult, report: *Report) -> formats.Status {
+    ora.clearReport(report)
+    into.*.image = null
+    const memory = allocator.alloc(@sizeOf(Reading), 16)
+    if memory == null { return formats.Status.noMemory }
+    const r: *Reading = unsafe { @ptrCast(*Reading, memory.?) }
+    r.*.known = std.ArrayList(Known).init(allocator)
+    r.*.clones = std.ArrayList(Known).init(allocator)
+    var status = formats.Status.unknownFormat
+    if zip.open(&r.*.reader, bytes, allocator) {
+        const index = zip.find(&r.*.reader, "maindoc.xml")
+        const kind = zip.find(&r.*.reader, "mimetype")
+        if index != null && kind != null && zip.size(&r.*.reader, kind.?) == MIME.length {
+            const mime: [*]u8 = &r.*.text
+            if zip.readInto(&r.*.reader, kind.?, mime, 32) && std.text.same(mime[0..MIME.length], MIME) {
+                status = readArchive(allocator, r, index.?, into, report)
+            }
+        }
+        zip.close(&r.*.reader)
+    }
+    r.*.known.deinit()
+    r.*.clones.deinit()
+    allocator.free(memory.?, @sizeOf(Reading), 16)
+    return status
+}
+
+fn readArchive(allocator: Allocator, r: *Reading, index: usize, into: *formats.LoadResult, report: *Report) -> formats.Status {
+    const size = zip.size(&r.*.reader, index)
+    const block = zip.read(&r.*.reader, index, allocator)
+    if block == null { return formats.Status.damaged }
+    const document = block.?[0..size]
+    xml.initAt(&r.*.tokenizer, document.pointer, document.length)
+    var width: i64 = 0
+    var height: i64 = 0
+    var resolution: f64 = 72.0
+    var status = readImageElement(r, document, &width, &height, &resolution, report)
+    if status == formats.Status.ok {
+        status = formats.Status.tooLarge
+        if width >= 1 && height >= 1 && width <= @intCast(i64, image_module.LARGEST) && height <= @intCast(i64, image_module.LARGEST) {
+            if !(resolution > 0.0) || resolution > 100000.0 { resolution = 72.0 }
+            const made = image_module.create(allocator, @intCast(i32, width), @intCast(i32, height), resolution)
+            status = formats.Status.noMemory
+            if made != null {
+                status = readTree(r, allocator, document, made.?, report)
+                if status == formats.Status.ok {
+                    ora.finish(made.?)
+                    into.*.image = made
+                } else {
+                    image_module.destroy(made.?)
+                }
+            }
+        }
+    }
+    zip.free(allocator, block.?, size)
+    return status
+}
+
+// read() as io/formats.mlx's list calls it.
+pub fn readImage(allocator: Allocator, bytes: []const u8, into: *formats.LoadResult) -> formats.Status {
+    var report: Report = undefined
+    return read(allocator, bytes, into, &report)
+}

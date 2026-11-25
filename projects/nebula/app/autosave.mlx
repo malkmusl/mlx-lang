@@ -1,0 +1,636 @@
+// nebula app: autosave: a document with changes that are not saved is
+// written aside every so many minutes (the setting autosave_minutes,
+// app/settings.mlx; 0: never), so that a crash or a power cut loses at
+// most that much work. The loop calls tick() about once a second, the file
+// actions call forget() when a document is saved or closed, and main
+// calls offer() once at the start:
+//
+//     autosave.tick(app)                 // once a second, whatever happens
+//     autosave.forget(app, doc)          // saved or closed: its autosave goes
+//     _ = autosave.offer(app)            // at the start: recover what is there?
+//
+// Where: $XDG_STATE_HOME/mlx/nebula/autosave/ (else
+// ~/.local/state/mlx/nebula/autosave/, through std.xdg on both systems),
+// a document's picture as ID.ora (the layered format) when io/formats.mlx
+// can write OpenRaster, else ID.png (what all its layers together show; the
+// status bar says so when it is written), and beside it ID.name: the
+// document's name and, on a second line, the file it was opened from or
+// saved as. ID is "nebula-" and the time the program started (seconds)
+// and a number of the run ("nebula-1764075123-2"), made once a document.
+//
+// When: a document is written the interval after the first change that
+// its autosave does not hold yet (a document changed all the time is
+// written every interval, one left alone after a change once); a change
+// undone back to what the autosave holds needs no writing. The time is
+// the Shell's (a script's clock in a run without a window).
+//
+// offer() looks for autosaves left by a run that ended without saving or
+// closing its documents, and shows them in a dialog: Open makes each a
+// document again (untitled and changed: it is to be saved under a name
+// of the person's choice; its autosave goes when it is saved or closed),
+// Discard removes them, Later (and Escape) leaves them for the next start.
+//
+// Not done: an autosave written while the program is busy in another way
+// (it is written in the loop's turn, the window waits for it); keeping
+// several generations of one document.
+const std = @import("std")
+const ui = @import("std.ui")
+const xdg = @import("std.xdg")
+const state = @import("./state.mlx")
+const api = @import("./api.mlx")
+const documents = @import("./documents.mlx")
+const settings = @import("./settings.mlx")
+const shell_module = @import("./shell.mlx")
+const image_module = @import("../core/image.mlx")
+const history_module = @import("../core/history.mlx")
+const formats = @import("../io/formats.mlx")
+const kit_module = @import("../ui/kit.mlx")
+const dialogs = @import("../ui/dialogs.mlx")
+const icons = @import("../ui/icons.mlx")
+
+pub const App = state.App
+pub const Document = state.Document
+
+// The slot of this module (state.SLOT_ACTIONS and its first ten are the
+// action modules').
+const SLOT: usize = state.SLOT_ACTIONS + 10
+
+// Where the autosaves are under the user's state directory.
+const FOLDER: []const u8 = "/mlx/nebula/autosave"
+
+// The most autosaves offered at once.
+const FOUND: usize = 16
+// An id's bytes ("nebula-" + 20 digits + "-" + 20 digits fit).
+const ID: usize = 56
+const NAME: usize = 256
+const PATH: usize = 4096
+// dialogs.Hooks.kind of the recovery dialog.
+const KIND_RECOVER: u8 = 40
+
+// What is kept for an open document.
+const Entry = struct {
+    // The document's address (0: the entry is free).
+    doc: usize
+    id: [56]u8
+    idLength: usize
+    // When a change the autosave does not hold was first seen (the
+    // Shell's milliseconds; 0: none is waiting).
+    since: usize
+    // The history's position the autosave holds, and whether one was
+    // written (its format: ORA or PNG).
+    position: u64
+    written: bool
+    format: u16
+}
+
+// An autosave found by offer().
+const Found = struct {
+    id: [56]u8
+    idLength: usize
+    name: [256]u8
+    nameLength: usize
+    format: u16
+    bytes: u64
+}
+
+const Store = struct {
+    entries: [16]Entry
+    // The ids made in this run, and when the run started (seconds).
+    serial: u64
+    started: u64
+    found: [16]Found
+    foundCount: usize
+    // Paths put together (the folder, a file in it, one more).
+    folder: [4096]u8
+    folderLength: usize
+    path: [4096]u8
+    pathLength: usize
+    other: [4096]u8
+    // A line read or written (a .name file).
+    line: [512]u8
+    // The note said when a flat picture was written (once a run).
+    flatSaid: bool
+    labels: [3][]const u8
+}
+
+fn storeOf(app: *App) -> ?*Store {
+    const memory = state.slot(app, SLOT, @sizeOf(Store))
+    if memory == null { return null }
+    return unsafe { @ptrCast(*Store, memory.?) }
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+
+// The folder into store.folder; false when the environment names none.
+fn folderOf(app: *App, store: *Store) -> bool {
+    store.*.folderLength = xdg.path(app.*.shell.*.environment, xdg.STATE, FOLDER, &store.*.folder, PATH)
+    return store.*.folderLength > 0
+}
+
+fn folderText(store: *Store) -> []const u8 {
+    const bytes: [*]const u8 = &store.*.folder
+    return bytes[0..store.*.folderLength]
+}
+
+// FOLDER/ID.EXTENSION into `into` (PATH bytes); its length, 0 when it
+// does not fit or there is no folder.
+fn fileOf(app: *App, store: *Store, id: []const u8, extension: []const u8, into: [*]u8) -> usize {
+    if !folderOf(app, store) { return 0 }
+    var length = std.text.append(into, 0, PATH - 1, folderText(store))
+    length = std.text.appendByte(into, length, PATH - 1, 47)
+    length = std.text.append(into, length, PATH - 1, id)
+    length = std.text.appendByte(into, length, PATH - 1, 46)
+    length = std.text.append(into, length, PATH - 1, extension)
+    if length >= PATH - 1 { return 0 }
+    into[length] = 0
+    return length
+}
+
+fn extensionOf(format: u16) -> []const u8 {
+    return if format == formats.ORA { "ora" } else { "png" }
+}
+
+// What autosaves are written as: OpenRaster when it can be written,
+// else PNG.
+fn formatNow() -> u16 {
+    const ora = formats.find(formats.ORA)
+    if ora != null && ora.?.*.canWrite && ora.?.*.writeImage != null { return formats.ORA }
+    return formats.PNG
+}
+
+fn idOf(entry: *Entry) -> []const u8 {
+    const bytes: [*]const u8 = &entry.*.id
+    return bytes[0..entry.*.idLength]
+}
+
+// Removes ID.ora, ID.png and ID.name.
+fn removeFiles(app: *App, store: *Store, id: []const u8) -> void {
+    const into: [*]u8 = &store.*.path
+    if fileOf(app, store, id, "ora", into) > 0 { _ = std.fs.delete(into) }
+    if fileOf(app, store, id, "png", into) > 0 { _ = std.fs.delete(into) }
+    if fileOf(app, store, id, "name", into) > 0 { _ = std.fs.delete(into) }
+}
+
+// ---------------------------------------------------------------------------
+// The documents' entries
+
+fn entryOf(store: *Store, doc: *Document) -> ?*Entry {
+    var index: usize = 0
+    while index < state.DOCUMENTS {
+        if store.*.entries[index].doc == @intFromPtr(doc) { return &store.*.entries[index] }
+        index += 1
+    }
+    return null
+}
+
+// A new id into `entry`: one no file of the folder has.
+fn makeId(app: *App, store: *Store, entry: *Entry) -> void {
+    if store.*.started == 0 {
+        const now = std.time.realtime()
+        store.*.started = if now.seconds > 0 { @intCast(u64, now.seconds) } else { 1 }
+    }
+    var tries: usize = 0
+    while tries < 1000 {
+        store.*.serial += 1
+        const bytes: [*]u8 = &entry.*.id
+        var length = std.text.append(bytes, 0, ID, "nebula-")
+        length = std.text.appendUnsigned(bytes, length, ID, @intCast(usize, store.*.started))
+        length = std.text.appendByte(bytes, length, ID, 45)
+        length = std.text.appendUnsigned(bytes, length, ID, @intCast(usize, store.*.serial))
+        entry.*.idLength = length
+        const into: [*]u8 = &store.*.other
+        const ora = fileOf(app, store, idOf(entry), "ora", into) > 0 && std.fs.exists(into)
+        const flat = fileOf(app, store, idOf(entry), "png", into) > 0 && std.fs.exists(into)
+        if !ora && !flat { return }
+        tries += 1
+    }
+}
+
+// The entry of `doc`, made (with a new id) when there is none. Null when
+// all are taken.
+fn entryFor(app: *App, store: *Store, doc: *Document) -> ?*Entry {
+    const found = entryOf(store, doc)
+    if found != null { return found }
+    var index: usize = 0
+    while index < state.DOCUMENTS {
+        const entry = &store.*.entries[index]
+        if entry.*.doc == 0 {
+            entry.*.doc = @intFromPtr(doc)
+            entry.*.since = 0
+            entry.*.position = @intCast(u64, history_module.position(doc.*.image.*.history))
+            entry.*.written = false
+            entry.*.format = formats.NONE
+            makeId(app, store, entry)
+            return entry
+        }
+        index += 1
+    }
+    return null
+}
+
+fn isOpen(app: *App, address: usize) -> bool {
+    var index: usize = 0
+    while index < app.*.count {
+        if app.*.documents[index] != null && @intFromPtr(app.*.documents[index].?) == address { return true }
+        index += 1
+    }
+    return false
+}
+
+fn release(app: *App, store: *Store, entry: *Entry) -> void {
+    if entry.*.written { removeFiles(app, store, idOf(entry)) }
+    entry.*.doc = 0
+    entry.*.written = false
+    entry.*.since = 0
+}
+
+// The document was saved, or is being closed: its autosave goes (and
+// with it what was kept for it).
+pub fn forget(app: *App, doc: *Document) -> void {
+    const store = storeOf(app)
+    if store == null { return }
+    const entry = entryOf(store.?, doc)
+    if entry != null { release(app, store.?, entry.?) }
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+// The document's ID.name: its name, a line feed, its file.
+fn writeName(app: *App, store: *Store, entry: *Entry, doc: *Document) -> bool {
+    const into: [*]u8 = &store.*.path
+    if fileOf(app, store, idOf(entry), "name", into) == 0 { return false }
+    const line: [*]u8 = &store.*.line
+    var length = std.text.append(line, 0, 512, documents.nameOf(doc))
+    length = std.text.appendByte(line, length, 512, 10)
+    const path = image_module.pathOf(doc.*.image)
+    if length + path.length + 1 < 512 {
+        length = std.text.append(line, length, 512, path)
+        length = std.text.appendByte(line, length, 512, 10)
+    }
+    return std.fs.replaceFile(into, line, length, 384)
+}
+
+// Writes the document's autosave now. False when it could not be written
+// (the status bar says why).
+pub fn write(app: *App, doc: *Document) -> bool {
+    const store = storeOf(app)
+    if store == null { return false }
+    const entry = entryFor(app, store.?, doc)
+    if entry == null { return false }
+    const s = store.?
+    // (448 = 0700: what somebody paints is theirs alone to see.)
+    if !folderOf(app, s) || !std.fs.makeDirectories(folderText(s), 448) {
+        api.say(app, state.tr(app, "Autosave: the folder cannot be made", "Automatisch sichern: der Ordner kann nicht angelegt werden"), true)
+        return false
+    }
+    const format = formatNow()
+    const into: [*]u8 = &s.*.path
+    const length = fileOf(app, s, idOf(entry.?), extensionOf(format), into)
+    if length == 0 { return false }
+    var options = formats.saveOptions()
+    options.level = 1
+    const status = formats.save(doc.*.image, into[0..length], format, &options)
+    if status != formats.Status.ok {
+        api.sayWith(app, state.tr(app, "Autosave failed: ", "Automatisch sichern misslungen: "), formats.message(status, app.*.german), true)
+        return false
+    }
+    // A file of the other kind from before goes.
+    if entry.?.*.written && entry.?.*.format != format {
+        const old: [*]u8 = &s.*.other
+        if fileOf(app, s, idOf(entry.?), extensionOf(entry.?.*.format), old) > 0 { _ = std.fs.delete(old) }
+    }
+    _ = writeName(app, s, entry.?, doc)
+    entry.?.*.written = true
+    entry.?.*.format = format
+    entry.?.*.position = @intCast(u64, history_module.position(doc.*.image.*.history))
+    entry.?.*.since = 0
+    if format == formats.PNG && image_module.nodeCount(doc.*.image) > 1 && !s.*.flatSaid {
+        s.*.flatSaid = true
+        api.sayWith(app, state.tr(app, "Autosaved as a flat picture (no layered format can be written yet): ", "Automatisch als flaches Bild gesichert (noch kann kein Format mit Ebenen geschrieben werden): "), documents.nameOf(doc), false)
+    }
+    return true
+}
+
+// Where the document's autosave is (its path into `into`, PATH bytes: the
+// length; 0 when none was written).
+pub fn pathOf(app: *App, doc: *Document, into: [*]u8) -> usize {
+    const store = storeOf(app)
+    if store == null { return 0 }
+    const entry = entryOf(store.?, doc)
+    if entry == null || !entry.?.*.written { return 0 }
+    return fileOf(app, store.?, idOf(entry.?), extensionOf(entry.?.*.format), into)
+}
+
+// Whether a document has a change its autosave does not hold yet (and
+// autosaving is on): while it has, the loop calls tick() about once a
+// second.
+pub fn pending(app: *App) -> bool {
+    if settings.get(app).*.autosaveMinutes == 0 { return false }
+    const store = storeOf(app)
+    var index: usize = 0
+    while index < app.*.count {
+        const doc = app.*.documents[index]
+        index += 1
+        if doc == null || !documents.isModified(doc.?) { continue }
+        if store == null { return true }
+        const entry = entryOf(store.?, doc.?)
+        if entry == null || !entry.?.*.written || entry.?.*.position != @intCast(u64, history_module.position(doc.?.*.image.*.history)) { return true }
+    }
+    return false
+}
+
+// Time passed: what is due is written. The loop calls it about once a
+// second (more often does no harm).
+pub fn tick(app: *App) -> void {
+    const store = storeOf(app)
+    if store == null { return }
+    const s = store.?
+    // Entries of documents closed without forget(): their files go.
+    var index: usize = 0
+    while index < state.DOCUMENTS {
+        const entry = &s.*.entries[index]
+        if entry.*.doc != 0 && !isOpen(app, entry.*.doc) { release(app, s, entry) }
+        index += 1
+    }
+    const minutes = settings.get(app).*.autosaveMinutes
+    if minutes == 0 { return }
+    const interval = @intCast(usize, minutes) * 60000
+    const now = shell_module.now(app.*.shell)
+    index = 0
+    while index < app.*.count {
+        const doc = app.*.documents[index]
+        index += 1
+        if doc == null { continue }
+        if !documents.isModified(doc.?) {
+            // (As saved: nothing is waiting.)
+            const kept = entryOf(s, doc.?)
+            if kept != null { kept.?.*.since = 0 }
+            continue
+        }
+        const entry = entryFor(app, s, doc.?)
+        if entry == null { continue }
+        const position = @intCast(u64, history_module.position(doc.?.*.image.*.history))
+        if entry.?.*.written && position == entry.?.*.position {
+            // What the autosave holds (a change undone back to it).
+            entry.?.*.since = 0
+            continue
+        }
+        // (0 is "none waiting": the first time counts from 1.)
+        if entry.?.*.since == 0 {
+            entry.?.*.since = if now > 0 { now } else { 1 }
+            continue
+        }
+        // (Failed: tried again an interval later, not every second.)
+        if now >= entry.?.*.since && now - entry.?.*.since >= interval && !write(app, doc.?) { entry.?.*.since = if now > 0 { now } else { 1 } }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recovering
+
+fn foundName(found: *Found) -> []const u8 {
+    const bytes: [*]const u8 = &found.*.name
+    return bytes[0..found.*.nameLength]
+}
+
+fn foundId(found: *Found) -> []const u8 {
+    const bytes: [*]const u8 = &found.*.id
+    return bytes[0..found.*.idLength]
+}
+
+// Whether an id is held by an open document's entry (its autosave is
+// this run's own).
+fn isInUse(app: *App, store: *Store, id: []const u8) -> bool {
+    var index: usize = 0
+    while index < state.DOCUMENTS {
+        const entry = &store.*.entries[index]
+        if entry.*.doc != 0 && isOpen(app, entry.*.doc) && std.text.same(idOf(entry), id) { return true }
+        index += 1
+    }
+    return false
+}
+
+// Entries with `id` whose document went without forget() let go of it
+// (and not of its files: those are being recovered or discarded now).
+fn unclaim(app: *App, store: *Store, id: []const u8) -> void {
+    var index: usize = 0
+    while index < state.DOCUMENTS {
+        const entry = &store.*.entries[index]
+        if entry.*.doc != 0 && !isOpen(app, entry.*.doc) && std.text.same(idOf(entry), id) {
+            entry.*.doc = 0
+            entry.*.written = false
+        }
+        index += 1
+    }
+}
+
+// The name kept in ID.name (its first line; the id when there is none).
+fn readName(app: *App, store: *Store, found: *Found) -> void {
+    const id = foundId(found)
+    const bytes: [*]u8 = &found.*.name
+    found.*.nameLength = std.text.append(bytes, 0, NAME, id)
+    const into: [*]u8 = &store.*.path
+    if fileOf(app, store, id, "name", into) == 0 { return }
+    const line: [*]u8 = &store.*.line
+    const read = std.fs.readFile(into, line, 511)
+    var end: usize = 0
+    while end < read && line[end] != 10 { end += 1 }
+    if end > 0 && end <= NAME { found.*.nameLength = std.text.append(bytes, 0, NAME, line[0..end]) }
+}
+
+// The autosaves in the folder that no open document holds, into
+// store.found; how many.
+fn scan(app: *App, store: *Store) -> usize {
+    store.*.foundCount = 0
+    if !folderOf(app, store) { return 0 }
+    const into: [*]u8 = &store.*.path
+    std.mem.copy(into, folderText(store).pointer, store.*.folderLength)
+    into[store.*.folderLength] = 0
+    const folder = std.fs.open(into, std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(folder) { return 0 }
+    const buffer = app.*.allocator.alloc(8192, 16)
+    if buffer == null {
+        _ = std.fs.close(folder)
+        return 0
+    }
+    var reader = std.fs.entries(folder, buffer.?, 8192)
+    var entry: std.fs.Entry = undefined
+    while std.fs.nextEntry(&reader, &entry) && store.*.foundCount < FOUND {
+        const name = entry.name.pointer[0..entry.name.length]
+        var format = formats.NONE
+        if std.text.endsWith(name, ".ora") { format = formats.ORA }
+        if std.text.endsWith(name, ".png") { format = formats.PNG }
+        if format == formats.NONE || !std.text.startsWith(name, "nebula-") || name.length - 4 > ID { continue }
+        const id = name[0..name.length - 4]
+        if isInUse(app, store, id) { continue }
+        const found = &store.*.found[store.*.foundCount]
+        const bytes: [*]u8 = &found.*.id
+        found.*.idLength = std.text.append(bytes, 0, ID, id)
+        found.*.format = format
+        found.*.bytes = 0
+        store.*.foundCount += 1
+    }
+    app.*.allocator.free(buffer.?, 8192, 16)
+    _ = std.fs.close(folder)
+    var index: usize = 0
+    while index < store.*.foundCount {
+        const found = &store.*.found[index]
+        readName(app, store, found)
+        if fileOf(app, store, foundId(found), extensionOf(found.*.format), into) > 0 {
+            var known: std.fs.Stat = undefined
+            if std.fs.status(into, &known) == 0 && known.size > 0 { found.*.bytes = @bitCast(u64, known.size) }
+        }
+        index += 1
+    }
+    return store.*.foundCount
+}
+
+// How many autosaves of earlier runs are in the folder now (that no open
+// document of this run holds).
+pub fn leftOver(app: *App) -> usize {
+    const store = storeOf(app)
+    if store == null { return 0 }
+    return scan(app, store.?)
+}
+
+// Shows the autosaves of earlier runs, if there are any, in a dialog that
+// asks what to do with them (see the header). False when there is none
+// (or the dialog cannot be shown).
+pub fn offer(app: *App) -> bool {
+    const store = storeOf(app)
+    if store == null || scan(app, store.?) == 0 { return false }
+    const hooks = dialogs.Hooks.{ .kind = KIND_RECOVER, .draw = drawRecover, .key = null, .finish = finishRecover, .tabs = true, .closable = true }
+    return dialogs.host(app, hooks, 16) != null
+}
+
+// "4.2 MB" as the file dialog writes sizes: whole units, one decimal
+// below ten.
+fn sizeText(bytes: u64, into: [*]u8, capacity: usize) -> usize {
+    var length: usize = 0
+    if bytes < 1000 {
+        length = std.text.appendUnsigned(into, 0, capacity, @intCast(usize, bytes))
+        return std.text.append(into, length, capacity, " B")
+    }
+    var unit: []const u8 = " kB"
+    var scaled = bytes
+    if bytes >= 1000000 {
+        unit = " MB"
+        scaled = bytes / 1000
+    }
+    // Tenths of the unit, rounded half up.
+    const tenths = (scaled + 50) / 100
+    if tenths < 100 {
+        length = std.text.appendUnsigned(into, 0, capacity, @intCast(usize, tenths / 10))
+        length = std.text.appendByte(into, length, capacity, 46)
+        length = std.text.appendUnsigned(into, length, capacity, @intCast(usize, tenths % 10))
+    } else {
+        length = std.text.appendUnsigned(into, 0, capacity, @intCast(usize, (tenths + 5) / 10))
+    }
+    return std.text.append(into, length, capacity, unit)
+}
+
+const ROW: i32 = 26
+const INTRO: i32 = 44
+
+fn drawRecover(app: *App, level: usize, window: ui.Rect) -> void {
+    const store = storeOf(app)
+    if store == null { return }
+    const s = store.?
+    const kit = api.kit(app)
+    const scale = state.themeOf(app).*.scale
+    const rows = @intCast(i32, s.*.foundCount)
+    const natural = INTRO * scale + rows * ROW * scale
+    var content = dialogs.frame(app, window, state.tr(app, "Recover Unsaved Work", "Ungespeicherte Arbeit wiederherstellen"), 500 * scale, dialogs.framed(app, natural))
+    const labels: [*][]const u8 = &s.*.labels
+    labels[0] = state.tr(app, "Open", "Öffnen")
+    labels[1] = state.tr(app, "Discard", "Verwerfen")
+    labels[2] = state.tr(app, "Later", "Später")
+    const clicked = dialogs.buttons(app, &content, labels[0..3], 0)
+    var area = dialogs.scrollBegin(app, content, natural)
+    const intro = ui.takeTop(&area, INTRO * scale)
+    kit_module.label(kit, ui.rect(intro.x, intro.y, intro.width, 20 * scale), state.tr(app, "Nebula ended without saving these pictures.", "Nebula wurde beendet, ohne diese Bilder zu speichern."), kit_module.TEXT_NORMAL, kit_module.ALIGN_LEFT)
+    kit_module.label(kit, ui.rect(intro.x, intro.y + 20 * scale, intro.width, 20 * scale), state.tr(app, "Open them again, or discard them?", "Wieder öffnen oder verwerfen?"), kit_module.TEXT_DIM, kit_module.ALIGN_LEFT)
+    const canvas = kit_module.canvasOf(kit)
+    const theme = state.themeOf(app)
+    var index: usize = 0
+    while index < s.*.foundCount {
+        const found = &s.*.found[index]
+        const row = ui.takeTop(&area, ROW * scale)
+        const icon = 16 * scale
+        icons.draw(canvas, icons.IMAGE, row.x, row.y + (row.height - icon) / 2, icon, theme.*.dim)
+        var size: [24]u8 = undefined
+        const size_bytes: [*]u8 = &size
+        const size_length = sizeText(found.*.bytes, size_bytes, 24)
+        const room = 90 * scale
+        kit_module.label(kit, ui.rect(row.x + icon + 8 * scale, row.y, row.width - icon - 8 * scale - room, row.height), foundName(found), kit_module.TEXT_NORMAL, kit_module.ALIGN_LEFT)
+        kit_module.label(kit, ui.rect(ui.right(row) - room, row.y, room, row.height), size_bytes[0..size_length], kit_module.TEXT_DIM, kit_module.ALIGN_RIGHT)
+        if index + 1 < s.*.foundCount { kit_module.hline(canvas, row.x, ui.bottom(row) - scale, row.width, theme.*.divider) }
+        index += 1
+    }
+    dialogs.scrollEnd(app)
+    if clicked != null { dialogs.close(app, level, clicked.?) }
+}
+
+// The autosave `found` as a document again: untitled, changed, holding
+// the autosave until it is saved or closed. False when it cannot be read.
+fn recover(app: *App, store: *Store, found: *Found) -> bool {
+    unclaim(app, store, foundId(found))
+    const into: [*]u8 = &store.*.path
+    const length = fileOf(app, store, foundId(found), extensionOf(found.*.format), into)
+    if length == 0 { return false }
+    var result: formats.LoadResult = undefined
+    const status = formats.load(app.*.allocator, into[0..length], &result)
+    if status != formats.Status.ok {
+        api.sayWith(app, state.tr(app, "Could not recover a picture: ", "Ein Bild konnte nicht wiederhergestellt werden: "), formats.message(status, app.*.german), true)
+        return false
+    }
+    const name: [*]u8 = &store.*.other
+    var name_length = std.text.append(name, 0, NAME, foundName(found))
+    name_length = std.text.append(name, name_length, NAME, state.tr(app, " (recovered)", " (wiederhergestellt)"))
+    const doc = documents.add(app, result.image.?, name[0..name_length])
+    if doc == null {
+        image_module.destroy(result.image.?)
+        return false
+    }
+    // Not the autosave's file: it is saved under a name of its own.
+    image_module.setPath(doc.?.*.image, "")
+    doc.?.*.format = 0
+    // Changed: closing it asks.
+    doc.?.*.savedSerial = 0xFFFFFFFFFFFFFFFF
+    const entry = entryFor(app, store, doc.?)
+    if entry != null {
+        // It keeps the autosave it came from.
+        const bytes: [*]u8 = &entry.?.*.id
+        entry.?.*.idLength = std.text.append(bytes, 0, ID, foundId(found))
+        entry.?.*.written = true
+        entry.?.*.format = found.*.format
+        entry.?.*.position = @intCast(u64, history_module.position(doc.?.*.image.*.history))
+    }
+    return true
+}
+
+fn finishRecover(app: *App, level: usize, answer: usize) -> void {
+    const store = storeOf(app)
+    if store == null { return }
+    const s = store.?
+    if answer == 0 {
+        var opened: usize = 0
+        var index: usize = 0
+        while index < s.*.foundCount {
+            if recover(app, s, &s.*.found[index]) { opened += 1 }
+            index += 1
+        }
+        if opened > 0 { api.say(app, state.tr(app, "Recovered: save the pictures under names of their own", "Wiederhergestellt: die Bilder unter eigenem Namen speichern"), false) }
+    } else if answer == 1 {
+        var index: usize = 0
+        while index < s.*.foundCount {
+            unclaim(app, s, foundId(&s.*.found[index]))
+            removeFiles(app, s, foundId(&s.*.found[index]))
+            index += 1
+        }
+    }
+    s.*.foundCount = 0
+    api.redraw(app)
+}

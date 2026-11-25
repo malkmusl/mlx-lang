@@ -1,0 +1,742 @@
+// nebula core: text set in a font at any size, for the text tool and for
+// whatever else puts words on an image. Glyphs come from std.truetype one
+// at a time (tt.rasterize: no atlas, so neither their size nor their
+// number is limited, which std.ui.text's atlas is), set on lines that end
+// at line feeds and, given a width, between words (inside a word longer
+// than the width); each line is aligned left, centred or right; the line
+// pitch and the room between letters are the style's. What comes out is
+// coverage, a byte a pixel: into a buffer of bytes, into a mask Device
+// (core/mask.mlx), or mixed into a layer in a colour with a blend mode, an
+// opacity and the selection (paint(), through core/fill.mlx's paint as a
+// fill is mixed in).
+//
+//     const fonts = textrender.create(allocator).?   // the fonts there are, none read yet
+//     var style = textrender.defaultStyle()
+//     style.size = 48.0
+//     const extent = textrender.measure(fonts, &style, "Hello")
+//     _ = textrender.paint(fonts, &style, "Hello", 20.0, 30.0, layer, 0xFF000000, blend.NORMAL, 255, 0, null)
+//     textrender.destroy(fonts)
+//
+// Where text goes: (x, y) is the top of its first line and, for text
+// without a width to wrap at, the point it is aligned to (its left edge,
+// its middle or its right edge); with a width, the left edge of the box
+// the lines are aligned in. The size is the font's em in pixels; one line
+// lies below the other by the font's ascent, descent and gap times the
+// line spacing. Glyphs stand on whole pixels (as std.ui.text sets them).
+//
+// The fonts: the DejaVu faces (Sans, Sans Bold, Sans Mono, Serif, Serif
+// Bold), Noto Sans and the Liberation faces where they are; on brixOS in
+// /system/fonts, where every other font file there is listed too, on
+// Linux in the usual folders of the distributions. A font's file is read
+// when the font is first used and kept until destroy().
+//
+// Not done: shaping (ligatures, complex scripts, right to left: glyphs are
+// set one after the other with the `kern` table's kerning), hinting,
+// positions finer than a pixel, another font for a character the font
+// has no glyph for (its .notdef box shows).
+const std = @import("std")
+const builtin = @import("builtin")
+const tt = @import("std.truetype")
+const device_module = @import("./device.mlx")
+const mask_module = @import("./mask.mlx")
+const fill = @import("./fill.mlx")
+const geom = @import("./geom.mlx")
+const scratch = @import("./scratch.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Device = device_module.Device
+pub const Rect = geom.Rect
+
+pub const ALIGN_LEFT: u8 = 0
+pub const ALIGN_CENTER: u8 = 1
+pub const ALIGN_RIGHT: u8 = 2
+
+// The sizes (the em in pixels) text is set at: what is asked is held to
+// them.
+pub const SMALLEST: f64 = 1.0
+pub const LARGEST: f64 = 1000.0
+
+// The most fonts listed; bytes of a font's path and of its name.
+pub const FONTS: usize = 24
+const PATH: usize = 256
+pub const NAME: usize = 64
+// Before the first glyph of a line (nothing to kern against).
+const NO_GLYPH: u32 = 0xFFFFFFFF
+// Coordinates beyond this many pixels are not set.
+const FAR: f64 = 1000000000.0
+
+// How text is set.
+pub const Style = struct {
+    // The font: its number in the Fonts' list (one that cannot be read:
+    // the first that can).
+    face: usize
+    // The em, in pixels (SMALLEST to LARGEST).
+    size: f64
+    // ALIGN_LEFT, ALIGN_CENTER or ALIGN_RIGHT.
+    alignment: u8
+    // Times the font's line (1: as the font says).
+    lineSpacing: f64
+    // Pixels added after every character (below 0: closer).
+    letterSpacing: f64
+    // Lines are broken between words to stay this wide (0: only at line
+    // feeds).
+    wrap: f64
+    // False: every pixel is covered or not (no soft edges).
+    antialias: bool
+}
+
+// Sans at 48 pixels, left, as the font spaces it, unwrapped, smooth.
+pub fn defaultStyle() -> Style {
+    return Style.{ .face = 0, .size = 48.0, .alignment = ALIGN_LEFT, .lineSpacing = 1.0, .letterSpacing = 0.0, .wrap = 0.0, .antialias = true }
+}
+
+// What text set in a style takes, in pixels.
+pub const Extent = struct {
+    // The box the lines are aligned in: its width (the widest line, or
+    // the width wrapped at) and its height (from the top of the first
+    // line to the bottom of the last one's descent).
+    width: f64
+    height: f64
+    // Where the box's left edge is from the x the text is set at (0, or
+    // minus all or half of the width for text without a width that is
+    // aligned right or centred).
+    left: f64
+    lines: usize
+    // From a line's top to its baseline, below it to the descent, and
+    // from one line's top to the next's.
+    ascent: f64
+    descent: f64
+    pitch: f64
+}
+
+// ---------------------------------------------------------------------------
+// Fonts
+
+const Entry = struct {
+    // NUL-terminated.
+    path: [256]u8
+    pathLength: usize
+    name: [64]u8
+    nameLength: usize
+    font: tt.Font
+    loaded: bool
+    failed: bool
+}
+
+pub const Fonts = struct {
+    allocator: Allocator
+    entries: [24]Entry
+    count: usize
+}
+
+// The faces looked for by name, in the order they are listed.
+const FAMILIES: usize = 9
+
+fn familyName(family: usize) -> []const u8 {
+    if family == 0 { return "DejaVu Sans" }
+    if family == 1 { return "DejaVu Sans Bold" }
+    if family == 2 { return "DejaVu Sans Mono" }
+    if family == 3 { return "DejaVu Serif" }
+    if family == 4 { return "DejaVu Serif Bold" }
+    if family == 5 { return "Noto Sans" }
+    if family == 6 { return "Liberation Sans" }
+    if family == 7 { return "Liberation Serif" }
+    return "Liberation Mono"
+}
+
+fn familyFile(family: usize) -> []const u8 {
+    if family == 0 { return "DejaVuSans.ttf" }
+    if family == 1 { return "DejaVuSans-Bold.ttf" }
+    if family == 2 { return "DejaVuSansMono.ttf" }
+    if family == 3 { return "DejaVuSerif.ttf" }
+    if family == 4 { return "DejaVuSerif-Bold.ttf" }
+    if family == 5 { return "NotoSans-Regular.ttf" }
+    if family == 6 { return "LiberationSans-Regular.ttf" }
+    if family == 7 { return "LiberationSerif-Regular.ttf" }
+    return "LiberationMono-Regular.ttf"
+}
+
+// The folders of the Linux distributions a family's file is looked for
+// in (Debian's, Arch's, then the others'); "" ends the list.
+const FOLDERS: usize = 4
+
+fn linuxFolder(family: usize, index: usize) -> []const u8 {
+    if family <= 4 {
+        if index == 0 { return "/usr/share/fonts/truetype/dejavu/" }
+        if index == 1 { return "/usr/share/fonts/TTF/" }
+        if index == 2 { return "/usr/share/fonts/dejavu/" }
+        if family == 2 { return "/usr/share/fonts/dejavu-sans-mono-fonts/" }
+        if family >= 3 { return "/usr/share/fonts/dejavu-serif-fonts/" }
+        return "/usr/share/fonts/dejavu-sans-fonts/"
+    }
+    if family == 5 {
+        if index == 0 { return "/usr/share/fonts/truetype/noto/" }
+        if index == 1 { return "/usr/share/fonts/noto/" }
+        if index == 2 { return "/usr/share/fonts/google-noto/" }
+        return ""
+    }
+    if index == 0 { return "/usr/share/fonts/truetype/liberation/" }
+    if index == 1 { return "/usr/share/fonts/TTF/" }
+    if index == 2 { return "/usr/share/fonts/liberation/" }
+    return "/usr/share/fonts/liberation-fonts/"
+}
+
+// brixOS keeps its fonts in one folder.
+const SYSTEM_FONTS: []const u8 = "/system/fonts/"
+
+fn entryPath(entry: *Entry) -> []const u8 {
+    const bytes: [*]const u8 = &entry.*.path
+    return bytes[0..entry.*.pathLength]
+}
+
+fn entryName(entry: *Entry) -> []const u8 {
+    const bytes: [*]const u8 = &entry.*.name
+    return bytes[0..entry.*.nameLength]
+}
+
+// Whether a font of the file `file` (its name alone) is listed already.
+fn listedFile(fonts: *Fonts, file: []const u8) -> bool {
+    var index: usize = 0
+    while index < fonts.*.count {
+        if std.text.endsWith(entryPath(&fonts.*.entries[index]), file) { return true }
+        index += 1
+    }
+    return false
+}
+
+// Lists the font `folder` + `file` as `name` when the file is there.
+fn add(fonts: *Fonts, folder: []const u8, file: []const u8, name: []const u8) -> void {
+    if fonts.*.count >= FONTS || folder.length + file.length + 1 > PATH { return }
+    const entry = &fonts.*.entries[fonts.*.count]
+    const path: [*]u8 = &entry.*.path
+    var length = std.text.append(path, 0, PATH, folder)
+    length = std.text.append(path, length, PATH, file)
+    path[length] = 0
+    if !std.fs.exists(path) { return }
+    entry.*.pathLength = length
+    const named: [*]u8 = &entry.*.name
+    entry.*.nameLength = std.text.append(named, 0, NAME, name)
+    entry.*.loaded = false
+    entry.*.failed = false
+    fonts.*.count += 1
+}
+
+fn isFontFile(name: []const u8) -> bool {
+    return std.text.endsWith(name, ".ttf") || std.text.endsWith(name, ".otf") || std.text.endsWith(name, ".TTF") || std.text.endsWith(name, ".OTF")
+}
+
+// A font file's name as people read it: without its extension, with
+// blanks for '-' and '_' ("Roboto-Regular.ttf": "Roboto Regular").
+fn nameOfFile(file: []const u8, into: [*]u8) -> usize {
+    var end = file.length
+    while end > 0 && file[end - 1] != 46 { end -= 1 }
+    if end > 0 { end -= 1 } else { end = file.length }
+    var length: usize = 0
+    var index: usize = 0
+    while index < end && length < NAME {
+        const byte = file[index]
+        into[length] = if byte == 45 || byte == 95 { 32 } else { byte }
+        length += 1
+        index += 1
+    }
+    return length
+}
+
+// Every other font file of `folder` (the families are listed already).
+fn addFolder(fonts: *Fonts, folder: []const u8) -> void {
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const buffer = scratch.bytes(pool, 8192)
+    const terminated = scratch.bytes(pool, PATH)
+    if buffer == null || terminated == null {
+        scratch.release(pool, mark)
+        return
+    }
+    const directory = std.fs.open(std.text.zeroTerminated(terminated.?, PATH, folder), std.fs.READ_ONLY | std.fs.DIRECTORY, 0)
+    if !std.fs.isValid(directory) {
+        scratch.release(pool, mark)
+        return
+    }
+    var reader = std.fs.entries(directory, buffer.?, 8192)
+    var entry: std.fs.Entry = undefined
+    var name: [64]u8 = undefined
+    const named: [*]u8 = &name
+    while fonts.*.count < FONTS && std.fs.nextEntry(&reader, &entry) {
+        if std.fs.isDotName(entry.name) { continue }
+        const file = entry.name.pointer[0..entry.name.length]
+        if !isFontFile(file) || listedFile(fonts, file) { continue }
+        const length = nameOfFile(file, named)
+        add(fonts, folder, file, named[0..length])
+    }
+    _ = std.fs.close(directory)
+    scratch.release(pool, mark)
+}
+
+// The fonts there are (none read yet; maybe none at all), in heap memory
+// of `allocator`. Null without memory.
+pub fn create(allocator: Allocator) -> ?*Fonts {
+    const memory = allocator.alloc(@sizeOf(Fonts), 16)
+    if memory == null { return null }
+    std.mem.zero(memory.?, @sizeOf(Fonts))
+    const fonts: *Fonts = unsafe { @ptrCast(*Fonts, memory.?) }
+    fonts.*.allocator = allocator
+    fonts.*.count = 0
+    var family: usize = 0
+    while family < FAMILIES {
+        const file = familyFile(family)
+        if comptime builtin.os == builtin.Os.brixos {
+            add(fonts, SYSTEM_FONTS, file, familyName(family))
+        } else {
+            var place: usize = 0
+            while place < FOLDERS && !listedFile(fonts, file) {
+                const folder = linuxFolder(family, place)
+                if folder.length > 0 { add(fonts, folder, file, familyName(family)) }
+                place += 1
+            }
+        }
+        family += 1
+    }
+    if comptime builtin.os == builtin.Os.brixos { addFolder(fonts, SYSTEM_FONTS) }
+    return fonts
+}
+
+// Lets the fonts go (the files read and the list).
+pub fn destroy(fonts: *Fonts) -> void {
+    var index: usize = 0
+    while index < fonts.*.count {
+        const entry = &fonts.*.entries[index]
+        if entry.*.loaded { tt.close(&entry.*.font) }
+        entry.*.loaded = false
+        index += 1
+    }
+    const allocator = fonts.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, fonts), @sizeOf(Fonts), 16) }
+}
+
+// How many fonts there are, and the name of one ("" past the last).
+pub fn count(fonts: *Fonts) -> usize { return fonts.*.count }
+
+pub fn name(fonts: *Fonts, index: usize) -> []const u8 {
+    if index >= fonts.*.count { return "" }
+    return entryName(&fonts.*.entries[index])
+}
+
+// The number of the font called `wanted` (count() when none is).
+pub fn find(fonts: *Fonts, wanted: []const u8) -> usize {
+    var index: usize = 0
+    while index < fonts.*.count {
+        if std.text.same(entryName(&fonts.*.entries[index]), wanted) { return index }
+        index += 1
+    }
+    return fonts.*.count
+}
+
+fn load(fonts: *Fonts, index: usize) -> bool {
+    const entry = &fonts.*.entries[index]
+    if entry.*.loaded { return true }
+    if entry.*.failed { return false }
+    const path: [*]const u8 = &entry.*.path
+    if tt.loadFile(&entry.*.font, path, fonts.*.allocator) != tt.Status.ok || entry.*.font.unitsPerEm == 0 {
+        entry.*.failed = true
+        return false
+    }
+    entry.*.loaded = true
+    return true
+}
+
+// The number of the font text of face `index` is set in: that one when
+// its file can be read, else the first that can; count() when none can.
+pub fn usable(fonts: *Fonts, index: usize) -> usize {
+    if index < fonts.*.count && load(fonts, index) { return index }
+    var other: usize = 0
+    while other < fonts.*.count {
+        if load(fonts, other) { return other }
+        other += 1
+    }
+    return fonts.*.count
+}
+
+// ---------------------------------------------------------------------------
+// Setting lines
+
+// A style worked out for its font, in pixels.
+const Setting = struct {
+    font: *tt.Font
+    scale: f64
+    ascent: f64
+    descent: f64
+    pitch: f64
+    spacing: f64
+    wrap: f64
+    alignment: u8
+    antialias: bool
+    allocator: Allocator
+}
+
+fn held(value: f64, low: f64, high: f64) -> f64 {
+    // (Not a number is the low end.)
+    if !(value > low) { return low }
+    return if value > high { high } else { value }
+}
+
+// The size a style asks for, as text is set at it.
+pub fn sizeOf(style: *const Style) -> f64 {
+    return held(style.*.size, SMALLEST, LARGEST)
+}
+
+fn prepare(fonts: *Fonts, style: *const Style, setting: *Setting) -> bool {
+    const index = usable(fonts, style.*.face)
+    if index >= fonts.*.count { return false }
+    const font = &fonts.*.entries[index].font
+    const size = sizeOf(style)
+    setting.*.font = font
+    setting.*.scale = size / @floatFromInt(f64, font.*.unitsPerEm)
+    setting.*.ascent = @floatFromInt(f64, font.*.ascender) * setting.*.scale
+    setting.*.descent = -@floatFromInt(f64, font.*.descender) * setting.*.scale
+    const gap = @floatFromInt(f64, font.*.lineGap) * setting.*.scale
+    setting.*.pitch = (setting.*.ascent + setting.*.descent + (if gap > 0.0 { gap } else { 0.0 })) * held(style.*.lineSpacing, 0.1, 10.0)
+    setting.*.spacing = held(style.*.letterSpacing, -LARGEST, LARGEST * 10.0)
+    setting.*.wrap = held(style.*.wrap, 0.0, FAR)
+    setting.*.alignment = if style.*.alignment > ALIGN_RIGHT { ALIGN_LEFT } else { style.*.alignment }
+    setting.*.antialias = style.*.antialias
+    setting.*.allocator = fonts.*.allocator
+    return true
+}
+
+fn kernOf(setting: *const Setting, previous: u32, glyph: u32) -> f64 {
+    if previous == NO_GLYPH || setting.*.font.*.kernCount == 0 { return 0.0 }
+    return @floatFromInt(f64, tt.kerning(setting.*.font, previous, glyph)) * setting.*.scale
+}
+
+fn advanceOf(setting: *const Setting, glyph: u32) -> f64 {
+    return @floatFromInt(f64, tt.advanceWidth(setting.*.font, glyph)) * setting.*.scale
+}
+
+fn isBlank(code: u32) -> bool { return code == 32 || code == 9 }
+
+// One line: the bytes start .. end of the text are on it, the next line
+// starts at `next` (past the line feed, or past the blanks it was broken
+// at), and it is `width` wide (without the blanks at its end). `hard`:
+// it ended at a line feed.
+const Line = struct {
+    start: usize
+    end: usize
+    next: usize
+    width: f64
+    hard: bool
+}
+
+// The line that starts at byte `start`.
+fn lineFrom(setting: *const Setting, text: []const u8, start: usize) -> Line {
+    var at = start
+    var pen: f64 = 0.0
+    var width: f64 = 0.0
+    var previous = NO_GLYPH
+    var characters: usize = 0
+    var blankBefore = false
+    // Where the line ends when it is broken at the last run of blanks.
+    var breakable = false
+    var breakEnd: usize = 0
+    var breakNext: usize = 0
+    var breakWidth: f64 = 0.0
+    while at < text.length {
+        if text[at] == 10 { return Line.{ .start = start, .end = at, .next = at + 1, .width = width, .hard = true } }
+        var consumed: usize = 1
+        const code = tt.decodeUtf8(text.pointer, text.length, at, &consumed)
+        const glyph = tt.glyphIndex(setting.*.font, code)
+        const right = pen + kernOf(setting, previous, glyph) + advanceOf(setting, glyph)
+        const blank = isBlank(code)
+        if setting.*.wrap > 0.0 && !blank && characters > 0 && right > setting.*.wrap + 0.001 {
+            if breakable { return Line.{ .start = start, .end = breakEnd, .next = breakNext, .width = breakWidth, .hard = false } }
+            return Line.{ .start = start, .end = at, .next = at, .width = width, .hard = false }
+        }
+        if blank {
+            // A run of blanks after a word: the line may be broken there.
+            if characters > 0 && !blankBefore {
+                breakable = true
+                breakEnd = at
+                breakWidth = width
+            }
+            if breakable { breakNext = at + consumed }
+        } else {
+            width = right
+        }
+        blankBefore = blank
+        pen = right + setting.*.spacing
+        previous = glyph
+        characters += 1
+        at += consumed
+    }
+    return Line.{ .start = start, .end = text.length, .next = text.length, .width = width, .hard = false }
+}
+
+// Going through the lines of a text.
+const Walk = struct {
+    at: usize
+    done: bool
+}
+
+fn nextLine(setting: *const Setting, text: []const u8, walk: *Walk, line: *Line) -> bool {
+    if walk.*.done { return false }
+    line.* = lineFrom(setting, text, walk.*.at)
+    // (A text that ends with a line feed has an empty line after it.)
+    if line.*.next >= text.length && !line.*.hard { walk.*.done = true }
+    walk.*.at = line.*.next
+    return true
+}
+
+fn extentOf(setting: *const Setting, text: []const u8) -> Extent {
+    var walk = Walk.{ .at = 0, .done = false }
+    var line: Line = undefined
+    var widest: f64 = 0.0
+    var lines: usize = 0
+    while nextLine(setting, text, &walk, &line) {
+        if line.width > widest { widest = line.width }
+        lines += 1
+    }
+    const width = if setting.*.wrap > 0.0 { setting.*.wrap } else { widest }
+    var left: f64 = 0.0
+    if setting.*.wrap <= 0.0 {
+        if setting.*.alignment == ALIGN_CENTER { left = -width / 2.0 }
+        if setting.*.alignment == ALIGN_RIGHT { left = -width }
+    }
+    return Extent.{
+        .width = width,
+        .height = setting.*.ascent + setting.*.descent + @floatFromInt(f64, lines - 1) * setting.*.pitch,
+        .left = left,
+        .lines = lines,
+        .ascent = setting.*.ascent,
+        .descent = setting.*.descent,
+        .pitch = setting.*.pitch,
+    }
+}
+
+// Where a line of `width` starts in a box `box` wide.
+fn indentOf(setting: *const Setting, box: f64, width: f64) -> f64 {
+    if setting.*.alignment == ALIGN_CENTER { return (box - width) / 2.0 }
+    if setting.*.alignment == ALIGN_RIGHT { return box - width }
+    return 0.0
+}
+
+// What `text` takes set in `style` (all 0 when no font can be read; an
+// empty text is one empty line).
+pub fn measure(fonts: *Fonts, style: *const Style, text: []const u8) -> Extent {
+    var setting: Setting = undefined
+    if !prepare(fonts, style, &setting) {
+        return Extent.{ .width = 0.0, .height = 0.0, .left = 0.0, .lines = 0, .ascent = 0.0, .descent = 0.0, .pitch = 0.0 }
+    }
+    return extentOf(&setting, text)
+}
+
+// Where the caret stands before byte `offset` of `text` set at (x, y):
+// the top of its line (into `caret_x`, `caret_y`) and the line's height
+// (ascent and descent). False when no font can be read.
+pub fn caretAt(fonts: *Fonts, style: *const Style, text: []const u8, x: f64, y: f64, offset: usize, caret_x: *f64, caret_y: *f64, height: *f64) -> bool {
+    var setting: Setting = undefined
+    if !prepare(fonts, style, &setting) { return false }
+    const extent = extentOf(&setting, text)
+    var walk = Walk.{ .at = 0, .done = false }
+    var line: Line = undefined
+    var index: usize = 0
+    while nextLine(&setting, text, &walk, &line) {
+        // A caret in the blanks a line was broken at stands at its end.
+        if offset <= line.end || (offset < line.next && !line.hard) || walk.done {
+            var pen = x + extent.left + indentOf(&setting, extent.width, line.width)
+            var previous = NO_GLYPH
+            var at = line.start
+            const stop = if offset < line.end { offset } else { line.end }
+            while at < stop {
+                var consumed: usize = 1
+                const code = tt.decodeUtf8(text.pointer, text.length, at, &consumed)
+                const glyph = tt.glyphIndex(setting.font, code)
+                pen += kernOf(&setting, previous, glyph) + advanceOf(&setting, glyph) + setting.spacing
+                previous = glyph
+                at += consumed
+            }
+            caret_x.* = pen
+            caret_y.* = y + @floatFromInt(f64, index) * setting.pitch
+            height.* = setting.ascent + setting.descent
+            return true
+        }
+        index += 1
+    }
+    return false
+}
+
+// The byte of `text` set at (x, y) the caret goes before for a click at
+// (px, py): on the line under it (the first above, the last below), at
+// the boundary between characters nearest to it.
+pub fn offsetAt(fonts: *Fonts, style: *const Style, text: []const u8, x: f64, y: f64, px: f64, py: f64) -> usize {
+    var setting: Setting = undefined
+    if !prepare(fonts, style, &setting) { return text.length }
+    const extent = extentOf(&setting, text)
+    var wanted: usize = 0
+    const row = (py - y) / (if setting.pitch > 0.0 { setting.pitch } else { 1.0 })
+    if row > 0.0 { wanted = @intFromFloat(usize, held(row, 0.0, 1000000.0)) }
+    var walk = Walk.{ .at = 0, .done = false }
+    var line: Line = undefined
+    var index: usize = 0
+    while nextLine(&setting, text, &walk, &line) {
+        if index == wanted || walk.done {
+            var pen = x + extent.left + indentOf(&setting, extent.width, line.width)
+            var previous = NO_GLYPH
+            var at = line.start
+            while at < line.end {
+                var consumed: usize = 1
+                const code = tt.decodeUtf8(text.pointer, text.length, at, &consumed)
+                const glyph = tt.glyphIndex(setting.font, code)
+                const origin = pen + kernOf(&setting, previous, glyph)
+                const advance = advanceOf(&setting, glyph)
+                if px < origin + advance / 2.0 { return at }
+                pen = origin + advance + setting.spacing
+                previous = glyph
+                at += consumed
+            }
+            return line.end
+        }
+        index += 1
+    }
+    return text.length
+}
+
+// ---------------------------------------------------------------------------
+// Coverage
+
+// Where coverage goes: bytes (`width` x `height` of them, `stride` from a
+// row to the next) or a mask; the rectangle the glyphs' boxes cover.
+const Target = struct {
+    bytes: ?[*]u8
+    width: i32
+    height: i32
+    stride: usize
+    mask: ?*Device
+    covered: Rect
+}
+
+fn whole(value: f64) -> i32 {
+    return @intFromFloat(i32, @floor(held(value, -FAR, FAR) + 0.5))
+}
+
+// The coverage of one glyph into the target, the larger of it and what
+// is there (glyphs that overlap do not add up). False without memory.
+fn stamp(setting: *const Setting, glyph: u32, origin: f64, baseline: f64, target: *Target) -> bool {
+    var bitmap: tt.Bitmap = undefined
+    if !tt.rasterize(setting.*.font, glyph, setting.*.scale, setting.*.allocator, &bitmap) { return false }
+    if bitmap.width == 0 || bitmap.height == 0 { return true }
+    const columns = @intCast(i32, bitmap.width)
+    const rows = @intCast(i32, bitmap.height)
+    const left = whole(origin) + bitmap.left
+    const top = whole(baseline) + bitmap.top
+    const source = bitmap.pixels
+    var done = true
+    if !setting.*.antialias {
+        var index: usize = 0
+        while index < bitmap.width * bitmap.height {
+            source[index] = if source[index] >= 128 { 255 } else { 0 }
+            index += 1
+        }
+    }
+    target.*.covered = geom.unite(target.*.covered, geom.rect(left, top, columns, rows))
+    if target.*.bytes != null {
+        const into = target.*.bytes.?
+        var row: i32 = 0
+        while row < rows {
+            const y = top + row
+            if y >= 0 && y < target.*.height {
+                var column: i32 = 0
+                while column < columns {
+                    const x = left + column
+                    if x >= 0 && x < target.*.width {
+                        const value = source[@intCast(usize, row * columns + column)]
+                        const at = @intCast(usize, y) * target.*.stride + @intCast(usize, x)
+                        if value > into[at] { into[at] = value }
+                    }
+                    column += 1
+                }
+            }
+            row += 1
+        }
+    } else if target.*.mask != null {
+        const area = geom.rect(left, top, columns, rows)
+        const pool = scratch.common()
+        const mark = scratch.mark(pool)
+        const there = scratch.bytes(pool, bitmap.width * bitmap.height)
+        if there == null {
+            done = false
+        } else {
+            mask_module.readBytes(target.*.mask.?, area, there.?, bitmap.width)
+            var index: usize = 0
+            while index < bitmap.width * bitmap.height {
+                if source[index] < there.?[index] { source[index] = there.?[index] }
+                index += 1
+            }
+            done = mask_module.writeBytes(target.*.mask.?, area, source, bitmap.width)
+        }
+        scratch.release(pool, mark)
+    }
+    setting.*.allocator.free(source, bitmap.width * bitmap.height, 8)
+    return done
+}
+
+// Sets every glyph of `text` at (x, y) into the target. False without a
+// font or without memory.
+fn set(fonts: *Fonts, style: *const Style, text: []const u8, x: f64, y: f64, target: *Target) -> bool {
+    var setting: Setting = undefined
+    if !prepare(fonts, style, &setting) { return false }
+    const extent = extentOf(&setting, text)
+    var walk = Walk.{ .at = 0, .done = false }
+    var line: Line = undefined
+    var index: usize = 0
+    var done = true
+    while nextLine(&setting, text, &walk, &line) && done {
+        const baseline = y + setting.ascent + @floatFromInt(f64, index) * setting.pitch
+        var pen = x + extent.left + indentOf(&setting, extent.width, line.width)
+        var previous = NO_GLYPH
+        var at = line.start
+        while at < line.end && done {
+            var consumed: usize = 1
+            const code = tt.decodeUtf8(text.pointer, text.length, at, &consumed)
+            const glyph = tt.glyphIndex(setting.font, code)
+            const origin = pen + kernOf(&setting, previous, glyph)
+            if !isBlank(code) { done = stamp(&setting, glyph, origin, baseline, target) }
+            pen = origin + advanceOf(&setting, glyph) + setting.spacing
+            previous = glyph
+            at += consumed
+        }
+        index += 1
+    }
+    return done
+}
+
+// The coverage of `text` set at (x, y) of a buffer of `width` x `height`
+// bytes (`stride` from one row to the next), the larger of it and what
+// the buffer holds in each byte. False without a font or without memory.
+pub fn render(fonts: *Fonts, style: *const Style, text: []const u8, x: f64, y: f64, into: [*]u8, width: usize, height: usize, stride: usize) -> bool {
+    var target = Target.{ .bytes = into, .width = @intCast(i32, width), .height = @intCast(i32, height), .stride = stride, .mask = null, .covered = geom.empty() }
+    return set(fonts, style, text, x, y, &target)
+}
+
+// The coverage of `text` set at (x, y) of the image into `mask` (a mask
+// device: the larger of it and what the mask holds). The rectangle of the
+// image the glyphs' boxes cover (empty: none, no font, or no memory).
+pub fn coverage(fonts: *Fonts, style: *const Style, text: []const u8, x: f64, y: f64, mask: *Device) -> Rect {
+    var target = Target.{ .bytes = null, .width = 0, .height = 0, .stride = 0, .mask = mask, .covered = geom.empty() }
+    if !set(fonts, style, text, x, y, &target) { return geom.empty() }
+    return target.covered
+}
+
+// `text` set at (x, y) of the image mixed into `target` in `color`
+// (straight 0xAARRGGBB) as core/fill.mlx's paint mixes a fill: each pixel
+// by the glyphs' coverage there, times the selection's amount when one is
+// given, times `opacity` (0-255), in blend mode `mode` with blend.mlx's
+// `flags`. The caller begins and commits the target's change. The
+// rectangle of the pixels changed (empty: none, no font, no memory).
+pub fn paint(fonts: *Fonts, style: *const Style, text: []const u8, x: f64, y: f64, target: *Device, color: u32, mode: u16, opacity: u32, flags: u32, selection: ?*Device) -> Rect {
+    const cover = mask_module.create(fonts.*.allocator, false)
+    if cover == null { return geom.empty() }
+    const area = coverage(fonts, style, text, x, y, cover.?)
+    var changed = geom.empty()
+    if !geom.isEmpty(area) { changed = fill.paint(target, cover.?, area, color, mode, opacity, flags, selection) }
+    device_module.destroy(cover.?)
+    return changed
+}

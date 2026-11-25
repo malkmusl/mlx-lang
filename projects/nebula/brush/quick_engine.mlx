@@ -1,0 +1,254 @@
+// nebula brush: the quick brush ("quick"): the fastest round brush. Every
+// dab is a plain disc of the dab's diameter, its edge anti-aliased, in the
+// dab's colour at its opacity and flow; nothing else of the brush counts
+// (the tip's shape, fades, ratio, turn, grain and mirroring, the
+// sharpness and softness options): no mask is made or kept, each pixel's
+// coverage is worked out where it is painted, and the inside of the disc
+// costs a comparison a pixel.
+//
+// The coverage is the hard round tip's (brush/tip.mlx) for dabs of 16
+// pixels and more: a pixel whose centre lies at d from the dab's centre,
+// with R half the diameter, is covered
+//
+//     clamp(R - d + 0.5, 0, 1)
+//
+// (a pixel half a pixel inside the edge all, half a pixel outside not at
+// all), as a byte rounded to the nearest. Smaller dabs are not sampled
+// finer as the tip's are: their edge is up to pi/12 of a pixel too
+// generous.
+//
+// Painted as the pixel engine paints (brush/pixel_engine.mlx's header has
+// the rules): on an overlay (wash) a dab raises the overlay's alpha toward
+// the dab's opacity and never beyond it; on the layer (build-up) it is
+// mixed in at once in the brush's blend mode, through the selection's
+// amounts, keeping alpha where it is locked. So a stroke of the quick
+// brush paints the same band as the pixel engine's hard round brush of
+// the same size, to a level. As an eraser (Settings.eraser) it takes
+// paint away by its coverage alone.
+const math = @import("std.math")
+const types = @import("./types.mlx")
+const shared = @import("./clone_engine.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const device_module = @import("../core/device.mlx")
+const mask_module = @import("../core/mask.mlx")
+const blend = @import("../core/blend.mlx")
+const table = @import("../core/table.mlx")
+
+pub const Rect = geom.Rect
+
+// The engine's number (Settings.engine). (brush/types.mlx names the
+// engines that were planned; this one follows them.)
+pub const ENGINE_QUICK: u16 = 11
+
+// What the engine keeps for a stroke: the part of the dab to paint, a
+// tile's row of the colour (blend.compositeSpanAt mixes pixels, not one
+// colour), and a tile's row of coverage and of the selection's amounts.
+const Own = struct {
+    area: shared.Area
+    filled: bool
+    color: u32
+    row: [64]u32
+    cover: [64]u8
+    chosen: [64]u8
+}
+
+fn ownOf(stroke: *types.Stroke) -> *Own {
+    unsafe { return @ptrFromInt(*Own, stroke.*.engineState) }
+}
+
+inline fn larger(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+inline fn smaller(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+
+// A quick brush: types.defaults() with this engine, 20 pixels, dabs a
+// tenth of it apart, the pressure driving the size.
+pub fn defaults(settings: *types.Settings) -> void {
+    types.defaults(settings)
+    types.setName(settings, "Quick brush")
+    settings.*.engine = ENGINE_QUICK
+    settings.*.size = 20.0
+}
+
+fn begin(stroke: *types.Stroke) -> bool {
+    const memory = stroke.*.allocator.alloc(@sizeOf(Own), 16)
+    if memory == null { return false }
+    const own: *Own = unsafe { @ptrCast(*Own, memory.?) }
+    own.*.filled = false
+    own.*.color = 0
+    stroke.*.engineState = @intFromPtr(own)
+    return true
+}
+
+fn free(stroke: *types.Stroke) -> void {
+    if stroke.*.engineState == 0 { return }
+    unsafe { stroke.*.allocator.free(@ptrFromInt([*]u8, stroke.*.engineState), @sizeOf(Own), 16) }
+    stroke.*.engineState = 0
+}
+
+// (x + 32512) / 65025, x up to 255^3, is (x + 32512) times this >> 40:
+// exactly, over that whole range.
+const BY_65025: u64 = 16909061
+
+// The wash rule (brush/pixel_engine.mlx's header) for `count` pixels of
+// one row, each at its coverage.
+fn raise(under: [*]u32, cover: [*]const u8, count: usize, rgb: u32, cap: u32, flow: u32) -> void {
+    const r = (rgb >> 16) & 255
+    const g = (rgb >> 8) & 255
+    const b = rgb & 255
+    var index: usize = 0
+    while index < count {
+        const amount = @intCast(u32, cover[index]) * flow
+        if amount != 0 {
+            const before = under[index]
+            const alpha = before >> 24
+            var raised = alpha
+            if alpha < cap {
+                const product = @intCast(u64, (cap - alpha) * amount) + 32512
+                raised = alpha + @intCast(u32, (product * BY_65025) >> 40)
+            }
+            const colour = before & 0x00FFFFFF
+            if alpha == 0 {
+                if raised != 0 { under[index] = (raised << 24) | rgb }
+            } else if raised != alpha || colour != rgb {
+                var mixed = colour
+                if colour != rgb {
+                    const scaled = amount + 128
+                    const weight = (scaled + (scaled >> 8)) >> 8
+                    const keep = 255 - weight
+                    const red = ((before >> 16) & 255) * keep + r * weight + 128
+                    const green = ((before >> 8) & 255) * keep + g * weight + 128
+                    const blue = (before & 255) * keep + b * weight + 128
+                    mixed = (((red + (red >> 8)) >> 8) << 16) | (((green + (green >> 8)) >> 8) << 8) | ((blue + (blue >> 8)) >> 8)
+                }
+                under[index] = (raised << 24) | mixed
+            }
+        }
+        index += 1
+    }
+}
+
+// The disc's coverage of `count` pixels of a row, the first one's centre
+// `dx` to the right of the dab's centre, `dy2` the square of the row's
+// distance from it; `inner` and `outer` the squares of R - 0.5 (-1 when
+// R is under a half) and R + 0.5. Whether any pixel is covered.
+fn coverRow(into: [*]u8, count: usize, dx: f64, dy2: f64, radius: f64, inner: f64, outer: f64) -> bool {
+    var any = false
+    var at = dx
+    var index: usize = 0
+    while index < count {
+        const d2 = at * at + dy2
+        var value: u8 = 0
+        if d2 <= inner {
+            value = 255
+        } else if d2 < outer {
+            const v = radius - @sqrt(d2) + 0.5
+            if v > 0.0 { value = if v >= 1.0 { 255 } else { @intFromFloat(u8, v * 255.0 + 0.5) } }
+        }
+        into[index] = value
+        if value != 0 { any = true }
+        at += 1.0
+        index += 1
+    }
+    return any
+}
+
+fn paint(stroke: *types.Stroke, dab: *const types.Dab) -> Rect {
+    const own = ownOf(stroke)
+    const radius = dab.*.diameter * 0.5
+    // (Copies of a dab, mirrored or wrapped, may land anywhere: one beyond
+    // a thousand million pixels is nowhere, as brush/tip.mlx's forDab
+    // says for the other engines.)
+    if !(radius > 0.0) || !(math.abs(dab.*.x) < 1000000000.0) || !(math.abs(dab.*.y) < 1000000000.0) { return geom.empty() }
+    const x0 = @intFromFloat(i32, @floor(dab.*.x - radius - 0.5))
+    const y0 = @intFromFloat(i32, @floor(dab.*.y - radius - 0.5))
+    const x1 = @intFromFloat(i32, @floor(dab.*.x + radius + 0.5)) + 1
+    const y1 = @intFromFloat(i32, @floor(dab.*.y + radius + 0.5)) + 1
+    if !shared.clipArea(stroke, x0, y0, x1, y1, &own.*.area) { return geom.empty() }
+    const area = &own.*.area
+    const settings = stroke.*.settings
+    const target = &stroke.*.target
+    const direct = target.*.direct
+    // Wash: the cap and the flow; build-up: the opacity, the mode, the
+    // colour's row.
+    const cap = pixel.mul(shared.level(dab.*.opacity), if settings.*.eraser { 255 } else { dab.*.color >> 24 })
+    const flow = shared.level(dab.*.flow)
+    const opacity = shared.level(dab.*.opacity * dab.*.flow)
+    if direct && opacity == 0 { return geom.empty() }
+    if !direct && (cap == 0 || flow == 0) { return geom.empty() }
+    const mode = if settings.*.eraser { blend.ERASE } else { settings.*.blend }
+    const flags: u32 = if target.*.alphaLock { blend.FLAG_ALPHA_LOCK } else { 0 }
+    const color = if settings.*.eraser { pixel.BLACK } else { dab.*.color }
+    const rgb = dab.*.color & 0x00FFFFFF
+    if direct && (!own.*.filled || own.*.color != color) {
+        device_module.fillWords(&own.*.row, 64, color)
+        own.*.color = color
+        own.*.filled = true
+    }
+    const inner = if radius > 0.5 { (radius - 0.5) * (radius - 0.5) } else { -1.0 }
+    const outer = (radius + 0.5) * (radius + 0.5)
+    const device = target.*.device
+    var selection: ?*device_module.Device = null
+    if direct { selection = target.*.selection }
+    const left = area.*.x0 - device.*.x
+    const top = area.*.y0 - device.*.y
+    const right = area.*.x1 - device.*.x
+    const bottom = area.*.y1 - device.*.y
+    var painted = false
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * 64)
+        const row1 = smaller(bottom, ty * 64 + 64)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * 64)
+            const col1 = smaller(right, tx * 64 + 64)
+            const span = @intCast(usize, col1 - col0)
+            // The first column's centre from the dab's.
+            const dx = @floatFromInt(f64, col0 + device.*.x) + 0.5 - dab.*.x
+            var pixels: ?[*]u32 = null
+            var row = row0
+            while row < row1 {
+                const dy = @floatFromInt(f64, row + device.*.y) + 0.5 - dab.*.y
+                if dy * dy < outer && coverRow(&own.*.cover, span, dx, dy * dy, radius, inner, outer) {
+                    if pixels == null {
+                        pixels = device_module.tileWrite(device, tx, ty)
+                        if pixels == null { return geom.rect(area.*.x0, area.*.y0, area.*.x1 - area.*.x0, area.*.y1 - area.*.y0) }
+                    }
+                    const under = pixels.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63))
+                    if direct {
+                        if selection != null {
+                            mask_module.readBytes(selection.?, geom.rect(col0 + device.*.x, row + device.*.y, @intCast(i32, span), 1), &own.*.chosen, 64)
+                            var index: usize = 0
+                            while index < span {
+                                own.*.cover[index] = @intCast(u8, pixel.mul(@intCast(u32, own.*.cover[index]), @intCast(u32, own.*.chosen[index])))
+                                index += 1
+                            }
+                        }
+                        blend.compositeSpanAt(mode, under, &own.*.row, span, opacity, &own.*.cover, flags, blend.seedAt(col0 + device.*.x, row + device.*.y))
+                    } else {
+                        raise(under, &own.*.cover, span, rgb, cap, flow)
+                    }
+                    painted = true
+                }
+                row += 1
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+    if !painted { return geom.empty() }
+    return geom.rect(area.*.x0, area.*.y0, area.*.x1 - area.*.x0, area.*.y1 - area.*.y0)
+}
+
+const ENGINES = [1]types.Engine{
+    types.Engine.{ .id = ENGINE_QUICK, .key = "quick", .name = "Quick brush", .german = "Schnellpinsel", .flags = 0, .begin = begin, .dab = paint, .end = null, .free = free },
+}
+
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's engine, "quick" (brush/engines.mlx lists it): a copy of
+// the table in heap memory made at the first asking (core/table.mlx).
+pub fn list() -> []const types.Engine {
+    if kept.address != 0 { return table.rows(types.Engine, &kept) }
+    return table.keep(types.Engine, &kept, ENGINES[0..])
+}

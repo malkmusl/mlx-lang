@@ -1,0 +1,196 @@
+// nebula app: the program's clipboard: pixels cut or copied, kept with
+// the place they came from, so that a paste can put them back there.
+//
+//     const copied = selection.copySelected(layer.*.device.?, chosen, area)
+//     if copied != null { _ = clipboard.set(app, copied.?) }   // the clipboard's now
+//     ...
+//     var pasted: clipboard.Pasted = undefined
+//     if clipboard.get(app, &pasted) {
+//         ... pasted.device (the caller's), pasted.bounds, pasted.own ...
+//         device_module.destroy(pasted.device)
+//     }
+//
+// What is kept: a Device (heap memory, its tiles shared with the layer it
+// was copied from until one of the two is written) and the rectangle
+// around its pixels in the image's coordinates, in the clipboard's slot
+// (state.SLOT_CLIPBOARD). The same pixels go to the system's clipboard as
+// image/png (io/png.mlx, through the Shell: Wayland's on Linux, the same
+// transport on brixOS; a run without a window keeps them in the Shell),
+// so that other programs can paste them.
+//
+// Pasting reads the system's clipboard first: when it holds image/png
+// that another program put there, that picture is pasted (decoded into a
+// new device at (0, 0): it comes from nowhere in the image, `own` is
+// false). When the bytes there are the ones this program published (the
+// same length and the same FNV-1a hash), the device kept here is handed
+// out instead: exact, with its place. When the system's clipboard holds
+// no picture, the program's own is pasted.
+//
+// Not done: other picture types on the system's clipboard (image/jpeg,
+// image/bmp ...), offered or taken; the published PNG is made at once
+// with the copy (a large copy takes its encoding time then).
+const std = @import("std")
+const state = @import("./state.mlx")
+const shell_module = @import("./shell.mlx")
+const geom = @import("../core/geom.mlx")
+const device_module = @import("../core/device.mlx")
+const formats = @import("../io/formats.mlx")
+const png = @import("../io/png.mlx")
+
+pub const App = state.App
+pub const Device = device_module.Device
+pub const Rect = geom.Rect
+
+// The type the system's clipboard is offered and read as.
+pub const MIME: []const u8 = "image/png"
+
+// How hard the published PNG is compressed: quickly (it lives only until
+// the next copy).
+const LEVEL: i32 = 1
+
+// The largest picture taken from another program, a side (what an image
+// can be).
+const LARGEST: u32 = 32768
+
+// What a paste gets.
+pub const Pasted = struct {
+    // The pixels, at their place in the image's coordinates: the
+    // caller's, to end with device_module.destroy.
+    device: *Device
+    // The rectangle they fill (for a picture of another program: its
+    // whole size, transparent margins too).
+    bounds: Rect
+    // Copied in this program: `bounds` is where the pixels came from.
+    own: bool
+}
+
+const Clip = struct {
+    // What was cut or copied last (null: nothing yet).
+    device: ?*Device
+    bounds: Rect
+    // The bytes published to the system's clipboard: whether there are
+    // any, how many, their hash.
+    published: bool
+    publishedLength: usize
+    publishedHash: u64
+}
+
+fn clipOf(app: *App) -> ?*Clip {
+    const memory = state.slot(app, state.SLOT_CLIPBOARD, @sizeOf(Clip))
+    if memory == null { return null }
+    return unsafe { @ptrCast(*Clip, memory.?) }
+}
+
+// FNV-1a, 64 bits: enough to know our own bytes again.
+fn hashOf(bytes: []const u8) -> u64 {
+    var hash: u64 = 0xCBF29CE484222325
+    for byte in bytes {
+        hash = (hash ^ @intCast(u64, byte)) *% 0x100000001B3
+    }
+    return hash
+}
+
+fn drop(clip: *Clip) -> void {
+    if clip.*.device != null { device_module.destroy(clip.*.device.?) }
+    clip.*.device = null
+    clip.*.bounds = geom.empty()
+    clip.*.published = false
+}
+
+// `pixels` (cut or copied: a device of the image's coordinates, now the
+// clipboard's whatever comes) become what is pasted, and are published to
+// the system's clipboard as a PNG of the rectangle around them. False when
+// they hold nothing (no pixel that is not transparent: the clipboard is as
+// it was) or without memory; true also when only the publishing failed
+// (the program's own paste still has them).
+pub fn set(app: *App, pixels: *Device) -> bool {
+    const clip = clipOf(app)
+    const bounds = device_module.exactBounds(pixels)
+    if clip == null || geom.isEmpty(bounds) {
+        device_module.destroy(pixels)
+        return false
+    }
+    drop(clip.?)
+    clip.?.*.device = pixels
+    clip.?.*.bounds = bounds
+    var bytes = std.ArrayList(u8).init(app.*.allocator)
+    defer bytes.deinit()
+    var settings = png.options(true)
+    settings.level = LEVEL
+    if png.encodeDevice(pixels, bounds, &settings, &bytes) && shell_module.setClipboard(app.*.shell, MIME, bytes.items()) {
+        clip.?.*.published = true
+        clip.?.*.publishedLength = bytes.count()
+        clip.?.*.publishedHash = hashOf(bytes.items())
+    }
+    return true
+}
+
+// Whether the bytes are the ones this program published last.
+fn isOurs(clip: *Clip, bytes: []const u8) -> bool {
+    return clip.*.published && bytes.length == clip.*.publishedLength && hashOf(bytes) == clip.*.publishedHash
+}
+
+// The width and height a PNG's header says (false: none, or too large).
+fn pngSize(bytes: []const u8, width: *i32, height: *i32) -> bool {
+    if bytes.length < 24 || !png.isPng(bytes) { return false }
+    const w = std.mem.readU32Big(bytes.pointer, 16)
+    const h = std.mem.readU32Big(bytes.pointer, 20)
+    if w == 0 || h == 0 || w > LARGEST || h > LARGEST { return false }
+    width.* = @intCast(i32, w)
+    height.* = @intCast(i32, h)
+    return true
+}
+
+// Another program's picture into `into`; false when it cannot be read.
+fn foreign(app: *App, bytes: []const u8, into: *Pasted) -> bool {
+    var width: i32 = 0
+    var height: i32 = 0
+    if !pngSize(bytes, &width, &height) { return false }
+    const made = device_module.create(app.*.allocator, 0)
+    if made == null { return false }
+    if formats.importPicture(app.*.allocator, bytes, made.?, 0, 0) != formats.Status.ok {
+        device_module.destroy(made.?)
+        return false
+    }
+    into.*.device = made.?
+    into.*.bounds = geom.rect(0, 0, width, height)
+    into.*.own = false
+    return true
+}
+
+// What a paste puts in: a copy of the clipboard's pixels into `into` (the
+// caller's device; see Pasted). False when there is nothing to paste, the
+// system's picture cannot be read, or without memory.
+pub fn get(app: *App, into: *Pasted) -> bool {
+    const clip = clipOf(app)
+    if clip == null { return false }
+    const shell = app.*.shell
+    if shell_module.clipboardHas(shell, MIME) {
+        const bytes = shell_module.clipboard(shell, MIME)
+        if bytes.length > 0 && !(clip.?.*.device != null && isOurs(clip.?, bytes)) {
+            if foreign(app, bytes, into) { return true }
+        }
+    }
+    if clip.?.*.device == null { return false }
+    const copied = device_module.copy(clip.?.*.device.?)
+    if copied == null { return false }
+    into.*.device = copied.?
+    into.*.bounds = clip.?.*.bounds
+    into.*.own = true
+    return true
+}
+
+// Whether a paste has something to put in (the program's own pixels, or
+// a picture on the system's clipboard).
+pub fn has(app: *App) -> bool {
+    const clip = clipOf(app)
+    if clip != null && clip.?.*.device != null { return true }
+    return shell_module.clipboardHas(app.*.shell, MIME)
+}
+
+// The rectangle the program's own pixels came from (empty: none kept).
+pub fn bounds(app: *App) -> Rect {
+    const clip = clipOf(app)
+    if clip == null || clip.?.*.device == null { return geom.empty() }
+    return clip.?.*.bounds
+}

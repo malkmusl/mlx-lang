@@ -1,0 +1,560 @@
+// nebula brush: the clone engine ("duplicate", Krita's clone tool), and
+// what the engines that work out the pixels of a dab share: the colour
+// smudge, filter and deform engines import that part from here.
+//
+// Cloning: a source point is set (the tool does it on Ctrl+click), and
+// painting then copies, through the tip's mask, the pixels at the source
+// point plus the way the pen has gone since the stroke began:
+//
+//     clone_engine.setSource(&settings, x, y)            // Ctrl+click
+//     ... stroke_module.begin(stroke, &target, &settings, &first) ... to ... end ...
+//     clone_engine.keepAlignment(stroke, &settings)      // after the stroke's end
+//
+// The source travels in the brush's own numbers (Settings.values, the
+// VALUE_ numbers below), not in the Target: a stroke copies its settings
+// at begin, so the point the tool set reaches the engine without a field
+// of the framework's of its own. The offset from a painted pixel to its
+// source is the source point minus the anchor, rounded to whole pixels
+// (so a hard tip at full opacity copies the source to the bit). The
+// anchor is the first stroke's first point; keepAlignment() hands it back
+// into the tool's settings, so that the next strokes keep the offset
+// (Krita's aligned mode). With VALUE_RESET every stroke starts at the
+// source point again. Without a source set a stroke paints nothing.
+//
+// The source is Target.sample when the tool sets one (cloning from all
+// visible layers: the projection, or another layer), and otherwise the
+// layer painted on as it was before the stroke, so that what the stroke
+// paints is never copied again by it. Healing (VALUE_HEALING) makes the
+// copy match where it goes: each channel of the copied pixels is moved
+// by the difference of the two places' mean colours under the dab
+// (alpha- and mask-weighted, the destination's as it was before the
+// stroke), so a patch taken from a lighter or tinted area takes on the
+// brightness and tint of the place it covers. Every mirrored or wrapped
+// copy of a dab clones with the same offset.
+//
+// Not done: perspective correction (it needs assistants), healing by
+// blurred ratios (Krita's: the mean is one number per dab here).
+//
+// ---------------------------------------------------------------------------
+// The shared part. An engine that works out pixels (clone, colour smudge,
+// filter, deform) finds the part of its dab to paint (dabArea: the tip's
+// mask in stroke.mask, clipped), works out for every pixel of it what the
+// full dab would make of it (`want`), and lays that down:
+//
+//     pixel' = mix(pixel, want, mask x opacity x selection)
+//
+// mix() being core/pixel.mlx's: from one straight pixel toward the other,
+// alpha and colour as if premultiplied (a transparent pixel's colour does
+// not count). On a direct target with a selection the selection's amounts
+// count (amounts()), with alpha locked every pixel keeps its alpha
+// (layDown()); on an overlay neither, ops.mergeOverlay does that. These
+// engines are flagged types.ENGINE_DIRECT: they see the layer, so the
+// tool paints them on it, not on an overlay.
+//
+// Buffers are taken from core/scratch.mlx for the length of one dab (a
+// dab D pixels across takes about 9 D^2 bytes of it: words for what is
+// read and what is wanted, bytes for the amounts; more where an engine
+// reads around the dab, the filter's margin, the deform's radius); what
+// lives from dab to dab
+// is in the engine's own heap block, made in begin() and freed in free().
+// Engines that keep something per copy of a dab (the smudge's carried
+// pixels, the deform's last centre) follow the copies by place (follow():
+// mirrored and wrapped copies are numbered as they come, not for good).
+const math = @import("std.math")
+const types = @import("./types.mlx")
+const tip = @import("./tip.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const device_module = @import("../core/device.mlx")
+const mask_module = @import("../core/mask.mlx")
+const scratch = @import("../core/scratch.mlx")
+const table = @import("../core/table.mlx")
+
+pub const Rect = geom.Rect
+pub const Device = device_module.Device
+
+// ---------------------------------------------------------------------------
+// The shared part
+
+// The part of a dab an engine paints: the image's pixels from (x0, y0) up
+// to (x1, y1). (Kept in the engine's own heap block: a rectangle made in a
+// function the stroke calls through the engine's record would be taken
+// from the value arena for every dab.)
+pub const Area = struct {
+    x0: i32
+    y0: i32
+    x1: i32
+    y1: i32
+}
+
+pub fn areaWidth(area: *const Area) -> usize { return @intCast(usize, area.*.x1 - area.*.x0) }
+pub fn areaHeight(area: *const Area) -> usize { return @intCast(usize, area.*.y1 - area.*.y0) }
+
+// The area as a rectangle (the image's).
+pub fn areaRect(area: *const Area) -> Rect {
+    return geom.rect(area.*.x0, area.*.y0, area.*.x1 - area.*.x0, area.*.y1 - area.*.y0)
+}
+
+inline fn larger(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+inline fn smaller(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+
+// 0..1 as 0..255 (what is no number: 0).
+pub fn level(value: f64) -> u32 {
+    if !(value > 0.0) { return 0 }
+    if value >= 1.0 { return 255 }
+    return @intFromFloat(u32, value * 255.0 + 0.5)
+}
+
+// (x0, y0) up to (x1, y1) inside the stroke's clip (when it clips) and
+// what the target's device reaches, into `area`. False when nothing of it
+// is left.
+pub fn clipArea(stroke: *types.Stroke, x0: i32, y0: i32, x1: i32, y1: i32, area: *Area) -> bool {
+    var left = x0
+    var top = y0
+    var right = x1
+    var bottom = y1
+    if stroke.*.clipped {
+        left = larger(left, stroke.*.clip.x)
+        top = larger(top, stroke.*.clip.y)
+        right = smaller(right, stroke.*.clip.x + stroke.*.clip.width)
+        bottom = smaller(bottom, stroke.*.clip.y + stroke.*.clip.height)
+    }
+    if right <= left || bottom <= top { return false }
+    const inside = device_module.reachable(stroke.*.target.device, geom.rect(left, top, right - left, bottom - top))
+    if geom.isEmpty(inside) { return false }
+    area.*.x0 = inside.x
+    area.*.y0 = inside.y
+    area.*.x1 = inside.x + inside.width
+    area.*.y1 = inside.y + inside.height
+    return true
+}
+
+// The dab's mask (into stroke.mask) and the part of it to paint (into
+// `area`). False when there is nothing to paint: no memory for the mask,
+// or nothing of it inside the clip and the device's reach.
+pub fn dabArea(stroke: *types.Stroke, dab: *const types.Dab, area: *Area) -> bool {
+    const mask = &stroke.*.mask
+    if !tip.forDab(&stroke.*.masks, &stroke.*.settings.*.tip, dab, mask) { return false }
+    return clipArea(stroke, mask.*.x, mask.*.y, mask.*.x + mask.*.width, mask.*.y + mask.*.height, area)
+}
+
+// The amount every pixel of `area` gets: the byte of the dab's mask
+// (stroke.mask) times `opacity` (0..255), times the selection's amount on
+// a direct target that has one; into `into`, the area's rows one after
+// the other. False when every amount is 0.
+pub fn amounts(stroke: *types.Stroke, area: *const Area, opacity: u32, into: [*]u8) -> bool {
+    if opacity == 0 { return false }
+    const mask = &stroke.*.mask
+    const target = &stroke.*.target
+    const width = areaWidth(area)
+    const height = areaHeight(area)
+    const stride = @intCast(usize, mask.*.width)
+    const first = mask.*.bytes + (@intCast(usize, area.*.y0 - mask.*.y) * stride + @intCast(usize, area.*.x0 - mask.*.x))
+    const selected = target.*.direct && target.*.selection != null
+    if selected { mask_module.readBytes(target.*.selection.?, areaRect(area), into, width) }
+    var any = false
+    var y: usize = 0
+    while y < height {
+        const from = first + y * stride
+        const to = into + y * width
+        var x: usize = 0
+        while x < width {
+            var amount = @intCast(u32, from[x])
+            if amount != 0 && opacity != 255 { amount = pixel.mul(amount, opacity) }
+            if selected { amount = pixel.mul(amount, @intCast(u32, to[x])) }
+            to[x] = @intCast(u8, amount)
+            if amount != 0 { any = true }
+            x += 1
+        }
+        y += 1
+    }
+    return any
+}
+
+// Whether any of `height` rows of `width` bytes is not 0.
+fn covers(bytes: [*]const u8, stride: usize, width: usize, height: usize) -> bool {
+    var y: usize = 0
+    while y < height {
+        const row = bytes + y * stride
+        var x: usize = 0
+        while x < width {
+            if row[x] != 0 { return true }
+            x += 1
+        }
+        y += 1
+    }
+    return false
+}
+
+// `want` laid down on the target's device through `amounts` (see the
+// header): `want` holds the area's rows `stride` words apart (stride 0:
+// its first row stands for every row), `amounts` the area's rows one
+// after the other. With `keep_alpha` (or alpha locked on a direct target)
+// every pixel keeps its alpha. Tiles the amounts leave empty are not
+// touched.
+pub fn layDown(stroke: *types.Stroke, area: *const Area, want: [*]const u32, stride: usize, amounts_of: [*]const u8, keep_alpha: bool) -> void {
+    const device = stroke.*.target.device
+    const lock = keep_alpha || (stroke.*.target.direct && stroke.*.target.alphaLock)
+    const width = areaWidth(area)
+    const left = area.*.x0 - device.*.x
+    const top = area.*.y0 - device.*.y
+    const right = area.*.x1 - device.*.x
+    const bottom = area.*.y1 - device.*.y
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * 64)
+        const row1 = smaller(bottom, ty * 64 + 64)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * 64)
+            const col1 = smaller(right, tx * 64 + 64)
+            const span = @intCast(usize, col1 - col0)
+            const first = amounts_of + (@intCast(usize, row0 - top) * width + @intCast(usize, col0 - left))
+            if covers(first, width, span, @intCast(usize, row1 - row0)) {
+                const pixels = device_module.tileWrite(device, tx, ty)
+                if pixels != null {
+                    var row = row0
+                    while row < row1 {
+                        const under = pixels.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63))
+                        const cover = first + @intCast(usize, row - row0) * width
+                        const wanted = want + (@intCast(usize, row - top) * stride + @intCast(usize, col0 - left))
+                        var index: usize = 0
+                        while index < span {
+                            const amount = @intCast(u32, cover[index])
+                            if amount != 0 {
+                                const before = under[index]
+                                var after = pixel.mix(before, wanted[index], amount)
+                                if lock { after = if before >> 24 == 0 { before } else { (after & 0x00FFFFFF) | (before & 0xFF000000) } }
+                                under[index] = after
+                            }
+                            index += 1
+                        }
+                        row += 1
+                    }
+                }
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+}
+
+// The layer as it was before the stroke, for the engines that read it: a
+// device that records a change (ops.beginPixels, how a tool paints
+// directly) still has it (device.readRectBefore); for any other a copy is
+// taken at the stroke's begin into `into` (its tiles are shared with the
+// layer's until those are written: it costs a tile only where the stroke
+// paints). False without memory.
+pub fn keepBefore(stroke: *types.Stroke, into: *?*Device) -> bool {
+    into.* = null
+    const device = stroke.*.target.device
+    if device_module.isRecording(device) { return true }
+    const copy = device_module.copy(device)
+    if copy == null { return false }
+    into.* = copy
+    return true
+}
+
+// `area` of the layer as it was before the stroke (keepBefore() made
+// `kept`) into `into`, rows `stride` words apart.
+pub fn readBefore(stroke: *types.Stroke, kept: ?*Device, area: Rect, into: [*]u32, stride: usize) -> void {
+    if kept != null {
+        device_module.readRect(kept.?, area, into, stride)
+    } else {
+        device_module.readRectBefore(stroke.*.target.device, area, into, stride)
+    }
+}
+
+// Gives back what keepBefore() took.
+pub fn dropBefore(kept: *?*Device) -> void {
+    if kept.* != null { device_module.destroy(kept.*.?) }
+    kept.* = null
+}
+
+// One copy of the dabs followed from dab to dab: whether it began, where
+// its last dab's centre was, the dab (its index + 1) that used it last
+// and when (a count that grows with every use).
+pub const Trail = struct {
+    live: bool
+    x: f64
+    y: f64
+    dab: u32
+    stamp: u64
+}
+
+pub fn clearTrails(trails: [*]Trail, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        trails[index].live = false
+        trails[index].x = 0.0
+        trails[index].y = 0.0
+        trails[index].dab = 0
+        trails[index].stamp = 0
+        index += 1
+    }
+}
+
+// Which of `count` trails `dab` goes on: the live one nearest to it whose
+// last centre is within reach (two of the stroke's gaps and diameters: a
+// copy of the dab before, not a jump), not yet used by another copy of
+// the same dab. Without one, a trail starts afresh (live false: the
+// caller begins it), the least lately used. `count` when every trail
+// serves another copy of this dab already (more copies than trails: the
+// dab goes on none). The trail chosen is marked as this dab's; its place
+// is the caller's to set.
+pub fn follow(trails: [*]Trail, count: usize, stroke: *const types.Stroke, dab: *const types.Dab, clock: *u64) -> usize {
+    const mark = dab.*.index +% 1
+    const reach = 2.0 * (stroke.*.gap + dab.*.diameter) + 4.0
+    var best = count
+    var nearest = reach * reach
+    var index: usize = 0
+    while index < count {
+        const trail = &trails[index]
+        if trail.*.live && trail.*.dab != mark {
+            const dx = trail.*.x - dab.*.x
+            const dy = trail.*.y - dab.*.y
+            const distance = dx * dx + dy * dy
+            if distance <= nearest {
+                nearest = distance
+                best = index
+            }
+        }
+        index += 1
+    }
+    if best == count {
+        // A trail that never began, else the one used longest ago.
+        index = 0
+        while index < count {
+            const trail = &trails[index]
+            if trail.*.dab != mark {
+                if best == count {
+                    best = index
+                } else if trails[best].live && (!trail.*.live || trail.*.stamp < trails[best].stamp) {
+                    best = index
+                }
+            }
+            index += 1
+        }
+        if best == count { return count }
+        trails[best].live = false
+    }
+    clock.* +%= 1
+    trails[best].dab = mark
+    trails[best].stamp = clock.*
+    return best
+}
+
+// ---------------------------------------------------------------------------
+// The clone engine
+
+// Its numbers in Settings.values.
+// The source point, in the image's coordinates, and 1 when it is set.
+pub const VALUE_SOURCE_X: usize = 0
+pub const VALUE_SOURCE_Y: usize = 1
+pub const VALUE_SOURCE_SET: usize = 2
+// The place the source point belongs to, and 1 when there is one (the
+// stroke's first point anchors it when there is none).
+pub const VALUE_ANCHOR_X: usize = 3
+pub const VALUE_ANCHOR_Y: usize = 4
+pub const VALUE_ANCHORED: usize = 5
+// 1: the copy is made to match where it goes (see the header).
+pub const VALUE_HEALING: usize = 6
+// 1: every stroke starts at the source point (not aligned).
+pub const VALUE_RESET: usize = 7
+
+const Own = struct {
+    area: Area
+    before: ?*Device
+    // Whether there is a source, and the offset from a painted pixel to
+    // it.
+    ready: bool
+    dx: i32
+    dy: i32
+    healing: bool
+}
+
+fn ownOf(stroke: *types.Stroke) -> *Own {
+    unsafe { return @ptrFromInt(*Own, stroke.*.engineState) }
+}
+
+fn isOn(settings: *const types.Settings, value: usize) -> bool {
+    return settings.*.values[value] > 0.5
+}
+
+// Sets the source point (the tool calls it on Ctrl+click): the next
+// stroke's first point is its anchor.
+pub fn setSource(settings: *types.Settings, x: f64, y: f64) -> void {
+    settings.*.values[VALUE_SOURCE_X] = @floatCast(f32, x)
+    settings.*.values[VALUE_SOURCE_Y] = @floatCast(f32, y)
+    settings.*.values[VALUE_SOURCE_SET] = 1.0
+    settings.*.values[VALUE_ANCHORED] = 0.0
+}
+
+// Whether a source point is set.
+pub fn hasSource(settings: *const types.Settings) -> bool {
+    return isOn(settings, VALUE_SOURCE_SET)
+}
+
+// After a stroke of the clone engine: its anchor into `settings` (the
+// tool's), so that the next strokes keep its offset, unless the brush
+// starts at the source with every stroke or `settings` has another source
+// by now. Nothing for a stroke that cloned nothing.
+pub fn keepAlignment(stroke: *const types.Stroke, settings: *types.Settings) -> void {
+    const used = stroke.*.settings
+    if !isOn(used, VALUE_SOURCE_SET) || !isOn(used, VALUE_ANCHORED) || isOn(settings, VALUE_RESET) || !hasSource(settings) { return }
+    if settings.*.values[VALUE_SOURCE_X] != used.*.values[VALUE_SOURCE_X] || settings.*.values[VALUE_SOURCE_Y] != used.*.values[VALUE_SOURCE_Y] { return }
+    settings.*.values[VALUE_ANCHOR_X] = used.*.values[VALUE_ANCHOR_X]
+    settings.*.values[VALUE_ANCHOR_Y] = used.*.values[VALUE_ANCHOR_Y]
+    settings.*.values[VALUE_ANCHORED] = 1.0
+}
+
+// A clone brush: types.defaults() with this engine, 40 pixels, a hard
+// tip, no source yet.
+pub fn defaults(settings: *types.Settings) -> void {
+    types.defaults(settings)
+    types.setName(settings, "Clone")
+    settings.*.engine = types.ENGINE_DUPLICATE
+    settings.*.paintMode = types.MODE_BUILD_UP
+}
+
+fn begin(stroke: *types.Stroke) -> bool {
+    const memory = stroke.*.allocator.alloc(@sizeOf(Own), 16)
+    if memory == null { return false }
+    const own: *Own = unsafe { @ptrCast(*Own, memory.?) }
+    own.*.before = null
+    own.*.ready = false
+    own.*.dx = 0
+    own.*.dy = 0
+    stroke.*.engineState = @intFromPtr(own)
+    const settings = stroke.*.settings
+    own.*.healing = isOn(settings, VALUE_HEALING)
+    if !isOn(settings, VALUE_SOURCE_SET) { return true }
+    if !isOn(settings, VALUE_ANCHORED) || isOn(settings, VALUE_RESET) {
+        // (The stroke's own copy of the settings: keepAlignment() reads
+        // it from there.)
+        settings.*.values[VALUE_ANCHOR_X] = @floatCast(f32, stroke.*.last.x)
+        settings.*.values[VALUE_ANCHOR_Y] = @floatCast(f32, stroke.*.last.y)
+        settings.*.values[VALUE_ANCHORED] = 1.0
+    }
+    const dx = math.round(@floatCast(f64, settings.*.values[VALUE_SOURCE_X]) - @floatCast(f64, settings.*.values[VALUE_ANCHOR_X]))
+    const dy = math.round(@floatCast(f64, settings.*.values[VALUE_SOURCE_Y]) - @floatCast(f64, settings.*.values[VALUE_ANCHOR_Y]))
+    // A source or a pen that is no place: nothing to copy.
+    if !(dx == dx) || !(dy == dy) { return true }
+    // (An offset beyond what a device reaches copies nothing but the
+    // default; held so that the sums of places stay inside an i32.)
+    own.*.dx = @intFromFloat(i32, math.clamp(dx, -1000000000.0, 1000000000.0))
+    own.*.dy = @intFromFloat(i32, math.clamp(dy, -1000000000.0, 1000000000.0))
+    // The layer before the stroke: the source without a sample, and what
+    // healing measures the destination by.
+    if stroke.*.target.sample == null || own.*.healing {
+        if !keepBefore(stroke, &own.*.before) { return false }
+    }
+    own.*.ready = true
+    return true
+}
+
+fn free(stroke: *types.Stroke) -> void {
+    if stroke.*.engineState == 0 { return }
+    const own = ownOf(stroke)
+    dropBefore(&own.*.before)
+    unsafe { stroke.*.allocator.free(@ptrFromInt([*]u8, stroke.*.engineState), @sizeOf(Own), 16) }
+    stroke.*.engineState = 0
+}
+
+// The mean colour of `count` pixels, each weighed by its amount and its
+// alpha, into sums of the three channels and the weight.
+fn weigh(pixels: [*]const u32, weights: [*]const u8, count: usize, sums: [*]u64) -> void {
+    var index: usize = 0
+    while index < count {
+        const weight = @intCast(u64, weights[index]) * @intCast(u64, pixels[index] >> 24)
+        if weight != 0 {
+            const value = pixels[index]
+            sums[0] += weight * @intCast(u64, (value >> 16) & 255)
+            sums[1] += weight * @intCast(u64, (value >> 8) & 255)
+            sums[2] += weight * @intCast(u64, value & 255)
+            sums[3] += weight
+        }
+        index += 1
+    }
+}
+
+// A channel moved by `shift` and held to 0..255.
+inline fn shifted(channel: u32, shift: i32) -> u32 {
+    return pixel.clamp(@intCast(i32, channel) + shift)
+}
+
+// Healing: `copied` moved channel by channel by the destination's mean
+// colour minus the source's (both under the amounts).
+fn heal(copied: [*]u32, destination: [*]const u32, weights: [*]const u8, count: usize, sums: [*]u64) -> void {
+    var index: usize = 0
+    while index < 8 {
+        sums[index] = 0
+        index += 1
+    }
+    weigh(destination, weights, count, sums)
+    weigh(copied, weights, count, sums + 4)
+    if sums[3] == 0 || sums[7] == 0 { return }
+    const red = @intCast(i32, (sums[0] + sums[3] / 2) / sums[3]) - @intCast(i32, (sums[4] + sums[7] / 2) / sums[7])
+    const green = @intCast(i32, (sums[1] + sums[3] / 2) / sums[3]) - @intCast(i32, (sums[5] + sums[7] / 2) / sums[7])
+    const blue = @intCast(i32, (sums[2] + sums[3] / 2) / sums[3]) - @intCast(i32, (sums[6] + sums[7] / 2) / sums[7])
+    index = 0
+    while index < count {
+        const value = copied[index]
+        copied[index] = (value & 0xFF000000) | (shifted((value >> 16) & 255, red) << 16) | (shifted((value >> 8) & 255, green) << 8) | shifted(value & 255, blue)
+        index += 1
+    }
+}
+
+fn paint(stroke: *types.Stroke, dab: *const types.Dab) -> Rect {
+    const own = ownOf(stroke)
+    if !own.*.ready { return geom.empty() }
+    if !dabArea(stroke, dab, &own.*.area) { return geom.empty() }
+    const area = &own.*.area
+    // (The source must be counted in an i32: one beyond is nowhere.)
+    if @intCast(i64, area.*.x0) + @intCast(i64, own.*.dx) < -2147483647 || @intCast(i64, area.*.x1) + @intCast(i64, own.*.dx) > 2147483647 { return geom.empty() }
+    if @intCast(i64, area.*.y0) + @intCast(i64, own.*.dy) < -2147483647 || @intCast(i64, area.*.y1) + @intCast(i64, own.*.dy) > 2147483647 { return geom.empty() }
+    const width = areaWidth(area)
+    const count = width * areaHeight(area)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const want = scratch.words(pool, count)
+    const weights = scratch.bytes(pool, count)
+    if want == null || weights == null || !amounts(stroke, area, level(dab.*.opacity * dab.*.flow), weights.?) {
+        scratch.release(pool, mark)
+        return geom.empty()
+    }
+    const source = geom.rect(area.*.x0 + own.*.dx, area.*.y0 + own.*.dy, area.*.x1 - area.*.x0, area.*.y1 - area.*.y0)
+    if stroke.*.target.sample != null {
+        device_module.readRect(stroke.*.target.sample.?, source, want.?, width)
+    } else {
+        readBefore(stroke, own.*.before, source, want.?, width)
+    }
+    if own.*.healing {
+        const destination = scratch.words(pool, count)
+        const sums = scratch.bytes(pool, 64)
+        if destination == null || sums == null {
+            scratch.release(pool, mark)
+            return geom.empty()
+        }
+        readBefore(stroke, own.*.before, areaRect(area), destination.?, width)
+        var totals: [*]u64 = undefined
+        unsafe { totals = @ptrCast([*]u64, sums.?) }
+        heal(want.?, destination.?, weights.?, count, totals)
+    }
+    layDown(stroke, area, want.?, width, weights.?, false)
+    scratch.release(pool, mark)
+    return geom.rect(area.*.x0, area.*.y0, area.*.x1 - area.*.x0, area.*.y1 - area.*.y0)
+}
+
+const ENGINES = [1]types.Engine{
+    types.Engine.{ .id = types.ENGINE_DUPLICATE, .key = "duplicate", .name = "Clone", .german = "Klonen", .flags = types.ENGINE_READS_SAMPLE | types.ENGINE_DIRECT, .begin = begin, .dab = paint, .end = null, .free = free },
+}
+
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's engine, "duplicate" (brush/engines.mlx lists it): a copy
+// of the table in heap memory made at the first asking (core/table.mlx).
+pub fn list() -> []const types.Engine {
+    if kept.address != 0 { return table.rows(types.Engine, &kept) }
+    return table.keep(types.Engine, &kept, ENGINES[0..])
+}

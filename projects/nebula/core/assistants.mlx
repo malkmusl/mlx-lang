@@ -1,0 +1,1437 @@
+// nebula core: painting assistants: guides laid over the image (rulers,
+// vanishing points, ellipses, perspective grids, a curve) that the points
+// of a stroke snap to. A Set is one document's (tools/assist.mlx keeps it
+// and edits it): up to MAX assistants, each with its handles in the
+// image's coordinates, whether it snaps and its colour, and the options
+// for all of them (shown, snapping, snap single, magnetism).
+//
+//     const set = assistants.create(allocator).?
+//     var ruler = assistants.blank(assistants.RULER, assistants.COLOR)
+//     _ = assistants.setHandle(&ruler, 0, 10.0, 100.0)
+//     _ = assistants.setHandle(&ruler, 1, 300.0, 100.0)
+//     _ = assistants.add(set, &ruler)
+//
+// A painting tool hands every stroke to the set:
+//
+//     assistants.begin(set, x, y)                          // pen down at (x, y)
+//     _ = assistants.project(set, x, y, &into_x, &into_y)  // each point, the first too
+//
+// project() puts the point onto an assistant, by the kind's rule (below),
+// and then moves it only `magnetism` (0 to 1) of the way there. Which
+// assistant: the one whose place for the point is nearest to it; with
+// "snap single" the one nearest when the pen is DECIDE pixels away from
+// where it went down is kept for the rest of the stroke (before that the
+// nearest is taken point by point). Some kinds make their line through
+// the stroke's start: a parallel ruler, a vanishing point, a concentric
+// ellipse, a fisheye point, the perspectives (which also keep, from
+// DECIDE pixels on, the vanishing point they chose).
+//
+//   kind                    handles             a point p goes to
+//   RULER                   2: the ends a, b    a + clamp(dot(p-a, b-a) / |b-a|^2, 0, 1) (b-a)
+//   INFINITE_RULER          2                   the same, not held between a and b
+//   PARALLEL_RULER          2                   the line through the start along b - a
+//   VANISHING_POINT         1: v                the line through v and the start
+//   ELLIPSE                 3: the ends of the  the nearest point of the ellipse
+//                           first axis, a point
+//                           on the ellipse
+//   CONCENTRIC_ELLIPSE      3                   the same of the ellipse scaled about the
+//                                               centre to pass through the start
+//   PERSPECTIVE             4: a quad's corners the line through the start toward the
+//                           in turn             vanishing point of either pair of opposite
+//                                               sides (parallel sides: along them),
+//                                               whichever is nearer to p
+//   TWO_POINT_PERSPECTIVE   3: two vanishing    the line through the start toward either
+//                           points, the centre  vanishing point, or upright to the
+//                           of vision           horizon, whichever is nearer
+//   FISHEYE                 3 as an ellipse     the nearest point of the ellipse of the
+//                                               family sharing the first axis (all pass
+//                                               through its ends) that passes through
+//                                               the start
+//   SPLINE                  4: start, end, the  the nearest point of the cubic Bezier
+//                           start's control,    curve
+//                           the end's control
+//
+// An assistant that cannot say (not all handles placed, an axis without
+// length, a start on its vanishing point) leaves the point to the
+// others. The nearest points of ellipses and curves are found
+// numerically (bisection to the double's last bit; samples refined by
+// golden section).
+//
+// preview() gives what is drawn of an assistant as polylines in the
+// image's coordinates (lines without end reach `reach` pixels each way);
+// write() and read() are its text, saved with the document; the history
+// records edits as custom steps (recordAdded, recordRemoved,
+// recordChanged) that undo and redo them.
+//
+// Not done: the perspective's "perspective" sensor (a dab's size by its
+// distance from the vanishing line), the perspective ellipse and the
+// curvilinear perspective of Krita 5.2, the vanishing point's side
+// handles.
+const std = @import("std")
+const math = @import("std.math")
+const geom = @import("./geom.mlx")
+// (The image before its history: the two import each other, and their
+// types resolve when the ring is entered at the image.)
+const image_module = @import("./image.mlx")
+const history_module = @import("./history.mlx")
+const text_io = @import("../io/text.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Rect = geom.Rect
+
+pub const MAX: usize = 32
+pub const HANDLES: usize = 4
+pub const NONE: usize = 18446744073709551615
+
+// The kinds (their numbers are kept in no file: the text names them).
+pub const RULER: u8 = 0
+pub const INFINITE_RULER: u8 = 1
+pub const PARALLEL_RULER: u8 = 2
+pub const VANISHING_POINT: u8 = 3
+pub const ELLIPSE: u8 = 4
+pub const CONCENTRIC_ELLIPSE: u8 = 5
+pub const PERSPECTIVE: u8 = 6
+pub const TWO_POINT_PERSPECTIVE: u8 = 7
+pub const FISHEYE: u8 = 8
+pub const SPLINE: u8 = 9
+pub const KINDS: usize = 10
+
+// The pen goes this far (image pixels) from where it went down before
+// "snap single" and the perspectives decide.
+pub const DECIDE: f64 = 10.0
+
+// The colour of a new assistant (straight).
+pub const COLOR: u32 = 0xE03C8CFF
+
+// Coordinates beyond this are no place (a handle is held inside).
+pub const LIMIT: f64 = 1000000000.0
+
+// Points of an ellipse's and a curve's polyline.
+const ELLIPSE_STEPS: usize = 96
+const SPLINE_STEPS: usize = 64
+// Samples of a curve before its nearest point is refined, and the
+// golden section's steps.
+const SPLINE_SAMPLES: usize = 64
+const GOLDEN_STEPS: usize = 64
+// The bisection for an ellipse ends long before this (when the interval
+// cannot be halved any more).
+const BISECTIONS: usize = 1100
+// Squared lengths below this have no direction.
+const TINY: f64 = 0.000000000001
+// Half axes below this make no ellipse.
+const THIN: f64 = 0.000001
+// A cross marking a point in a preview: its arm (image pixels).
+const ARM: f64 = 6.0
+
+pub const Assistant = struct {
+    kind: u8
+    // Handles placed (in order); complete with handlesOf(kind).
+    count: u8
+    snap: bool
+    // Straight 0xAARRGGBB.
+    color: u32
+    // How dense its preview is: a vanishing point's rays, the rings of
+    // the ellipse families, the cells of a perspective's grid.
+    density: u32
+    x: [4]f64
+    y: [4]f64
+}
+
+pub const Set = struct {
+    allocator: Allocator
+    items: [32]Assistant
+    count: usize
+    // For all of them: drawn over the canvas, points snap at all, one
+    // assistant a stroke, how far a point is moved (0 to 1).
+    show: bool
+    snap: bool
+    single: bool
+    magnetism: f64
+    // The stroke begun (begin): where, whether it is one (a place), the
+    // assistant "snap single" kept (NONE: not yet), and the line each
+    // perspective kept (0: not yet).
+    stroking: bool
+    startX: f64
+    startY: f64
+    chosen: usize
+    lines: [32]u8
+}
+
+// An ellipse: its centre, the unit direction of its first axis, its
+// half axes along and across that.
+pub const Ellipse = struct {
+    centerX: f64
+    centerY: f64
+    axisX: f64
+    axisY: f64
+    along: f64
+    across: f64
+}
+
+// A vanishing point: a place, or (not `finite`) a direction (dx, dy)
+// lines go to it in (parallel sides).
+pub const Vanishing = struct {
+    x: f64
+    y: f64
+    dx: f64
+    dy: f64
+    finite: bool
+}
+
+// Polylines, written by preview() into the caller's memory: `points`
+// holds x and y of each point in turn (room for `room` points), `runs`
+// how many points each polyline has (room for `runRoom`).
+pub const Lines = struct {
+    points: [*]f64
+    room: usize
+    count: usize
+    runs: [*]u32
+    runRoom: usize
+    runCount: usize
+}
+
+// ---------------------------------------------------------------------------
+// The kinds
+
+// How many handles an assistant of `kind` has when it is complete (0:
+// no such kind).
+pub fn handlesOf(kind: u8) -> usize {
+    if kind == RULER || kind == INFINITE_RULER || kind == PARALLEL_RULER { return 2 }
+    if kind == VANISHING_POINT { return 1 }
+    if kind == ELLIPSE || kind == CONCENTRIC_ELLIPSE || kind == FISHEYE || kind == TWO_POINT_PERSPECTIVE { return 3 }
+    if kind == PERSPECTIVE || kind == SPLINE { return 4 }
+    return 0
+}
+
+// The kind's name in the text ("" for none).
+pub fn keyOf(kind: u8) -> []const u8 {
+    if kind == RULER { return "ruler" }
+    if kind == INFINITE_RULER { return "infinite-ruler" }
+    if kind == PARALLEL_RULER { return "parallel-ruler" }
+    if kind == VANISHING_POINT { return "vanishing-point" }
+    if kind == ELLIPSE { return "ellipse" }
+    if kind == CONCENTRIC_ELLIPSE { return "concentric-ellipse" }
+    if kind == PERSPECTIVE { return "perspective" }
+    if kind == TWO_POINT_PERSPECTIVE { return "two-point-perspective" }
+    if kind == FISHEYE { return "fisheye" }
+    if kind == SPLINE { return "spline" }
+    return ""
+}
+
+// The kind named `key` (KINDS: none is).
+pub fn kindByKey(key: []const u8) -> u8 {
+    var kind: u8 = 0
+    while @intCast(usize, kind) < KINDS {
+        if std.text.same(keyOf(kind), key) { return kind }
+        kind += 1
+    }
+    return @intCast(u8, KINDS)
+}
+
+// What people read for the kind.
+pub fn title(kind: u8, german: bool) -> []const u8 {
+    if kind == RULER { return if german { "Lineal" } else { "Ruler" } }
+    if kind == INFINITE_RULER { return if german { "Unendliches Lineal" } else { "Infinite Ruler" } }
+    if kind == PARALLEL_RULER { return if german { "Parallellineal" } else { "Parallel Ruler" } }
+    if kind == VANISHING_POINT { return if german { "Fluchtpunkt" } else { "Vanishing Point" } }
+    if kind == ELLIPSE { return if german { "Ellipse" } else { "Ellipse" } }
+    if kind == CONCENTRIC_ELLIPSE { return if german { "Konzentrische Ellipse" } else { "Concentric Ellipse" } }
+    if kind == PERSPECTIVE { return if german { "Perspektive" } else { "Perspective" } }
+    if kind == TWO_POINT_PERSPECTIVE { return if german { "Zweipunktperspektive" } else { "2-Point Perspective" } }
+    if kind == FISHEYE { return if german { "Fischaugenpunkt" } else { "Fisheye Point" } }
+    if kind == SPLINE { return if german { "Spline" } else { "Spline" } }
+    return ""
+}
+
+fn defaultDensity(kind: u8) -> u32 {
+    if kind == VANISHING_POINT { return 16 }
+    if kind == CONCENTRIC_ELLIPSE || kind == FISHEYE || kind == PERSPECTIVE || kind == TWO_POINT_PERSPECTIVE { return 8 }
+    return 0
+}
+
+// The most a density may be (the preview's size grows with it).
+pub const DENSITY: u32 = 64
+
+// ---------------------------------------------------------------------------
+// Assistants and the set
+
+inline fn isPlace(value: f64) -> bool { return value > -LIMIT && value < LIMIT }
+
+// An assistant of `kind` (a kind of this module's) without handles yet,
+// snapping, in `color`.
+pub fn blank(kind: u8, color: u32) -> Assistant {
+    return Assistant.{
+        .kind = if @intCast(usize, kind) < KINDS { kind } else { RULER },
+        .count = 0,
+        .snap = true,
+        .color = color,
+        .density = defaultDensity(kind),
+        .x = [4]f64{ 0.0, 0.0, 0.0, 0.0 },
+        .y = [4]f64{ 0.0, 0.0, 0.0, 0.0 },
+    }
+}
+
+// Places handle `handle` of `assistant` at (x, y): one it has is moved,
+// the next one is added. False for a handle beyond those (or the kind's)
+// and for a point that is no place.
+pub fn setHandle(assistant: *Assistant, handle: usize, x: f64, y: f64) -> bool {
+    if handle >= handlesOf(assistant.*.kind) || handle > @intCast(usize, assistant.*.count) || !isPlace(x) || !isPlace(y) { return false }
+    assistant.*.x[handle] = x
+    assistant.*.y[handle] = y
+    if handle == @intCast(usize, assistant.*.count) { assistant.*.count += 1 }
+    return true
+}
+
+// Whether all its handles are placed.
+pub fn isComplete(assistant: *const Assistant) -> bool {
+    const wanted = handlesOf(assistant.*.kind)
+    return wanted > 0 && @intCast(usize, assistant.*.count) == wanted
+}
+
+// An empty set in heap memory: shown, snapping, snap single, full
+// magnetism. Null without memory.
+pub fn create(allocator: Allocator) -> ?*Set {
+    const memory = allocator.alloc(@sizeOf(Set), 16)
+    if memory == null { return null }
+    std.mem.zero(memory.?, @sizeOf(Set))
+    const set: *Set = unsafe { @ptrCast(*Set, memory.?) }
+    set.*.allocator = allocator
+    set.*.count = 0
+    set.*.show = true
+    set.*.snap = true
+    set.*.single = true
+    set.*.magnetism = 1.0
+    set.*.stroking = false
+    set.*.chosen = NONE
+    return set
+}
+
+pub fn destroy(set: *Set) -> void {
+    const allocator = set.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, set), @sizeOf(Set), 16) }
+}
+
+// A change of the list ends what the stroke under way had chosen.
+fn forgetStroke(set: *Set) -> void {
+    set.*.chosen = NONE
+    var index: usize = 0
+    while index < MAX {
+        set.*.lines[index] = 0
+        index += 1
+    }
+}
+
+// Puts `assistant` into the set at place `at` (those from there on move
+// up). False when the set is full or `at` is beyond its end.
+pub fn insert(set: *Set, at: usize, assistant: *const Assistant) -> bool {
+    if set.*.count >= MAX || at > set.*.count { return false }
+    var index = set.*.count
+    while index > at {
+        set.*.items[index] = set.*.items[index - 1]
+        index -= 1
+    }
+    set.*.items[at] = assistant.*
+    set.*.count += 1
+    forgetStroke(set)
+    return true
+}
+
+// Puts `assistant` at the end; its place (null: the set is full).
+pub fn add(set: *Set, assistant: *const Assistant) -> ?usize {
+    const at = set.*.count
+    if !insert(set, at, assistant) { return null }
+    return at
+}
+
+// Takes assistant `index` out (those after it move down). False when
+// there is none.
+pub fn remove(set: *Set, index: usize) -> bool {
+    if index >= set.*.count { return false }
+    var at = index
+    while at + 1 < set.*.count {
+        set.*.items[at] = set.*.items[at + 1]
+        at += 1
+    }
+    set.*.count -= 1
+    forgetStroke(set)
+    return true
+}
+
+// Takes all assistants out (the options stay).
+pub fn clear(set: *Set) -> void {
+    set.*.count = 0
+    forgetStroke(set)
+}
+
+// ---------------------------------------------------------------------------
+// Geometry
+
+// The point of the line through (ax, ay) along (dx, dy) nearest to
+// (px, py). False when the direction has no length.
+fn ontoLine(ax: f64, ay: f64, dx: f64, dy: f64, px: f64, py: f64, ox: *f64, oy: *f64) -> bool {
+    const length = dx * dx + dy * dy
+    if !(length > TINY) { return false }
+    const t = ((px - ax) * dx + (py - ay) * dy) / length
+    ox.* = ax + t * dx
+    oy.* = ay + t * dy
+    return true
+}
+
+// The same of the segment from (ax, ay) to (bx, by): a segment of no
+// length is its one point.
+fn ontoSegment(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64, ox: *f64, oy: *f64) -> bool {
+    const dx = bx - ax
+    const dy = by - ay
+    const length = dx * dx + dy * dy
+    var t: f64 = 0.0
+    if length > TINY { t = ((px - ax) * dx + (py - ay) * dy) / length }
+    if !(t > 0.0) { t = 0.0 }
+    if t > 1.0 { t = 1.0 }
+    ox.* = ax + t * dx
+    oy.* = ay + t * dy
+    return true
+}
+
+// The ellipse's coordinates of image point (x, y): along its first axis
+// and across it.
+fn localX(e: *const Ellipse, x: f64, y: f64) -> f64 { return (x - e.*.centerX) * e.*.axisX + (y - e.*.centerY) * e.*.axisY }
+fn localY(e: *const Ellipse, x: f64, y: f64) -> f64 { return (y - e.*.centerY) * e.*.axisX - (x - e.*.centerX) * e.*.axisY }
+
+// The image point of the ellipse's coordinates (u, v).
+fn globalX(e: *const Ellipse, u: f64, v: f64) -> f64 { return e.*.centerX + u * e.*.axisX - v * e.*.axisY }
+fn globalY(e: *const Ellipse, u: f64, v: f64) -> f64 { return e.*.centerY + u * e.*.axisY + v * e.*.axisX }
+
+// The ellipse frame of the axis from (x0, y0) to (x1, y1), its `across`
+// still 0. False for an axis without length.
+fn axisFrame(x0: f64, y0: f64, x1: f64, y1: f64, into: *Ellipse) -> bool {
+    const dx = x1 - x0
+    const dy = y1 - y0
+    const length = math.hypot(dx, dy)
+    if !(length > THIN) || !(length < LIMIT * 4.0) { return false }
+    into.*.centerX = (x0 + x1) / 2.0
+    into.*.centerY = (y0 + y1) / 2.0
+    into.*.axisX = dx / length
+    into.*.axisY = dy / length
+    into.*.along = length / 2.0
+    into.*.across = 0.0
+    return true
+}
+
+// The half axis across of the ellipse with the half axis `along` that
+// passes through (u, v) of its coordinates; false when none does (|u|
+// not below `along`).
+fn acrossThrough(along: f64, u: f64, v: f64, into: *f64) -> bool {
+    const r = u / along
+    if !(r * r < 1.0) { return false }
+    into.* = math.abs(v) / @sqrt(1.0 - r * r)
+    return into.* < LIMIT
+}
+
+// The ellipse of an ELLIPSE, CONCENTRIC_ELLIPSE or FISHEYE assistant
+// (its handles: the ends of the first axis and a point on it). False
+// when it is not complete or makes no ellipse (the third handle at or
+// beyond the axis's ends, or on the axis).
+pub fn ellipseOf(assistant: *const Assistant, into: *Ellipse) -> bool {
+    const kind = assistant.*.kind
+    if !isComplete(assistant) || (kind != ELLIPSE && kind != CONCENTRIC_ELLIPSE && kind != FISHEYE) { return false }
+    if !axisFrame(assistant.*.x[0], assistant.*.y[0], assistant.*.x[1], assistant.*.y[1], into) { return false }
+    const u = localX(into, assistant.*.x[2], assistant.*.y[2])
+    const v = localY(into, assistant.*.x[2], assistant.*.y[2])
+    var across: f64 = 0.0
+    if !acrossThrough(into.*.along, u, v, &across) || !(across > THIN) { return false }
+    into.*.across = across
+    return true
+}
+
+// The root of g(s) = (r0 z0 / (s + r0))^2 + (z1 / (s + 1))^2 - 1 between
+// z1 - 1 and |(r0 z0, z1)| - 1, by halving until the interval cannot be
+// halved any more (D. Eberly, "Distance from a point to an ellipse").
+fn ellipseRoot(r0: f64, z0: f64, z1: f64, g_start: f64) -> f64 {
+    const n0 = r0 * z0
+    var s0 = z1 - 1.0
+    var s1: f64 = if g_start < 0.0 { 0.0 } else { math.hypot(n0, z1) - 1.0 }
+    var s: f64 = 0.0
+    var step: usize = 0
+    while step < BISECTIONS {
+        s = (s0 + s1) / 2.0
+        if s == s0 || s == s1 { break }
+        const ratio0 = n0 / (s + r0)
+        const ratio1 = z1 / (s + 1.0)
+        const g = ratio0 * ratio0 + ratio1 * ratio1 - 1.0
+        if g > 0.0 {
+            s0 = s
+        } else if g < 0.0 {
+            s1 = s
+        } else {
+            break
+        }
+        step += 1
+    }
+    return s
+}
+
+// The point (x0, x1) of the ellipse with half axes e0 >= e1 > 0 nearest
+// to (y0, y1), both of the first quadrant.
+fn quadrantNearest(e0: f64, e1: f64, y0: f64, y1: f64, x0: *f64, x1: *f64) -> void {
+    if y1 > 0.0 {
+        if y0 > 0.0 {
+            const z0 = y0 / e0
+            const z1 = y1 / e1
+            const g = z0 * z0 + z1 * z1 - 1.0
+            if g != 0.0 {
+                const r0 = (e0 / e1) * (e0 / e1)
+                const s = ellipseRoot(r0, z0, z1, g)
+                x0.* = r0 * y0 / (s + r0)
+                x1.* = y1 / (s + 1.0)
+            } else {
+                x0.* = y0
+                x1.* = y1
+            }
+        } else {
+            x0.* = 0.0
+            x1.* = e1
+        }
+        return
+    }
+    // On the long axis: inside the evolute the nearest points are off it.
+    const numerator = e0 * y0
+    const denominator = e0 * e0 - e1 * e1
+    if numerator < denominator {
+        const ratio = numerator / denominator
+        x0.* = e0 * ratio
+        x1.* = e1 * @sqrt(1.0 - ratio * ratio)
+    } else {
+        x0.* = e0
+        x1.* = 0.0
+    }
+}
+
+// The point of ellipse `e` nearest to image point (x, y).
+pub fn nearestOnEllipse(e: *const Ellipse, x: f64, y: f64, into_x: *f64, into_y: *f64) -> void {
+    const u = localX(e, x, y)
+    const v = localY(e, x, y)
+    var qu: f64 = 0.0
+    var qv: f64 = 0.0
+    if e.*.along >= e.*.across {
+        quadrantNearest(e.*.along, e.*.across, math.abs(u), math.abs(v), &qu, &qv)
+    } else {
+        quadrantNearest(e.*.across, e.*.along, math.abs(v), math.abs(u), &qv, &qu)
+    }
+    if u < 0.0 { qu = -qu }
+    if v < 0.0 { qv = -qv }
+    into_x.* = globalX(e, qu, qv)
+    into_y.* = globalY(e, qu, qv)
+}
+
+// The image point of ellipse `e` at angle `t` (its parameter).
+fn ellipseAt(e: *const Ellipse, t: f64, into_x: *f64, into_y: *f64) -> void {
+    const u = e.*.along * math.cos(t)
+    const v = e.*.across * math.sin(t)
+    into_x.* = globalX(e, u, v)
+    into_y.* = globalY(e, u, v)
+}
+
+// The point of a SPLINE's curve at `t` (0: the start, 1: the end).
+pub fn splineAt(assistant: *const Assistant, t: f64, into_x: *f64, into_y: *f64) -> void {
+    const s = 1.0 - t
+    const a = s * s * s
+    const b = 3.0 * s * s * t
+    const c = 3.0 * s * t * t
+    const d = t * t * t
+    into_x.* = a * assistant.*.x[0] + b * assistant.*.x[2] + c * assistant.*.x[3] + d * assistant.*.x[1]
+    into_y.* = a * assistant.*.y[0] + b * assistant.*.y[2] + c * assistant.*.y[3] + d * assistant.*.y[1]
+}
+
+fn splineDistance(assistant: *const Assistant, t: f64, x: f64, y: f64) -> f64 {
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    splineAt(assistant, t, &cx, &cy)
+    return (cx - x) * (cx - x) + (cy - y) * (cy - y)
+}
+
+// The parameter between `low` and `high` where the curve comes nearest
+// to (x, y), the distance being taken as having one valley there.
+fn goldenSection(assistant: *const Assistant, low: f64, high: f64, x: f64, y: f64) -> f64 {
+    const ratio: f64 = 0.6180339887498949
+    var a = low
+    var b = high
+    var c = b - (b - a) * ratio
+    var d = a + (b - a) * ratio
+    var fc = splineDistance(assistant, c, x, y)
+    var fd = splineDistance(assistant, d, x, y)
+    var step: usize = 0
+    while step < GOLDEN_STEPS {
+        if fc < fd {
+            b = d
+            d = c
+            fd = fc
+            c = b - (b - a) * ratio
+            fc = splineDistance(assistant, c, x, y)
+        } else {
+            a = c
+            c = d
+            fc = fd
+            d = a + (b - a) * ratio
+            fd = splineDistance(assistant, d, x, y)
+        }
+        step += 1
+    }
+    return (a + b) / 2.0
+}
+
+// The point of a complete SPLINE's curve nearest to (x, y) and its
+// parameter (`at`). False for another kind or one not complete.
+pub fn nearestOnSpline(assistant: *const Assistant, x: f64, y: f64, into_x: *f64, into_y: *f64, at: *f64) -> bool {
+    if assistant.*.kind != SPLINE || !isComplete(assistant) { return false }
+    // Every valley of the samples is refined (a curve may come near a
+    // point in two places), the deepest wins.
+    const step = 1.0 / @floatFromInt(f64, SPLINE_SAMPLES)
+    var best_t: f64 = 0.0
+    var best = splineDistance(assistant, 0.0, x, y)
+    var before = best
+    var here = best
+    var index: usize = 0
+    while index <= SPLINE_SAMPLES {
+        const t = @floatFromInt(f64, index) * step
+        var next = here
+        if index < SPLINE_SAMPLES { next = splineDistance(assistant, t + step, x, y) }
+        if (index == 0 || here <= before) && (index == SPLINE_SAMPLES || here <= next) {
+            if here < best {
+                best = here
+                best_t = t
+            }
+            const low = if t - step > 0.0 { t - step } else { 0.0 }
+            const high = if t + step < 1.0 { t + step } else { 1.0 }
+            const refined = goldenSection(assistant, low, high, x, y)
+            const distance = splineDistance(assistant, refined, x, y)
+            if distance < best {
+                best = distance
+                best_t = refined
+            }
+        }
+        before = here
+        here = next
+        index += 1
+    }
+    splineAt(assistant, best_t, into_x, into_y)
+    at.* = best_t
+    return true
+}
+
+// Where the lines (px, py) + t (ax, ay) and (qx, qy) + u (bx, by) meet,
+// as a Vanishing (parallel or nearly: a direction, along the first).
+// False when either has no direction.
+fn meeting(px: f64, py: f64, ax: f64, ay: f64, qx: f64, qy: f64, bx: f64, by: f64, into: *Vanishing) -> bool {
+    const first = math.hypot(ax, ay)
+    const second = math.hypot(bx, by)
+    if !(first > THIN) || !(second > THIN) { return false }
+    const cross = ax * by - ay * bx
+    into.*.dx = ax / first
+    into.*.dy = ay / first
+    into.*.finite = false
+    into.*.x = 0.0
+    into.*.y = 0.0
+    if !(math.abs(cross) > 0.000000001 * first * second) { return true }
+    const t = ((qx - px) * by - (qy - py) * bx) / cross
+    const x = px + t * ax
+    const y = py + t * ay
+    // So far away it is as good as parallel.
+    if !isPlace(x) || !isPlace(y) { return true }
+    into.*.x = x
+    into.*.y = y
+    into.*.finite = true
+    return true
+}
+
+// Vanishing point `which` of a complete PERSPECTIVE (0: of the sides
+// from the first corner to the second and from the fourth to the third,
+// 1: of the other two) or TWO_POINT_PERSPECTIVE (0, 1: its two points;
+// 2: the upright direction, across the horizon). False when there is
+// none (not complete, a side or the horizon without length).
+pub fn vanishing(assistant: *const Assistant, which: usize, into: *Vanishing) -> bool {
+    if !isComplete(assistant) { return false }
+    const x = &assistant.*.x
+    const y = &assistant.*.y
+    if assistant.*.kind == PERSPECTIVE {
+        if which == 0 { return meeting(x.*[0], y.*[0], x.*[1] - x.*[0], y.*[1] - y.*[0], x.*[3], y.*[3], x.*[2] - x.*[3], y.*[2] - y.*[3], into) }
+        if which == 1 { return meeting(x.*[1], y.*[1], x.*[2] - x.*[1], y.*[2] - y.*[1], x.*[0], y.*[0], x.*[3] - x.*[0], y.*[3] - y.*[0], into) }
+        return false
+    }
+    if assistant.*.kind == TWO_POINT_PERSPECTIVE {
+        if which < 2 {
+            into.*.x = x.*[which]
+            into.*.y = y.*[which]
+            into.*.dx = 0.0
+            into.*.dy = 0.0
+            into.*.finite = true
+            return true
+        }
+        if which == 2 {
+            const dx = x.*[1] - x.*[0]
+            const dy = y.*[1] - y.*[0]
+            const length = math.hypot(dx, dy)
+            if !(length > THIN) { return false }
+            into.*.x = 0.0
+            into.*.y = 0.0
+            into.*.dx = -dy / length
+            into.*.dy = dx / length
+            into.*.finite = false
+            return true
+        }
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
+// Snapping
+
+// The direction of perspective line `line` (1, 2, 3: vanishing point 0,
+// 1, 2) through the stroke's start. False when it has none.
+fn perspectiveDirection(assistant: *const Assistant, line: u8, sx: f64, sy: f64, dx: *f64, dy: *f64) -> bool {
+    if line == 0 { return false }
+    var point: Vanishing = undefined
+    if !vanishing(assistant, @intCast(usize, line - 1), &point) { return false }
+    if point.finite {
+        dx.* = point.x - sx
+        dy.* = point.y - sy
+    } else {
+        dx.* = point.dx
+        dy.* = point.dy
+    }
+    return dx.* * dx.* + dy.* * dy.* > TINY
+}
+
+// A perspective's place for (px, py): on the line it kept, or on the
+// nearer of its lines, which it keeps once the pen is `far` from the
+// start.
+fn ontoPerspective(set: *Set, index: usize, px: f64, py: f64, far: bool, ox: *f64, oy: *f64) -> bool {
+    const assistant = &set.*.items[index]
+    const sx = set.*.startX
+    const sy = set.*.startY
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    const kept = set.*.lines[index]
+    if kept != 0 {
+        if !perspectiveDirection(assistant, kept, sx, sy, &dx, &dy) { return false }
+        return ontoLine(sx, sy, dx, dy, px, py, ox, oy)
+    }
+    const lines: u8 = if assistant.*.kind == PERSPECTIVE { 2 } else { 3 }
+    var which: u8 = 0
+    var best: f64 = 0.0
+    var line: u8 = 1
+    while line <= lines {
+        var qx: f64 = 0.0
+        var qy: f64 = 0.0
+        if perspectiveDirection(assistant, line, sx, sy, &dx, &dy) && ontoLine(sx, sy, dx, dy, px, py, &qx, &qy) {
+            const distance = (qx - px) * (qx - px) + (qy - py) * (qy - py)
+            if which == 0 || distance < best {
+                which = line
+                best = distance
+                ox.* = qx
+                oy.* = qy
+            }
+        }
+        line += 1
+    }
+    if which == 0 { return false }
+    if far { set.*.lines[index] = which }
+    return true
+}
+
+// Where assistant `index` puts (px, py) of the stroke begun, all the
+// way (no magnetism). False when it cannot say.
+fn snapOne(set: *Set, index: usize, px: f64, py: f64, far: bool, ox: *f64, oy: *f64) -> bool {
+    const assistant = &set.*.items[index]
+    if !isComplete(assistant) { return false }
+    const x = &assistant.*.x
+    const y = &assistant.*.y
+    const sx = set.*.startX
+    const sy = set.*.startY
+    const kind = assistant.*.kind
+    if kind == RULER { return ontoSegment(x.*[0], y.*[0], x.*[1], y.*[1], px, py, ox, oy) }
+    if kind == INFINITE_RULER { return ontoLine(x.*[0], y.*[0], x.*[1] - x.*[0], y.*[1] - y.*[0], px, py, ox, oy) }
+    if kind == PARALLEL_RULER { return ontoLine(sx, sy, x.*[1] - x.*[0], y.*[1] - y.*[0], px, py, ox, oy) }
+    if kind == VANISHING_POINT { return ontoLine(x.*[0], y.*[0], sx - x.*[0], sy - y.*[0], px, py, ox, oy) }
+    if kind == PERSPECTIVE || kind == TWO_POINT_PERSPECTIVE { return ontoPerspective(set, index, px, py, far, ox, oy) }
+    if kind == SPLINE {
+        var at: f64 = 0.0
+        return nearestOnSpline(assistant, px, py, ox, oy, &at)
+    }
+    var e: Ellipse = undefined
+    if kind == ELLIPSE {
+        if !ellipseOf(assistant, &e) { return false }
+        nearestOnEllipse(&e, px, py, ox, oy)
+        return true
+    }
+    if kind == CONCENTRIC_ELLIPSE {
+        if !ellipseOf(assistant, &e) { return false }
+        // The scale that takes the ellipse through the start.
+        const u = localX(&e, sx, sy) / e.along
+        const v = localY(&e, sx, sy) / e.across
+        const scale = @sqrt(u * u + v * v)
+        if !(scale > THIN) || !(scale < LIMIT) { return false }
+        e.along *= scale
+        e.across *= scale
+        nearestOnEllipse(&e, px, py, ox, oy)
+        return true
+    }
+    if kind == FISHEYE {
+        if !axisFrame(x.*[0], y.*[0], x.*[1], y.*[1], &e) { return false }
+        var across: f64 = 0.0
+        if !acrossThrough(e.along, localX(&e, sx, sy), localY(&e, sx, sy), &across) { return false }
+        // A start on the axis: the flattest of the family, the axis.
+        if !(across > THIN) { return ontoSegment(x.*[0], y.*[0], x.*[1], y.*[1], px, py, ox, oy) }
+        e.across = across
+        nearestOnEllipse(&e, px, py, ox, oy)
+        return true
+    }
+    return false
+}
+
+// The magnetism held to 0 to 1 (what is no number: 0).
+fn heldMagnetism(value: f64) -> f64 {
+    if !(value > 0.0) { return 0.0 }
+    return if value > 1.0 { 1.0 } else { value }
+}
+
+// A stroke begins at image point (x, y): what the last one chose is
+// forgotten.
+pub fn begin(set: *Set, x: f64, y: f64) -> void {
+    set.*.stroking = isPlace(x) && isPlace(y)
+    set.*.startX = if set.*.stroking { x } else { 0.0 }
+    set.*.startY = if set.*.stroking { y } else { 0.0 }
+    forgetStroke(set)
+}
+
+// Where assistant `index` alone puts point (x, y) of the stroke begun
+// (whether it snaps or not, all the way): false when it cannot say.
+pub fn snapOnto(set: *Set, index: usize, x: f64, y: f64, into_x: *f64, into_y: *f64) -> bool {
+    into_x.* = x
+    into_y.* = y
+    if index >= set.*.count || !set.*.stroking || !isPlace(x) || !isPlace(y) { return false }
+    const far = math.hypot(x - set.*.startX, y - set.*.startY) >= DECIDE
+    var qx: f64 = 0.0
+    var qy: f64 = 0.0
+    if !snapOne(set, index, x, y, far, &qx, &qy) { return false }
+    into_x.* = qx
+    into_y.* = qy
+    return true
+}
+
+// Where point (x, y) of the stroke begun goes (see the header): into
+// (into_x, into_y), which is (x, y) itself when no assistant takes it
+// (none snaps, snapping is off, no stroke was begun). True when one took
+// it.
+pub fn project(set: *Set, x: f64, y: f64, into_x: *f64, into_y: *f64) -> bool {
+    into_x.* = x
+    into_y.* = y
+    if !set.*.snap || set.*.count == 0 || !set.*.stroking || !isPlace(x) || !isPlace(y) { return false }
+    const far = math.hypot(x - set.*.startX, y - set.*.startY) >= DECIDE
+    var qx: f64 = 0.0
+    var qy: f64 = 0.0
+    if set.*.single && set.*.chosen != NONE {
+        const kept = set.*.chosen
+        if kept >= set.*.count || !set.*.items[kept].snap { return false }
+        if !snapOne(set, kept, x, y, far, &qx, &qy) { return false }
+    } else {
+        var which = NONE
+        var best: f64 = 0.0
+        var index: usize = 0
+        while index < set.*.count {
+            var cx: f64 = 0.0
+            var cy: f64 = 0.0
+            if set.*.items[index].snap && snapOne(set, index, x, y, far, &cx, &cy) {
+                const distance = (cx - x) * (cx - x) + (cy - y) * (cy - y)
+                if which == NONE || distance < best {
+                    which = index
+                    best = distance
+                    qx = cx
+                    qy = cy
+                }
+            }
+            index += 1
+        }
+        if which == NONE { return false }
+        if set.*.single && far { set.*.chosen = which }
+    }
+    const pull = heldMagnetism(set.*.magnetism)
+    into_x.* = x + (qx - x) * pull
+    into_y.* = y + (qy - y) * pull
+    return true
+}
+
+// The assistant "snap single" keeps for the stroke under way (NONE: none
+// is chosen yet).
+pub fn chosenOf(set: *const Set) -> usize { return set.*.chosen }
+
+// ---------------------------------------------------------------------------
+// Undo
+
+const EDIT_ADDED: u8 = 0
+const EDIT_REMOVED: u8 = 1
+const EDIT_CHANGED: u8 = 2
+
+// What a custom step of the history keeps: the set, where, and the
+// assistant before and after (an added one is `after`, a removed one
+// `before`).
+const Edit = struct {
+    allocator: Allocator
+    set: *Set
+    what: u8
+    index: usize
+    before: Assistant
+    after: Assistant
+}
+
+fn editOf(context: usize) -> *Edit {
+    unsafe { return @ptrFromInt(*Edit, context) }
+}
+
+// Undoes or redoes an edit. The assistants are drawn over the image, not
+// in it: nothing of the image looks different.
+fn perform(context: usize, image: *image_module.Image, undo: bool) -> Rect {
+    const edit = editOf(context)
+    const set = edit.*.set
+    if edit.*.what == EDIT_CHANGED {
+        if edit.*.index < set.*.count {
+            set.*.items[edit.*.index] = if undo { edit.*.before } else { edit.*.after }
+            forgetStroke(set)
+        }
+        return geom.empty()
+    }
+    // Out of the set when an adding is undone or a removing redone.
+    const out = (edit.*.what == EDIT_ADDED) == undo
+    if out {
+        _ = remove(set, edit.*.index)
+    } else {
+        _ = insert(set, edit.*.index, if undo { &edit.*.before } else { &edit.*.after })
+    }
+    return geom.empty()
+}
+
+fn discard(context: usize) -> void {
+    const edit = editOf(context)
+    const allocator = edit.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, edit), @sizeOf(Edit), 16) }
+}
+
+// A custom step that keeps `before` and `after` of assistant `index`.
+fn record(history: *history_module.History, set: *Set, what: u8, index: usize, before: *const Assistant, after: *const Assistant, name: []const u8) -> bool {
+    const memory = set.*.allocator.alloc(@sizeOf(Edit), 16)
+    if memory == null { return false }
+    const edit: *Edit = unsafe { @ptrCast(*Edit, memory.?) }
+    edit.*.allocator = set.*.allocator
+    edit.*.set = set
+    edit.*.what = what
+    edit.*.index = index
+    edit.*.before = before.*
+    edit.*.after = after.*
+    history_module.custom(history, name, @intFromPtr(edit), perform, discard)
+    return true
+}
+
+// Assistant `index` of `set` was added (it is there now): one step of
+// `history` called `name` (or part of the step begun there). The set must
+// live as long as the history (a document's do). False without memory:
+// the edit stays, not to be undone.
+pub fn recordAdded(history: *history_module.History, set: *Set, index: usize, name: []const u8) -> bool {
+    if index >= set.*.count { return false }
+    return record(history, set, EDIT_ADDED, index, &set.*.items[index], &set.*.items[index], name)
+}
+
+// `removed` was taken out of place `index`.
+pub fn recordRemoved(history: *history_module.History, set: *Set, index: usize, removed: *const Assistant, name: []const u8) -> bool {
+    return record(history, set, EDIT_REMOVED, index, removed, removed, name)
+}
+
+// Assistant `index` was `before` and is changed now (moved handles, its
+// colour, its snapping).
+pub fn recordChanged(history: *history_module.History, set: *Set, index: usize, before: *const Assistant, name: []const u8) -> bool {
+    if index >= set.*.count { return false }
+    return record(history, set, EDIT_CHANGED, index, before, &set.*.items[index], name)
+}
+
+// ---------------------------------------------------------------------------
+// What is drawn
+
+// Lines writing into the caller's memory (see Lines).
+pub fn linesInto(points: [*]f64, room: usize, runs: [*]u32, run_room: usize) -> Lines {
+    return Lines.{ .points = points, .room = room, .count = 0, .runs = runs, .runRoom = run_room, .runCount = 0 }
+}
+
+// A new polyline; false when there is no room for it.
+fn open(lines: *Lines) -> bool {
+    if lines.*.runCount >= lines.*.runRoom { return false }
+    lines.*.runs[lines.*.runCount] = 0
+    lines.*.runCount += 1
+    return true
+}
+
+// A point more of the polyline opened last; false when there is no room.
+fn put(lines: *Lines, x: f64, y: f64) -> bool {
+    if lines.*.count >= lines.*.room || lines.*.runCount == 0 { return false }
+    lines.*.points[lines.*.count * 2] = x
+    lines.*.points[lines.*.count * 2 + 1] = y
+    lines.*.count += 1
+    lines.*.runs[lines.*.runCount - 1] += 1
+    return true
+}
+
+fn segment(lines: *Lines, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+    return open(lines) && put(lines, x0, y0) && put(lines, x1, y1)
+}
+
+// The line through (x, y) along (dx, dy) (any length), `reach` each way.
+fn endless(lines: *Lines, x: f64, y: f64, dx: f64, dy: f64, reach: f64) -> bool {
+    const length = math.hypot(dx, dy)
+    if !(length > THIN) { return true }
+    const ux = dx / length * reach
+    const uy = dy / length * reach
+    return segment(lines, x - ux, y - uy, x + ux, y + uy)
+}
+
+// A ray from (x, y) at `angle`, `reach` long.
+fn ray(lines: *Lines, x: f64, y: f64, angle: f64, reach: f64) -> bool {
+    return segment(lines, x, y, x + math.cos(angle) * reach, y + math.sin(angle) * reach)
+}
+
+// A small cross (an x) marking (x, y).
+fn mark(lines: *Lines, x: f64, y: f64) -> bool {
+    return segment(lines, x - ARM, y - ARM, x + ARM, y + ARM) && segment(lines, x - ARM, y + ARM, x + ARM, y - ARM)
+}
+
+fn ellipseLine(lines: *Lines, e: *const Ellipse) -> bool {
+    if !open(lines) { return false }
+    var step: usize = 0
+    while step <= ELLIPSE_STEPS {
+        var x: f64 = 0.0
+        var y: f64 = 0.0
+        ellipseAt(e, @floatFromInt(f64, step) * math.tau / @floatFromInt(f64, ELLIPSE_STEPS), &x, &y)
+        if !put(lines, x, y) { return false }
+        step += 1
+    }
+    return true
+}
+
+// The point (u, v) of the unit square as the quad maps it (`h`: the
+// projective map, see quadMap); false where the map has no finite point.
+fn mapped(h: *const [8]f64, u: f64, v: f64, x: *f64, y: *f64) -> bool {
+    const w = h.*[6] * u + h.*[7] * v + 1.0
+    if !(math.abs(w) > 0.000000001) { return false }
+    x.* = (h.*[0] * u + h.*[1] * v + h.*[2]) / w
+    y.* = (h.*[3] * u + h.*[4] * v + h.*[5]) / w
+    return isPlace(x.*) && isPlace(y.*)
+}
+
+// The projective map that takes the unit square's corners (0, 0), (1, 0),
+// (1, 1), (0, 1) to the quad's in turn (P. Heckbert's square-to-quad):
+// a b c d e f g h of x = (a u + b v + c) / (g u + h v + 1), y = (d u + e v
+// + f) / (g u + h v + 1). False for a quad with three corners in a line.
+fn quadMap(assistant: *const Assistant, h: *[8]f64) -> bool {
+    const x = &assistant.*.x
+    const y = &assistant.*.y
+    const sx = x.*[0] - x.*[1] + x.*[2] - x.*[3]
+    const sy = y.*[0] - y.*[1] + y.*[2] - y.*[3]
+    var g: f64 = 0.0
+    var k: f64 = 0.0
+    if math.abs(sx) > THIN || math.abs(sy) > THIN {
+        const dx1 = x.*[1] - x.*[2]
+        const dx2 = x.*[3] - x.*[2]
+        const dy1 = y.*[1] - y.*[2]
+        const dy2 = y.*[3] - y.*[2]
+        const det = dx1 * dy2 - dx2 * dy1
+        if !(math.abs(det) > THIN) { return false }
+        g = (sx * dy2 - dx2 * sy) / det
+        k = (dx1 * sy - sx * dy1) / det
+    }
+    h.*[0] = x.*[1] - x.*[0] + g * x.*[1]
+    h.*[1] = x.*[3] - x.*[0] + k * x.*[3]
+    h.*[2] = x.*[0]
+    h.*[3] = y.*[1] - y.*[0] + g * y.*[1]
+    h.*[4] = y.*[3] - y.*[0] + k * y.*[3]
+    h.*[5] = y.*[0]
+    h.*[6] = g
+    h.*[7] = k
+    return true
+}
+
+// The assistant's density, held to DENSITY.
+fn densityOf(assistant: *const Assistant, least: u32) -> u32 {
+    const density = assistant.*.density
+    if density < least { return least }
+    return if density > DENSITY { DENSITY } else { density }
+}
+
+fn perspectiveLines(lines: *Lines, assistant: *const Assistant) -> bool {
+    const x = &assistant.*.x
+    const y = &assistant.*.y
+    if !open(lines) { return false }
+    var corner: usize = 0
+    while corner <= 4 {
+        if !put(lines, x.*[corner & 3], y.*[corner & 3]) { return false }
+        corner += 1
+    }
+    var h: [8]f64 = undefined
+    if quadMap(assistant, &h) {
+        const cells = densityOf(assistant, 1)
+        var line: u32 = 1
+        while line < cells {
+            const t = @floatFromInt(f64, line) / @floatFromInt(f64, cells)
+            var x0: f64 = 0.0
+            var y0: f64 = 0.0
+            var x1: f64 = 0.0
+            var y1: f64 = 0.0
+            if mapped(&h, t, 0.0, &x0, &y0) && mapped(&h, t, 1.0, &x1, &y1) {
+                if !segment(lines, x0, y0, x1, y1) { return false }
+            }
+            if mapped(&h, 0.0, t, &x0, &y0) && mapped(&h, 1.0, t, &x1, &y1) {
+                if !segment(lines, x0, y0, x1, y1) { return false }
+            }
+            line += 1
+        }
+    }
+    var which: usize = 0
+    while which < 2 {
+        var point: Vanishing = undefined
+        if vanishing(assistant, which, &point) && point.finite {
+            if !mark(lines, point.x, point.y) { return false }
+        }
+        which += 1
+    }
+    return true
+}
+
+fn twoPointLines(lines: *Lines, assistant: *const Assistant, reach: f64) -> bool {
+    const x = &assistant.*.x
+    const y = &assistant.*.y
+    const dx = x.*[1] - x.*[0]
+    const dy = y.*[1] - y.*[0]
+    // The horizon, through both points.
+    if !endless(lines, (x.*[0] + x.*[1]) / 2.0, (y.*[0] + y.*[1]) / 2.0, dx, dy, reach + math.hypot(dx, dy) / 2.0) { return false }
+    const rays = densityOf(assistant, 2)
+    // From each point a fan of rays toward the centre of vision, a
+    // quarter turn wide.
+    var which: usize = 0
+    while which < 2 {
+        var toward = math.atan2(y.*[2] - y.*[which], x.*[2] - x.*[which])
+        if math.hypot(y.*[2] - y.*[which], x.*[2] - x.*[which]) < THIN { toward = math.atan2(y.*[1 - which] - y.*[which], x.*[1 - which] - x.*[which]) }
+        var index: u32 = 0
+        while index < rays {
+            const angle = toward + (@floatFromInt(f64, index) / @floatFromInt(f64, rays - 1) - 0.5) * math.pi / 2.0
+            if !ray(lines, x.*[which], y.*[which], angle, reach) { return false }
+            index += 1
+        }
+        which += 1
+    }
+    // Uprights through the centre of vision and along the horizon.
+    var upright: Vanishing = undefined
+    if vanishing(assistant, 2, &upright) {
+        if !endless(lines, x.*[2], y.*[2], upright.dx, upright.dy, reach) { return false }
+        var index: u32 = 1
+        while index <= rays {
+            const t = @floatFromInt(f64, index) / @floatFromInt(f64, rays + 1)
+            if !endless(lines, x.*[0] + dx * t, y.*[0] + dy * t, upright.dx, upright.dy, reach) { return false }
+            index += 1
+        }
+    }
+    return mark(lines, x.*[2], y.*[2])
+}
+
+fn splineLines(lines: *Lines, assistant: *const Assistant) -> bool {
+    if !open(lines) { return false }
+    var step: usize = 0
+    while step <= SPLINE_STEPS {
+        var x: f64 = 0.0
+        var y: f64 = 0.0
+        splineAt(assistant, @floatFromInt(f64, step) / @floatFromInt(f64, SPLINE_STEPS), &x, &y)
+        if !put(lines, x, y) { return false }
+        step += 1
+    }
+    // The controls' arms.
+    return segment(lines, assistant.*.x[0], assistant.*.y[0], assistant.*.x[2], assistant.*.y[2]) && segment(lines, assistant.*.x[1], assistant.*.y[1], assistant.*.x[3], assistant.*.y[3])
+}
+
+// What is drawn of `assistant`, appended to `lines`: its guide lines and
+// curves as polylines in the image's coordinates, lines without end
+// `reach` pixels each way from where they are anchored. One not complete
+// yet: its handles joined in turn. False when `lines` had no room for all
+// (what fitted is there).
+pub fn preview(assistant: *const Assistant, given_reach: f64, lines: *Lines) -> bool {
+    var reach = given_reach
+    if !(reach > 1.0) { reach = 1.0 }
+    if reach > LIMIT { reach = LIMIT }
+    const x = &assistant.*.x
+    const y = &assistant.*.y
+    const kind = assistant.*.kind
+    if !isComplete(assistant) {
+        const count = @intCast(usize, assistant.*.count)
+        if count < 2 { return true }
+        if !open(lines) { return false }
+        var handle: usize = 0
+        while handle < count {
+            if !put(lines, x.*[handle], y.*[handle]) { return false }
+            handle += 1
+        }
+        return true
+    }
+    if kind == RULER || kind == PARALLEL_RULER { return segment(lines, x.*[0], y.*[0], x.*[1], y.*[1]) }
+    if kind == INFINITE_RULER { return endless(lines, (x.*[0] + x.*[1]) / 2.0, (y.*[0] + y.*[1]) / 2.0, x.*[1] - x.*[0], y.*[1] - y.*[0], reach) }
+    if kind == VANISHING_POINT {
+        const rays = densityOf(assistant, 1)
+        var index: u32 = 0
+        while index < rays {
+            if !ray(lines, x.*[0], y.*[0], @floatFromInt(f64, index) * math.tau / @floatFromInt(f64, rays), reach) { return false }
+            index += 1
+        }
+        return mark(lines, x.*[0], y.*[0])
+    }
+    if kind == PERSPECTIVE { return perspectiveLines(lines, assistant) }
+    if kind == TWO_POINT_PERSPECTIVE { return twoPointLines(lines, assistant, reach) }
+    if kind == SPLINE { return splineLines(lines, assistant) }
+    var e: Ellipse = undefined
+    if kind == ELLIPSE {
+        if !ellipseOf(assistant, &e) { return segment(lines, x.*[0], y.*[0], x.*[1], y.*[1]) }
+        return ellipseLine(lines, &e) && segment(lines, x.*[0], y.*[0], x.*[1], y.*[1])
+    }
+    // The families: rings a quarter of the base apart (the base is the
+    // fourth; a fisheye's keep their axis along), and the axis (the
+    // fisheye's flattest).
+    if !ellipseOf(assistant, &e) { return segment(lines, x.*[0], y.*[0], x.*[1], y.*[1]) }
+    const along = e.along
+    const across = e.across
+    const rings = densityOf(assistant, 1)
+    var ring: u32 = 1
+    while ring <= rings {
+        const scale = @floatFromInt(f64, ring) / 4.0
+        if kind == CONCENTRIC_ELLIPSE { e.along = along * scale }
+        e.across = across * scale
+        if !ellipseLine(lines, &e) { return false }
+        ring += 1
+    }
+    return segment(lines, x.*[0], y.*[0], x.*[1], y.*[1])
+}
+
+// How many points and polylines preview() writes at most for an
+// assistant of `density` (room for any kind).
+pub fn previewRoom(density: u32, points: *usize, runs: *usize) -> void {
+    const d = @intCast(usize, if density > DENSITY { DENSITY } else { density }) + 2
+    points.* = d * (ELLIPSE_STEPS + 1) + 4 * d + 40 + SPLINE_STEPS
+    runs.* = 4 * d + 16
+}
+
+// ---------------------------------------------------------------------------
+// The text saved with the document
+//
+//     assistants 1
+//     options SHOW SNAP SINGLE MAGNETISM
+//     KIND COLOR SNAP DENSITY HANDLES X0 Y0 X1 Y1 ...
+//
+// a line for each assistant: its kind's key (keyOf), its colour as eight
+// hexadecimal digits (AARRGGBB), 1 or 0, whole numbers, and the handles'
+// coordinates in decimal (as many digits as read back as the same
+// double). Words are separated by blanks.
+
+const VERSION: u64 = 1
+
+fn appendText(into: *std.ArrayList(u8), text: []const u8) -> bool {
+    return into.appendSlice(text)
+}
+
+fn appendUnsigned(into: *std.ArrayList(u8), value: u64) -> bool {
+    var digits: [24]u8 = undefined
+    const bytes: [*]u8 = &digits
+    const length = std.text.appendUnsigned(bytes, 0, 24, @intCast(usize, value))
+    return into.appendSlice(bytes[0..length])
+}
+
+fn appendNumber(into: *std.ArrayList(u8), value: f64) -> bool {
+    var digits: [48]u8 = undefined
+    const bytes: [*]u8 = &digits
+    const length = text_io.formatFloat(value, text_io.MOST_DECIMALS, bytes, 48)
+    if length == 0 { return into.append(48) }
+    return into.appendSlice(bytes[0..length])
+}
+
+fn appendColor(into: *std.ArrayList(u8), color: u32) -> bool {
+    var shift: u5 = 28
+    while true {
+        const digit = @intCast(u8, (color >> shift) & 15)
+        if !into.append(if digit < 10 { 48 + digit } else { 55 + digit }) { return false }
+        if shift == 0 { break }
+        shift -= 4
+    }
+    return true
+}
+
+fn flag(value: bool) -> []const u8 { return if value { " 1" } else { " 0" } }
+
+// The set's text appended to `into` (a magnetism or density beyond its
+// range as held there); false without memory (what was appended stays).
+pub fn write(set: *const Set, into: *std.ArrayList(u8)) -> bool {
+    if !appendText(into, "assistants ") || !appendUnsigned(into, VERSION) || !appendText(into, "\noptions") { return false }
+    if !appendText(into, flag(set.*.show)) || !appendText(into, flag(set.*.snap)) || !appendText(into, flag(set.*.single)) || !appendText(into, " ") { return false }
+    if !appendNumber(into, heldMagnetism(set.*.magnetism)) || !appendText(into, "\n") { return false }
+    var index: usize = 0
+    while index < set.*.count {
+        const assistant = &set.*.items[index]
+        if !appendText(into, keyOf(assistant.*.kind)) || !appendText(into, " ") || !appendColor(into, assistant.*.color) { return false }
+        const density = if assistant.*.density > DENSITY { DENSITY } else { assistant.*.density }
+        if !appendText(into, flag(assistant.*.snap)) || !appendText(into, " ") || !appendUnsigned(into, @intCast(u64, density)) { return false }
+        if !appendText(into, " ") || !appendUnsigned(into, @intCast(u64, assistant.*.count)) { return false }
+        var handle: usize = 0
+        while handle < @intCast(usize, assistant.*.count) {
+            if !appendText(into, " ") || !appendNumber(into, assistant.*.x[handle]) || !appendText(into, " ") || !appendNumber(into, assistant.*.y[handle]) { return false }
+            handle += 1
+        }
+        if !appendText(into, "\n") { return false }
+        index += 1
+    }
+    return true
+}
+
+// Reads the text a word at a time.
+const Reader = struct {
+    text: []const u8
+    at: usize
+}
+
+fn isBlank(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 13 }
+
+// The next word of the line (empty at its end); the line's end is not
+// passed.
+fn word(reader: *Reader) -> []const u8 {
+    const text = reader.*.text
+    var start = reader.*.at
+    while start < text.length && isBlank(text[start]) { start += 1 }
+    var end = start
+    while end < text.length && !isBlank(text[end]) && text[end] != 10 { end += 1 }
+    reader.*.at = end
+    return text[start..end]
+}
+
+// Past the end of the line; false when anything but blanks was left on
+// it.
+fn lineEnd(reader: *Reader) -> bool {
+    const text = reader.*.text
+    var at = reader.*.at
+    while at < text.length && isBlank(text[at]) { at += 1 }
+    if at < text.length && text[at] != 10 { return false }
+    reader.*.at = if at < text.length { at + 1 } else { at }
+    return true
+}
+
+// Whether lines are left (blank ones are passed).
+fn more(reader: *Reader) -> bool {
+    const text = reader.*.text
+    while reader.*.at < text.length && (isBlank(text[reader.*.at]) || text[reader.*.at] == 10) { reader.*.at += 1 }
+    return reader.*.at < text.length
+}
+
+fn readFlag(reader: *Reader, into: *bool) -> bool {
+    const value = word(reader)
+    if value.length != 1 || (value[0] != 48 && value[0] != 49) { return false }
+    into.* = value[0] == 49
+    return true
+}
+
+fn readWhole(reader: *Reader, most: u64, into: *u64) -> bool {
+    const value = word(reader)
+    if value.length == 0 || value.length > 9 { return false }
+    var number: u64 = 0
+    for byte in value {
+        if byte < 48 || byte > 57 { return false }
+        number = number * 10 + @intCast(u64, byte - 48)
+    }
+    if number > most { return false }
+    into.* = number
+    return true
+}
+
+fn readNumber(reader: *Reader, into: *f64) -> bool {
+    var value: f64 = 0.0
+    if !text_io.parseFloat(word(reader), &value) || !isPlace(value) { return false }
+    into.* = value
+    return true
+}
+
+fn readColor(reader: *Reader, into: *u32) -> bool {
+    const value = word(reader)
+    if value.length != 8 { return false }
+    var color: u32 = 0
+    for byte in value {
+        var digit: u32 = 0
+        if byte >= 48 && byte <= 57 {
+            digit = @intCast(u32, byte - 48)
+        } else if byte >= 65 && byte <= 70 {
+            digit = @intCast(u32, byte - 55)
+        } else if byte >= 97 && byte <= 102 {
+            digit = @intCast(u32, byte - 87)
+        } else {
+            return false
+        }
+        color = (color << 4) | digit
+    }
+    into.* = color
+    return true
+}
+
+// One assistant's line into `into` (the kind's key read already).
+fn readAssistant(reader: *Reader, kind: u8, into: *Assistant) -> bool {
+    var color: u32 = 0
+    var snap = false
+    var density: u64 = 0
+    var count: u64 = 0
+    if !readColor(reader, &color) || !readFlag(reader, &snap) || !readWhole(reader, @intCast(u64, DENSITY), &density) || !readWhole(reader, @intCast(u64, handlesOf(kind)), &count) { return false }
+    into.* = blank(kind, color)
+    into.*.snap = snap
+    into.*.density = @intCast(u32, density)
+    var handle: usize = 0
+    while handle < @intCast(usize, count) {
+        var x: f64 = 0.0
+        var y: f64 = 0.0
+        if !readNumber(reader, &x) || !readNumber(reader, &y) || !setHandle(into, handle, x, y) { return false }
+        handle += 1
+    }
+    return lineEnd(reader)
+}
+
+// Goes through `text`; with `into` it fills the set as it goes (the
+// first pass checks with null, the second writes: a text that fails
+// changes nothing).
+fn readAll(text: []const u8, into: ?*Set) -> bool {
+    var reader = Reader.{ .text = text, .at = 0 }
+    if !more(&reader) || !std.text.same(word(&reader), "assistants") { return false }
+    var version: u64 = 0
+    if !readWhole(&reader, 1000, &version) || version != VERSION || !lineEnd(&reader) { return false }
+    var show = true
+    var snap = true
+    var single = true
+    var magnetism: f64 = 1.0
+    if !more(&reader) || !std.text.same(word(&reader), "options") { return false }
+    if !readFlag(&reader, &show) || !readFlag(&reader, &snap) || !readFlag(&reader, &single) || !readNumber(&reader, &magnetism) || !lineEnd(&reader) { return false }
+    if !(magnetism >= 0.0) || magnetism > 1.0 { return false }
+    if into != null {
+        clear(into.?)
+        into.?.*.show = show
+        into.?.*.snap = snap
+        into.?.*.single = single
+        into.?.*.magnetism = magnetism
+    }
+    var count: usize = 0
+    var assistant: Assistant = undefined
+    while more(&reader) {
+        const kind = kindByKey(word(&reader))
+        if @intCast(usize, kind) >= KINDS || count >= MAX { return false }
+        if !readAssistant(&reader, kind, &assistant) { return false }
+        if into != null { _ = add(into.?, &assistant) }
+        count += 1
+    }
+    return true
+}
+
+// Replaces the set's assistants and options by what `text` (write()'s)
+// says. False when it is not such a text (the set stays as it was).
+pub fn read(set: *Set, text: []const u8) -> bool {
+    if !readAll(text, null) { return false }
+    return readAll(text, set)
+}

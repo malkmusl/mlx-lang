@@ -1,0 +1,310 @@
+// nebula brush: the shape engine ("shape"), Krita's experiment brush:
+// the stroke becomes one flat shape with clean edges. It is the area the
+// dabs sweep (a band along the dabs' places, as wide as each dab: the
+// band between their left and right sides, joined round) together with
+// the area the stroke's path closes (its places as a polygon, the last
+// joined back to the first): a loop drawn with it is a filled blob, two
+// passes side by side fill what lies between them.
+//
+// Its numbers in Settings.values (values() lists them with their ranges
+// and defaults; defaults() makes a shape brush):
+//
+//   0  width       the band's width in dab diameters (0 to 10; 1); 0:
+//                  only the closed area
+//   1  smoothing   passes of smoothing over the dabs' places and widths
+//                  before the shape is made (0 to 20; 4): each moves
+//                  every place a quarter of the way to its neighbours'
+//                  middle, the ends stay
+//   2  fill        1: the area the path closes is filled (1)
+//   3  even odd    1: a place the path winds around twice is left out
+//                  (0: Krita's winding fill, it is filled)
+//
+// The shape is made when the stroke ends, at once and anti-aliased as
+// the tip is: no seam inside it, no edge counted twice (its parts go into
+// a mask first, the band and the closed area each, and the mask through
+// the ink), in the colour, opacity and flow of the stroke's last dab.
+// While the stroke goes on, on an indirect target (wash: the stroke's
+// own overlay) the band shows as it grows; that preview is cleared when
+// the shape is laid down. On a direct target (build-up) nothing shows
+// before the end. Each copy of a dab (mirrored) makes its own shape.
+// Not done: Krita's speed and displacement, patterns as fills.
+const std = @import("std")
+const math = @import("std.math")
+const types = @import("./types.mlx")
+const geom = @import("../core/geom.mlx")
+const device_module = @import("../core/device.mlx")
+const mask_module = @import("../core/mask.mlx")
+const scratch = @import("../core/scratch.mlx")
+const raster = @import("../core/raster.mlx")
+const table = @import("../core/table.mlx")
+// (The ink the procedural engines share lives in the sketch engine's
+// module.)
+const ink_module = @import("./sketch_engine.mlx")
+
+pub const Rect = geom.Rect
+const Value = ink_module.Value
+const SLOTS = ink_module.SLOTS
+
+const WIDTH: usize = 0
+const SMOOTHING: usize = 1
+const FILL: usize = 2
+const EVEN_ODD: usize = 3
+
+const VALUES = [4]Value{
+    Value.{ .key = "width", .name = "Width", .german = "Breite", .low = 0.0, .high = 10.0, .initial = 1.0 },
+    Value.{ .key = "smoothing", .name = "Smoothing", .german = "Glättung", .low = 0.0, .high = 20.0, .initial = 4.0 },
+    Value.{ .key = "fill", .name = "Fill the closed area", .german = "Umschlossene Fläche füllen", .low = 0.0, .high = 1.0, .initial = 1.0 },
+    Value.{ .key = "even_odd", .name = "Even-odd fill", .german = "Gerade-ungerade-Füllung", .low = 0.0, .high = 1.0, .initial = 0.0 },
+}
+
+var keptValues: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The engine's numbers (row N is Settings.values[N]).
+pub fn values() -> []const Value {
+    if keptValues.address != 0 { return table.rows(Value, &keptValues) }
+    return table.keep(Value, &keptValues, VALUES[0..])
+}
+
+// A shape brush: types.defaults() with this engine, 20 pixels, the size
+// not by pressure, and the numbers' defaults.
+pub fn defaults(settings: *types.Settings) -> void {
+    types.defaults(settings)
+    types.setName(settings, "Shape")
+    settings.*.engine = types.ENGINE_SHAPE
+    settings.*.size = 20.0
+    settings.*.options[types.OPTION_SIZE].on = false
+    ink_module.applyValues(settings, values())
+}
+
+// What a stroke keeps: the ink; every dab as its slot, place and radius;
+// each slot's last dab and how many it had; the preview's box.
+const Own = @noncopy(struct) {
+    ink: *ink_module.Ink
+    // Slot, x, y and radius of every dab, in order.
+    dabs: std.ArrayList(f64)
+    counts: [8]usize
+    lastX: [8]f64
+    lastY: [8]f64
+    lastRadius: [8]f64
+    shownLeft: i32
+    shownTop: i32
+    shownRight: i32
+    shownBottom: i32
+}
+
+fn ownOf(stroke: *types.Stroke) -> *Own {
+    unsafe { return @ptrFromInt(*Own, stroke.*.engineState) }
+}
+
+fn begin(stroke: *types.Stroke) -> bool {
+    const allocator = stroke.*.allocator
+    const memory = allocator.alloc(@sizeOf(Own), 16)
+    const ink = ink_module.inkCreate(allocator)
+    if memory == null || ink == null {
+        if memory != null { allocator.free(memory.?, @sizeOf(Own), 16) }
+        if ink != null { ink_module.inkDestroy(ink.?, allocator) }
+        return false
+    }
+    const own: *Own = unsafe { @ptrCast(*Own, memory.?) }
+    own.*.ink = ink.?
+    own.*.dabs = std.ArrayList(f64).init(allocator)
+    var slot: usize = 0
+    while slot < SLOTS {
+        own.*.counts[slot] = 0
+        slot += 1
+    }
+    own.*.shownLeft = 0
+    own.*.shownTop = 0
+    own.*.shownRight = 0
+    own.*.shownBottom = 0
+    stroke.*.engineState = @intFromPtr(own)
+    return true
+}
+
+fn free(stroke: *types.Stroke) -> void {
+    if stroke.*.engineState == 0 { return }
+    const own = ownOf(stroke)
+    const allocator = stroke.*.allocator
+    own.*.dabs.deinit()
+    ink_module.inkDestroy(own.*.ink, allocator)
+    unsafe { allocator.free(@ptrCast([*]u8, own), @sizeOf(Own), 16) }
+    stroke.*.engineState = 0
+}
+
+fn paint(stroke: *types.Stroke, dab: *const types.Dab) -> Rect {
+    const own = ownOf(stroke)
+    const ink = own.*.ink
+    ink_module.inkFor(ink, stroke, dab)
+    const slot = @intCast(usize, dab.*.copy)
+    // (A copy with no slot of its own makes no shape.)
+    if slot >= SLOTS { return geom.empty() }
+    const list = values()
+    const radius = dab.*.diameter * 0.5 * ink_module.number(stroke, WIDTH, &list[WIDTH])
+    const x = dab.*.x
+    const y = dab.*.y
+    // (Without memory the shape is made of the dabs there was room for.)
+    if own.*.dabs.ensureUnusedCapacity(4) {
+        _ = own.*.dabs.append(@floatFromInt(f64, slot))
+        _ = own.*.dabs.append(x)
+        _ = own.*.dabs.append(y)
+        _ = own.*.dabs.append(radius)
+    }
+    if !ink.*.direct {
+        // The preview: the band's newest piece.
+        const path = ink.*.path
+        if own.*.counts[slot] > 0 { ink_module.trapezoid(path, own.*.lastX[slot], own.*.lastY[slot], own.*.lastRadius[slot], x, y, radius) }
+        ink_module.disc(path, x, y, radius)
+        ink_module.inkFill(ink, path, raster.NONZERO)
+        if ink.*.right > ink.*.left {
+            if own.*.shownRight <= own.*.shownLeft {
+                own.*.shownLeft = ink.*.left
+                own.*.shownTop = ink.*.top
+                own.*.shownRight = ink.*.right
+                own.*.shownBottom = ink.*.bottom
+            } else {
+                if ink.*.left < own.*.shownLeft { own.*.shownLeft = ink.*.left }
+                if ink.*.top < own.*.shownTop { own.*.shownTop = ink.*.top }
+                if ink.*.right > own.*.shownRight { own.*.shownRight = ink.*.right }
+                if ink.*.bottom > own.*.shownBottom { own.*.shownBottom = ink.*.bottom }
+            }
+        }
+    }
+    own.*.lastX[slot] = x
+    own.*.lastY[slot] = y
+    own.*.lastRadius[slot] = radius
+    own.*.counts[slot] += 1
+    return ink_module.inkBox(ink)
+}
+
+// Smoothing passes over `count` points of x, y and radius each at
+// `points`: every inner point a quarter of the way to its neighbours'
+// middle (weights 1, 2, 1), the ends where they are.
+fn smooth(points: [*]f64, count: usize, passes: usize) -> void {
+    if count < 3 { return }
+    var pass: usize = 0
+    while pass < passes {
+        var part: usize = 0
+        while part < 3 {
+            var before = points[part]
+            var index: usize = 1
+            while index + 1 < count {
+                const here = points[index * 3 + part]
+                points[index * 3 + part] = (before + 2.0 * here + points[(index + 1) * 3 + part]) * 0.25
+                before = here
+                index += 1
+            }
+            part += 1
+        }
+        pass += 1
+    }
+}
+
+// The shape of one slot's `count` points (x, y, radius each) into `mask`.
+fn shapeInto(ink: *ink_module.Ink, mask: *device_module.Device, points: [*]const f64, count: usize, fill: bool, rule: u8) -> void {
+    const path = ink.*.path
+    // The band: a disc at every point and the piece between each two
+    // (all clockwise: NONZERO fills their union).
+    var index: usize = 0
+    while index < count {
+        const x = points[index * 3]
+        const y = points[index * 3 + 1]
+        const radius = points[index * 3 + 2]
+        ink_module.disc(path, x, y, radius)
+        if index + 1 < count { ink_module.trapezoid(path, x, y, radius, points[index * 3 + 3], points[index * 3 + 4], points[index * 3 + 5]) }
+        index += 1
+    }
+    if !raster.isEmpty(path) { _ = raster.fillMask(mask, path, raster.NONZERO, ink.*.antialias, ink.*.area, 255, raster.ADD) }
+    raster.clear(path)
+    if fill && count >= 3 {
+        raster.moveTo(path, points[0], points[1])
+        index = 1
+        while index < count {
+            raster.lineTo(path, points[index * 3], points[index * 3 + 1])
+            index += 1
+        }
+        raster.close(path)
+        _ = raster.fillMask(mask, path, rule, ink.*.antialias, ink.*.area, 255, raster.ADD)
+        raster.clear(path)
+    }
+}
+
+fn end(stroke: *types.Stroke) -> Rect {
+    const own = ownOf(stroke)
+    const ink = own.*.ink
+    const total = own.*.dabs.items().length / 4
+    if total == 0 { return geom.empty() }
+    ink_module.inkFor(ink, stroke, &stroke.*.dab)
+    const list = values()
+    const passes = ink_module.count(stroke, SMOOTHING, &list[SMOOTHING])
+    const fill = ink_module.isSet(stroke, FILL, &list[FILL])
+    const rule = if ink_module.isSet(stroke, EVEN_ODD, &list[EVEN_ODD]) { raster.EVEN_ODD } else { raster.NONZERO }
+    const mask = mask_module.create(stroke.*.allocator, false)
+    // (Without memory for the mask the preview stays as it is.)
+    if mask == null { return geom.empty() }
+    const dabs = own.*.dabs.items()
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const points = scratch.doubles(pool, total * 3)
+    if points != null {
+        var slot: usize = 0
+        while slot < SLOTS {
+            var count: usize = 0
+            var index: usize = 0
+            while index < total {
+                if dabs[index * 4] == @floatFromInt(f64, slot) {
+                    points.?[count * 3] = dabs[index * 4 + 1]
+                    points.?[count * 3 + 1] = dabs[index * 4 + 2]
+                    points.?[count * 3 + 2] = dabs[index * 4 + 3]
+                    count += 1
+                }
+                index += 1
+            }
+            if count > 0 {
+                smooth(points.?, count, passes)
+                shapeInto(ink, mask.?, points.?, count, fill, rule)
+            }
+            slot += 1
+        }
+    }
+    scratch.release(pool, mark)
+    // The preview goes (it was the stroke's own overlay's), the shape
+    // comes.
+    if !ink.*.direct && own.*.shownRight > own.*.shownLeft {
+        device_module.clearRect(ink.*.device, geom.rect(own.*.shownLeft, own.*.shownTop, own.*.shownRight - own.*.shownLeft, own.*.shownBottom - own.*.shownTop))
+        ink_module.inkNote(ink, own.*.shownLeft, own.*.shownTop, own.*.shownRight, own.*.shownBottom)
+    }
+    lay(ink, mask.?)
+    device_module.destroy(mask.?)
+    return ink_module.inkBox(ink)
+}
+
+// The mask's amounts through the ink, row by row.
+fn lay(ink: *ink_module.Ink, mask: *device_module.Device) -> void {
+    const bounds = mask_module.bounds(mask)
+    if geom.isEmpty(bounds) || bounds.width > 16777216 { return }
+    const width = @intCast(usize, bounds.width)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const row = scratch.bytes(pool, width)
+    if row != null {
+        var y = bounds.y
+        while y < bounds.y + bounds.height {
+            mask_module.readBytes(mask, geom.rect(bounds.x, y, bounds.width, 1), row.?, width)
+            ink_module.inkRow(ink, y, bounds.x, row.?, width)
+            y += 1
+        }
+    }
+    scratch.release(pool, mark)
+}
+
+const ENGINES = [1]types.Engine{
+    types.Engine.{ .id = types.ENGINE_SHAPE, .key = "shape", .name = "Shape brush", .german = "Formpinsel", .flags = 0, .begin = begin, .dab = paint, .end = end, .free = free },
+}
+
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's engine, "shape" (brush/engines.mlx lists it).
+pub fn list() -> []const types.Engine {
+    if kept.address != 0 { return table.rows(types.Engine, &kept) }
+    return table.keep(types.Engine, &kept, ENGINES[0..])
+}

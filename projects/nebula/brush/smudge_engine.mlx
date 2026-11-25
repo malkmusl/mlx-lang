@@ -1,0 +1,413 @@
+// nebula brush: the colour smudge engine ("colorsmudge"): every dab picks
+// up the paint under the dab before it and lays it down where it is,
+// mixed with the brush's colour: paint dragged along the stroke.
+//
+// Per dab, with the dab's mask M, its opacity O (opacity times flow), the
+// smudge length S, the colour rate C and the brush's colour K (all 0..1;
+// mix and over are core/pixel.mlx's: mix goes from one straight pixel to
+// the other as if premultiplied, over lays a colour on at an opacity):
+//
+//   smearing   (the dab carries pixels: the area of the dab before,
+//              as it was after that dab, is laid down at the new place)
+//              for each pixel p of the dab, `under` the picture at p and
+//              `carried` the pixel at the same place relative to the dab
+//              before's centre (`under` where the dab before did not
+//              reach):
+//                  D = over(mix(under, carried, S), K, C)
+//                  p' = mix(p, D, M O)
+//              and the dab's area, as it is now, is carried on.
+//   dulling    (one colour carried): A is the mean colour (alpha
+//              weighted) of the picture within the smudge radius of the
+//              dab's centre; picked = mix(A, picked before, S) (A at the
+//              first dab); D = over(picked, K, C) for every pixel;
+//              p' = mix(p, D, M O).
+//
+// So S = 0 paints the picture with the brush's colour laid over at C (with
+// C = 0 nothing changes), and with S near 1 paint is dragged far. When
+// smearing, the paint under the dab travels with it and only what its
+// leading edge takes in (1 - S of the picture there, every dab) pushes it
+// back, so how far it goes grows with the dab's size over the spacing as
+// well; dulling carries one colour, of which S^n is left after n dabs.
+// Smearing wants dabs close together (spacing 0.05 to 0.1). The smudge
+// radius (dulling) is the part of the dab's radius averaged, at least half
+// a pixel. (In whole levels, a smear can leave a trace of a few levels of
+// what it dragged: the mean of two neighbours a level apart rounds toward
+// the carried one.)
+//
+// The engine's numbers are Settings.values[VALUE_...] (defaults() sets
+// them); smudge length, smudge radius and colour rate are each also
+// multiplied by its option (types.OPTION_SMUDGE_LENGTH, _RADIUS,
+// OPTION_COLOR_RATE: 1 when the option is off), so the pen can drive
+// them. With VALUE_OVERLAY the picture read is Target.sample when the
+// tool sets one (all visible layers: the projection) with the layer's own
+// pixels laid over it, while the paint goes onto the layer; otherwise the
+// layer itself. (The layer laid over the sample, the dabs see what the
+// stroke painted before the projection is drawn again; exact for the top
+// layer in Normal mode at full opacity.) With VALUE_KEEP_ALPHA
+// only colour is smudged: every pixel keeps its alpha (Krita's "smear
+// alpha" off).
+//
+// The carried pixels live in heap memory of the stroke (one block for
+// each of up to four copies of the dabs: mirrored and wrapped ones carry
+// their own paint, followed by place: clone_engine.follow), grown when a
+// dab is larger than the block, given back at the stroke's end. The rest
+// is working memory of one dab (core/scratch.mlx).
+//
+// Not done: paint thickness (impasto), gradient colour sources, Krita 5's
+// "smudge from the brush's tip shape" variants.
+const types = @import("./types.mlx")
+const shared = @import("./clone_engine.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const device_module = @import("../core/device.mlx")
+const scratch = @import("../core/scratch.mlx")
+const table = @import("../core/table.mlx")
+
+pub const Rect = geom.Rect
+
+// The engine's numbers in Settings.values.
+// 0: smearing, 1: dulling.
+pub const VALUE_MODE: usize = 0
+// 0..1, each times its option's number.
+pub const VALUE_LENGTH: usize = 1
+pub const VALUE_RADIUS: usize = 2
+pub const VALUE_RATE: usize = 3
+// 1: the picture is read from Target.sample (when there is one).
+pub const VALUE_OVERLAY: usize = 4
+// 1: colour only, every pixel keeps its alpha.
+pub const VALUE_KEEP_ALPHA: usize = 5
+
+pub const SMEARING: f32 = 0.0
+pub const DULLING: f32 = 1.0
+
+const TRAILS: usize = 4
+
+// What one copy of the dabs carries: the pixels under its last dab after
+// that dab (`width` x `height`, the first at (left, top) counted from the
+// pixel the dab's centre was in), in a heap block of `capacity` words;
+// and, dulling, the colour picked up so far.
+const Carried = struct {
+    pixels: ?[*]u32
+    capacity: usize
+    width: i32
+    height: i32
+    left: i32
+    top: i32
+    color: u32
+}
+
+const Own = struct {
+    area: shared.Area
+    trails: [4]shared.Trail
+    carried: [4]Carried
+    clock: u64
+    dulling: bool
+    overlay: bool
+    keepAlpha: bool
+}
+
+fn ownOf(stroke: *types.Stroke) -> *Own {
+    unsafe { return @ptrFromInt(*Own, stroke.*.engineState) }
+}
+
+fn isOn(settings: *const types.Settings, value: usize) -> bool {
+    return settings.*.values[value] > 0.5
+}
+
+// A smudge brush: types.defaults() with this engine, 40 pixels, a soft
+// tip, dabs a twentieth of it apart, smearing with smudge length 0.8,
+// smudge radius 0.5 and no colour of its own.
+pub fn defaults(settings: *types.Settings) -> void {
+    types.defaults(settings)
+    types.setName(settings, "Colour smudge")
+    settings.*.engine = types.ENGINE_COLORSMUDGE
+    settings.*.paintMode = types.MODE_BUILD_UP
+    settings.*.tip.spacing = 0.05
+    settings.*.tip.horizontalFade = 0.5
+    settings.*.tip.verticalFade = 0.5
+    settings.*.values[VALUE_MODE] = SMEARING
+    settings.*.values[VALUE_LENGTH] = 0.8
+    settings.*.values[VALUE_RADIUS] = 0.5
+    settings.*.values[VALUE_RATE] = 0.0
+}
+
+fn begin(stroke: *types.Stroke) -> bool {
+    const memory = stroke.*.allocator.alloc(@sizeOf(Own), 16)
+    if memory == null { return false }
+    const own: *Own = unsafe { @ptrCast(*Own, memory.?) }
+    shared.clearTrails(&own.*.trails, TRAILS)
+    var index: usize = 0
+    while index < TRAILS {
+        own.*.carried[index].pixels = null
+        own.*.carried[index].capacity = 0
+        own.*.carried[index].color = 0
+        index += 1
+    }
+    own.*.clock = 0
+    const settings = stroke.*.settings
+    own.*.dulling = settings.*.values[VALUE_MODE] > 0.5
+    own.*.overlay = isOn(settings, VALUE_OVERLAY)
+    own.*.keepAlpha = isOn(settings, VALUE_KEEP_ALPHA)
+    stroke.*.engineState = @intFromPtr(own)
+    return true
+}
+
+fn free(stroke: *types.Stroke) -> void {
+    if stroke.*.engineState == 0 { return }
+    const own = ownOf(stroke)
+    var index: usize = 0
+    while index < TRAILS {
+        const carried = &own.*.carried[index]
+        if carried.*.pixels != null {
+            unsafe { stroke.*.allocator.free(@ptrCast([*]u8, carried.*.pixels.?), carried.*.capacity * 4, 16) }
+        }
+        index += 1
+    }
+    unsafe { stroke.*.allocator.free(@ptrFromInt([*]u8, stroke.*.engineState), @sizeOf(Own), 16) }
+    stroke.*.engineState = 0
+}
+
+// Room for `count` words in a copy's block (what it held is lost). False
+// without memory.
+fn room(stroke: *types.Stroke, carried: *Carried, count: usize) -> bool {
+    if carried.*.pixels != null && carried.*.capacity >= count { return true }
+    if carried.*.pixels != null {
+        unsafe { stroke.*.allocator.free(@ptrCast([*]u8, carried.*.pixels.?), carried.*.capacity * 4, 16) }
+    }
+    carried.*.pixels = null
+    carried.*.capacity = 0
+    // A quarter more: the sizes of a stroke's dabs creep up and down.
+    const wanted = count + count / 4 + 64
+    const memory = stroke.*.allocator.alloc(wanted * 4, 16)
+    if memory == null { return false }
+    unsafe { carried.*.pixels = @ptrCast([*]u32, memory.?) }
+    carried.*.capacity = wanted
+    return true
+}
+
+// Whether the dab reads the sample (overlay mode, and the tool set one).
+fn overlaid(stroke: *types.Stroke, own: *const Own) -> bool {
+    return own.*.overlay && stroke.*.target.sample != null
+}
+
+// The picture of `area` into `into` (`count` pixels, rows one after the
+// other): the layer's pixels, or in overlay mode the sample with the
+// layer's laid over it (`spare`: room for those, as many).
+fn readPicture(stroke: *types.Stroke, own: *const Own, area: Rect, into: [*]u32, spare: ?[*]u32, count: usize) -> void {
+    const layer = stroke.*.target.device
+    const stride = @intCast(usize, area.width)
+    if !overlaid(stroke, own) || spare == null {
+        device_module.readRect(layer, area, into, stride)
+        return
+    }
+    device_module.readRect(stroke.*.target.sample.?, area, into, stride)
+    device_module.readRect(layer, area, spare.?, stride)
+    var index: usize = 0
+    while index < count {
+        if spare.?[index] >> 24 != 0 { into[index] = pixel.over(into[index], spare.?[index], 255) }
+        index += 1
+    }
+}
+
+// The dab's numbers: smudge length, smudge radius and colour rate, each
+// its value times its option's.
+fn length(stroke: *types.Stroke, dab: *const types.Dab) -> u32 {
+    return shared.level(@floatCast(f64, stroke.*.settings.*.values[VALUE_LENGTH]) * types.engineValue(dab, types.OPTION_SMUDGE_LENGTH))
+}
+
+fn rate(stroke: *types.Stroke, dab: *const types.Dab) -> u32 {
+    return shared.level(@floatCast(f64, stroke.*.settings.*.values[VALUE_RATE]) * types.engineValue(dab, types.OPTION_COLOR_RATE))
+}
+
+// Smearing (see the header). `under` holds the picture of the area and
+// becomes what the dab leaves there (the next dab's carried pixels);
+// `want` gets D; `weights` are the amounts (null: all 0).
+fn smear(own: *Own, slot: usize, centre_x: i32, centre_y: i32, under: [*]u32, want: [*]u32, weights: ?[*]const u8, smudge: u32, color_rate: u32, color: u32, lock: bool) -> void {
+    const area = &own.*.area
+    const width = shared.areaWidth(area)
+    const height = shared.areaHeight(area)
+    // Where the carried block begins, counted from the area's first pixel.
+    var from_x: i32 = 0
+    var from_y: i32 = 0
+    var carried_width: i32 = 0
+    var carried_height: i32 = 0
+    var carried: [*]const u32 = under
+    if slot < TRAILS && own.*.trails[slot].live && own.*.carried[slot].pixels != null {
+        const block = &own.*.carried[slot]
+        carried = block.*.pixels.?
+        carried_width = block.*.width
+        carried_height = block.*.height
+        from_x = block.*.left - (area.*.x0 - centre_x)
+        from_y = block.*.top - (area.*.y0 - centre_y)
+    }
+    var y: usize = 0
+    while y < height {
+        const row = y * width
+        // The carried block's row for this one, and whether it has one.
+        const carried_y = @intCast(i32, y) - from_y
+        const inside_y = carried_y >= 0 && carried_y < carried_height
+        var x: usize = 0
+        while x < width {
+            const before = under[row + x]
+            var paint = before
+            if smudge != 0 && inside_y {
+                const carried_x = @intCast(i32, x) - from_x
+                if carried_x >= 0 && carried_x < carried_width {
+                    paint = pixel.mix(before, carried[@intCast(usize, carried_y * carried_width + carried_x)], smudge)
+                }
+            }
+            if color_rate != 0 { paint = pixel.over(paint, color, color_rate) }
+            if lock { paint = (paint & 0x00FFFFFF) | (before & 0xFF000000) }
+            want[row + x] = paint
+            if weights != null {
+                const amount = @intCast(u32, weights.?[row + x])
+                if amount != 0 {
+                    var after = pixel.mix(before, paint, amount)
+                    if lock { after = if before >> 24 == 0 { before } else { (after & 0x00FFFFFF) | (before & 0xFF000000) } }
+                    under[row + x] = after
+                }
+            }
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// The mean colour (alpha weighted) of the picture within `radius` of
+// (x, y): `buffer` holds the picture of the square of `side` pixels
+// around it, its first pixel at the floor of (x - radius, y - radius).
+// 0 where there is nothing.
+fn meanAround(buffer: [*]const u32, side: usize, x: f64, y: f64, radius: f64) -> u32 {
+    const left = @floor(x - radius)
+    const top = @floor(y - radius)
+    var red: u64 = 0
+    var green: u64 = 0
+    var blue: u64 = 0
+    var alpha: u64 = 0
+    var count: u64 = 0
+    const reach = radius * radius
+    var row: usize = 0
+    while row < side {
+        const dy = top + @floatFromInt(f64, row) + 0.5 - y
+        var column: usize = 0
+        while column < side {
+            const dx = left + @floatFromInt(f64, column) + 0.5 - x
+            if dx * dx + dy * dy <= reach {
+                const value = buffer[row * side + column]
+                const a = @intCast(u64, value >> 24)
+                red += a * @intCast(u64, (value >> 16) & 255)
+                green += a * @intCast(u64, (value >> 8) & 255)
+                blue += a * @intCast(u64, value & 255)
+                alpha += a
+                count += 1
+            }
+            column += 1
+        }
+        row += 1
+    }
+    if count == 0 || alpha == 0 { return 0 }
+    const half = alpha / 2
+    const mean_alpha = @intCast(u32, (alpha + count / 2) / count)
+    return (mean_alpha << 24) | (@intCast(u32, (red + half) / alpha) << 16) | (@intCast(u32, (green + half) / alpha) << 8) | @intCast(u32, (blue + half) / alpha)
+}
+
+fn paint(stroke: *types.Stroke, dab: *const types.Dab) -> Rect {
+    const own = ownOf(stroke)
+    if !shared.dabArea(stroke, dab, &own.*.area) { return geom.empty() }
+    const area = &own.*.area
+    const width = shared.areaWidth(area)
+    const count = width * shared.areaHeight(area)
+    const slot = shared.follow(&own.*.trails, TRAILS, stroke, dab, &own.*.clock)
+    const centre_x = @intFromFloat(i32, @floor(dab.*.x))
+    const centre_y = @intFromFloat(i32, @floor(dab.*.y))
+    const smudge = length(stroke, dab)
+    const color_rate = rate(stroke, dab)
+    const lock = own.*.keepAlpha || (stroke.*.target.direct && stroke.*.target.alphaLock)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const weights = scratch.bytes(pool, count)
+    if weights == null {
+        scratch.release(pool, mark)
+        return geom.empty()
+    }
+    const any = shared.amounts(stroke, area, shared.level(dab.*.opacity * dab.*.flow), weights.?)
+    var changed = false
+    if own.*.dulling {
+        // The square around the radius, read once.
+        var radius = @floatCast(f64, stroke.*.settings.*.values[VALUE_RADIUS]) * types.engineValue(dab, types.OPTION_SMUDGE_RADIUS) * dab.*.diameter * 0.5
+        if !(radius >= 0.5) { radius = 0.5 }
+        const side = @intFromFloat(usize, @ceil(radius * 2.0)) + 2
+        const around = scratch.words(pool, side * side)
+        const row = scratch.words(pool, width)
+        var spare: ?[*]u32 = null
+        if overlaid(stroke, own) { spare = scratch.words(pool, side * side) }
+        if around == null || row == null || (overlaid(stroke, own) && spare == null) {
+            scratch.release(pool, mark)
+            return geom.empty()
+        }
+        const square = geom.rect(@intFromFloat(i32, @floor(dab.*.x - radius)), @intFromFloat(i32, @floor(dab.*.y - radius)), @intCast(i32, side), @intCast(i32, side))
+        readPicture(stroke, own, square, around.?, spare, side * side)
+        var picked = meanAround(around.?, side, dab.*.x, dab.*.y, radius)
+        if slot < TRAILS && own.*.trails[slot].live && smudge != 0 { picked = pixel.mix(picked, own.*.carried[slot].color, smudge) }
+        const wanted = if color_rate != 0 { pixel.over(picked, dab.*.color, color_rate) } else { picked }
+        device_module.fillWords(row.?, width, wanted)
+        if any {
+            shared.layDown(stroke, area, row.?, 0, weights.?, lock)
+            changed = true
+        }
+        if slot < TRAILS {
+            own.*.carried[slot].color = picked
+            own.*.trails[slot].live = true
+        }
+    } else {
+        const under = scratch.words(pool, count)
+        const want = scratch.words(pool, count)
+        // (In overlay mode `want` first holds the layer's pixels, which
+        // readPicture lays over the sample's.)
+        if under == null || want == null {
+            scratch.release(pool, mark)
+            return geom.empty()
+        }
+        readPicture(stroke, own, shared.areaRect(area), under.?, want, count)
+        var amounts_of: ?[*]const u8 = null
+        if any { amounts_of = weights.? }
+        smear(own, slot, centre_x, centre_y, under.?, want.?, amounts_of, smudge, color_rate, dab.*.color, lock)
+        if any {
+            shared.layDown(stroke, area, want.?, width, weights.?, lock)
+            changed = true
+        }
+        // What the dab left is carried on (without room for it the copy
+        // starts afresh at its next dab).
+        if slot < TRAILS {
+            const block = &own.*.carried[slot]
+            own.*.trails[slot].live = room(stroke, block, count)
+            if own.*.trails[slot].live {
+                device_module.copyWords(block.*.pixels.?, under.?, count)
+                block.*.width = @intCast(i32, width)
+                block.*.height = area.*.y1 - area.*.y0
+                block.*.left = area.*.x0 - centre_x
+                block.*.top = area.*.y0 - centre_y
+            }
+        }
+    }
+    if slot < TRAILS {
+        own.*.trails[slot].x = dab.*.x
+        own.*.trails[slot].y = dab.*.y
+    }
+    scratch.release(pool, mark)
+    if !changed { return geom.empty() }
+    return geom.rect(area.*.x0, area.*.y0, area.*.x1 - area.*.x0, area.*.y1 - area.*.y0)
+}
+
+const ENGINES = [1]types.Engine{
+    types.Engine.{ .id = types.ENGINE_COLORSMUDGE, .key = "colorsmudge", .name = "Colour smudge", .german = "Farbe verwischen", .flags = types.ENGINE_READS_SAMPLE | types.ENGINE_DIRECT, .begin = begin, .dab = paint, .end = null, .free = free },
+}
+
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's engine, "colorsmudge" (brush/engines.mlx lists it): a copy
+// of the table in heap memory made at the first asking (core/table.mlx).
+pub fn list() -> []const types.Engine {
+    if kept.address != 0 { return table.rows(types.Engine, &kept) }
+    return table.keep(types.Engine, &kept, ENGINES[0..])
+}

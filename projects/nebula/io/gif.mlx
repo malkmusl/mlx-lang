@@ -1,0 +1,722 @@
+// nebula io: GIF read and written, and LZW (GIF's code and TIFF's:
+// io/tiff.mlx).
+//
+//     var picture: png.Picture = undefined
+//     if gif.decode(bytes, allocator, &picture) == png.Status.ok { ... png.free(&picture) }
+//     _ = gif.encode(&picture, &options, &list)
+//     var load = gif.LoadOptions.{ .frames = true }
+//     _ = gif.read(allocator, bytes, &load, &result, &report)     // every frame a layer
+//
+// Reading: the logical screen's size; the first frame (or each frame, a
+// layer of its own at its place, the first the lowest, when the load
+// options ask for frames) with its colours from its local table or the
+// global one, its transparent index from the graphic control extension
+// before it, interlaced rows put in their places; what lies outside a
+// frame is transparent. Disposal is not applied (frames as layers are
+// the frames as stored). Pixels the data does not reach stay transparent
+// (a frame cut short is read as far as it goes); what is not a GIF, or
+// has a damaged header, a code that is none or a frame outside the
+// screen's 32768 is refused.
+//
+// Writing: GIF89a of the picture's size, its colours chosen by median
+// cut (core/palette.mlx's fromPixels: at most 256, 255 when a pixel's
+// alpha is below 128: those become the transparent index) and
+// Floyd-Steinberg dithering (quantizeIndices), one frame, LZW in sub-blocks
+// of 255 bytes. A picture of no more colours than that is kept exactly.
+//
+// LZW: lzwDecode() and lzwEncode() in either form: GIF's (codes from the
+// least significant bit on, a code wider once the table reaches a power
+// of two) and TIFF's (from the most significant bit, one code earlier:
+// "early change"); codes of at most 12 bits, a clear code when the table
+// is full (the encoder), an end code at the end.
+const std = @import("std")
+const png = @import("./png.mlx")
+const ora = @import("./ora.mlx")
+const formats = @import("./formats.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const device_module = @import("../core/device.mlx")
+const node_module = @import("../core/node.mlx")
+const image_module = @import("../core/image.mlx")
+const palette_module = @import("../core/palette.mlx")
+const scratch = @import("../core/scratch.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Picture = png.Picture
+
+// What loading a GIF makes: its first frame (one layer), or every frame
+// as a layer of its own.
+pub const LoadOptions = struct {
+    frames: bool
+}
+
+// ---------------------------------------------------------------------------
+// LZW
+
+// Which form of LZW: GIF's or TIFF's.
+pub const Form = struct {
+    // Codes from the most significant bit on (TIFF) or the least (GIF).
+    msb: bool
+    // A code wider one code early (TIFF).
+    early: bool
+}
+
+pub const GIF_FORM = Form.{ .msb = false, .early = false }
+pub const TIFF_FORM = Form.{ .msb = true, .early = true }
+
+// The table of the decoder: for each code the code it extends, its last
+// byte, its first byte and its length (scratch memory, 4096 each).
+const Strings = struct {
+    prefix: [*]u16
+    last: [*]u8
+    first: [*]u8
+    length: [*]u16
+}
+
+// `input` decoded (codes of `minimum` + 1 bits to begin with: 8 for TIFF,
+// the GIF frame's own size) into `into` (`capacity` bytes): how many
+// bytes into `produced`. Decoding ends at the end code, at the end of the
+// input or when `into` is full (all of these are true); false only for a
+// code that is none (`produced` says what was made before it), and
+// without scratch memory.
+pub fn lzwDecode(input: []const u8, minimum: u32, form: Form, into: [*]u8, capacity: usize, produced: *usize) -> bool {
+    produced.* = 0
+    if minimum < 1 || minimum > 11 { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const memory = scratch.bytes(pool, 4096 * 6)
+    if memory == null { return false }
+    var strings: Strings = undefined
+    unsafe {
+        strings.prefix = @ptrCast([*]u16, memory.?)
+        strings.length = @ptrCast([*]u16, memory.? + 8192)
+    }
+    strings.last = memory.? + 16384
+    strings.first = memory.? + 20480
+    const done = lzwRun(input, minimum, form, &strings, into, capacity, produced)
+    scratch.release(pool, mark)
+    return done
+}
+
+fn lzwRun(input: []const u8, minimum: u32, form: Form, strings: *Strings, into: [*]u8, capacity: usize, produced: *usize) -> bool {
+    const clear = @intCast(usize, 1) << @intCast(u6, minimum)
+    const end = clear + 1
+    var code_index: usize = 0
+    while code_index < clear {
+        strings.*.prefix[code_index] = 0
+        strings.*.last[code_index] = @intCast(u8, code_index & 255)
+        strings.*.first[code_index] = @intCast(u8, code_index & 255)
+        strings.*.length[code_index] = 1
+        code_index += 1
+    }
+    const early: usize = if form.early { 1 } else { 0 }
+    var width: u32 = minimum + 1
+    var next = clear + 2
+    var previous: usize = 4096
+    var bits: u64 = 0
+    var count: u32 = 0
+    var at: usize = 0
+    var made: usize = 0
+    while true {
+        while count < width {
+            if at >= input.length {
+                produced.* = made
+                return true
+            }
+            if form.msb {
+                bits = (bits << 8) | @intCast(u64, input[at])
+            } else {
+                bits |= @intCast(u64, input[at]) << @intCast(u6, count)
+            }
+            at += 1
+            count += 8
+        }
+        var code: usize = 0
+        const mask = (@intCast(u64, 1) << @intCast(u6, width)) - 1
+        if form.msb {
+            code = @intCast(usize, (bits >> @intCast(u6, count - width)) & mask)
+        } else {
+            code = @intCast(usize, bits & mask)
+            bits = bits >> @intCast(u6, width)
+        }
+        count -= width
+        if form.msb { bits &= (@intCast(u64, 1) << @intCast(u6, count)) - 1 }
+        if code == clear {
+            width = minimum + 1
+            next = clear + 2
+            previous = 4096
+            continue
+        }
+        if code == end { break }
+        var string = code
+        if previous == 4096 {
+            if code >= clear {
+                produced.* = made
+                return false
+            }
+        } else if code < next {
+            if next < 4096 {
+                strings.*.prefix[next] = @intCast(u16, previous)
+                strings.*.last[next] = strings.*.first[code]
+                strings.*.first[next] = strings.*.first[previous]
+                strings.*.length[next] = strings.*.length[previous] + 1
+                next += 1
+            }
+        } else if code == next && next < 4096 {
+            // The string being defined: the previous one and its own first byte.
+            strings.*.prefix[next] = @intCast(u16, previous)
+            strings.*.last[next] = strings.*.first[previous]
+            strings.*.first[next] = strings.*.first[previous]
+            strings.*.length[next] = strings.*.length[previous] + 1
+            next += 1
+        } else {
+            produced.* = made
+            return false
+        }
+        if previous != 4096 && next + early >= (@intCast(usize, 1) << @intCast(u6, width)) && width < 12 { width += 1 }
+        previous = code
+        // The string, from its last byte back to its first.
+        const length = @intCast(usize, strings.*.length[string])
+        const room = capacity - made
+        var place = if length <= room { length } else { room }
+        var skip = length - place
+        while skip > 0 {
+            string = @intCast(usize, strings.*.prefix[string])
+            skip -= 1
+        }
+        while place > 0 {
+            place -= 1
+            into[made + place] = strings.*.last[string]
+            string = @intCast(usize, strings.*.prefix[string])
+        }
+        made += if length <= room { length } else { room }
+        if made >= capacity { break }
+    }
+    produced.* = made
+    return true
+}
+
+// What the encoder keeps: the codes' strings by a hash of (the code
+// extended, the byte), and the bits not yet written.
+const Encoder = struct {
+    keys: [*]u32
+    codes: [*]u16
+    out: *std.ArrayList(u8)
+    bits: u64
+    count: u32
+    msb: bool
+    ok: bool
+}
+
+const HASH: usize = 5003
+
+fn emit(e: *Encoder, code: usize, width: u32) -> void {
+    if e.*.msb {
+        e.*.bits = (e.*.bits << @intCast(u6, width)) | @intCast(u64, code)
+        e.*.count += width
+        while e.*.count >= 8 {
+            e.*.count -= 8
+            if !e.*.out.*.append(@intCast(u8, (e.*.bits >> @intCast(u6, e.*.count)) & 255)) { e.*.ok = false }
+        }
+        e.*.bits &= (@intCast(u64, 1) << @intCast(u6, e.*.count)) - 1
+    } else {
+        e.*.bits |= @intCast(u64, code) << @intCast(u6, e.*.count)
+        e.*.count += width
+        while e.*.count >= 8 {
+            if !e.*.out.*.append(@intCast(u8, e.*.bits & 255)) { e.*.ok = false }
+            e.*.bits >>= 8
+            e.*.count -= 8
+        }
+    }
+}
+
+fn forget(e: *Encoder) -> void {
+    var index: usize = 0
+    while index < HASH {
+        e.*.keys[index] = 0
+        index += 1
+    }
+}
+
+// `count` bytes at `from` (each below 2 to the `minimum`) encoded at the
+// end of `into`: a clear code, the codes, the end code, the last bits
+// filled up with zeros. False without memory.
+pub fn lzwEncode(from: [*]const u8, count: usize, minimum: u32, form: Form, into: *std.ArrayList(u8)) -> bool {
+    if minimum < 1 || minimum > 11 { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const memory = scratch.bytes(pool, HASH * 6)
+    if memory == null { return false }
+    var e: Encoder = undefined
+    unsafe {
+        e.keys = @ptrCast([*]u32, memory.?)
+        e.codes = @ptrCast([*]u16, memory.? + HASH * 4)
+    }
+    e.out = into
+    e.bits = 0
+    e.count = 0
+    e.msb = form.msb
+    e.ok = true
+    forget(&e)
+    const clear = @intCast(usize, 1) << @intCast(u6, minimum)
+    const early: usize = if form.early { 1 } else { 0 }
+    var width: u32 = minimum + 1
+    var next = clear + 2
+    emit(&e, clear, width)
+    if count > 0 {
+        var prefix = @intCast(usize, from[0]) & (clear - 1)
+        var at: usize = 1
+        while at < count && e.ok {
+            const byte = @intCast(usize, from[at]) & (clear - 1)
+            at += 1
+            // Keys are (prefix + 1) << 8 | byte, never 0 (0: an empty slot).
+            const key = @intCast(u32, ((prefix + 1) << 8) | byte)
+            var slot = @intCast(usize, key) % HASH
+            var found = false
+            while e.keys[slot] != 0 {
+                if e.keys[slot] == key {
+                    found = true
+                    break
+                }
+                slot += 1
+                if slot == HASH { slot = 0 }
+            }
+            if found {
+                prefix = @intCast(usize, e.codes[slot])
+                continue
+            }
+            emit(&e, prefix, width)
+            if next + early >= 4096 {
+                // The table is full: it starts again.
+                emit(&e, clear, width)
+                forget(&e)
+                width = minimum + 1
+                next = clear + 2
+            } else {
+                e.keys[slot] = key
+                e.codes[slot] = @intCast(u16, next)
+                next += 1
+                if next + early > (@intCast(usize, 1) << @intCast(u6, width)) && width < 12 { width += 1 }
+            }
+            prefix = byte
+        }
+        emit(&e, prefix, width)
+        // The decoder adds a code for the last one too before the end code.
+        if next < 4096 && next + 1 + early > (@intCast(usize, 1) << @intCast(u6, width)) && width < 12 { width += 1 }
+    }
+    emit(&e, clear + 1, width)
+    if e.count > 0 { emit(&e, 0, 8 - e.count) }
+    scratch.release(pool, mark)
+    return e.ok
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+fn get16(bytes: []const u8, at: usize) -> usize { return @intCast(usize, std.mem.readU16Little(bytes.pointer, at)) }
+
+// Whether `bytes` begin as a GIF does.
+pub fn isGif(bytes: []const u8) -> bool {
+    return bytes.length >= 6 && std.mem.eql(bytes.pointer, "GIF8".pointer, 4) && (bytes[4] == 55 || bytes[4] == 57) && bytes[5] == 97
+}
+
+// One frame: where it is, its colours, its data's sub-blocks.
+const Frame = struct {
+    left: usize
+    top: usize
+    width: usize
+    height: usize
+    interlaced: bool
+    // The colour table: where its bytes are, how many colours.
+    table: usize
+    colours: usize
+    transparent: usize
+    // The LZW code size and where the first sub-block is.
+    minimum: u32
+    data: usize
+}
+
+// The sub-blocks from `at`: their bytes together and where they end.
+fn subBlocks(bytes: []const u8, at: usize, length: *usize) -> ?usize {
+    var place = at
+    var total: usize = 0
+    while true {
+        if place >= bytes.length { return null }
+        const size = @intCast(usize, bytes[place])
+        place += 1
+        if size == 0 { break }
+        if size > bytes.length - place { return null }
+        total += size
+        place += size
+    }
+    length.* = total
+    return place
+}
+
+// The next frame from `at.*` on (its descriptor, the extensions before
+// it): false at the trailer or the end, and for what is damaged
+// (`damaged` set).
+fn nextFrame(bytes: []const u8, at: *usize, global: usize, global_colours: usize, frame: *Frame, damaged: *bool) -> bool {
+    damaged.* = false
+    var transparent: usize = 256
+    while at.* < bytes.length {
+        const kind = bytes[at.*]
+        if kind == 0x3B { return false }
+        if kind == 0x21 {
+            if at.* + 2 > bytes.length {
+                damaged.* = true
+                return false
+            }
+            const label = bytes[at.* + 1]
+            if label == 0xF9 && at.* + 7 < bytes.length && bytes[at.* + 2] >= 4 && bytes[at.* + 3] & 1 != 0 { transparent = @intCast(usize, bytes[at.* + 6]) }
+            var length: usize = 0
+            const after = subBlocks(bytes, at.* + 2, &length)
+            if after == null {
+                damaged.* = true
+                return false
+            }
+            at.* = after.?
+            continue
+        }
+        if kind != 0x2C || at.* + 10 > bytes.length {
+            damaged.* = true
+            return false
+        }
+        frame.*.left = get16(bytes, at.* + 1)
+        frame.*.top = get16(bytes, at.* + 3)
+        frame.*.width = get16(bytes, at.* + 5)
+        frame.*.height = get16(bytes, at.* + 7)
+        const flags = bytes[at.* + 9]
+        frame.*.interlaced = flags & 0x40 != 0
+        at.* += 10
+        frame.*.table = global
+        frame.*.colours = global_colours
+        if flags & 0x80 != 0 {
+            frame.*.colours = @intCast(usize, 2) << @intCast(u6, flags & 7)
+            frame.*.table = at.*
+            if frame.*.colours * 3 > bytes.length - at.* {
+                damaged.* = true
+                return false
+            }
+            at.* += frame.*.colours * 3
+        }
+        frame.*.transparent = transparent
+        if at.* >= bytes.length {
+            damaged.* = true
+            return false
+        }
+        frame.*.minimum = @intCast(u32, bytes[at.*])
+        frame.*.data = at.* + 1
+        var length: usize = 0
+        const after = subBlocks(bytes, at.* + 1, &length)
+        if after == null || frame.*.minimum < 1 || frame.*.minimum > 11 {
+            damaged.* = true
+            return false
+        }
+        at.* = after.?
+        return true
+    }
+    return false
+}
+
+// The frame's pixels (frame.width x frame.height, straight words) into
+// `into`: its data's bytes gathered, decoded, its rows put in their
+// places. False for data that is damaged or without scratch memory.
+fn framePixels(bytes: []const u8, frame: *const Frame, into: [*]u32) -> bool {
+    const count = frame.*.width * frame.*.height
+    var length: usize = 0
+    _ = subBlocks(bytes, frame.*.data, &length)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const data = scratch.bytes(pool, length + 1)
+    const indices = scratch.bytes(pool, count + 1)
+    var ok = data != null && indices != null
+    if ok {
+        // The sub-blocks' bytes after each other.
+        var place = frame.*.data
+        var filled: usize = 0
+        while bytes[place] != 0 {
+            const size = @intCast(usize, bytes[place])
+            std.mem.copy(data.? + filled, bytes.pointer + place + 1, size)
+            filled += size
+            place += size + 1
+        }
+        var produced: usize = 0
+        ok = lzwDecode(data.?[0..filled], frame.*.minimum, GIF_FORM, indices.?, count, &produced)
+        if ok {
+            device_module.fillWords(into, count, 0)
+            var row: usize = 0
+            while row < frame.*.height {
+                const y = if frame.*.interlaced { interlacedRow(row, frame.*.height) } else { row }
+                var x: usize = 0
+                while x < frame.*.width {
+                    const at = row * frame.*.width + x
+                    if at >= produced { break }
+                    const index = @intCast(usize, indices.?[at])
+                    if index != frame.*.transparent && index < frame.*.colours {
+                        const colour = frame.*.table + index * 3
+                        into[y * frame.*.width + x] = pixel.rgb(@intCast(u32, bytes[colour]), @intCast(u32, bytes[colour + 1]), @intCast(u32, bytes[colour + 2]))
+                    }
+                    x += 1
+                }
+                row += 1
+            }
+        }
+    }
+    scratch.release(pool, mark)
+    return ok
+}
+
+// The row stored `row`-th of an interlaced frame of `height` rows: every
+// 8th from 0, every 8th from 4, every 4th from 2, every 2nd from 1.
+fn interlacedRow(row: usize, height: usize) -> usize {
+    const first = (height + 7) / 8
+    if row < first { return row * 8 }
+    const second = (height + 3) / 8
+    if row < first + second { return (row - first) * 8 + 4 }
+    const third = (height + 1) / 4
+    if row < first + second + third { return (row - first - second) * 4 + 2 }
+    return (row - first - second - third) * 2 + 1
+}
+
+// The header: the screen's size, the global table. False when it is no
+// GIF (`gif` false) or damaged.
+fn readHeader(bytes: []const u8, width: *usize, height: *usize, global: *usize, colours: *usize, at: *usize, gif: *bool) -> bool {
+    gif.* = isGif(bytes)
+    if !gif.* || bytes.length < 13 { return false }
+    width.* = get16(bytes, 6)
+    height.* = get16(bytes, 8)
+    const flags = bytes[10]
+    at.* = 13
+    global.* = 0
+    colours.* = 0
+    if flags & 0x80 != 0 {
+        colours.* = @intCast(usize, 2) << @intCast(u6, flags & 7)
+        global.* = 13
+        if colours.* * 3 > bytes.length - 13 { return false }
+        at.* = 13 + colours.* * 3
+    }
+    return true
+}
+
+// A frame's place in the screen's picture (false: it does not fit in
+// LARGEST).
+fn fits(frame: *const Frame) -> bool {
+    return frame.*.left + frame.*.width <= png.LARGEST && frame.*.top + frame.*.height <= png.LARGEST
+}
+
+// The GIF `bytes`' first frame as a picture of the screen's size (what
+// lies outside the frame transparent) into `into` (png.free() it after
+// Status.ok). notThisFormat, damaged, tooLarge, noMemory.
+pub fn decode(bytes: []const u8, allocator: Allocator, into: *Picture) -> png.Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    var width: usize = 0
+    var height: usize = 0
+    var global: usize = 0
+    var colours: usize = 0
+    var at: usize = 0
+    var gif = false
+    if !readHeader(bytes, &width, &height, &global, &colours, &at, &gif) { return if gif { png.Status.damaged } else { png.Status.notThisFormat } }
+    var frame: Frame = undefined
+    var damaged = false
+    if !nextFrame(bytes, &at, global, colours, &frame, &damaged) { return png.Status.damaged }
+    if !fits(&frame) { return png.Status.tooLarge }
+    // A screen of nothing takes the frame's size.
+    if width == 0 || height == 0 {
+        width = frame.left + frame.width
+        height = frame.top + frame.height
+    }
+    const made = png.makePicture(into, width, height, allocator)
+    if made != png.Status.ok { return made }
+    device_module.fillWords(into.*.pixels, width * height, 0)
+    if frame.width == 0 || frame.height == 0 { return png.Status.ok }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const pixels = scratch.words(pool, frame.width * frame.height)
+    var status = png.Status.noMemory
+    if pixels != null {
+        status = png.Status.damaged
+        if framePixels(bytes, &frame, pixels.?) {
+            status = png.Status.ok
+            // The part of the frame inside the screen.
+            var row: usize = 0
+            while row < frame.height && frame.top + row < height {
+                var x: usize = 0
+                while x < frame.width && frame.left + x < width {
+                    into.*.pixels[(frame.top + row) * width + frame.left + x] = pixels.?[row * frame.width + x]
+                    x += 1
+                }
+                row += 1
+            }
+        }
+    }
+    scratch.release(pool, mark)
+    if status != png.Status.ok { png.free(into) }
+    return status
+}
+
+// The GIF `bytes` as an image: one layer "Background" of its first frame,
+// or (options.frames) a layer "Frame N" for every frame at its place, the
+// first the lowest. Status as formats.load() says it; `report.skipped`
+// for frames after a damaged one.
+pub fn read(allocator: Allocator, bytes: []const u8, options: *const LoadOptions, into: *formats.LoadResult, report: *ora.Report) -> formats.Status {
+    ora.clearReport(report)
+    into.*.image = null
+    var width: usize = 0
+    var height: usize = 0
+    var global: usize = 0
+    var colours: usize = 0
+    var at: usize = 0
+    var gif = false
+    if !readHeader(bytes, &width, &height, &global, &colours, &at, &gif) { return if gif { formats.Status.damaged } else { formats.Status.unknownFormat } }
+    var frame: Frame = undefined
+    var damaged = false
+    var first_at = at
+    if !nextFrame(bytes, &first_at, global, colours, &frame, &damaged) { return formats.Status.damaged }
+    if width == 0 || height == 0 {
+        width = frame.left + frame.width
+        height = frame.top + frame.height
+    }
+    if width < 1 || height < 1 { return formats.Status.damaged }
+    if width > @intCast(usize, image_module.LARGEST) || height > @intCast(usize, image_module.LARGEST) { return formats.Status.tooLarge }
+    const made = image_module.create(allocator, @intCast(i32, width), @intCast(i32, height), 72.0)
+    if made == null { return formats.Status.noMemory }
+    const image = made.?
+    var status = formats.Status.ok
+    var number: usize = 0
+    while status == formats.Status.ok && nextFrame(bytes, &at, global, colours, &frame, &damaged) {
+        number += 1
+        if !fits(&frame) {
+            status = formats.Status.tooLarge
+            break
+        }
+        var name: [32]u8 = undefined
+        var length = std.text.append(&name, 0, 32, if options.*.frames { "Frame " } else { "Background" })
+        if options.*.frames { length = std.text.appendUnsigned(&name, length, 32, number) }
+        const layer = ora.newNode(image, node_module.PAINT, name[0..length])
+        if layer == null || !node_module.insert(image.*.root, layer.?, node_module.childCount(image.*.root)) {
+            if layer != null { node_module.destroy(layer.?) }
+            status = formats.Status.noMemory
+            break
+        }
+        status = framePlaced(bytes, &frame, layer.?.*.device.?, allocator)
+        if !options.*.frames { break }
+    }
+    if damaged && status == formats.Status.ok {
+        // Frames after the damage are left out; a first one that is
+        // damaged makes the file damaged.
+        if number == 0 { status = formats.Status.damaged } else { report.*.skipped = true }
+    }
+    if status != formats.Status.ok {
+        image_module.destroy(image)
+        return status
+    }
+    ora.finish(image)
+    into.*.image = image
+    return formats.Status.ok
+}
+
+// A frame into a layer's device at its place.
+fn framePlaced(bytes: []const u8, frame: *const Frame, device: *device_module.Device, allocator: Allocator) -> formats.Status {
+    if frame.*.width == 0 || frame.*.height == 0 { return formats.Status.ok }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const pixels = scratch.words(pool, frame.*.width * frame.*.height)
+    var status = formats.Status.noMemory
+    if pixels != null {
+        status = formats.Status.damaged
+        if framePixels(bytes, frame, pixels.?) {
+            var picture: Picture = undefined
+            picture.pixels = pixels.?
+            picture.width = frame.*.width
+            picture.height = frame.*.height
+            picture.resolution = 0.0
+            picture.allocator = allocator
+            status = if formats.writePicture(device, &picture, @intCast(i32, frame.*.left), @intCast(i32, frame.*.top)) { formats.Status.ok } else { formats.Status.noMemory }
+        }
+    }
+    scratch.release(pool, mark)
+    return status
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+fn put16(out: *std.ArrayList(u8), value: usize) -> bool {
+    return out.*.append(@intCast(u8, value & 255)) && out.*.append(@intCast(u8, (value >> 8) & 255))
+}
+
+// The picture as a GIF at the end of `into` (see the header). False
+// without memory and for a side of more than 65535 (`into` is as it was).
+pub fn encode(picture: *const Picture, options: *const formats.SaveOptions, into: *std.ArrayList(u8)) -> bool {
+    const width = picture.*.width
+    const height = picture.*.height
+    if width == 0 || height == 0 || width > 65535 || height > 65535 { return false }
+    const count = width * height
+    var transparent = false
+    var index: usize = 0
+    while index < count && !transparent {
+        transparent = picture.*.pixels[index] >> 24 < 128
+        index += 1
+    }
+    const palette = palette_module.create(picture.*.allocator)
+    if palette == null { return false }
+    const begun = into.*.count()
+    var ok = palette_module.fromPixels(palette.?, picture.*.pixels, count, if transparent { 255 } else { 256 })
+    // A picture of nothing but transparency still needs one colour.
+    if ok && palette_module.count(palette.?) == 0 { ok = palette_module.add(palette.?, pixel.BLACK, "", 0) }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const indices = scratch.bytes(pool, count)
+    ok = ok && indices != null
+    const used = palette_module.count(palette.?)
+    const key = used
+    if ok { ok = palette_module.quantizeIndices(picture.*.pixels, width, height, width, palette.?, palette_module.FLOYD_STEINBERG, 1.0, @intCast(u8, key & 255), indices.?) }
+    // The table: a power of two of at least the colours (and the
+    // transparent one), at least 2.
+    var bits: u32 = 1
+    while (@intCast(usize, 1) << @intCast(u6, bits)) < used + (if transparent { 1 } else { 0 }) { bits += 1 }
+    ok = ok && into.*.appendSlice("GIF89a") && put16(into, width) && put16(into, height)
+    ok = ok && into.*.append(@intCast(u8, 0x80 | ((bits - 1) << 4) | (bits - 1))) && into.*.append(0) && into.*.append(0)
+    var entry: usize = 0
+    while ok && entry < (@intCast(usize, 1) << @intCast(u6, bits)) {
+        const value = if entry < used { palette_module.colorAt(palette.?, entry) } else { pixel.BLACK }
+        ok = into.*.append(@intCast(u8, pixel.red(value))) && into.*.append(@intCast(u8, pixel.green(value))) && into.*.append(@intCast(u8, pixel.blue(value)))
+        entry += 1
+    }
+    if ok && transparent {
+        ok = into.*.appendSlice("\x21\xF9\x04\x01\x00\x00") && into.*.append(@intCast(u8, key)) && into.*.append(0)
+    }
+    ok = ok && into.*.append(0x2C) && put16(into, 0) && put16(into, 0) && put16(into, width) && put16(into, height) && into.*.append(0)
+    const minimum: u32 = if bits < 2 { 2 } else { bits }
+    ok = ok && into.*.append(@intCast(u8, minimum))
+    if ok {
+        // The codes, then cut into sub-blocks of 255 behind their sizes.
+        const start = into.*.count()
+        ok = lzwEncode(indices.?, count, minimum, GIF_FORM, into)
+        const length = into.*.count() - start
+        const blocks = (length + 254) / 255
+        ok = ok && into.*.appendNTimes(0, blocks)
+        if ok {
+            const bytes = into.*.items().pointer
+            // From the last block back, each moved to its place.
+            var block = blocks
+            while block > 0 {
+                block -= 1
+                const from = start + block * 255
+                const size = if length - block * 255 < 255 { length - block * 255 } else { 255 }
+                const to = start + block * 256
+                std.mem.copyBackwards(bytes + to + 1, bytes + from, size)
+                bytes[to] = @intCast(u8, size)
+            }
+        }
+        ok = ok && into.*.append(0) && into.*.append(0x3B)
+    }
+    scratch.release(pool, mark)
+    palette_module.destroy(palette.?)
+    if !ok { _ = into.*.resize(begun) }
+    return ok
+}
