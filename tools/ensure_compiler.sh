@@ -537,6 +537,22 @@ negates_floats_by_sign() {
     return $ok
 }
 
+# Whether $1 passes a comparison of floats as a bool
+# (tests/456_float_comparison_values_runtime.mlx exits 13); older
+# compilers passed it in a float register, where the callee did not look.
+passes_float_comparisons_as_values() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/456_float_comparison_values_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 types a function named in a module-level initializer above
 # its declaration (tests/439_function_before_declaration_runtime.mlx
 # exits 13).
@@ -1108,6 +1124,7 @@ probes=(
     "reads_constant_tables_from_static_data|module-level const tables read from static data"
     "aligns_functions|functions at multiples of 16"
     "types_slices_of_constants|slices of constants and of by-value parameters as []const T"
+    "passes_float_comparisons_as_values|comparisons of floats passed as bools"
     "takes_addresses_of_constants|the address of a module-level constant"
     "writes_places_through_try|places with a try among their parts as writable as without"
     "nests_function_types|function types with function types among their parameters"

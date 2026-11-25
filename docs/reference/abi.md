@@ -125,6 +125,15 @@ fn mixed(integer_a: u8, float_a: f64, integer_b: u16, float_b: f32) -> u8 {
 argument interleaved in source order while still drawing from separate
 integer/SSE register banks)
 
+What decides the bank is the value's type, not its operands': a comparison
+of two floats (`x < y` with `x: f64`) is a `bool` and goes in an integer
+register like any other `bool`, also when it is passed straight as an
+argument (`check(x < y, ...)`). On both backends the call's argument
+classification asks `State.isFloatValue`, which counts `icmp`/`fcmp`
+results as integers even though the LIR types an `fcmp` by its operands
+(`tests/456_float_comparison_values_runtime.mlx`; on aarch64 the same rule
+picks `w`/`x` registers over `d`/`s` ones).
+
 `178_float_cast_abi_runtime.mlx` pushes both banks to their limits in one
 call — seven `u8` integer arguments (filling all six integer registers plus
 one stack slot) and nine `f64` arguments (filling all eight `xmm` registers
