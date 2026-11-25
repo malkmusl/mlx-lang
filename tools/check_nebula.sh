@@ -73,8 +73,10 @@ release 272
 wait 400
 shot $work/stroke.ppm
 down 29
+mods 4
 down 44
 up 44
+mods 0
 up 29
 wait 400
 shot $work/undone.ppm
