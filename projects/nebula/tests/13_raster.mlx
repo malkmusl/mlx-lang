@@ -1,0 +1,812 @@
+// nebula's paths and their rasterizer (core/raster.mlx): a rectangle on
+// whole pixels covers exactly them, one on half pixels half of its edge
+// pixels; the coverage of triangles, circles, ellipses and stars adds up
+// to their area under both fill rules, and a star that overlaps itself
+// differs between the rules by its middle; a clip gets nothing outside it
+// and the same bytes inside, coordinates of 1e9 and more draw; a layer is
+// filled across tile borders and left of the origin, through a blend mode
+// and a selection; strokes: caps, joins and the miter limit, a closed
+// square, dashes (also around a closed corner), a dot, a thick line along
+// a curve without doubled pixels; curves stay within the tolerance and
+// have the curve's length; contains() agrees with the pixels; matrices;
+// the selection's replace, add, subtract and intersect; no anti-aliasing
+// gives 0 and 255 only; 500 fills take none of the value arena; and how
+// fast a circle the size of a screen is filled (printed). Exits 13.
+const std = @import("std")
+const math = @import("std.math")
+const turns = @import("std.turns")
+const raster = @import("../core/raster.mlx")
+const device = @import("../core/device.mlx")
+const geom = @import("../core/geom.mlx")
+const mask = @import("../core/mask.mlx")
+const pixel = @import("../core/pixel.mlx")
+const blend = @import("../core/blend.mlx")
+
+const RED: u32 = 0xFFFF0000
+const GREEN: u32 = 0xFF00FF00
+const BLUE: u32 = 0xFF0000FF
+
+const SIZE: i32 = 256
+const PIXELS: usize = 65536
+const PI: f64 = 3.141592653589793
+
+// Two plates of SIZE x SIZE bytes the coverage is looked at on.
+var plate: [*]u8 = undefined
+var other: [*]u8 = undefined
+
+fn whole() -> geom.Rect { return geom.rect(0, 0, SIZE, SIZE) }
+
+fn render(path: *raster.Path, rule: u8, antialias: bool) -> void {
+    raster.coverageBytes(path, rule, antialias, whole(), plate, PIXELS / 256)
+}
+
+fn at(x: i32, y: i32) -> u32 { return @intCast(u32, plate[@intCast(usize, y * SIZE + x)]) }
+
+// The sum of a plate's coverage in pixels.
+fn total(bytes: [*]const u8) -> f64 {
+    var sum: u64 = 0
+    var index: usize = 0
+    while index < PIXELS {
+        sum += @intCast(u64, bytes[index])
+        index += 1
+    }
+    return @floatFromInt(f64, sum) / 255.0
+}
+
+fn area(path: *raster.Path, rule: u8) -> f64 {
+    render(path, rule, true)
+    return total(plate)
+}
+
+fn near(value: f64, wanted: f64, fraction: f64) -> bool {
+    return math.abs(value - wanted) <= math.abs(wanted) * fraction
+}
+
+fn about(value: u32, wanted: u32) -> bool { return value + 1 >= wanted && value <= wanted + 1 }
+
+// Whether the plate is 255 in the pixels from (x0, y0) to before (x1, y1)
+// and 0 in all others.
+fn onlyBox(x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
+    var y: i32 = 0
+    while y < SIZE {
+        var x: i32 = 0
+        while x < SIZE {
+            const inside = x >= x0 && x < x1 && y >= y0 && y < y1
+            if at(x, y) != (if inside { 255 } else { 0 }) { return false }
+            x += 1
+        }
+        y += 1
+    }
+    return true
+}
+
+// A sink that writes into `other`, and notes everything a sink may not
+// be given: a stretch outside the clip, a byte of 0, rows or stretches
+// out of order.
+const Probe = struct {
+    clip: geom.Rect
+    calls: usize
+    wrong: usize
+    lastY: i32
+    lastEnd: i32
+}
+
+fn probeSink(context: *anyopaque, y: i32, x: i32, coverage: [*]const u8, count: usize) -> void {
+    const probe: *Probe = unsafe { @ptrCast(*Probe, context) }
+    probe.*.calls += 1
+    const end = x + @intCast(i32, count)
+    if count == 0 || y < probe.*.clip.y || y >= probe.*.clip.y + probe.*.clip.height || x < probe.*.clip.x || end > probe.*.clip.x + probe.*.clip.width { probe.*.wrong += 1 }
+    if probe.*.calls > 1 && (y < probe.*.lastY || (y == probe.*.lastY && x < probe.*.lastEnd)) { probe.*.wrong += 1 }
+    probe.*.lastY = y
+    probe.*.lastEnd = end
+    var index: usize = 0
+    while index < count {
+        if coverage[index] == 0 { probe.*.wrong += 1 }
+        const px = x + @intCast(i32, index)
+        if px >= 0 && px < SIZE && y >= 0 && y < SIZE { other[@intCast(usize, y * SIZE + px)] = coverage[index] }
+        index += 1
+    }
+}
+
+fn probeFill(probe: *Probe, path: *raster.Path, rule: u8, clip: geom.Rect) -> void {
+    probe.*.clip = clip
+    probe.*.calls = 0
+    probe.*.wrong = 0
+    probe.*.lastY = 0
+    probe.*.lastEnd = 0
+    std.mem.zero(other, PIXELS)
+    raster.fill(path, rule, true, clip, probeSink, probe)
+}
+
+// A sink that only counts.
+const Count = struct {
+    pixels: usize
+    sum: usize
+}
+
+fn countSink(context: *anyopaque, y: i32, x: i32, coverage: [*]const u8, count: usize) -> void {
+    const counted: *Count = unsafe { @ptrCast(*Count, context) }
+    counted.*.pixels += count
+    counted.*.sum += @intCast(usize, coverage[0]) + @intCast(usize, coverage[count - 1])
+    if y == x { counted.*.sum += 1 }
+}
+
+// The length of a cubic by Simpson's rule over its speed.
+fn cubicSpeed(x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64, t: f64) -> f64 {
+    const u = 1.0 - t
+    const dx = 3.0 * u * u * (x1 - x0) + 6.0 * u * t * (x2 - x1) + 3.0 * t * t * (x3 - x2)
+    const dy = 3.0 * u * u * (y1 - y0) + 6.0 * u * t * (y2 - y1) + 3.0 * t * t * (y3 - y2)
+    return @sqrt(dx * dx + dy * dy)
+}
+
+fn cubicLength(x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) -> f64 {
+    const parts: f64 = 4000.0
+    var sum = cubicSpeed(x0, y0, x1, y1, x2, y2, x3, y3, 0.0) + cubicSpeed(x0, y0, x1, y1, x2, y2, x3, y3, 1.0)
+    var step: f64 = 1.0
+    while step < parts {
+        const weight: f64 = if @floor(step / 2.0) * 2.0 == step { 2.0 } else { 4.0 }
+        sum += weight * cubicSpeed(x0, y0, x1, y1, x2, y2, x3, y3, step / parts)
+        step += 1.0
+    }
+    return sum / (3.0 * parts)
+}
+
+// How far (x, y) is from the nearest line of the path.
+fn distanceTo(path: *raster.Path, x: f64, y: f64) -> f64 {
+    var best: f64 = 1.0e30
+    var index: usize = 0
+    while index + 1 < raster.pointCount(path) {
+        const a = raster.vertex(path, index)
+        const b = raster.vertex(path, index + 1)
+        const dx = b.x - a.x
+        const dy = b.y - a.y
+        var t = ((x - a.x) * dx + (y - a.y) * dy) / (dx * dx + dy * dy)
+        t = math.clamp(t, 0.0, 1.0)
+        const ex = a.x + t * dx - x
+        const ey = a.y + t * dy - y
+        const distance = @sqrt(ex * ex + ey * ey)
+        if distance < best { best = distance }
+        index += 1
+    }
+    return best
+}
+
+// The farthest the cubic gets from the path's lines.
+fn cubicDeviation(path: *raster.Path, x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) -> f64 {
+    var worst: f64 = 0.0
+    var step: f64 = 0.0
+    while step <= 1000.0 {
+        const t = step / 1000.0
+        const u = 1.0 - t
+        const x = u * u * u * x0 + 3.0 * u * u * t * x1 + 3.0 * u * t * t * x2 + t * t * t * x3
+        const y = u * u * u * y0 + 3.0 * u * u * t * y1 + 3.0 * u * t * t * y2 + t * t * t * y3
+        const distance = distanceTo(path, x, y)
+        if distance > worst { worst = distance }
+        step += 1.0
+    }
+    return worst
+}
+
+// How many pixels of the plate (rendered without anti-aliasing) say
+// something else than contains() at their centre, or are neither 0 nor
+// 255.
+fn disagreements(path: *raster.Path, rule: u8) -> usize {
+    render(path, rule, false)
+    var wrong: usize = 0
+    var y: i32 = 0
+    while y < SIZE {
+        var x: i32 = 0
+        while x < SIZE {
+            const shade = at(x, y)
+            const inside = raster.contains(path, @floatFromInt(f64, x) + 0.5, @floatFromInt(f64, y) + 0.5, rule)
+            if shade != 0 && shade != 255 { wrong += 1 }
+            if inside != (shade == 255) { wrong += 1 }
+            x += 1
+        }
+        y += 1
+    }
+    return wrong
+}
+
+fn pentagram(path: *raster.Path, cx: f64, cy: f64, radius: f64) -> void {
+    var coordinates: [10]f64 = undefined
+    var tip: usize = 0
+    while tip < 5 {
+        const angle = -PI / 2.0 + @floatFromInt(f64, tip) * 4.0 * PI / 5.0
+        coordinates[tip * 2] = cx + radius * math.cos(angle)
+        coordinates[tip * 2 + 1] = cy + radius * math.sin(angle)
+        tip += 1
+    }
+    raster.polygon(path, coordinates[0..])
+}
+
+// The stroke of `path` by `style`, as coverage on the plate; its area.
+fn strokeArea(path: *raster.Path, outline: *raster.Path, style: *const raster.Stroke) -> f64 {
+    raster.clear(outline)
+    raster.stroke(path, outline, style)
+    return area(outline, raster.NONZERO)
+}
+
+pub fn main() -> u8 {
+    const allocator = std.heap.allocator()
+    const plates = allocator.alloc(PIXELS * 2, 16)
+    if plates == null { return 1 }
+    plate = plates.?
+    other = plates.? + PIXELS
+    const made = raster.create(allocator)
+    const second = raster.create(allocator)
+    if made == null || second == null { return 2 }
+    const path = made.?
+    const outline = second.?
+    if !raster.isEmpty(path) || raster.pointCount(path) != 0 || !geom.isEmpty(raster.bounds(path)) || raster.failed(path) { return 3 }
+
+    // A rectangle on whole pixels: all of them and nothing else.
+    raster.rect(path, 10.0, 5.0, 20.0, 8.0)
+    render(path, raster.NONZERO, true)
+    if !onlyBox(10, 5, 30, 13) { return 4 }
+    render(path, raster.EVEN_ODD, true)
+    if !onlyBox(10, 5, 30, 13) { return 5 }
+    render(path, raster.NONZERO, false)
+    if !onlyBox(10, 5, 30, 13) { return 6 }
+    if raster.pointCount(path) != 4 || raster.contourCount(path) != 1 || !raster.contourAt(path, 0).closed { return 7 }
+    if !geom.same(raster.bounds(path), geom.rect(10, 5, 20, 8)) { return 8 }
+
+    // The same half a pixel on: half of the pixels on its edges, a
+    // quarter of those on its corners, and its area all the same.
+    raster.clear(path)
+    raster.rect(path, 10.5, 5.5, 20.0, 8.0)
+    if !near(area(path, raster.NONZERO), 160.0, 0.005) { return 9 }
+    if !about(at(10, 8), 128) || !about(at(30, 8), 128) || !about(at(20, 5), 128) || !about(at(20, 13), 128) { return 10 }
+    if !about(at(10, 5), 64) || !about(at(30, 13), 64) || at(20, 8) != 255 || at(11, 6) != 255 || at(29, 12) != 255 { return 11 }
+    if at(9, 8) != 0 || at(31, 8) != 0 || at(20, 4) != 0 || at(20, 14) != 0 { return 12 }
+    if !geom.same(raster.bounds(path), geom.rect(10, 5, 21, 9)) { return 14 }
+
+    // Areas: a triangle, circles large and small, an ellipse, a star.
+    raster.clear(path)
+    const triangle = [6]f64{ 20.3, 15.7, 180.9, 60.2, 70.4, 200.6 }
+    raster.polygon(path, triangle[0..])
+    const triangle_area = 0.5 * math.abs(20.3 * (60.2 - 200.6) + 180.9 * (200.6 - 15.7) + 70.4 * (15.7 - 60.2))
+    if !near(area(path, raster.NONZERO), triangle_area, 0.002) || !near(area(path, raster.EVEN_ODD), triangle_area, 0.002) { return 15 }
+    raster.clear(path)
+    raster.circle(path, 100.3, 110.7, 50.25)
+    if !near(area(path, raster.NONZERO), PI * 50.25 * 50.25, 0.003) || !near(area(path, raster.EVEN_ODD), PI * 50.25 * 50.25, 0.003) { return 16 }
+    raster.clear(path)
+    raster.circle(path, 20.5, 20.25, 2.4)
+    if !near(area(path, raster.NONZERO), PI * 2.4 * 2.4, 0.003) { return 17 }
+    raster.clear(path)
+    raster.ellipse(path, 120.5, 100.25, 90.5, 30.25)
+    if !near(area(path, raster.NONZERO), PI * 90.5 * 30.25, 0.003) || !near(area(path, raster.EVEN_ODD), PI * 90.5 * 30.25, 0.003) { return 18 }
+    raster.clear(path)
+    raster.star(path, 128.5, 128.25, 7, 30.0, 80.0, 0.3)
+    const star_area = 7.0 * 30.0 * 80.0 * math.sin(PI / 7.0)
+    if raster.pointCount(path) != 14 { return 19 }
+    if !near(area(path, raster.NONZERO), star_area, 0.005) || !near(area(path, raster.EVEN_ODD), star_area, 0.005) { return 20 }
+
+    // A star drawn in one go through every second tip overlaps itself in
+    // its middle: NONZERO fills the five-sided middle, EVEN_ODD does not.
+    raster.clear(path)
+    pentagram(path, 128.0, 130.0, 100.0)
+    const inner = 100.0 * math.cos(2.0 * PI / 5.0) / math.cos(PI / 5.0)
+    const outer_area = 5.0 * inner * 100.0 * math.sin(PI / 5.0)
+    const middle_area = 2.5 * inner * inner * math.sin(2.0 * PI / 5.0)
+    const filled = area(path, raster.NONZERO)
+    const hollow = area(path, raster.EVEN_ODD)
+    if !near(filled, outer_area, 0.005) || !near(hollow, outer_area - middle_area, 0.005) { return 21 }
+    if !near(filled - hollow, middle_area, 0.01) || at(128, 130) != 0 { return 22 }
+    render(path, raster.NONZERO, true)
+    if at(128, 130) != 255 { return 23 }
+
+    // A rounded rectangle and an arc as SVG has them.
+    raster.clear(path)
+    raster.roundedRect(path, 20.5, 30.5, 150.0, 90.0, 30.0, 20.0)
+    if !near(area(path, raster.NONZERO), 150.0 * 90.0 - (4.0 - PI) * 30.0 * 20.0, 0.003) { return 24 }
+    if at(22, 32) != 0 || at(95, 31) != 255 || at(21, 75) != 255 || at(169, 118) != 0 { return 25 }
+    raster.clear(path)
+    raster.moveTo(path, 30.0, 120.0)
+    raster.arcTo(path, 60.0, 60.0, 0.0, false, true, 150.0, 120.0)
+    raster.close(path)
+    if !near(area(path, raster.NONZERO), PI * 60.0 * 60.0 / 2.0, 0.003) || at(90, 80) != 255 || at(90, 140) != 0 { return 26 }
+    raster.clear(path)
+    raster.moveTo(path, 30.0, 120.0)
+    raster.arcTo(path, 60.0, 60.0, 0.0, false, false, 150.0, 120.0)
+    raster.close(path)
+    render(path, raster.NONZERO, true)
+    if at(90, 80) != 0 || at(90, 140) != 255 { return 27 }
+    // (Three quarters of a circle of radius 40 around (100, 100) and the
+    // triangle that closes it.)
+    raster.clear(path)
+    raster.moveTo(path, 140.0, 100.0)
+    raster.arcTo(path, 40.0, 40.0, 0.0, true, true, 100.0, 60.0)
+    raster.close(path)
+    if !near(area(path, raster.NONZERO), 0.75 * PI * 1600.0 + 800.0, 0.003) { return 28 }
+    // (Radii too short to reach are scaled up: half a circle over the
+    // two ends.)
+    raster.clear(path)
+    raster.moveTo(path, 40.0, 100.0)
+    raster.arcTo(path, 1.0, 1.0, 0.0, false, true, 140.0, 100.0)
+    raster.close(path)
+    if !near(area(path, raster.NONZERO), PI * 2500.0 / 2.0, 0.003) { return 29 }
+
+    // A clip gets the bytes the whole picture has there and nothing
+    // outside; a stretch never holds a 0 and they come in order.
+    var probe: Probe = undefined
+    raster.clear(path)
+    raster.circle(path, 60.5, 60.5, 50.0)
+    render(path, raster.NONZERO, true)
+    const clip = geom.rect(30, 20, 25, 70)
+    probeFill(&probe, path, raster.NONZERO, clip)
+    if probe.calls == 0 || probe.wrong != 0 { return 30 }
+    var y: i32 = 0
+    while y < SIZE {
+        var x: i32 = 0
+        while x < SIZE {
+            const got = @intCast(u32, other[@intCast(usize, y * SIZE + x)])
+            if geom.contains(clip, x, y) {
+                if !about(got, at(x, y)) { return 31 }
+            } else if got != 0 {
+                return 32
+            }
+            x += 1
+        }
+        y += 1
+    }
+    probeFill(&probe, path, raster.NONZERO, whole())
+    if probe.wrong != 0 || !std.mem.eql(plate, other, PIXELS) { return 33 }
+    probeFill(&probe, path, raster.NONZERO, geom.rect(200, 200, 40, 40))
+    if probe.calls != 0 { return 34 }
+    probeFill(&probe, path, raster.NONZERO, geom.rect(30, 20, 0, 70))
+    if probe.calls != 0 { return 35 }
+    probeFill(&probe, path, raster.NONZERO, geom.rect(60, 60, 1, 1))
+    if probe.calls != 1 || probe.wrong != 0 || other[60 * 256 + 60] != 255 { return 36 }
+    // A clip as large as an i32 allows, around a small shape.
+    var counted = Count.{ .pixels = 0, .sum = 0 }
+    raster.clear(path)
+    raster.rect(path, 10.0, 10.0, 5.0, 5.0)
+    raster.fill(path, raster.NONZERO, true, geom.rect(-2000000000, -2000000000, 2147483647, 2147483647), countSink, &counted)
+    if counted.pixels != 25 { return 37 }
+    counted.pixels = 0
+    raster.fill(path, raster.NONZERO, true, geom.rect(12, 12, 2147483647, 2147483647), countSink, &counted)
+    if counted.pixels != 9 { return 38 }
+
+    // Coordinates of 1e9 and of 1e30: a triangle around everything, a
+    // rectangle beyond all numbers, a circle far out seen from near it
+    // and not seen from here.
+    raster.clear(path)
+    const huge = [6]f64{ -1.0e9, -1.0e9, 1.0e9, -1.0e9, 0.0, 1.0e9 }
+    raster.polygon(path, huge[0..])
+    render(path, raster.NONZERO, true)
+    if !onlyBox(0, 0, SIZE, SIZE) { return 39 }
+    render(path, raster.EVEN_ODD, false)
+    if !onlyBox(0, 0, SIZE, SIZE) { return 40 }
+    if raster.bounds(path).width < 1000000000 || !raster.contains(path, 5.0, 5.0, raster.NONZERO) || raster.contains(path, 9.0e8, 5.0, raster.NONZERO) { return 41 }
+    raster.clear(path)
+    raster.rect(path, -1.0e30, -1.0e30, 2.0e30, 2.0e30)
+    raster.lineTo(path, math.nan(), 5.0)
+    raster.coverageBytes(path, raster.NONZERO, true, geom.rect(-100, -100, SIZE, SIZE), plate, 256)
+    if !onlyBox(0, 0, SIZE, SIZE) || raster.pointCount(path) != 4 || geom.isEmpty(raster.bounds(path)) { return 42 }
+    raster.clear(path)
+    raster.circle(path, 1.0e9 + 100.5, 1.0e9 + 100.5, 20.0)
+    render(path, raster.NONZERO, true)
+    if !onlyBox(0, 0, 0, 0) { return 43 }
+    raster.coverageBytes(path, raster.NONZERO, true, geom.rect(1000000000, 1000000000, SIZE, SIZE), plate, 256)
+    if !near(total(plate), PI * 400.0, 0.01) || at(100, 100) != 255 || at(100, 130) != 0 { return 44 }
+
+    // Into a layer: left of and above the origin and across tile borders.
+    const layer = device.create(allocator, 0).?
+    const everywhere = geom.rect(-1000, -1000, 3000, 3000)
+    raster.clear(path)
+    raster.rect(path, -70.0, -10.0, 140.0, 80.0)
+    device.begin(layer)
+    var changed = raster.fillDevice(layer, path, raster.NONZERO, true, everywhere, RED, blend.NORMAL, 255, 0, null)
+    const change = device.commit(layer)
+    if change == null || !geom.same(changed, geom.rect(-70, -10, 140, 80)) { return 45 }
+    y = -14
+    while y < 76 {
+        var x: i32 = -76
+        while x < 76 {
+            const inside = x >= -70 && x < 70 && y >= -10 && y < 70
+            if device.pixel(layer, x, y) != (if inside { RED } else { 0 }) { return 46 }
+            x += 1
+        }
+        y += 1
+    }
+    if device.tileCount(layer) != 12 { return 47 }
+    // (Blue at half opacity over the red; erasing; undone.)
+    raster.clear(path)
+    raster.rect(path, -5.0, 0.0, 10.0, 10.0)
+    changed = raster.fillDevice(layer, path, raster.NONZERO, true, everywhere, BLUE, blend.NORMAL, 128, 0, null)
+    if device.pixel(layer, -3, 3) != pixel.over(RED, BLUE, 128) || device.pixel(layer, 4, 9) != pixel.over(RED, BLUE, 128) || device.pixel(layer, 5, 5) != RED { return 48 }
+    if !geom.same(changed, geom.rect(-5, 0, 10, 10)) { return 49 }
+    raster.clear(path)
+    raster.rect(path, 60.0, 60.0, 8.5, 8.0)
+    _ = raster.fillDevice(layer, path, raster.NONZERO, true, everywhere, 0xFF000000, blend.ERASE, 255, 0, null)
+    if device.pixel(layer, 63, 63) != 0 || device.pixel(layer, 64, 64) != 0 || device.pixel(layer, 59, 63) != RED { return 50 }
+    if !about(device.pixel(layer, 68, 64) >> 24, 127) || device.pixel(layer, 69, 64) != RED { return 51 }
+    changed = raster.fillDevice(layer, path, raster.NONZERO, true, geom.rect(0, 0, 10, 10), RED, blend.NORMAL, 255, 0, null)
+    if !geom.isEmpty(changed) { return 52 }
+    _ = device.apply(layer, change.?, true)
+    if device.pixel(layer, 0, 0) != 0 || device.tileCount(layer) != 0 { return 53 }
+    device.destroyChange(change.?)
+    // (A circle on the corner of four tiles has the coverage's bytes as
+    // its alpha.)
+    raster.clear(path)
+    raster.circle(path, 64.0, 64.25, 20.5)
+    render(path, raster.NONZERO, true)
+    changed = raster.fillDevice(layer, path, raster.NONZERO, true, everywhere, GREEN, blend.NORMAL, 255, 0, null)
+    if device.tileCount(layer) != 4 || changed.x != 43 || changed.width != 42 || changed.y != 43 || changed.height != 42 { return 54 }
+    y = 40
+    while y < 90 {
+        var x: i32 = 40
+        while x < 90 {
+            const shade = at(x, y)
+            if device.pixel(layer, x, y) != (if shade == 0 { 0 } else { (shade << 24) | 0x0000FF00 }) { return 55 }
+            x += 1
+        }
+        y += 1
+    }
+    // (Only where the selection lets it, and half where that is half.)
+    const selection = mask.create(allocator, false).?
+    _ = device.fill(selection, geom.rect(0, 200, 10, 10), mask.ALL)
+    _ = device.fill(selection, geom.rect(0, 210, 10, 2), pixel.gray(128))
+    raster.clear(path)
+    raster.rect(path, -5.0, 195.0, 200.0, 20.0)
+    changed = raster.fillDevice(layer, path, raster.NONZERO, true, everywhere, RED, blend.NORMAL, 255, 0, selection)
+    if device.pixel(layer, 5, 205) != RED || device.pixel(layer, 15, 205) != 0 || device.pixel(layer, -2, 205) != 0 || device.pixel(layer, 5, 197) != 0 { return 56 }
+    if device.pixel(layer, 5, 211) != 0x80FF0000 || device.pixel(layer, 5, 212) != 0 { return 57 }
+    if changed.x != 0 || changed.y != 200 || changed.height != 12 || changed.width > 64 || device.tileCount(layer) != 5 { return 58 }
+    // (A stroke straight into the layer.)
+    var style = raster.solid(4.0)
+    raster.clear(path)
+    raster.line(path, 300.0, 300.0, 340.0, 300.0)
+    changed = raster.strokeDevice(layer, path, &style, true, everywhere, BLUE, blend.NORMAL, 255, 0, null)
+    if !geom.same(changed, geom.rect(300, 298, 40, 4)) || device.pixel(layer, 320, 299) != BLUE || device.pixel(layer, 320, 302) != 0 { return 59 }
+
+    // EVEN_ODD cuts a circle out of a circle; so does NONZERO when the
+    // inner one goes the other way round.
+    raster.clear(path)
+    raster.circle(path, 128.0, 128.0, 80.0)
+    raster.circle(path, 128.0, 128.0, 40.0)
+    if raster.contourCount(path) != 2 { return 60 }
+    if !near(area(path, raster.EVEN_ODD), PI * (6400.0 - 1600.0), 0.003) || at(128, 128) != 0 || at(128, 60) != 255 { return 61 }
+    if !near(area(path, raster.NONZERO), PI * 6400.0, 0.003) || at(128, 128) != 255 { return 62 }
+    raster.clear(path)
+    raster.circle(path, 128.0, 128.0, 80.0)
+    raster.clear(outline)
+    raster.circle(outline, 128.0, 128.0, 40.0)
+    raster.reverse(outline)
+    raster.append(path, outline)
+    if raster.contourCount(path) != 2 || !near(area(path, raster.NONZERO), PI * (6400.0 - 1600.0), 0.003) || at(128, 128) != 0 { return 63 }
+    const twin = raster.copy(path)
+    if twin == null || raster.pointCount(twin.?) != raster.pointCount(path) || !near(area(twin.?, raster.NONZERO), PI * 4800.0, 0.003) { return 64 }
+    raster.destroy(twin.?)
+
+    // Strokes. A level line 4 wide is a band of 4 rows: as long as the
+    // line with butt caps, half the width longer at each end with square
+    // ones, and with round ones as much as two half discs more.
+    raster.clear(path)
+    raster.line(path, 10.0, 20.0, 60.0, 20.0)
+    _ = strokeArea(path, outline, &style)
+    if !onlyBox(10, 18, 60, 22) { return 65 }
+    style.cap = raster.CAP_SQUARE
+    _ = strokeArea(path, outline, &style)
+    if !onlyBox(8, 18, 62, 22) { return 66 }
+    style.cap = raster.CAP_ROUND
+    if !near(strokeArea(path, outline, &style), 200.0 + PI * 4.0, 0.005) { return 67 }
+    if at(30, 18) != 255 || at(30, 21) != 255 || at(30, 17) != 0 || at(8, 19) == 0 || at(61, 20) == 0 || at(7, 20) != 0 || at(62, 20) != 0 || at(8, 18) > 128 { return 68 }
+
+    // A corner of 90 degrees 6 wide: with a miter the two bands whole, a
+    // bevel cuts the corner off, a round join rounds it.
+    const bend = [6]f64{ 20.0, 20.0, 60.0, 20.0, 60.0, 60.0 }
+    raster.clear(path)
+    raster.polyline(path, bend[0..])
+    style = raster.solid(6.0)
+    if strokeArea(path, outline, &style) != 480.0 { return 69 }
+    if at(62, 17) != 255 || at(20, 17) != 255 || at(57, 59) != 255 || at(56, 23) != 0 || at(63, 17) != 0 || at(19, 20) != 0 || at(60, 60) != 0 { return 70 }
+    style.join = raster.JOIN_BEVEL
+    if !near(strokeArea(path, outline, &style), 480.0 - 9.0 + 4.5, 0.002) || at(62, 17) != 0 || at(61, 19) != 255 { return 71 }
+    style.join = raster.JOIN_ROUND
+    if !near(strokeArea(path, outline, &style), 480.0 - 9.0 + PI * 9.0 / 4.0, 0.003) || at(62, 17) == 0 || at(62, 17) > 40 || at(61, 18) != 255 { return 72 }
+
+    // Two lines 5 degrees apart: the miter would reach 23 times the
+    // width, so at the limit of 4 the corner is a bevel, and at a limit
+    // of 30 the long tip (46 pixels past the corner, up and to the right
+    // of it).
+    const tilt = 5.0 * PI / 180.0
+    raster.clear(path)
+    raster.moveTo(path, 40.0, 60.0)
+    raster.lineTo(path, 140.0, 60.0)
+    raster.lineTo(path, 140.0 - 100.0 * math.cos(tilt), 60.0 + 100.0 * math.sin(tilt))
+    style = raster.solid(4.0)
+    const overlap = 4.0 * math.tan((PI - tilt) / 2.0)
+    if !near(strokeArea(path, outline, &style), 800.0 - overlap + 2.0 * math.sin(tilt), 0.003) || at(150, 59) != 0 || at(139, 59) != 255 { return 73 }
+    style.miterLimit = 30.0
+    if !near(strokeArea(path, outline, &style), 800.0, 0.003) || at(150, 59) != 255 || at(180, 58) == 0 || at(188, 58) != 0 { return 74 }
+
+    // A closed square has no caps and a join at every corner: its
+    // outline covers the length of its lines times the width.
+    raster.clear(path)
+    raster.rect(path, 60.0, 60.0, 80.0, 80.0)
+    style = raster.solid(5.0)
+    if !near(strokeArea(path, outline, &style), 320.0 * 5.0, 0.01) || raster.contourCount(outline) != 2 { return 75 }
+    if at(100, 100) != 0 || at(60, 100) != 255 || at(58, 58) != 255 || !about(at(57, 100), 128) || !about(at(62, 100), 128) { return 76 }
+    style.join = raster.JOIN_ROUND
+    if !near(strokeArea(path, outline, &style), 1600.0 - 4.0 * 6.25 * (1.0 - PI / 4.0), 0.003) || at(57, 57) != 0 { return 77 }
+
+    // Dashes of 10 with gaps of 5 along 103 pixels: seven dashes; the
+    // pattern started 5 in: half a dash, six, and three pixels of one;
+    // started 5 before its start: the gap first; a single length is
+    // dashes and gaps of that length.
+    raster.clear(path)
+    raster.line(path, 10.0, 30.0, 113.0, 30.0)
+    style = raster.solid(2.0)
+    style.dashes[0] = 10.0
+    style.dashes[1] = 5.0
+    style.dashCount = 2
+    if strokeArea(path, outline, &style) != 140.0 || raster.contourCount(outline) != 7 { return 78 }
+    if at(10, 29) != 255 || at(19, 30) != 255 || at(20, 30) != 0 || at(24, 29) != 0 || at(25, 29) != 255 || at(109, 30) != 255 || at(110, 30) != 0 { return 79 }
+    style.dashOffset = 5.0
+    if strokeArea(path, outline, &style) != 136.0 || at(14, 30) != 255 || at(15, 30) != 0 || at(20, 30) != 255 || at(112, 30) != 255 { return 80 }
+    style.dashOffset = -5.0
+    if strokeArea(path, outline, &style) != 136.0 || at(14, 30) != 0 || at(15, 30) != 255 || at(24, 30) != 255 || at(25, 30) != 0 { return 81 }
+    style.dashOffset = 0.0
+    style.dashes[0] = 6.0
+    style.dashCount = 1
+    if strokeArea(path, outline, &style) != 108.0 || at(15, 30) != 255 || at(16, 30) != 0 || at(22, 30) != 255 { return 82 }
+    // (Round a closed square 40 a side, 6 wide, dashes of 30 and gaps of
+    // 10 started 10 in: the dash that is cut by the start is one dash
+    // with a join there, as the three other corners have: every dash
+    // covers its length times the width. Two caps at the start would
+    // leave the corner's 9 pixels out.)
+    raster.clear(path)
+    raster.rect(path, 60.0, 60.0, 40.0, 40.0)
+    style = raster.solid(6.0)
+    style.dashes[0] = 30.0
+    style.dashes[1] = 10.0
+    style.dashCount = 2
+    style.dashOffset = 10.0
+    if !near(strokeArea(path, outline, &style), 120.0 * 6.0, 0.003) || raster.contourCount(outline) != 4 || at(58, 58) != 255 { return 83 }
+    // (Started at its start every dash begins at a corner, with a cap.)
+    style.dashOffset = 0.0
+    if strokeArea(path, outline, &style) != 720.0 || raster.contourCount(outline) != 4 || at(58, 58) != 0 || at(60, 58) != 255 || at(89, 62) != 255 || at(90, 60) != 0 { return 84 }
+    // (One dash longer than the way round is the closed line.)
+    style.dashes[0] = 1000.0
+    if !near(strokeArea(path, outline, &style), 160.0 * 6.0, 0.003) || raster.contourCount(outline) != 2 || at(58, 58) != 255 { return 85 }
+
+    // A line of no length: a dot under round caps, a square under square
+    // ones, nothing under butt caps.
+    raster.clear(path)
+    raster.moveTo(path, 50.0, 50.0)
+    raster.lineTo(path, 50.0, 50.0)
+    if raster.pointCount(path) != 1 { return 86 }
+    style = raster.solid(10.0)
+    if strokeArea(path, outline, &style) != 0.0 || !raster.isEmpty(outline) { return 87 }
+    style.cap = raster.CAP_ROUND
+    if !near(strokeArea(path, outline, &style), PI * 25.0, 0.005) { return 88 }
+    style.cap = raster.CAP_SQUARE
+    _ = strokeArea(path, outline, &style)
+    if !onlyBox(45, 45, 55, 55) { return 89 }
+
+    // A line 20 wide along a circle of radius 60: the ring between the
+    // radii 50 and 70, and no place of the outline covered twice (EVEN_ODD
+    // would leave such places out).
+    raster.clear(path)
+    raster.circle(path, 128.0, 128.0, 60.0)
+    style = raster.solid(20.0)
+    const ring = strokeArea(path, outline, &style)
+    if !near(ring, PI * (4900.0 - 2500.0), 0.003) || !near(area(outline, raster.EVEN_ODD), ring, 0.0005) { return 90 }
+    style.join = raster.JOIN_ROUND
+    if !near(strokeArea(path, outline, &style), PI * 2400.0, 0.003) || !near(area(outline, raster.EVEN_ODD), ring, 0.0005) { return 91 }
+    // (A line wider than its circle is a disc: the inside folds over
+    // itself and is filled all the same.)
+    raster.clear(path)
+    raster.circle(path, 128.0, 128.0, 10.0)
+    style = raster.solid(60.0)
+    if !near(strokeArea(path, outline, &style), PI * 1600.0, 0.003) || at(128, 128) != 255 || at(128, 120) != 255 { return 92 }
+    // (There and back along one line: the line, once.)
+    const back = [6]f64{ 20.0, 200.0, 80.0, 200.0, 20.0, 200.0 }
+    raster.clear(path)
+    raster.polyline(path, back[0..])
+    style = raster.solid(4.0)
+    _ = strokeArea(path, outline, &style)
+    if !onlyBox(20, 198, 80, 202) { return 93 }
+
+    // Curves. A cubic's lines are no farther from it than the tolerance
+    // and as long as the curve; a finer tolerance gives more of them.
+    raster.clear(path)
+    raster.moveTo(path, 10.0, 10.0)
+    raster.cubicTo(path, 60.0, 150.0, 140.0, -40.0, 200.0, 90.0)
+    const curve = cubicLength(10.0, 10.0, 60.0, 150.0, 140.0, -40.0, 200.0, 90.0)
+    const coarse = raster.pointCount(path)
+    if coarse < 8 || coarse > 200 || !near(raster.length(path), curve, 0.0005) || raster.length(path) > curve { return 94 }
+    if cubicDeviation(path, 10.0, 10.0, 60.0, 150.0, 140.0, -40.0, 200.0, 90.0) > 0.1 { return 95 }
+    var place: raster.Position = undefined
+    if !raster.pointAt(path, 0.0, &place) || place.x != 10.0 || place.y != 10.0 || place.dy < 0.9 { return 96 }
+    if !raster.pointAt(path, -3.0, &place) || place.x != 10.0 || place.y != 10.0 { return 97 }
+    if !raster.pointAt(path, curve + 10.0, &place) || place.x != 200.0 || place.y != 90.0 { return 98 }
+    var walked: f64 = 1.0
+    var before_x: f64 = 10.0
+    var before_y: f64 = 10.0
+    while walked < raster.length(path) {
+        _ = raster.pointAt(path, walked, &place)
+        const step = @sqrt((place.x - before_x) * (place.x - before_x) + (place.y - before_y) * (place.y - before_y))
+        if step > 1.0000001 || step < 0.95 || distanceTo(path, place.x, place.y) > 0.000001 { return 99 }
+        if !near(place.dx * place.dx + place.dy * place.dy, 1.0, 0.000001) { return 100 }
+        before_x = place.x
+        before_y = place.y
+        walked += 1.0
+    }
+    raster.clear(path)
+    raster.setTolerance(path, 0.01)
+    raster.moveTo(path, 10.0, 10.0)
+    raster.cubicTo(path, 60.0, 150.0, 140.0, -40.0, 200.0, 90.0)
+    if raster.pointCount(path) <= coarse * 2 || cubicDeviation(path, 10.0, 10.0, 60.0, 150.0, 140.0, -40.0, 200.0, 90.0) > 0.01 { return 101 }
+    raster.setTolerance(path, raster.DEFAULT_TOLERANCE)
+    // (A quadratic as the cubic with the same shape; a parabola's area.)
+    raster.clear(path)
+    raster.moveTo(path, 20.0, 200.0)
+    raster.quadTo(path, 120.0, 0.0, 220.0, 200.0)
+    if cubicDeviation(path, 20.0, 200.0, 20.0 + 200.0 / 3.0, 200.0 - 400.0 / 3.0, 220.0 - 200.0 / 3.0, 200.0 - 400.0 / 3.0, 220.0, 200.0) > 0.1 { return 102 }
+    if !near(raster.length(path), cubicLength(20.0, 200.0, 20.0 + 200.0 / 3.0, 200.0 - 400.0 / 3.0, 220.0 - 200.0 / 3.0, 200.0 - 400.0 / 3.0, 220.0, 200.0), 0.0005) { return 103 }
+    if !near(area(path, raster.NONZERO), 2.0 / 3.0 * 200.0 * 100.0, 0.003) { return 104 }
+    // (A closed path's length has its closing line; a square's corners
+    // by distance.)
+    raster.clear(path)
+    raster.rect(path, 10.0, 10.0, 30.0, 20.0)
+    if raster.length(path) != 100.0 || !raster.pointAt(path, 40.0, &place) || place.x != 40.0 || place.y != 20.0 || place.dy != 1.0 { return 105 }
+    if !raster.pointAt(path, 95.0, &place) || place.x != 10.0 || place.y != 15.0 || place.dy != -1.0 { return 106 }
+    if raster.pointAt(outline, 1.0, &place) && raster.isEmpty(outline) { return 107 }
+
+    // contains() says what the pixels say, for both rules.
+    raster.clear(path)
+    raster.star(path, 128.3, 127.6, 7, 31.7, 90.2, 0.37)
+    if disagreements(path, raster.NONZERO) != 0 || disagreements(path, raster.EVEN_ODD) != 0 { return 108 }
+    raster.clear(path)
+    pentagram(path, 127.7, 131.2, 99.3)
+    raster.circle(path, 60.3, 60.9, 41.7)
+    if disagreements(path, raster.NONZERO) != 0 || disagreements(path, raster.EVEN_ODD) != 0 { return 109 }
+    if !raster.contains(path, 127.7, 131.2, raster.NONZERO) || raster.contains(path, 127.7, 131.2, raster.EVEN_ODD) || raster.contains(path, 250.0, 250.0, raster.NONZERO) { return 110 }
+    // (Without anti-aliasing a circle is 0 and 255 only, as many as its
+    // area.)
+    raster.clear(path)
+    raster.circle(path, 100.4, 99.7, 30.3)
+    if disagreements(path, raster.NONZERO) != 0 || !near(total(plate), PI * 30.3 * 30.3, 0.01) { return 111 }
+
+    // Matrices: a quarter turn takes a rectangle onto the other rectangle
+    // exactly; the order of two maps; a map undone.
+    const quarter = raster.rotate(PI / 2.0)
+    if quarter.xx != 0.0 || quarter.yx != 1.0 || quarter.xy != -1.0 || quarter.yy != 0.0 { return 112 }
+    raster.clear(path)
+    raster.rect(path, 10.0, 20.0, 30.0, 12.0)
+    raster.transform(path, quarter)
+    raster.clear(outline)
+    raster.rect(outline, -32.0, 10.0, 12.0, 30.0)
+    raster.coverageBytes(path, raster.NONZERO, true, geom.rect(-128, -128, SIZE, SIZE), plate, 256)
+    raster.coverageBytes(outline, raster.NONZERO, true, geom.rect(-128, -128, SIZE, SIZE), other, 256)
+    if !std.mem.eql(plate, other, PIXELS) || total(plate) != 360.0 || !geom.same(raster.bounds(path), geom.rect(-32, 10, 12, 30)) { return 113 }
+    const moved = raster.apply(raster.multiply(raster.translate(5.0, 7.0), raster.scale(2.0, 3.0)), 1.0, 1.0)
+    if moved.x != 12.0 || moved.y != 24.0 { return 114 }
+    const same = raster.apply(raster.identity(), 3.5, -2.25)
+    if same.x != 3.5 || same.y != -2.25 { return 115 }
+    const tangled = raster.multiply(raster.rotate(0.3), raster.multiply(raster.scale(2.0, 0.5), raster.translate(10.0, -4.0)))
+    const untangled = raster.invert(tangled)
+    if untangled == null || raster.invert(raster.scale(0.0, 1.0)) != null { return 116 }
+    const there = raster.apply(tangled, 3.0, 4.0)
+    const home = raster.apply(untangled.?, there.x, there.y)
+    if math.abs(home.x - 3.0) > 0.000000001 || math.abs(home.y - 4.0) > 0.000000001 || math.abs(there.x - 3.0) < 1.0 { return 117 }
+    const turned = raster.apply(raster.rotate(PI / 6.0), 2.0, 0.0)
+    if math.abs(turned.x - @sqrt(3.0)) > 0.000000001 || math.abs(turned.y - 1.0) > 0.000000001 { return 118 }
+    // (A circle stretched is the ellipse.)
+    raster.clear(path)
+    raster.circle(path, 60.0, 200.0, 40.0)
+    raster.transform(path, raster.scale(2.0, 0.5))
+    if !near(area(path, raster.NONZERO), PI * 1600.0, 0.003) || at(120, 100) != 255 || at(195, 100) != 255 || at(120, 125) != 0 { return 119 }
+
+    // A selection: replaced, added to, taken from, cut down to a shape.
+    const chosen = mask.create(allocator, false).?
+    mask.set(chosen, 900, 900, 255)
+    raster.clear(path)
+    raster.rect(path, 0.0, 0.0, 40.0, 40.0)
+    changed = raster.fillMask(chosen, path, raster.NONZERO, true, everywhere, 255, raster.REPLACE)
+    if mask.at(chosen, 10, 10) != 255 || mask.at(chosen, 39, 39) != 255 || mask.at(chosen, 40, 10) != 0 || mask.at(chosen, 900, 900) != 0 { return 120 }
+    if changed.x != 0 || changed.y != 0 || changed.width < 901 || changed.height < 901 { return 121 }
+    raster.clear(path)
+    raster.rect(path, 30.0, 30.0, 40.0, 40.0)
+    changed = raster.fillMask(chosen, path, raster.NONZERO, true, everywhere, 255, raster.ADD)
+    if !geom.same(changed, geom.rect(30, 30, 40, 40)) { return 122 }
+    if mask.at(chosen, 35, 35) != 255 || mask.at(chosen, 60, 60) != 255 || mask.at(chosen, 10, 10) != 255 || mask.at(chosen, 45, 10) != 0 { return 123 }
+    raster.clear(path)
+    raster.rect(path, 0.0, 0.0, 20.0, 20.5)
+    _ = raster.fillMask(chosen, path, raster.NONZERO, true, everywhere, 255, raster.SUBTRACT)
+    if mask.at(chosen, 10, 10) != 0 || mask.at(chosen, 25, 25) != 255 || !about(mask.at(chosen, 10, 20), 127) || mask.at(chosen, 10, 21) != 255 { return 124 }
+    _ = raster.fillMask(chosen, path, raster.NONZERO, true, geom.rect(200, 200, 100, 100), 255, raster.SUBTRACT)
+    if device.tileCount(chosen) != 4 { return 125 }
+    mask.set(chosen, 500, 500, 255)
+    device.begin(chosen)
+    raster.clear(path)
+    raster.rect(path, 10.0, 10.0, 100.0, 15.0)
+    _ = raster.fillMask(chosen, path, raster.NONZERO, true, everywhere, 255, raster.INTERSECT)
+    const cut = device.commit(chosen)
+    if cut == null { return 126 }
+    if mask.at(chosen, 25, 15) != 255 || mask.at(chosen, 35, 20) != 255 || mask.at(chosen, 15, 15) != 0 || mask.at(chosen, 50, 50) != 0 || mask.at(chosen, 35, 35) != 0 || mask.at(chosen, 500, 500) != 0 || mask.at(chosen, 60, 15) != 0 { return 127 }
+    if device.tileCount(chosen) != 1 { return 128 }
+    _ = device.apply(chosen, cut.?, true)
+    if mask.at(chosen, 500, 500) != 255 || mask.at(chosen, 50, 50) != 255 || mask.at(chosen, 10, 10) != 0 { return 129 }
+    _ = device.apply(chosen, cut.?, false)
+    if mask.at(chosen, 500, 500) != 0 || mask.at(chosen, 25, 15) != 255 { return 130 }
+    device.destroyChange(cut.?)
+    // (At half strength; two shapes side by side on half a pixel add up
+    // to all of it.)
+    raster.clear(path)
+    raster.rect(path, 0.0, 0.0, 10.5, 10.0)
+    _ = raster.fillMask(chosen, path, raster.NONZERO, true, everywhere, 128, raster.REPLACE)
+    if mask.at(chosen, 5, 5) != 128 || mask.at(chosen, 35, 20) != 0 || !about(mask.at(chosen, 10, 5), 64) { return 131 }
+    _ = raster.fillMask(chosen, path, raster.NONZERO, true, everywhere, 255, raster.REPLACE)
+    raster.clear(path)
+    raster.rect(path, 10.5, 0.0, 10.0, 10.0)
+    _ = raster.fillMask(chosen, path, raster.NONZERO, true, everywhere, 255, raster.ADD)
+    if mask.at(chosen, 10, 5) != 255 || mask.at(chosen, 5, 5) != 255 || mask.at(chosen, 15, 5) != 255 || !about(mask.at(chosen, 20, 5), 128) { return 132 }
+    // (Only the clip's part of the path is the shape.)
+    raster.clear(path)
+    raster.rect(path, 0.0, 0.0, 100.0, 100.0)
+    _ = raster.fillMask(chosen, path, raster.NONZERO, false, geom.rect(0, 0, 5, 5), 255, raster.INTERSECT)
+    if mask.at(chosen, 2, 2) != 255 || mask.at(chosen, 7, 2) != 0 || mask.at(chosen, 15, 5) != 0 { return 133 }
+    // (A mask of everything cut down to a shape, and one with a hole.)
+    const all = mask.create(allocator, true).?
+    raster.clear(path)
+    raster.circle(path, 30.0, 30.0, 10.0)
+    changed = raster.fillMask(all, path, raster.NONZERO, true, everywhere, 255, raster.INTERSECT)
+    if mask.at(all, 30, 30) != 255 || mask.at(all, 100, 100) != 0 || mask.at(all, -5000, 7) != 0 || mask.reachesEverywhere(all) || changed.width < 3000 { return 134 }
+    const holed = mask.create(allocator, true).?
+    _ = raster.fillMask(holed, path, raster.NONZERO, true, everywhere, 255, raster.SUBTRACT)
+    if mask.at(holed, 30, 30) != 0 || mask.at(holed, 100, 100) != 255 || !mask.reachesEverywhere(holed) { return 135 }
+
+    // Filling and stroking many times takes nothing of the value arena.
+    raster.clear(path)
+    raster.circle(path, 70.0, 70.0, 60.0)
+    raster.moveTo(path, 10.0, 10.0)
+    raster.cubicTo(path, 60.0, 150.0, 140.0, -40.0, 200.0, 90.0)
+    style = raster.solid(3.0)
+    style.join = raster.JOIN_ROUND
+    style.cap = raster.CAP_ROUND
+    const arena = turns.locate()
+    const before = turns.used(arena)
+    var round: u32 = 0
+    while round < 500 {
+        _ = raster.fillDevice(layer, path, raster.EVEN_ODD, true, everywhere, 0x80000000 | round, blend.NORMAL, 200, 0, selection)
+        _ = raster.fillDevice(layer, path, raster.NONZERO, round & 1 == 0, geom.rect(40, 40, 100, 100), RED, blend.NORMAL, 255, 0, null)
+        _ = raster.strokeDevice(layer, path, &style, true, everywhere, BLUE, blend.NORMAL, 255, 0, null)
+        _ = raster.fillMask(chosen, path, raster.NONZERO, true, everywhere, 255, @intCast(u8, round & 3))
+        raster.coverageBytes(path, raster.NONZERO, true, whole(), plate, 256)
+        round += 1
+    }
+    const grown = turns.used(arena) - before
+    if grown > 4096 { return 136 }
+
+    // How fast: a circle as large as a screen, 20 times.
+    raster.clear(path)
+    raster.circle(path, 960.0, 540.0, 530.0)
+    counted.pixels = 0
+    const started = std.time.monotonicNanoseconds()
+    round = 0
+    while round < 20 {
+        raster.fill(path, raster.NONZERO, true, geom.rect(0, 0, 1920, 1080), countSink, &counted)
+        round += 1
+    }
+    const took = std.time.monotonicNanoseconds() - started
+    if !near(@floatFromInt(f64, counted.pixels) / 20.0, PI * 530.0 * 530.0, 0.01) { return 137 }
+    _ = std.io.print("raster: a circle of 1060 pixels across on 1920 x 1080, megapixels of the screen per second: ")
+    _ = std.io.writeUnsigned(std.io.stdout(), 1920 * 1080 * 20 * 1000 / (took / 1000 + 1))
+    _ = std.io.print(", of the circle: ")
+    _ = std.io.writeUnsigned(std.io.stdout(), counted.pixels * 1000 / (took / 1000 + 1))
+    _ = std.io.println("")
+
+    device.destroy(layer)
+    device.destroy(selection)
+    device.destroy(chosen)
+    device.destroy(all)
+    device.destroy(holed)
+    raster.destroy(path)
+    raster.destroy(outline)
+    allocator.free(plates.?, PIXELS * 2, 16)
+    return 13
+}

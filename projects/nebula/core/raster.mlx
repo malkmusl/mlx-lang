@@ -1,0 +1,2026 @@
+// nebula core: paths, and how a path becomes pixels. The shape tools, the
+// selection tools, vector layers, text outlines, shaped fills and the
+// brush's outline cursor all draw through here.
+//
+// A Path is a list of sub-paths, each a row of points joined by straight
+// lines, kept in heap memory. Coordinates are the image's, f64, x to the
+// right and y down; the pixel (x, y) is the square from (x, y) to
+// (x + 1, y + 1), its centre at (x + 0.5, y + 0.5).
+//
+//     const path = raster.create(allocator).?
+//     raster.moveTo(path, 10.0, 10.0)
+//     raster.cubicTo(path, 40.0, 0.0, 60.0, 40.0, 90.0, 10.0)
+//     raster.close(path)
+//     raster.circle(path, 50.0, 60.0, 20.5)
+//     device.begin(layer)
+//     const dirty = raster.fillDevice(layer, path, raster.NONZERO, true, clip, color, blend.NORMAL, 255, 0, null)
+//     ... device.commit(layer), image.damage(dirty) ...
+//     raster.destroy(path)
+//
+// Curves become lines the moment they are added (quadTo, cubicTo, arcTo,
+// the round shapes): never farther from the true curve than the path's
+// tolerance, 0.1 of a pixel unless setTolerance() says otherwise. So a
+// path holds nothing but points, and everything after (transform, stroke,
+// length, contains, fill) is exact on them. The price: a path that is to
+// be scaled up by transform() afterwards is built with a tolerance that
+// much finer (setTolerance(path, 0.1 / scale)) before its curves go in.
+// Circles, ellipses and arcs are polygons of the true shape's area, their
+// corners a little outside it and their sides a little inside.
+//
+// The shapes of this module go clockwise on the screen; where two
+// sub-paths overlap NONZERO fills both and EVEN_ODD cuts the one out of
+// the other (reverse() turns a path round, to cut a hole under NONZERO).
+// Open sub-paths are filled as if closed.
+//
+// fill() is the rasterizer: for every row of the clip the path crosses it
+// adds up, cell by cell, the exact area the path covers of each pixel
+// (signed area and cover accumulated per cell and summed along the row:
+// the method of font-rs and of FreeType's smooth rasterizer), and hands
+// the row's stretches of coverage to a Sink, a byte a pixel. Only one row
+// is in memory at a time (taken from core/scratch.mlx), edges are cut to
+// the clip in f64 before anything becomes an integer, rows and columns
+// outside the clip cost nothing, and coordinates may be as large as they
+// like. Without anti-aliasing a pixel is covered (255) or not, by whether
+// its centre is inside. On top of fill(): fillDevice (a colour into a
+// layer through a blend mode, a selection honoured), fillMask (the
+// selection's replace, add, subtract and intersect), coverageBytes (the
+// bytes themselves), strokeDevice.
+//
+// stroke() builds the outline of a stroked path as another path, to be
+// filled NONZERO: joins and caps, dashes, closed and open sub-paths. The
+// outline's inner corners are cut where its two sides cross whenever the
+// lines are long enough for that, so that a thick line along a curve has
+// no pixel counted twice on its inner edge.
+//
+// Memory running out leaves a path short of points and marked
+// (failed()): such a path is not drawn at all. fill() without working
+// memory draws nothing.
+//
+// Not done here: curves are not kept as curves (see above), and pointAt()
+// walks the path from its start at each asking.
+const std = @import("std")
+const math = @import("std.math")
+const geom = @import("./geom.mlx")
+const pixel = @import("./pixel.mlx")
+const scratch = @import("./scratch.mlx")
+const blend = @import("./blend.mlx")
+const device = @import("./device.mlx")
+const mask_module = @import("./mask.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Rect = geom.Rect
+
+// Fill rules: a place is inside when the path winds around it at all, or
+// an odd number of times.
+pub const NONZERO: u8 = 0
+pub const EVEN_ODD: u8 = 1
+
+pub const JOIN_MITER: u8 = 0
+pub const JOIN_ROUND: u8 = 1
+pub const JOIN_BEVEL: u8 = 2
+
+pub const CAP_BUTT: u8 = 0
+pub const CAP_ROUND: u8 = 1
+pub const CAP_SQUARE: u8 = 2
+
+// What fillMask() does with what the mask held.
+pub const REPLACE: u8 = 0
+pub const ADD: u8 = 1
+pub const SUBTRACT: u8 = 2
+pub const INTERSECT: u8 = 3
+
+pub const DEFAULT_TOLERANCE: f64 = 0.1
+pub const MAX_DASHES: usize = 8
+
+const PI: f64 = 3.141592653589793
+const TWO_PI: f64 = 6.283185307179586
+const HALF_PI: f64 = 1.5707963267948966
+const QUARTER_PI: f64 = 0.7853981633974483
+
+// No coordinate is kept beyond this: differences and products of two
+// coordinates then stay far inside what an f64 holds.
+const FARTHEST: f64 = 1.0e15
+// Points closer than this are one point to the stroker.
+const NEAR: f64 = 1.0e-9
+// A curve never becomes more lines than this (2 to the 18th by halving).
+const DEEPEST: u32 = 18
+const MOST_PIECES: f64 = 262144.0
+
+// ---------------------------------------------------------------------------
+// Numbers
+
+// The angle of the direction (x, y) from the x axis, -pi to pi (the arc
+// tangent of y / x in the right quadrant; std.math has none). The ratio
+// of the shorter side to the longer is brought below tan(pi / 8) by
+// atan(t) = pi / 4 + atan((t - 1) / (t + 1)), where the series
+// t - t^3 / 3 + t^5 / 5 - ... is exact to the last bit after 22 terms.
+fn angleOf(y: f64, x: f64) -> f64 {
+    const ax = math.abs(x)
+    const ay = math.abs(y)
+    if ax == 0.0 && ay == 0.0 { return 0.0 }
+    var t = if ay > ax { ax / ay } else { ay / ax }
+    var base: f64 = 0.0
+    if t > 0.41421356237309503 {
+        t = (t - 1.0) / (t + 1.0)
+        base = QUARTER_PI
+    }
+    const z = t * t
+    var series: f64 = 0.0
+    var term: f64 = 43.0
+    while term >= 1.0 {
+        series = 1.0 / term - z * series
+        term -= 2.0
+    }
+    var angle = base + t * series
+    if ay > ax { angle = HALF_PI - angle }
+    if x < 0.0 { angle = PI - angle }
+    return if y < 0.0 { -angle } else { angle }
+}
+
+fn held(value: f64) -> f64 {
+    return if value > FARTHEST { FARTHEST } else if value < -FARTHEST { -FARTHEST } else { value }
+}
+
+// ---------------------------------------------------------------------------
+// Matrix: an affine map of the plane, two rows of three numbers:
+//
+//     x' = xx * x + xy * y + x0
+//     y' = yx * x + yy * y + y0
+
+pub const Matrix = struct {
+    xx: f64
+    yx: f64
+    xy: f64
+    yy: f64
+    x0: f64
+    y0: f64
+}
+
+pub const Point = struct {
+    x: f64
+    y: f64
+}
+
+pub fn identity() -> Matrix {
+    return Matrix.{ .xx = 1.0, .yx = 0.0, .xy = 0.0, .yy = 1.0, .x0 = 0.0, .y0 = 0.0 }
+}
+
+pub fn translate(dx: f64, dy: f64) -> Matrix {
+    return Matrix.{ .xx = 1.0, .yx = 0.0, .xy = 0.0, .yy = 1.0, .x0 = dx, .y0 = dy }
+}
+
+pub fn scale(sx: f64, sy: f64) -> Matrix {
+    return Matrix.{ .xx = sx, .yx = 0.0, .xy = 0.0, .yy = sy, .x0 = 0.0, .y0 = 0.0 }
+}
+
+// A turn around (0, 0) by `radians`, clockwise on the screen (from the x
+// axis towards the y axis, which points down). Quarter turns are exact:
+// a sine or cosine within rounding of 0 is 0, so that turning a picture
+// by 90 degrees moves whole pixels onto whole pixels.
+pub fn rotate(radians: f64) -> Matrix {
+    var c = math.cos(radians)
+    var s = math.sin(radians)
+    if math.abs(c) < 1.0e-15 {
+        c = 0.0
+        s = if s < 0.0 { -1.0 } else { 1.0 }
+    } else if math.abs(s) < 1.0e-15 {
+        s = 0.0
+        c = if c < 0.0 { -1.0 } else { 1.0 }
+    }
+    return Matrix.{ .xx = c, .yx = s, .xy = -s, .yy = c, .x0 = 0.0, .y0 = 0.0 }
+}
+
+// The map that does `first` and then `second`.
+pub fn multiply(first: Matrix, second: Matrix) -> Matrix {
+    return Matrix.{
+        .xx = second.xx * first.xx + second.xy * first.yx,
+        .yx = second.yx * first.xx + second.yy * first.yx,
+        .xy = second.xx * first.xy + second.xy * first.yy,
+        .yy = second.yx * first.xy + second.yy * first.yy,
+        .x0 = second.xx * first.x0 + second.xy * first.y0 + second.x0,
+        .y0 = second.yx * first.x0 + second.yy * first.y0 + second.y0,
+    }
+}
+
+// The map that undoes `matrix`; null for one that flattens the plane
+// onto a line or a point (nothing undoes that).
+pub fn invert(matrix: Matrix) -> ?Matrix {
+    const determinant = matrix.xx * matrix.yy - matrix.xy * matrix.yx
+    if determinant == 0.0 || determinant != determinant { return null }
+    const xx = matrix.yy / determinant
+    const yx = -matrix.yx / determinant
+    const xy = -matrix.xy / determinant
+    const yy = matrix.xx / determinant
+    if math.abs(xx) > FARTHEST || math.abs(yx) > FARTHEST || math.abs(xy) > FARTHEST || math.abs(yy) > FARTHEST { return null }
+    return Matrix.{
+        .xx = xx,
+        .yx = yx,
+        .xy = xy,
+        .yy = yy,
+        .x0 = -(xx * matrix.x0 + xy * matrix.y0),
+        .y0 = -(yx * matrix.x0 + yy * matrix.y0),
+    }
+}
+
+// Where `matrix` takes the point (x, y).
+pub fn apply(matrix: Matrix, x: f64, y: f64) -> Point {
+    return Point.{ .x = matrix.xx * x + matrix.xy * y + matrix.x0, .y = matrix.yx * x + matrix.yy * y + matrix.y0 }
+}
+
+// ---------------------------------------------------------------------------
+// The path
+
+// One sub-path: `count` points from point `first` on, and whether a line
+// goes from its last point back to its first.
+pub const Contour = struct {
+    first: usize
+    count: usize
+    closed: bool
+}
+
+// Where the pen is: nowhere yet; moved to a place no line left yet; in a
+// sub-path that takes more points; back at the start of one just closed.
+const NOWHERE: u8 = 0
+const MOVED: u8 = 1
+const DRAWING: u8 = 2
+const CLOSED: u8 = 3
+
+pub const Path = struct {
+    allocator: Allocator
+    // x and y of each point, one after the other.
+    points: std.ArrayList(f64)
+    contours: std.ArrayList(Contour)
+    // How far a curve's lines may be from the curve.
+    tolerance: f64
+    // The pen, and where its sub-path started.
+    x: f64
+    y: f64
+    startX: f64
+    startY: f64
+    state: u8
+    // False once memory ran out: points are missing.
+    whole: bool
+}
+
+// An empty path. Null without memory.
+pub fn create(allocator: Allocator) -> ?*Path {
+    const memory = allocator.alloc(@sizeOf(Path), 16)
+    if memory == null { return null }
+    const path: *Path = unsafe { @ptrCast(*Path, memory.?) }
+    path.*.allocator = allocator
+    path.*.points = std.ArrayList(f64).init(allocator)
+    path.*.contours = std.ArrayList(Contour).init(allocator)
+    path.*.tolerance = DEFAULT_TOLERANCE
+    path.*.x = 0.0
+    path.*.y = 0.0
+    path.*.startX = 0.0
+    path.*.startY = 0.0
+    path.*.state = NOWHERE
+    path.*.whole = true
+    return path
+}
+
+pub fn destroy(path: *Path) -> void {
+    path.*.points.deinit()
+    path.*.contours.deinit()
+    const allocator = path.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, path), @sizeOf(Path), 16) }
+}
+
+// No points any more (the memory and the tolerance stay), and whole again.
+pub fn clear(path: *Path) -> void {
+    path.*.points.clearRetainingCapacity()
+    path.*.contours.clearRetainingCapacity()
+    path.*.state = NOWHERE
+    path.*.whole = true
+}
+
+// Whether memory ran out while the path was built (since the last
+// clear()): it lacks points then and is not drawn.
+pub fn failed(path: *Path) -> bool { return !path.*.whole }
+
+// How far the lines of curves added from now on may be from the curve,
+// in the path's units (at least a millionth).
+pub fn setTolerance(path: *Path, tolerance: f64) -> void {
+    path.*.tolerance = if tolerance > 0.000001 { tolerance } else { 0.000001 }
+}
+
+pub fn isEmpty(path: *Path) -> bool { return path.*.points.length == 0 }
+
+pub fn pointCount(path: *Path) -> usize { return path.*.points.length / 2 }
+
+pub fn contourCount(path: *Path) -> usize { return path.*.contours.length }
+
+// Sub-path `index` (below contourCount()).
+pub fn contourAt(path: *Path, index: usize) -> Contour { return path.*.contours.pointer[index] }
+
+// Point `index` (below pointCount()).
+pub fn vertex(path: *Path, index: usize) -> Point {
+    return Point.{ .x = path.*.points.pointer[index * 2], .y = path.*.points.pointer[index * 2 + 1] }
+}
+
+// A sub-path starts at the pen.
+fn begin(path: *Path) -> bool {
+    if !path.*.points.ensureUnusedCapacity(2) || !path.*.contours.append(Contour.{ .first = path.*.points.length / 2, .count = 1, .closed = false }) {
+        path.*.whole = false
+        return false
+    }
+    const at = path.*.points.length
+    path.*.points.pointer[at] = path.*.x
+    path.*.points.pointer[at + 1] = path.*.y
+    path.*.points.length = at + 2
+    path.*.startX = path.*.x
+    path.*.startY = path.*.y
+    path.*.state = DRAWING
+    return true
+}
+
+// The next lineTo() starts a sub-path of its own, as a moveTo() would.
+fn lift(path: *Path) -> void { path.*.state = NOWHERE }
+
+// The pen goes to (x, y) without a line: the next line starts a new
+// sub-path there. (A point that is not a number is passed over, here and
+// in everything below.)
+pub fn moveTo(path: *Path, x: f64, y: f64) -> void {
+    if x != x || y != y { return }
+    path.*.x = held(x)
+    path.*.y = held(y)
+    path.*.startX = path.*.x
+    path.*.startY = path.*.y
+    path.*.state = MOVED
+}
+
+// A line from the pen to (x, y) (a moveTo when the pen is nowhere yet).
+// A line to where the pen is adds no point, but a sub-path of that one
+// point stays: stroked with round or square caps it is a dot.
+pub fn lineTo(path: *Path, x: f64, y: f64) -> void {
+    if x != x || y != y { return }
+    if path.*.state == NOWHERE {
+        moveTo(path, x, y)
+        return
+    }
+    if path.*.state != DRAWING && !begin(path) { return }
+    const px = held(x)
+    const py = held(y)
+    if px == path.*.x && py == path.*.y { return }
+    if !path.*.points.ensureUnusedCapacity(2) {
+        path.*.whole = false
+        return
+    }
+    const at = path.*.points.length
+    path.*.points.pointer[at] = px
+    path.*.points.pointer[at + 1] = py
+    path.*.points.length = at + 2
+    path.*.contours.pointer[path.*.contours.length - 1].count += 1
+    path.*.x = px
+    path.*.y = py
+}
+
+// The sub-path goes back to where it started and is closed (stroked, it
+// has a join there and no caps); the pen is at its start, and a line
+// from there starts a new sub-path.
+pub fn close(path: *Path) -> void {
+    if path.*.state == NOWHERE || path.*.state == CLOSED { return }
+    if path.*.state == MOVED && !begin(path) { return }
+    const last = &path.*.contours.pointer[path.*.contours.length - 1]
+    // A last point back on the first says nothing the closing does not.
+    if last.*.count > 1 {
+        const points = path.*.points.pointer
+        const end = (last.*.first + last.*.count - 1) * 2
+        if points[end] == points[last.*.first * 2] && points[end + 1] == points[last.*.first * 2 + 1] {
+            last.*.count -= 1
+            path.*.points.length -= 2
+        }
+    }
+    last.*.closed = true
+    path.*.x = path.*.startX
+    path.*.y = path.*.startY
+    path.*.state = CLOSED
+}
+
+// A quadratic curve from the pen to (x, y), bent towards (cx, cy). In
+// equal steps of its parameter: n of them leave it no farther than
+// |p0 - 2 c + p1| / (4 n n) from its lines.
+pub fn quadTo(path: *Path, cx: f64, cy: f64, x: f64, y: f64) -> void {
+    if cx != cx || cy != cy || x != x || y != y { return }
+    if path.*.state == NOWHERE { moveTo(path, cx, cy) }
+    const x0 = path.*.x
+    const y0 = path.*.y
+    const bx = x0 - 2.0 * cx + x
+    const by = y0 - 2.0 * cy + y
+    var pieces = @ceil(@sqrt(@sqrt(bx * bx + by * by) / (4.0 * path.*.tolerance)))
+    if !(pieces >= 1.0) { pieces = 1.0 }
+    if pieces > MOST_PIECES { pieces = MOST_PIECES }
+    var step: f64 = 1.0
+    while step < pieces {
+        const t = step / pieces
+        const u = 1.0 - t
+        lineTo(path, u * u * x0 + 2.0 * u * t * cx + t * t * x, u * u * y0 + 2.0 * u * t * cy + t * t * y)
+        step += 1.0
+    }
+    lineTo(path, x, y)
+}
+
+// The lines of one cubic curve, halved until each half is flat: a cubic
+// is no farther from its chord than 3 / 4 of the larger of its two second
+// differences, and halving it quarters them (`limit` is that bound on
+// their squares). Flat parts of a curve so get few lines and bent parts
+// many.
+fn cubicInto(path: *Path, x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64, limit: f64, depth: u32) -> void {
+    const ax = x0 - 2.0 * x1 + x2
+    const ay = y0 - 2.0 * y1 + y2
+    const bx = x1 - 2.0 * x2 + x3
+    const by = y1 - 2.0 * y2 + y3
+    if depth == 0 || math.max(ax * ax + ay * ay, bx * bx + by * by) <= limit {
+        lineTo(path, x3, y3)
+        return
+    }
+    const x01 = (x0 + x1) * 0.5
+    const y01 = (y0 + y1) * 0.5
+    const x12 = (x1 + x2) * 0.5
+    const y12 = (y1 + y2) * 0.5
+    const x23 = (x2 + x3) * 0.5
+    const y23 = (y2 + y3) * 0.5
+    const xa = (x01 + x12) * 0.5
+    const ya = (y01 + y12) * 0.5
+    const xb = (x12 + x23) * 0.5
+    const yb = (y12 + y23) * 0.5
+    const xm = (xa + xb) * 0.5
+    const ym = (ya + yb) * 0.5
+    cubicInto(path, x0, y0, x01, y01, xa, ya, xm, ym, limit, depth - 1)
+    cubicInto(path, xm, ym, xb, yb, x23, y23, x3, y3, limit, depth - 1)
+}
+
+// A cubic curve from the pen to (x, y) with the control points (ax, ay)
+// and (bx, by).
+pub fn cubicTo(path: *Path, ax: f64, ay: f64, bx: f64, by: f64, x: f64, y: f64) -> void {
+    if ax != ax || ay != ay || bx != bx || by != by || x != x || y != y { return }
+    if path.*.state == NOWHERE { moveTo(path, ax, ay) }
+    const flat = path.*.tolerance / 0.75
+    cubicInto(path, path.*.x, path.*.y, held(ax), held(ay), held(bx), held(by), held(x), held(y), flat * flat, DEEPEST)
+}
+
+// Into how many lines an arc of `angle` radians on a circle of `radius`
+// goes: a chord over the angle a is r (1 - cos(a / 2)) from the circle,
+// and no circle has fewer than eight sides.
+fn arcPieces(radius: f64, angle: f64, tolerance: f64) -> f64 {
+    var step = QUARTER_PI
+    if radius > tolerance {
+        // (cos(a / 2) = 1 - e: its sine is the root of e (2 - e))
+        const e = tolerance / radius
+        const most = 2.0 * angleOf(@sqrt(e * (2.0 - e)), 1.0 - e)
+        if most < step { step = most }
+    }
+    var pieces = @ceil(angle / step)
+    if !(pieces >= 1.0) { pieces = 1.0 }
+    if pieces > MOST_PIECES { pieces = MOST_PIECES }
+    return pieces
+}
+
+// How much farther out than the circle a polygon's corners lie for the
+// polygon to have the area of the circle's part it stands for (each side
+// spanning `step` radians): the corners are outside by a third of what
+// the sides' middles are inside.
+fn arcStretch(step: f64) -> f64 {
+    const a = math.abs(step)
+    if a < 0.000001 { return 1.0 }
+    return @sqrt(a / math.sin(a))
+}
+
+// The points of an arc between its ends (the ends are the caller's): on
+// the ellipse around (cx, cy) with the radii rx and ry, turned by the
+// angle whose cosine and sine are cr and sr, from the direction (ux, uy)
+// (of length 1, before the radii and the turn) over `sweep` radians,
+// clockwise on the screen for a positive sweep.
+fn arcPoints(path: *Path, cx: f64, cy: f64, rx: f64, ry: f64, cr: f64, sr: f64, ux: f64, uy: f64, sweep: f64) -> void {
+    const pieces = arcPieces(math.max(rx, ry), math.abs(sweep), path.*.tolerance)
+    if pieces < 2.0 { return }
+    const step = sweep / pieces
+    const stretch = arcStretch(step)
+    const c = math.cos(step)
+    const s = math.sin(step)
+    var vx = ux
+    var vy = uy
+    var piece: f64 = 1.0
+    while piece < pieces {
+        const turned = vx * c - vy * s
+        vy = vx * s + vy * c
+        vx = turned
+        const ex = rx * stretch * vx
+        const ey = ry * stretch * vy
+        lineTo(path, cx + cr * ex - sr * ey, cy + sr * ex + cr * ey)
+        piece += 1.0
+    }
+}
+
+// An arc of an ellipse from the pen to (x, y), as SVG's path command A
+// has it: the ellipse has the radii rx and ry and is turned by `rotation`
+// radians; of the four arcs that fit, `large` takes one of more than half
+// a turn and `sweep` one that goes clockwise on the screen. Radii too
+// small to reach are scaled up until they do; a radius of 0 gives a line.
+pub fn arcTo(path: *Path, rx: f64, ry: f64, rotation: f64, large: bool, sweep: bool, x: f64, y: f64) -> void {
+    if rx != rx || ry != ry || rotation != rotation || x != x || y != y { return }
+    if path.*.state == NOWHERE {
+        moveTo(path, x, y)
+        return
+    }
+    const x0 = path.*.x
+    const y0 = path.*.y
+    const x1 = held(x)
+    const y1 = held(y)
+    if x0 == x1 && y0 == y1 { return }
+    var a = held(math.abs(rx))
+    var b = held(math.abs(ry))
+    if a == 0.0 || b == 0.0 {
+        lineTo(path, x1, y1)
+        return
+    }
+    const cr = math.cos(rotation)
+    const sr = math.sin(rotation)
+    // The pen as seen from the middle between the two ends, the ellipse's
+    // axes along x and y.
+    const hx = (x0 - x1) * 0.5
+    const hy = (y0 - y1) * 0.5
+    const px = cr * hx + sr * hy
+    const py = cr * hy - sr * hx
+    const short = (px * px) / (a * a) + (py * py) / (b * b)
+    if short > 1.0 {
+        const grow = @sqrt(short)
+        a *= grow
+        b *= grow
+    }
+    // The centre, there.
+    const below = a * a * py * py + b * b * px * px
+    var above = a * a * b * b - below
+    if above < 0.0 { above = 0.0 }
+    var factor = @sqrt(above / below)
+    if large == sweep { factor = -factor }
+    const mx = factor * a * py / b
+    const my = -factor * b * px / a
+    const cx = cr * mx - sr * my + (x0 + x1) * 0.5
+    const cy = sr * mx + cr * my + (y0 + y1) * 0.5
+    // The directions of the two ends from the centre on the unit circle,
+    // and the angle between them the way asked for.
+    const ux = (px - mx) / a
+    const uy = (py - my) / b
+    const vx = (-px - mx) / a
+    const vy = (-py - my) / b
+    const size = @sqrt(ux * ux + uy * uy)
+    var turn = angleOf(ux * vy - uy * vx, ux * vx + uy * vy)
+    if sweep && turn < 0.0 {
+        turn += TWO_PI
+    } else if !sweep && turn > 0.0 {
+        turn -= TWO_PI
+    }
+    if size > 0.0 { arcPoints(path, cx, cy, a, b, cr, sr, ux / size, uy / size, turn) }
+    lineTo(path, x1, y1)
+}
+
+// ---------------------------------------------------------------------------
+// Shapes: each its own closed sub-path (or open, where it says so),
+// clockwise on the screen.
+
+pub fn rect(path: *Path, x: f64, y: f64, width: f64, height: f64) -> void {
+    moveTo(path, x, y)
+    lineTo(path, x + width, y)
+    lineTo(path, x + width, y + height)
+    lineTo(path, x, y + height)
+    close(path)
+}
+
+// A rectangle whose corners are quarters of an ellipse with the radii rx
+// and ry (no more than half the rectangle each).
+pub fn roundedRect(path: *Path, x: f64, y: f64, width: f64, height: f64, rx: f64, ry: f64) -> void {
+    var a = math.abs(rx)
+    var b = math.abs(ry)
+    if a > math.abs(width) * 0.5 { a = math.abs(width) * 0.5 }
+    if b > math.abs(height) * 0.5 { b = math.abs(height) * 0.5 }
+    if !(a > 0.0) || !(b > 0.0) || !(width > 0.0) || !(height > 0.0) {
+        rect(path, x, y, width, height)
+        return
+    }
+    const right = x + width
+    const bottom = y + height
+    moveTo(path, x + a, y)
+    lineTo(path, right - a, y)
+    arcPoints(path, right - a, y + b, a, b, 1.0, 0.0, 0.0, -1.0, HALF_PI)
+    lineTo(path, right, y + b)
+    lineTo(path, right, bottom - b)
+    arcPoints(path, right - a, bottom - b, a, b, 1.0, 0.0, 1.0, 0.0, HALF_PI)
+    lineTo(path, right - a, bottom)
+    lineTo(path, x + a, bottom)
+    arcPoints(path, x + a, bottom - b, a, b, 1.0, 0.0, 0.0, 1.0, HALF_PI)
+    lineTo(path, x, bottom - b)
+    lineTo(path, x, y + b)
+    arcPoints(path, x + a, y + b, a, b, 1.0, 0.0, -1.0, 0.0, HALF_PI)
+    close(path)
+}
+
+// The ellipse around (cx, cy) with the radii rx and ry: a polygon of
+// exactly its area.
+pub fn ellipse(path: *Path, cx: f64, cy: f64, rx: f64, ry: f64) -> void {
+    if cx != cx || cy != cy || rx != rx || ry != ry { return }
+    const a = held(math.abs(rx))
+    const b = held(math.abs(ry))
+    const pieces = arcPieces(math.max(a, b), TWO_PI, path.*.tolerance)
+    const step = TWO_PI / pieces
+    const stretch = arcStretch(step)
+    const c = math.cos(step)
+    const s = math.sin(step)
+    var vx: f64 = 1.0
+    var vy: f64 = 0.0
+    moveTo(path, cx + a * stretch, cy)
+    var piece: f64 = 1.0
+    while piece < pieces {
+        const turned = vx * c - vy * s
+        vy = vx * s + vy * c
+        vx = turned
+        lineTo(path, cx + a * stretch * vx, cy + b * stretch * vy)
+        piece += 1.0
+    }
+    close(path)
+}
+
+pub fn circle(path: *Path, cx: f64, cy: f64, radius: f64) -> void {
+    ellipse(path, cx, cy, radius, radius)
+}
+
+// The closed polygon through the points (x0, y0, x1, y1, ...).
+pub fn polygon(path: *Path, coordinates: []const f64) -> void {
+    polyline(path, coordinates)
+    if coordinates.length >= 2 { close(path) }
+}
+
+// The open row of lines through the points (x0, y0, x1, y1, ...).
+pub fn polyline(path: *Path, coordinates: []const f64) -> void {
+    if coordinates.length < 2 { return }
+    moveTo(path, coordinates[0], coordinates[1])
+    var index: usize = 2
+    while index + 1 < coordinates.length {
+        lineTo(path, coordinates[index], coordinates[index + 1])
+        index += 2
+    }
+}
+
+// A star of `tips` tips around (cx, cy): its tips `outer` from the
+// centre, the corners between them `inner`; the first tip points up,
+// turned clockwise by `rotation` radians.
+pub fn star(path: *Path, cx: f64, cy: f64, tips: usize, inner: f64, outer: f64, rotation: f64) -> void {
+    if tips < 2 || tips > 100000 { return }
+    const step = PI / @floatFromInt(f64, tips)
+    var at: usize = 0
+    while at < tips * 2 {
+        const angle = rotation - HALF_PI + step * @floatFromInt(f64, at)
+        const radius = if at & 1 == 0 { outer } else { inner }
+        const x = cx + radius * math.cos(angle)
+        const y = cy + radius * math.sin(angle)
+        if at == 0 { moveTo(path, x, y) } else { lineTo(path, x, y) }
+        at += 1
+    }
+    close(path)
+}
+
+// The open line from (x0, y0) to (x1, y1): something to stroke.
+pub fn line(path: *Path, x0: f64, y0: f64, x1: f64, y1: f64) -> void {
+    moveTo(path, x0, y0)
+    lineTo(path, x1, y1)
+}
+
+// ---------------------------------------------------------------------------
+// The path as a whole
+
+// The smallest box around all points (left > right: there are none).
+const Extent = struct {
+    left: f64
+    top: f64
+    right: f64
+    bottom: f64
+}
+
+fn extent(path: *Path) -> Extent {
+    const points = path.*.points.pointer
+    const size = path.*.points.length
+    if size < 2 { return Extent.{ .left = 1.0, .top = 1.0, .right = 0.0, .bottom = 0.0 } }
+    var left = points[0]
+    var right = points[0]
+    var top = points[1]
+    var bottom = points[1]
+    var index: usize = 2
+    while index < size {
+        const x = points[index]
+        const y = points[index + 1]
+        if x < left { left = x }
+        if x > right { right = x }
+        if y < top { top = y }
+        if y > bottom { bottom = y }
+        index += 2
+    }
+    return Extent.{ .left = left, .top = top, .right = right, .bottom = bottom }
+}
+
+// The rectangle of whole pixels around the path's points: empty only for
+// a path without points (a single point, or an upright or level line,
+// has the pixels it touches). What lies farther than 2 to the 30th from
+// the origin is cut off.
+pub fn bounds(path: *Path) -> Rect {
+    const box = extent(path)
+    if box.left > box.right { return geom.empty() }
+    const far: f64 = 1073741822.0
+    const x0 = @intFromFloat(i32, @floor(math.clamp(box.left, -far, far)))
+    const y0 = @intFromFloat(i32, @floor(math.clamp(box.top, -far, far)))
+    var x1 = @intFromFloat(i32, @ceil(math.clamp(box.right, -far, far)))
+    var y1 = @intFromFloat(i32, @ceil(math.clamp(box.bottom, -far, far)))
+    if x1 == x0 { x1 = x0 + 1 }
+    if y1 == y0 { y1 = y0 + 1 }
+    return geom.rect(x0, y0, x1 - x0, y1 - y0)
+}
+
+// Every point through `matrix` (the points as they are: see the header
+// for curves and scaling up).
+pub fn transform(path: *Path, matrix: Matrix) -> void {
+    const points = path.*.points.pointer
+    const size = path.*.points.length
+    var index: usize = 0
+    while index < size {
+        const x = points[index]
+        const y = points[index + 1]
+        points[index] = held(matrix.xx * x + matrix.xy * y + matrix.x0)
+        points[index + 1] = held(matrix.yx * x + matrix.yy * y + matrix.y0)
+        index += 2
+    }
+    const px = path.*.x
+    const py = path.*.y
+    path.*.x = held(matrix.xx * px + matrix.xy * py + matrix.x0)
+    path.*.y = held(matrix.yx * px + matrix.yy * py + matrix.y0)
+    const sx = path.*.startX
+    const sy = path.*.startY
+    path.*.startX = held(matrix.xx * sx + matrix.xy * sy + matrix.x0)
+    path.*.startY = held(matrix.yx * sx + matrix.yy * sy + matrix.y0)
+}
+
+// Every sub-path the other way round (the same lines; what went
+// clockwise goes counter-clockwise). The pen is lifted.
+pub fn reverse(path: *Path) -> void {
+    const points = path.*.points.pointer
+    var index: usize = 0
+    while index < path.*.contours.length {
+        const contour = &path.*.contours.pointer[index]
+        if contour.*.count > 1 {
+            var low = contour.*.first * 2
+            var high = (contour.*.first + contour.*.count - 1) * 2
+            while low < high {
+                const x = points[low]
+                const y = points[low + 1]
+                points[low] = points[high]
+                points[low + 1] = points[high + 1]
+                points[high] = x
+                points[high + 1] = y
+                low += 2
+                high -= 2
+            }
+        }
+        index += 1
+    }
+    lift(path)
+}
+
+// The sub-paths of `other` added to `path` (which may not be `other`).
+// The pen is lifted. Without memory nothing is added and the path is
+// marked (failed()).
+pub fn append(path: *Path, other: *Path) -> void {
+    if @intFromPtr(path) == @intFromPtr(other) { return }
+    if !other.*.whole { path.*.whole = false }
+    if !path.*.points.ensureUnusedCapacity(other.*.points.length) || !path.*.contours.ensureUnusedCapacity(other.*.contours.length) {
+        path.*.whole = false
+        return
+    }
+    const offset = path.*.points.length / 2
+    var index: usize = 0
+    while index < other.*.points.length {
+        path.*.points.pointer[path.*.points.length + index] = other.*.points.pointer[index]
+        index += 1
+    }
+    path.*.points.length += other.*.points.length
+    index = 0
+    while index < other.*.contours.length {
+        const contour = other.*.contours.pointer[index]
+        path.*.contours.pointer[path.*.contours.length + index] = Contour.{ .first = contour.first + offset, .count = contour.count, .closed = contour.closed }
+        index += 1
+    }
+    path.*.contours.length += other.*.contours.length
+    lift(path)
+}
+
+// Another path with the same points, tolerance and pen. Null without
+// memory.
+pub fn copy(path: *Path) -> ?*Path {
+    const made = create(path.*.allocator)
+    if made == null { return null }
+    const twin = made.?
+    append(twin, path)
+    if !twin.*.whole && path.*.whole {
+        destroy(twin)
+        return null
+    }
+    twin.*.tolerance = path.*.tolerance
+    twin.*.x = path.*.x
+    twin.*.y = path.*.y
+    twin.*.startX = path.*.startX
+    twin.*.startY = path.*.startY
+    twin.*.state = path.*.state
+    return twin
+}
+
+// Whether (x, y) is inside the path by `rule` (open sub-paths as if
+// closed): what fill() without anti-aliasing covers of the pixel whose
+// centre the point is. A line counts for the points on it and to its
+// right, a line's upper end for the line and its lower end not.
+pub fn contains(path: *Path, x: f64, y: f64, rule: u8) -> bool {
+    const points = path.*.points.pointer
+    var winding: i64 = 0
+    var index: usize = 0
+    while index < path.*.contours.length {
+        const contour = path.*.contours.pointer[index]
+        index += 1
+        if contour.count < 2 { continue }
+        const first = contour.first * 2
+        var ax = points[first + contour.count * 2 - 2]
+        var ay = points[first + contour.count * 2 - 1]
+        var at: usize = 0
+        while at < contour.count {
+            const bx = points[first + at * 2]
+            const by = points[first + at * 2 + 1]
+            if ay <= y && y < by {
+                if ax + (y - ay) * ((bx - ax) / (by - ay)) <= x { winding += 1 }
+            } else if by <= y && y < ay {
+                if bx + (y - by) * ((ax - bx) / (ay - by)) <= x { winding -= 1 }
+            }
+            ax = bx
+            ay = by
+            at += 1
+        }
+    }
+    if rule == EVEN_ODD { return winding & 1 != 0 }
+    return winding != 0
+}
+
+// The length of all lines of the path (a closed sub-path's closing line
+// with them).
+pub fn length(path: *Path) -> f64 {
+    const points = path.*.points.pointer
+    var total: f64 = 0.0
+    var index: usize = 0
+    while index < path.*.contours.length {
+        const contour = path.*.contours.pointer[index]
+        index += 1
+        if contour.count < 2 { continue }
+        const first = contour.first * 2
+        var at: usize = 1
+        while at < contour.count {
+            const dx = points[first + at * 2] - points[first + at * 2 - 2]
+            const dy = points[first + at * 2 + 1] - points[first + at * 2 - 1]
+            total += @sqrt(dx * dx + dy * dy)
+            at += 1
+        }
+        if contour.closed {
+            const dx = points[first] - points[first + contour.count * 2 - 2]
+            const dy = points[first + 1] - points[first + contour.count * 2 - 1]
+            total += @sqrt(dx * dx + dy * dy)
+        }
+    }
+    return total
+}
+
+// A place on the path and the direction the path goes there (of length
+// 1).
+pub const Position = struct {
+    x: f64
+    y: f64
+    dx: f64
+    dy: f64
+}
+
+// The place `distance` along the path from its start (through all its
+// sub-paths one after the other, each closed one's closing line with
+// them): what text on a path, dashes and a brush stroke along a path
+// walk. Before the start it is the start, past the end the end. False
+// for a path without points.
+pub fn pointAt(path: *Path, distance: f64, into: *Position) -> bool {
+    const points = path.*.points.pointer
+    if path.*.points.length < 2 { return false }
+    into.*.x = points[0]
+    into.*.y = points[1]
+    into.*.dx = 1.0
+    into.*.dy = 0.0
+    var left = if distance > 0.0 { distance } else { 0.0 }
+    var met = false
+    var index: usize = 0
+    while index < path.*.contours.length {
+        const contour = path.*.contours.pointer[index]
+        index += 1
+        const first = contour.first * 2
+        if contour.count < 2 {
+            // A dot has a place and no direction: the one before stays.
+            if !met {
+                into.*.x = points[first]
+                into.*.y = points[first + 1]
+            }
+            continue
+        }
+        const lines = if contour.closed { contour.count } else { contour.count - 1 }
+        var at: usize = 0
+        while at < lines {
+            const from = first + at * 2
+            const to = if at + 1 < contour.count { from + 2 } else { first }
+            const dx = points[to] - points[from]
+            const dy = points[to + 1] - points[from + 1]
+            const size = @sqrt(dx * dx + dy * dy)
+            at += 1
+            if !(size > 0.0) { continue }
+            met = true
+            into.*.dx = dx / size
+            into.*.dy = dy / size
+            if left <= size {
+                into.*.x = points[from] + dx * (left / size)
+                into.*.y = points[from + 1] + dy * (left / size)
+                return true
+            }
+            left -= size
+            into.*.x = points[to]
+            into.*.y = points[to + 1]
+        }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Stroking
+
+// How a path is stroked: `width` across, corners by `join` (a miter
+// corner whose tip would be farther from the corner's inside than
+// `miterLimit` times the width becomes a bevel, as in SVG), open ends by
+// `cap`, and in dashes when `dashCount` is not 0: `dashes` are the lengths of a dash, a gap, a dash, ... in
+// turn (an odd number of them is gone through twice, as in SVG), and the
+// pattern starts `dashOffset` into itself.
+pub const Stroke = struct {
+    width: f64
+    join: u8
+    cap: u8
+    miterLimit: f64
+    dashes: [8]f64
+    dashCount: usize
+    dashOffset: f64
+}
+
+// A stroke `width` wide without dashes, with miter joins (limit 4) and
+// butt caps: set the other fields from there.
+pub fn solid(width: f64) -> Stroke {
+    return Stroke.{
+        .width = width,
+        .join = JOIN_MITER,
+        .cap = CAP_BUTT,
+        .miterLimit = 4.0,
+        .dashes = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+        .dashCount = 0,
+        .dashOffset = 0.0,
+    }
+}
+
+// The corner at (px, py) of the side that lies to the left of the way
+// gone (up, going right on the screen), coming in the direction (ax, ay)
+// along a line `la` long and leaving in (bx, by) along one `lb` long.
+//
+// Where the way turns towards the other side this side is the corner's
+// outside and gets the join. Where it turns towards this side, the
+// two sides' lines cross before the corner: the side goes through that
+// crossing when both lines are long enough to reach it with half their
+// length (then no two corners want the same stretch of a line), and
+// otherwise to the corner itself and out again, which leaves every line's
+// own rectangle whole and so fills at least what must be filled.
+fn corner(into: *Path, px: f64, py: f64, ax: f64, ay: f64, la: f64, bx: f64, by: f64, lb: f64, half: f64, style: *const Stroke, backward: bool) -> void {
+    const cross = ax * by - ay * bx
+    const dot = ax * bx + ay * by
+    const shared = 1.0 + dot
+    const outside = cross > 0.0 || (cross == 0.0 && dot < 0.0 && !backward)
+    if !outside {
+        if cross == 0.0 && dot > 0.0 {
+            lineTo(into, px + half * ay, py - half * ax)
+            return
+        }
+        if shared > 0.000000001 {
+            // (half the width times the tangent of half the turn)
+            const cut = half * -cross / shared
+            if cut <= la * 0.5 && cut <= lb * 0.5 {
+                lineTo(into, px + half * (ay + by) / shared, py - half * (ax + bx) / shared)
+                return
+            }
+        }
+        lineTo(into, px + half * ay, py - half * ax)
+        lineTo(into, px, py)
+        lineTo(into, px + half * by, py - half * bx)
+        return
+    }
+    if style.*.join == JOIN_ROUND {
+        lineTo(into, px + half * ay, py - half * ax)
+        arcPoints(into, px, py, half, half, 1.0, 0.0, ay, -ax, if cross == 0.0 { PI } else { angleOf(cross, dot) })
+        lineTo(into, px + half * by, py - half * bx)
+        return
+    }
+    if style.*.join == JOIN_MITER {
+        // The tip is half the width over the cosine of half the turn from
+        // the corner, and that cosine's square is (1 + dot) / 2.
+        const limit = if style.*.miterLimit > 1.0 { style.*.miterLimit } else { 1.0 }
+        if shared > 0.000000000001 && shared * limit * limit >= 2.0 {
+            lineTo(into, px + half * (ay + by) / shared, py - half * (ax + bx) / shared)
+            return
+        }
+    }
+    lineTo(into, px + half * ay, py - half * ax)
+    lineTo(into, px + half * by, py - half * bx)
+}
+
+// The end of an open line at (px, py), reached in the direction (dx, dy):
+// from the left side around to where the right side starts back.
+fn capEnd(into: *Path, px: f64, py: f64, dx: f64, dy: f64, half: f64, style: *const Stroke) -> void {
+    lineTo(into, px + half * dy, py - half * dx)
+    if style.*.cap == CAP_SQUARE {
+        lineTo(into, px + half * dy + half * dx, py - half * dx + half * dy)
+        lineTo(into, px - half * dy + half * dx, py + half * dx + half * dy)
+    } else if style.*.cap == CAP_ROUND {
+        arcPoints(into, px, py, half, half, 1.0, 0.0, dy, -dx, PI)
+    }
+    lineTo(into, px - half * dy, py + half * dx)
+}
+
+// The left side of the row of `count` points (at least two, no two in a
+// row the same) gone forward, or of the same row gone backward (which is
+// its right side): all its corners when `closed`, and from the first
+// point's side to the cap at the last when not.
+fn side(into: *Path, points: [*]const f64, count: usize, closed: bool, backward: bool, half: f64, style: *const Stroke) -> void {
+    const steps = if closed { count + 1 } else { count }
+    // The line into the point at hand: its direction and its length.
+    var ax: f64 = 0.0
+    var ay: f64 = 0.0
+    var la: f64 = 0.0
+    var step: usize = 0
+    if closed {
+        const last = if backward { 0 } else { count - 1 }
+        const first = if backward { count - 1 } else { 0 }
+        const dx = points[first * 2] - points[last * 2]
+        const dy = points[first * 2 + 1] - points[last * 2 + 1]
+        la = @sqrt(dx * dx + dy * dy)
+        ax = dx / la
+        ay = dy / la
+    }
+    while step + 1 < steps {
+        const here = if backward { count - 1 - step % count } else { step % count }
+        const next = if backward { count - 1 - (step + 1) % count } else { (step + 1) % count }
+        const px = points[here * 2]
+        const py = points[here * 2 + 1]
+        const dx = points[next * 2] - px
+        const dy = points[next * 2 + 1] - py
+        const lb = @sqrt(dx * dx + dy * dy)
+        const bx = dx / lb
+        const by = dy / lb
+        if closed || step > 0 {
+            corner(into, px, py, ax, ay, la, bx, by, lb, half, style, backward)
+        } else {
+            lineTo(into, px + half * by, py - half * bx)
+        }
+        ax = bx
+        ay = by
+        la = lb
+        step += 1
+    }
+    if !closed {
+        const last = if backward { 0 } else { count - 1 }
+        capEnd(into, points[last * 2], points[last * 2 + 1], ax, ay, half, style)
+    }
+}
+
+// The outline of one row of points (none twice in a row; a closed row's
+// last is not its first).
+fn outline(into: *Path, points: [*]const f64, count: usize, closed: bool, half: f64, style: *const Stroke) -> void {
+    if count == 0 { return }
+    if count == 1 {
+        // A line of no length is its caps: a dot or a square, or nothing.
+        if style.*.cap == CAP_ROUND {
+            ellipse(into, points[0], points[1], half, half)
+        } else if style.*.cap == CAP_SQUARE {
+            rect(into, points[0] - half, points[1] - half, half * 2.0, half * 2.0)
+        }
+        return
+    }
+    lift(into)
+    side(into, points, count, closed, false, half, style)
+    if closed {
+        close(into)
+        lift(into)
+    }
+    side(into, points, count, closed, true, half, style)
+    close(into)
+}
+
+// Whether two points are two to the stroker (a line between them has a
+// direction).
+fn apart(ax: f64, ay: f64, bx: f64, by: f64) -> bool {
+    const dx = bx - ax
+    const dy = by - ay
+    return dx * dx + dy * dy >= NEAR * NEAR
+}
+
+// A point more for the row at `row` (`count` points so far), unless it
+// is where the last one is. The new count.
+fn rowPoint(row: [*]f64, count: usize, x: f64, y: f64) -> usize {
+    if count > 0 && !apart(row[count * 2 - 2], row[count * 2 - 1], x, y) { return count }
+    row[count * 2] = x
+    row[count * 2 + 1] = y
+    return count + 1
+}
+
+// The dash pattern of a stroke as it is gone through: `count` entries
+// (twice the given ones when they are odd in number), dashes at the even
+// places; 0 when the stroke has no dashes (or lengths that are none).
+fn patternCount(style: *const Stroke) -> usize {
+    const given = style.*.dashCount
+    if given == 0 || given > MAX_DASHES { return 0 }
+    var total: f64 = 0.0
+    var index: usize = 0
+    while index < given {
+        const entry = style.*.dashes[index]
+        if !(entry >= 0.0) || entry > FARTHEST { return 0 }
+        total += entry
+        index += 1
+    }
+    if !(total > 0.0) { return 0 }
+    return if given & 1 == 1 { given * 2 } else { given }
+}
+
+// The outlines of the dashes of one row of points. `dash` has room for
+// twice the row's points and eight more, `opening` for the row's points
+// and four more.
+//
+// A closed row that starts inside a dash and ends inside one has those
+// two as one dash around its start (with a join there, not two caps);
+// one dash that goes all the way round is the closed line itself.
+fn dashed(into: *Path, points: [*]const f64, count: usize, closed: bool, half: f64, style: *const Stroke, entries: usize, dash: [*]f64, opening: [*]f64) -> void {
+    const given = style.*.dashCount
+    var period: f64 = 0.0
+    var index: usize = 0
+    while index < entries {
+        period += style.*.dashes[index % given]
+        index += 1
+    }
+    // Where in the pattern the row starts.
+    var phase = style.*.dashOffset
+    if phase != phase || math.abs(phase) > FARTHEST { phase = 0.0 }
+    phase = phase - period * @floor(phase / period)
+    var entry: usize = 0
+    var left = style.*.dashes[0]
+    while phase >= left && phase > 0.0 {
+        phase -= left
+        entry = (entry + 1) % entries
+        left = style.*.dashes[entry % given]
+    }
+    left -= phase
+    var on = entry & 1 == 0
+    const lines = if closed { count } else { count - 1 }
+    var dash_count: usize = 0
+    var opening_count: usize = 0
+    // Whether the dash at hand is the one the row started in (kept back
+    // for the last one to join it).
+    var first = closed && on
+    if on { dash_count = rowPoint(dash, 0, points[0], points[1]) }
+    var at: usize = 0
+    while at < lines {
+        const from = at * 2
+        const to = if at + 1 < count { from + 2 } else { 0 }
+        const dx = points[to] - points[from]
+        const dy = points[to + 1] - points[from + 1]
+        const size = @sqrt(dx * dx + dy * dy)
+        var gone: f64 = 0.0
+        while size - gone > left {
+            // The entry ends on this line.
+            gone += left
+            const x = points[from] + dx * (gone / size)
+            const y = points[from + 1] + dy * (gone / size)
+            if on {
+                dash_count = rowPoint(dash, dash_count, x, y)
+                if first {
+                    index = 0
+                    while index < dash_count * 2 {
+                        opening[index] = dash[index]
+                        index += 1
+                    }
+                    opening_count = dash_count
+                    first = false
+                } else {
+                    outline(into, dash, dash_count, false, half, style)
+                }
+                dash_count = 0
+            }
+            entry = (entry + 1) % entries
+            left = style.*.dashes[entry % given]
+            on = entry & 1 == 0
+            if on { dash_count = rowPoint(dash, 0, x, y) }
+        }
+        left -= size - gone
+        if on { dash_count = rowPoint(dash, dash_count, points[to], points[to + 1]) }
+        at += 1
+    }
+    if on && first {
+        outline(into, points, count, true, half, style)
+        return
+    }
+    if on && opening_count > 0 {
+        index = 0
+        while index < opening_count {
+            dash_count = rowPoint(dash, dash_count, opening[index * 2], opening[index * 2 + 1])
+            index += 1
+        }
+        opening_count = 0
+    }
+    if on { outline(into, dash, dash_count, false, half, style) }
+    if opening_count > 0 { outline(into, opening, opening_count, false, half, style) }
+}
+
+// The outline of `source` stroked by `style`, added to `into` (another
+// path) as closed sub-paths that all go the same way round: fill it
+// NONZERO. Round joins and caps are as fine as `into`'s tolerance. A
+// sub-path of one point is a dot under round caps and a square under
+// square ones. A path with more than a million dashes is stroked without
+// them.
+pub fn stroke(source: *Path, into: *Path, style: *const Stroke) -> void {
+    if @intFromPtr(source) == @intFromPtr(into) { return }
+    const half = style.*.width * 0.5
+    if !(half > 0.0) || half > FARTHEST { return }
+    if !source.*.whole {
+        into.*.whole = false
+        return
+    }
+    var longest: usize = 0
+    var index: usize = 0
+    while index < source.*.contours.length {
+        if source.*.contours.pointer[index].count > longest { longest = source.*.contours.pointer[index].count }
+        index += 1
+    }
+    if longest == 0 { return }
+    var entries = patternCount(style)
+    if entries > 0 {
+        var period: f64 = 0.0
+        index = 0
+        while index < style.*.dashCount {
+            period += style.*.dashes[index]
+            index += 1
+        }
+        if length(source) / period * @floatFromInt(f64, style.*.dashCount) > 2000000.0 { entries = 0 }
+    }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const row = scratch.doubles(pool, longest * 2 + 2)
+    var dash: ?[*]f64 = null
+    var opening: ?[*]f64 = null
+    if entries > 0 {
+        dash = scratch.doubles(pool, longest * 4 + 16)
+        opening = scratch.doubles(pool, longest * 2 + 8)
+    }
+    if row == null || (entries > 0 && (dash == null || opening == null)) {
+        into.*.whole = false
+        scratch.release(pool, mark)
+        return
+    }
+    const points = source.*.points.pointer
+    index = 0
+    while index < source.*.contours.length {
+        const contour = source.*.contours.pointer[index]
+        index += 1
+        // The sub-path's points without those that say nothing new.
+        var count: usize = 0
+        var at: usize = 0
+        while at < contour.count {
+            count = rowPoint(row.?, count, points[(contour.first + at) * 2], points[(contour.first + at) * 2 + 1])
+            at += 1
+        }
+        // (A closed one's last point back on its first is one of those.)
+        while contour.closed && count > 1 && !apart(row.?[count * 2 - 2], row.?[count * 2 - 1], row.?[0], row.?[1]) { count -= 1 }
+        if count > 1 && entries > 0 {
+            dashed(into, row.?, count, contour.closed, half, style, entries, dash.?, opening.?)
+        } else {
+            outline(into, row.?, count, contour.closed, half, style)
+        }
+    }
+    scratch.release(pool, mark)
+}
+
+// ---------------------------------------------------------------------------
+// The rasterizer
+
+// What fill() hands the coverage to: `count` pixels of row `y` from
+// column `x` on, a byte each (0 nothing, 255 all of the pixel; none of
+// the bytes is 0, and stretches of one row come from left to right, rows
+// from the top down). The bytes are fill()'s own and gone after the call.
+pub const Sink = fn(context: *anyopaque, y: i32, x: i32, coverage: [*]const u8, count: usize) -> void
+
+// One fill's working memory (all of it from core/scratch.mlx).
+const Raster = struct {
+    // Five numbers an edge: x at its top, its top, its bottom, x per y,
+    // and which way the path went along it (1 down, -1 up). All relative
+    // to the corner of the rectangle that is drawn, and inside it.
+    edges: [*]f64
+    // The edges by the row they start in: each row's first (-1: none) and
+    // the one after each.
+    head: [*]i32
+    next: [*]i32
+    // The edges that cross the row at hand.
+    active: [*]i32
+    count: usize
+    capacity: usize
+    // False while the edges are only counted.
+    storing: bool
+    // The row at hand: for each cell what the coverage changes by from
+    // the cell before it (two cells more than the row has pixels), which
+    // blocks of 64 cells have anything, and the bytes that go out.
+    cells: [*]f64
+    dirty: [*]u8
+    coverage: [*]u8
+    columns: usize
+    lines: usize
+    width: f64
+    height: f64
+    originX: f64
+    originY: f64
+}
+
+// What of `clip` the path can touch: its own box cut to the clip, in f64
+// first (neither the clip's far edge nor a path at 1e15 fits an i32).
+fn reach(path: *Path, clip: Rect) -> Rect {
+    if !path.*.whole || clip.width <= 0 || clip.height <= 0 { return geom.empty() }
+    const box = extent(path)
+    if box.left > box.right { return geom.empty() }
+    const most: f64 = 2147483647.0
+    const left = math.max(@floatFromInt(f64, clip.x), @floor(box.left))
+    const top = math.max(@floatFromInt(f64, clip.y), @floor(box.top))
+    const right = math.min(math.min(@floatFromInt(f64, clip.x) + @floatFromInt(f64, clip.width), most), @ceil(box.right))
+    const bottom = math.min(math.min(@floatFromInt(f64, clip.y) + @floatFromInt(f64, clip.height), most), @ceil(box.bottom))
+    if !(right > left) || !(bottom > top) { return geom.empty() }
+    return geom.rect(@intFromFloat(i32, left), @intFromFloat(i32, top), @intFromFloat(i32, right - left), @intFromFloat(i32, bottom - top))
+}
+
+// An edge, inside the rectangle and going down from (x0, y0) to (x1, y1).
+fn keep(r: *Raster, x0: f64, y0: f64, x1: f64, y1: f64, way: f64) -> void {
+    if !(y1 > y0) { return }
+    if !r.*.storing {
+        r.*.count += 1
+        return
+    }
+    if r.*.count >= r.*.capacity { return }
+    var slope = (x1 - x0) / (y1 - y0)
+    // (An edge too low for its slope to be a number is as good as upright.)
+    if !(math.abs(slope) < 1.0e300) { slope = 0.0 }
+    const base = r.*.count * 5
+    r.*.edges[base] = x0
+    r.*.edges[base + 1] = y0
+    r.*.edges[base + 2] = y1
+    r.*.edges[base + 3] = slope
+    r.*.edges[base + 4] = way
+    var row = @intFromFloat(usize, y0)
+    if row >= r.*.lines { row = r.*.lines - 1 }
+    r.*.next[r.*.count] = r.*.head[row]
+    r.*.head[row] = @intCast(i32, r.*.count)
+    r.*.count += 1
+}
+
+// One line of the path, cut to the rectangle. What of it lies above or
+// below is dropped, and what lies right of it too (nothing right of a
+// row changes the row). What lies left of it counts for every pixel of
+// its rows: it becomes an upright edge on the rectangle's left side.
+fn edge(r: *Raster, ax: f64, ay: f64, bx: f64, by: f64) -> void {
+    if ay == by { return }
+    var x0 = ax - r.*.originX
+    var y0 = ay - r.*.originY
+    var x1 = bx - r.*.originX
+    var y1 = by - r.*.originY
+    var way: f64 = 1.0
+    if y0 > y1 {
+        x0 = bx - r.*.originX
+        y0 = by - r.*.originY
+        x1 = ax - r.*.originX
+        y1 = ay - r.*.originY
+        way = -1.0
+    }
+    const height = r.*.height
+    if y1 <= 0.0 || y0 >= height { return }
+    const slope = (x1 - x0) / (y1 - y0)
+    if !(math.abs(slope) < 1.0e300) { return }
+    if y0 < 0.0 {
+        x0 = x0 - y0 * slope
+        y0 = 0.0
+    }
+    if y1 > height {
+        x1 = x0 + (height - y0) * slope
+        y1 = height
+    }
+    const width = r.*.width
+    if x0 <= 0.0 && x1 <= 0.0 {
+        keep(r, 0.0, y0, 0.0, y1, way)
+        return
+    }
+    if x0 >= width && x1 >= width { return }
+    if x0 < 0.0 {
+        const cut = math.clamp(y0 - x0 / slope, y0, y1)
+        keep(r, 0.0, y0, 0.0, cut, way)
+        x0 = 0.0
+        y0 = cut
+    } else if x1 < 0.0 {
+        const cut = math.clamp(y0 - x0 / slope, y0, y1)
+        keep(r, 0.0, cut, 0.0, y1, way)
+        x1 = 0.0
+        y1 = cut
+    }
+    if x0 > width {
+        y0 = math.clamp(y0 + (width - x0) / slope, y0, y1)
+        x0 = width
+    } else if x1 > width {
+        y1 = math.clamp(y0 + (width - x0) / slope, y0, y1)
+        x1 = width
+    }
+    keep(r, x0, y0, x1, y1, way)
+}
+
+// Every line of the path through edge() (each sub-path closed).
+fn edgesOf(r: *Raster, path: *Path) -> void {
+    const points = path.*.points.pointer
+    var index: usize = 0
+    while index < path.*.contours.length {
+        const contour = path.*.contours.pointer[index]
+        index += 1
+        if contour.count < 2 { continue }
+        const first = contour.first * 2
+        var ax = points[first + contour.count * 2 - 2]
+        var ay = points[first + contour.count * 2 - 1]
+        var at: usize = 0
+        while at < contour.count {
+            const bx = points[first + at * 2]
+            const by = points[first + at * 2 + 1]
+            edge(r, ax, ay, bx, by)
+            ax = bx
+            ay = by
+            at += 1
+        }
+    }
+}
+
+// The working memory of one fill of `area` and the path's edges in it.
+// False when there is nothing to draw or no memory.
+fn prepare(r: *Raster, pool: *scratch.Pool, path: *Path, area: Rect) -> bool {
+    r.*.columns = @intCast(usize, area.width)
+    r.*.lines = @intCast(usize, area.height)
+    r.*.width = @floatFromInt(f64, area.width)
+    r.*.height = @floatFromInt(f64, area.height)
+    r.*.originX = @floatFromInt(f64, area.x)
+    r.*.originY = @floatFromInt(f64, area.y)
+    r.*.count = 0
+    r.*.capacity = 0
+    r.*.storing = false
+    edgesOf(r, path)
+    if r.*.count == 0 || r.*.count > 2147483647 { return false }
+    const count = r.*.count
+    const blocks = (r.*.columns + 2) / 64 + 1
+    const edges = scratch.doubles(pool, count * 5)
+    const next = scratch.ints(pool, count)
+    const active = scratch.ints(pool, count)
+    const head = scratch.ints(pool, r.*.lines)
+    const cells = scratch.doubles(pool, r.*.columns + 2)
+    const dirty = scratch.bytes(pool, blocks)
+    const coverage = scratch.bytes(pool, r.*.columns)
+    if edges == null || next == null || active == null || head == null || cells == null || dirty == null || coverage == null { return false }
+    r.*.edges = edges.?
+    r.*.next = next.?
+    r.*.active = active.?
+    r.*.head = head.?
+    r.*.cells = cells.?
+    r.*.dirty = dirty.?
+    r.*.coverage = coverage.?
+    var index: usize = 0
+    while index < r.*.lines {
+        r.*.head[index] = -1
+        index += 1
+    }
+    index = 0
+    while index < r.*.columns + 2 {
+        r.*.cells[index] = 0.0
+        index += 1
+    }
+    std.mem.zero(r.*.dirty, blocks)
+    r.*.capacity = count
+    r.*.count = 0
+    r.*.storing = true
+    edgesOf(r, path)
+    return r.*.count > 0
+}
+
+// The byte for a cell whose coverage sums to `sum`: by NONZERO as much as
+// is covered at all (once is all), by EVEN_ODD what is covered an odd
+// number of times.
+inline fn shadeOf(sum: f64, even_odd: bool) -> u32 {
+    var amount = if sum < 0.0 { -sum } else { sum }
+    if even_odd {
+        amount = amount - 2.0 * @floor(amount * 0.5)
+        if amount > 1.0 { amount = 2.0 - amount }
+    }
+    if !(amount <= 1.0) { amount = 1.0 }
+    return @intFromFloat(u32, amount * 255.0 + 0.5)
+}
+
+// The row at hand summed up from left to right into bytes, its stretches
+// of coverage handed out, and its cells cleared for the next row. Blocks
+// of cells no edge touched are not gone through: the sum stays what it
+// was across them, so they are nothing or one stretch of one shade.
+fn sweepRow(r: *Raster, even_odd: bool, y: i32, origin: i32, sink: Sink, context: *anyopaque) -> void {
+    const columns = r.*.columns
+    const cells = r.*.cells
+    const dirty = r.*.dirty
+    const coverage = r.*.coverage
+    var sum: f64 = 0.0
+    // Where the stretch being gathered starts (`columns`: none is).
+    var begun = columns
+    var at: usize = 0
+    while at < columns {
+        if dirty[at >> 6] != 0 {
+            dirty[at >> 6] = 0
+            var stop = at + 64
+            if stop > columns { stop = columns }
+            while at < stop {
+                sum += cells[at]
+                cells[at] = 0.0
+                const shade = shadeOf(sum, even_odd)
+                coverage[at] = @intCast(u8, shade)
+                if shade == 0 {
+                    if begun < at { sink(context, y, origin + @intCast(i32, begun), coverage + begun, at - begun) }
+                    begun = columns
+                } else if begun == columns {
+                    begun = at
+                }
+                at += 1
+            }
+        } else {
+            var stop = at + 64
+            while stop < columns && dirty[stop >> 6] == 0 { stop += 64 }
+            if stop > columns { stop = columns }
+            const shade = shadeOf(sum, even_odd)
+            if shade == 0 {
+                if begun < at { sink(context, y, origin + @intCast(i32, begun), coverage + begun, at - begun) }
+                begun = columns
+            } else {
+                std.mem.set(coverage + at, @intCast(u8, shade), stop - at)
+                if begun == columns { begun = at }
+            }
+            at = stop
+        }
+    }
+    if begun < columns { sink(context, y, origin + @intCast(i32, begun), coverage + begun, columns - begun) }
+    // The two cells past the row took what crossed its right edge.
+    cells[columns] = 0.0
+    cells[columns + 1] = 0.0
+    dirty[columns >> 6] = 0
+    dirty[(columns + 1) >> 6] = 0
+}
+
+// All rows: each takes the edges that start in it, adds what every edge
+// crossing it covers to its cells, lets go of the edges that end in it,
+// and is swept.
+//
+// An edge's piece in a row covers, of each cell it crosses, the area to
+// its right, and of every cell further right the whole height of the
+// piece: that height (times the way the edge goes) is added where the
+// piece is and carried on by the sweep's sum, so that a cell holds how
+// much more is covered in it than in the one before. Without
+// anti-aliasing an edge counts whole from the first pixel whose centre
+// is on it or right of it, in the rows whose centre line it crosses.
+fn rows(r: *Raster, even_odd: bool, antialias: bool, origin_x: i32, origin_y: i32, sink: Sink, context: *anyopaque) -> void {
+    const edges = r.*.edges
+    const cells = r.*.cells
+    const dirty = r.*.dirty
+    const active = r.*.active
+    const limit = r.*.width
+    var live: usize = 0
+    var row: usize = 0
+    while row < r.*.lines {
+        var starting = r.*.head[row]
+        while starting >= 0 {
+            active[live] = starting
+            live += 1
+            starting = r.*.next[@intCast(usize, starting)]
+        }
+        if live == 0 {
+            row += 1
+            continue
+        }
+        const top = @floatFromInt(f64, row)
+        const bottom = top + 1.0
+        const centre = top + 0.5
+        var kept: usize = 0
+        var index: usize = 0
+        while index < live {
+            const id = active[index]
+            index += 1
+            const base = @intCast(usize, id) * 5
+            const x0 = edges[base]
+            const y0 = edges[base + 1]
+            const y1 = edges[base + 2]
+            const slope = edges[base + 3]
+            if y1 > bottom {
+                active[kept] = id
+                kept += 1
+            }
+            if !antialias {
+                if y0 <= centre && centre < y1 {
+                    const x = math.clamp(@ceil(x0 + (centre - y0) * slope - 0.5), 0.0, limit)
+                    const cell = @intFromFloat(usize, x)
+                    cells[cell] += edges[base + 4]
+                    dirty[cell >> 6] = 1
+                }
+                continue
+            }
+            const ya = if y0 > top { y0 } else { top }
+            const yb = if y1 < bottom { y1 } else { bottom }
+            if !(yb > ya) { continue }
+            const xa = math.clamp(x0 + (ya - y0) * slope, 0.0, limit)
+            const xb = math.clamp(x0 + (yb - y0) * slope, 0.0, limit)
+            const d = (yb - ya) * edges[base + 4]
+            const left = if xa < xb { xa } else { xb }
+            const right = if xa < xb { xb } else { xa }
+            const left_floor = @floor(left)
+            const first = @intFromFloat(usize, left_floor)
+            const right_ceil = @ceil(right)
+            const last = @intFromFloat(usize, right_ceil)
+            if last <= first + 1 {
+                // Within one cell: the piece's middle says how much of it
+                // lies to the right.
+                const middle = 0.5 * (left + right) - left_floor
+                cells[first] += d - d * middle
+                cells[first + 1] += d * middle
+                dirty[first >> 6] = 1
+                dirty[(first + 1) >> 6] = 1
+            } else {
+                // Across cells: a corner's triangle in the first and in
+                // the last, a slice of the same height in each between.
+                const s = 1.0 / (right - left)
+                const lead = 1.0 - (left - left_floor)
+                const a0 = 0.5 * s * lead * lead
+                const tail = right - right_ceil + 1.0
+                const am = 0.5 * s * tail * tail
+                cells[first] += d * a0
+                if last == first + 2 {
+                    cells[first + 1] += d * (1.0 - a0 - am)
+                } else {
+                    const a1 = s * (0.5 + lead)
+                    cells[first + 1] += d * (a1 - a0)
+                    var cell = first + 2
+                    while cell < last - 1 {
+                        cells[cell] += d * s
+                        cell += 1
+                    }
+                    const a2 = a1 + @floatFromInt(f64, last - first - 3) * s
+                    cells[last - 1] += d * (1.0 - a2 - am)
+                }
+                cells[last] += d * am
+                var block = first >> 6
+                while block <= last >> 6 {
+                    dirty[block] = 1
+                    block += 1
+                }
+            }
+        }
+        live = kept
+        sweepRow(r, even_odd, origin_y + @intCast(i32, row), origin_x, sink, context)
+        row += 1
+    }
+}
+
+// The path filled by `rule`, as far as it lies in `clip`: every stretch
+// of every row that has coverage goes to `sink` with `context`, top to
+// bottom and left to right. `antialias` off gives bytes of 255 only,
+// for the pixels whose centre is inside. Nothing is drawn for a path
+// that failed(), nor without working memory.
+pub fn fill(path: *Path, rule: u8, antialias: bool, clip: Rect, sink: Sink, context: *anyopaque) -> void {
+    const area = reach(path, clip)
+    if geom.isEmpty(area) { return }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const memory = scratch.bytes(pool, @sizeOf(Raster))
+    if memory != null {
+        const r: *Raster = unsafe { @ptrCast(*Raster, memory.?) }
+        if prepare(r, pool, path, area) { rows(r, rule == EVEN_ODD, antialias, area.x, area.y, sink, context) }
+    }
+    scratch.release(pool, mark)
+}
+
+// ---------------------------------------------------------------------------
+// What a fill went over
+
+const Box = struct {
+    left: i32
+    top: i32
+    right: i32
+    bottom: i32
+}
+
+fn boxNone(box: *Box) -> void {
+    box.*.left = 0
+    box.*.top = 0
+    box.*.right = 0
+    box.*.bottom = 0
+}
+
+fn boxAdd(box: *Box, y: i32, x: i32, count: usize) -> void {
+    const end = x + @intCast(i32, count)
+    if box.*.right == box.*.left {
+        box.*.left = x
+        box.*.right = end
+        box.*.top = y
+        box.*.bottom = y + 1
+        return
+    }
+    if x < box.*.left { box.*.left = x }
+    if end > box.*.right { box.*.right = end }
+    if y < box.*.top { box.*.top = y }
+    if y >= box.*.bottom { box.*.bottom = y + 1 }
+}
+
+fn boxRect(box: *Box) -> Rect {
+    return geom.rect(box.*.left, box.*.top, box.*.right - box.*.left, box.*.bottom - box.*.top)
+}
+
+// ---------------------------------------------------------------------------
+// Into a layer
+
+const DeviceFill = struct {
+    target: *device.Device
+    selection: ?*device.Device
+    // 64 pixels of the colour: what one tile's row is mixed from.
+    source: [*]u32
+    // A row of the selection's amounts times the coverage.
+    amounts: [*]u8
+    mode: u16
+    opacity: u32
+    flags: u32
+    box: Box
+}
+
+fn deviceSink(context: *anyopaque, y: i32, x: i32, coverage: [*]const u8, count: usize) -> void {
+    const state: *DeviceFill = unsafe { @ptrCast(*DeviceFill, context) }
+    var amounts = coverage
+    if state.*.selection != null {
+        const chosen = state.*.amounts
+        mask_module.readBytes(state.*.selection.?, geom.rect(x, y, @intCast(i32, count), 1), chosen, count)
+        var index: usize = 0
+        while index < count {
+            chosen[index] = @intCast(u8, pixel.mul(@intCast(u32, chosen[index]), @intCast(u32, coverage[index])))
+            index += 1
+        }
+        amounts = chosen
+    }
+    const target = state.*.target
+    const lx = x - target.*.x
+    const ly = y - target.*.y
+    const row = @intCast(usize, (ly & 63) << 6)
+    var done: usize = 0
+    while done < count {
+        const px = lx + @intCast(i32, done)
+        const within = @intCast(usize, px & 63)
+        var piece = 64 - within
+        if piece > count - done { piece = count - done }
+        // Where the selection lets nothing through no tile is made.
+        var wanted = state.*.selection == null
+        var index: usize = 0
+        while !wanted && index < piece {
+            wanted = amounts[done + index] != 0
+            index += 1
+        }
+        if wanted {
+            const pixels = device.tileWrite(target, px >> 6, ly >> 6)
+            if pixels != null {
+                blend.compositeSpan(state.*.mode, pixels.? + (row + within), state.*.source, piece, state.*.opacity, amounts + done, state.*.flags)
+                boxAdd(&state.*.box, y, x + @intCast(i32, done), piece)
+            }
+        }
+        done += piece
+    }
+}
+
+// The path filled with `color` (a straight pixel; its alpha counts) into
+// `target`, as far as it lies in `clip`: mixed in by the blend mode
+// `mode` with `opacity` (0-255) and blend.mlx's `flags`, and only where
+// `selection` (a mask, or null) lets it. The rectangle of the image that
+// changed (empty: nothing). begin() and commit() around it are the
+// caller's.
+pub fn fillDevice(target: *device.Device, path: *Path, rule: u8, antialias: bool, clip: Rect, color: u32, mode: u16, opacity: u32, flags: u32, selection: ?*device.Device) -> Rect {
+    const area = reach(path, clip)
+    if geom.isEmpty(area) || opacity == 0 { return geom.empty() }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const memory = scratch.bytes(pool, @sizeOf(DeviceFill))
+    const source = scratch.words(pool, 64)
+    const amounts = scratch.bytes(pool, @intCast(usize, area.width))
+    var changed = geom.empty()
+    if memory != null && source != null && amounts != null {
+        const state: *DeviceFill = unsafe { @ptrCast(*DeviceFill, memory.?) }
+        state.*.target = target
+        state.*.selection = selection
+        state.*.source = source.?
+        state.*.amounts = amounts.?
+        state.*.mode = mode
+        state.*.opacity = if opacity > 255 { 255 } else { opacity }
+        state.*.flags = flags
+        boxNone(&state.*.box)
+        device.fillWords(source.?, 64, color)
+        fill(path, rule, antialias, area, deviceSink, state)
+        changed = boxRect(&state.*.box)
+    }
+    scratch.release(pool, mark)
+    return changed
+}
+
+// The path stroked by `style` and that outline filled into `target` as
+// fillDevice() does. Empty also when there was no memory for the outline.
+pub fn strokeDevice(target: *device.Device, path: *Path, style: *const Stroke, antialias: bool, clip: Rect, color: u32, mode: u16, opacity: u32, flags: u32, selection: ?*device.Device) -> Rect {
+    const made = create(path.*.allocator)
+    if made == null { return geom.empty() }
+    made.?.*.tolerance = path.*.tolerance
+    stroke(path, made.?, style)
+    const changed = fillDevice(target, made.?, NONZERO, antialias, clip, color, mode, opacity, flags, selection)
+    destroy(made.?)
+    return changed
+}
+
+// ---------------------------------------------------------------------------
+// Into a mask
+
+const MaskFill = struct {
+    // The mask as it was, and what is written: the mask itself (ADD,
+    // SUBTRACT) or the one that takes its place.
+    mask: *device.Device
+    into: *device.Device
+    amount: u32
+    mode: u8
+    whole: bool
+    box: Box
+}
+
+fn maskSink(context: *anyopaque, y: i32, x: i32, coverage: [*]const u8, count: usize) -> void {
+    const state: *MaskFill = unsafe { @ptrCast(*MaskFill, context) }
+    const mask = state.*.mask
+    const amount = state.*.amount
+    const mode = state.*.mode
+    const blank = mask.*.defaultPixel & 255
+    // (The two devices sit at the same place: one tile grid for both.)
+    const lx = x - mask.*.x
+    const ly = y - mask.*.y
+    const row = @intCast(usize, (ly & 63) << 6)
+    var done: usize = 0
+    while done < count {
+        const px = lx + @intCast(i32, done)
+        const within = @intCast(usize, px & 63)
+        var piece = 64 - within
+        if piece > count - done { piece = count - done }
+        const before = device.tileRead(mask, px >> 6, ly >> 6)
+        // Nothing to take from and nothing to share with: no tile.
+        const idle = before == null && blank == 0 && (mode == SUBTRACT || mode == INTERSECT)
+        if !idle {
+            const pixels = device.tileWrite(state.*.into, px >> 6, ly >> 6)
+            if pixels == null {
+                state.*.whole = false
+            } else {
+                const words = pixels.? + (row + within)
+                var index: usize = 0
+                while index < piece {
+                    const value = pixel.mul(@intCast(u32, coverage[done + index]), amount)
+                    var old = blank
+                    if before != null { old = before.?[row + within + index] & 255 }
+                    var now = value
+                    if mode == ADD {
+                        now = if old + value > 255 { 255 } else { old + value }
+                    } else if mode == SUBTRACT {
+                        now = if old > value { old - value } else { 0 }
+                    } else if mode == INTERSECT {
+                        now = if old < value { old } else { value }
+                    }
+                    words[index] = pixel.gray(now)
+                    index += 1
+                }
+                boxAdd(&state.*.box, y, x + @intCast(i32, done), piece)
+            }
+        }
+        done += piece
+    }
+}
+
+// The path, as far as it lies in `clip`, into a mask (a selection) at
+// the strength `amount` (0-255: what a fully covered pixel counts):
+//
+//   REPLACE    the mask becomes the path: nothing is left anywhere else
+//   ADD        the path joins what is there (the amounts add up to 255)
+//   SUBTRACT   the path is taken out of what is there
+//   INTERSECT  what is there stays only inside the path (the smaller of
+//              the two amounts), and nowhere else
+//
+// REPLACE and INTERSECT also clear what lies outside the clip, and leave
+// the mask's default nothing. The rectangle of the image that changed
+// (for those two: with all the mask covered before, and with `clip` for
+// a mask whose default was not nothing). Without memory REPLACE and
+// INTERSECT leave the mask as it was and say empty. begin() and commit()
+// around it are the caller's.
+pub fn fillMask(mask: *device.Device, path: *Path, rule: u8, antialias: bool, clip: Rect, amount: u32, mode: u8) -> Rect {
+    const within = mode == ADD || mode == SUBTRACT
+    const strength = if amount > 255 { 255 } else { amount }
+    if within && strength == 0 { return geom.empty() }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const memory = scratch.bytes(pool, @sizeOf(MaskFill))
+    if memory == null {
+        scratch.release(pool, mark)
+        return geom.empty()
+    }
+    const state: *MaskFill = unsafe { @ptrCast(*MaskFill, memory.?) }
+    state.*.mask = mask
+    state.*.into = mask
+    state.*.amount = strength
+    state.*.mode = mode
+    state.*.whole = true
+    boxNone(&state.*.box)
+    if !within {
+        const fresh = device.create(mask.*.allocator, mask_module.NOTHING)
+        if fresh == null {
+            scratch.release(pool, mark)
+            return geom.empty()
+        }
+        device.moveTo(fresh.?, mask.*.x, mask.*.y)
+        state.*.into = fresh.?
+    }
+    fill(path, rule, antialias, clip, maskSink, state)
+    var changed = boxRect(&state.*.box)
+    if !within {
+        if state.*.whole {
+            changed = geom.unite(changed, device.extent(mask))
+            if mask.*.defaultPixel & 255 != 0 { changed = geom.unite(changed, reachOf(clip)) }
+            _ = device.assign(mask, state.*.into)
+        } else {
+            changed = geom.empty()
+        }
+        device.destroy(state.*.into)
+    }
+    scratch.release(pool, mark)
+    return changed
+}
+
+// `clip` without what lies farther than 2 to the 30th from the origin
+// (a rectangle whose edges can be added up).
+fn reachOf(clip: Rect) -> Rect {
+    if clip.width <= 0 || clip.height <= 0 { return geom.empty() }
+    const far: f64 = 1073741823.0
+    const left = math.clamp(@floatFromInt(f64, clip.x), -far, far)
+    const top = math.clamp(@floatFromInt(f64, clip.y), -far, far)
+    const right = math.clamp(@floatFromInt(f64, clip.x) + @floatFromInt(f64, clip.width), -far, far)
+    const bottom = math.clamp(@floatFromInt(f64, clip.y) + @floatFromInt(f64, clip.height), -far, far)
+    return geom.fromBounds(left, top, right, bottom)
+}
+
+// ---------------------------------------------------------------------------
+// As bytes
+
+const BytesFill = struct {
+    into: [*]u8
+    stride: usize
+    x: i32
+    y: i32
+}
+
+fn bytesSink(context: *anyopaque, y: i32, x: i32, coverage: [*]const u8, count: usize) -> void {
+    const state: *BytesFill = unsafe { @ptrCast(*BytesFill, context) }
+    std.mem.copy(state.*.into + (@intCast(usize, y - state.*.y) * state.*.stride + @intCast(usize, x - state.*.x)), coverage, count)
+}
+
+// The path's coverage of `area`, a byte a pixel, into `into`: row after
+// row, `stride` bytes from one row to the next (every byte of the area
+// is written, 0 where the path is not): a brush tip, a preview.
+pub fn coverageBytes(path: *Path, rule: u8, antialias: bool, area: Rect, into: [*]u8, stride: usize) -> void {
+    if area.width <= 0 || area.height <= 0 { return }
+    var row: usize = 0
+    while row < @intCast(usize, area.height) {
+        std.mem.zero(into + row * stride, @intCast(usize, area.width))
+        row += 1
+    }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const memory = scratch.bytes(pool, @sizeOf(BytesFill))
+    if memory != null {
+        const state: *BytesFill = unsafe { @ptrCast(*BytesFill, memory.?) }
+        state.*.into = into
+        state.*.stride = stride
+        state.*.x = area.x
+        state.*.y = area.y
+        fill(path, rule, antialias, area, bytesSink, state)
+    }
+    scratch.release(pool, mark)
+}

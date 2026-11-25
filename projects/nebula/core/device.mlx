@@ -1,0 +1,882 @@
+// nebula core: Device, a plane of pixels without edges, kept in tiles of
+// 64 x 64 that exist only where something was written. Everything that
+// holds pixels is one: a paint layer's content, a mask, the selection, a
+// group's cached picture, the image's projection.
+//
+// A pixel is a u32, 0xAARRGGBB with straight (not premultiplied) alpha:
+// what the file formats keep, and no colour is lost where alpha is low.
+// Where no tile is, every pixel is the device's default (transparent for
+// a layer; a mask is an opaque grey plane: 0xFF000000 nothing, 0xFFFFFFFF
+// all, see core/mask.mlx).
+//
+// Coordinates are the image's; the device sits at (x, y) in it (moving a
+// layer changes only that). Tiles are shared: a copy of a device takes no
+// memory until one of the two is written (the tile is copied then), and
+// that is also how changes are undone. Between begin() and commit() the
+// device keeps the tile each written place had before; commit() hands
+// them out as a Change, apply() puts the state before or after it back:
+//
+//     device.begin(layer)
+//     ... setPixel, writeRect, tileWrite, moveBy ...
+//     const change = device.commit(layer)        // null: nothing changed
+//     const dirty = device.apply(layer, change.?, true)    // undo
+//
+// Pixel loops go by tile (tileRead, tileWrite: 4096 words, row after row)
+// or by rectangle (readRect, writeRect into a buffer of the caller's);
+// pixel() and setPixel() are for single places.
+const std = @import("std")
+const geom = @import("./geom.mlx")
+const tilepool = @import("./tilepool.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Rect = geom.Rect
+
+pub const TILE: i32 = 64
+pub const TILE_MASK: i32 = 63
+pub const TILE_PIXELS: usize = 4096
+
+pub const TRANSPARENT: u32 = 0
+
+// 64 rows of 64 pixels, the top row first, and how many hold it (devices
+// and changes): a tile more than one holds is never written. Tiles are
+// cut from core/tilepool.mlx's blocks (`pool` is its word).
+pub const Tile = struct {
+    refs: usize
+    pool: usize
+    pixels: [4096]u32
+}
+
+// What a place held before a change and after it (null: no tile).
+pub const Memento = struct {
+    key: u64
+    before: ?*Tile
+    after: ?*Tile
+}
+
+// What one begin() ... commit() changed: the tiles before and after, where
+// the device sat and what its default was, and the image's rectangle that
+// looks different (both states).
+pub const Change = struct {
+    allocator: Allocator
+    entries: [*]Memento
+    count: usize
+    beforeX: i32
+    beforeY: i32
+    afterX: i32
+    afterY: i32
+    beforeDefault: u32
+    afterDefault: u32
+    area: Rect
+}
+
+pub const Device = struct {
+    allocator: Allocator
+    // Tile addresses by key (tileKey).
+    tiles: std.AutoHashMap(u64, usize)
+    defaultPixel: u32
+    x: i32
+    y: i32
+    // The tile looked up last (0: that place has none).
+    lastKey: u64
+    lastTile: usize
+    lastKnown: bool
+    // Between begin() and commit(): what each written place held before.
+    recording: bool
+    // (each place's index in `mementos`)
+    touched: std.AutoHashMap(u64, usize)
+    mementos: std.ArrayList(Memento)
+    startX: i32
+    startY: i32
+    startDefault: u32
+}
+
+// ---------------------------------------------------------------------------
+// Tiles
+
+fn larger(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+fn smaller(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+
+pub fn tileKey(tx: i32, ty: i32) -> u64 {
+    return (@intCast(u64, @bitCast(u32, tx)) << 32) | @intCast(u64, @bitCast(u32, ty))
+}
+
+pub fn keyX(key: u64) -> i32 { return @bitCast(i32, @intCast(u32, key >> 32)) }
+pub fn keyY(key: u64) -> i32 { return @bitCast(i32, @intCast(u32, key & 0xFFFFFFFF)) }
+
+fn tileAt(address: usize) -> *Tile { unsafe { return @ptrFromInt(*Tile, address) } }
+
+pub fn tilePixels(tile: *Tile) -> [*]u32 { return &tile.*.pixels }
+
+// `count` words at `target` set to `value`.
+pub fn fillWords(target: [*]u32, count: usize, value: u32) -> void {
+    var index: usize = 0
+    if count >= 16 {
+        const pair = @intCast(u64, value) | (@intCast(u64, value) << 32)
+        var pairs: [*]u64 = undefined
+        unsafe { pairs = @ptrCast([*]u64, target) }
+        const half = count / 2
+        var word: usize = 0
+        while word + 4 <= half {
+            pairs[word] = pair
+            pairs[word + 1] = pair
+            pairs[word + 2] = pair
+            pairs[word + 3] = pair
+            word += 4
+        }
+        while word < half {
+            pairs[word] = pair
+            word += 1
+        }
+        index = half * 2
+    }
+    while index < count {
+        target[index] = value
+        index += 1
+    }
+}
+
+// `count` words from `source` to `target` (not overlapping).
+pub fn copyWords(target: [*]u32, source: [*]const u32, count: usize) -> void {
+    if count == 0 { return }
+    unsafe { std.mem.copy(@ptrCast([*]u8, target), @ptrCast([*]const u8, source), count * 4) }
+}
+
+fn newTile(device: *Device, value: u32) -> ?*Tile {
+    const memory = tilepool.take(@sizeOf(Tile))
+    if memory == null { return null }
+    const tile: *Tile = unsafe { @ptrCast(*Tile, memory.?) }
+    tile.*.refs = 1
+    fillWords(tilePixels(tile), TILE_PIXELS, value)
+    return tile
+}
+
+fn copyOfTile(device: *Device, source: *Tile) -> ?*Tile {
+    const memory = tilepool.take(@sizeOf(Tile))
+    if memory == null { return null }
+    const tile: *Tile = unsafe { @ptrCast(*Tile, memory.?) }
+    tile.*.refs = 1
+    copyWords(tilePixels(tile), tilePixels(source), TILE_PIXELS)
+    return tile
+}
+
+fn retain(tile: ?*Tile) -> void {
+    if tile != null { tile.?.*.refs += 1 }
+}
+
+fn release(allocator: Allocator, tile: ?*Tile) -> void {
+    if tile == null { return }
+    const held = tile.?
+    if held.*.refs > 1 {
+        held.*.refs -= 1
+        return
+    }
+    unsafe { tilepool.give(@ptrCast([*]u8, held)) }
+}
+
+fn uniform(tile: *Tile, value: u32) -> bool {
+    const pixels = tilePixels(tile)
+    var index: usize = 0
+    while index < TILE_PIXELS {
+        if pixels[index] != value { return false }
+        index += 1
+    }
+    return true
+}
+
+fn lookup(device: *Device, key: u64) -> ?*Tile {
+    if device.*.lastKnown && device.*.lastKey == key {
+        if device.*.lastTile == 0 { return null }
+        return tileAt(device.*.lastTile)
+    }
+    const found = device.*.tiles.get(key)
+    device.*.lastKey = key
+    device.*.lastKnown = true
+    if found == null {
+        device.*.lastTile = 0
+        return null
+    }
+    device.*.lastTile = found.?
+    return tileAt(found.?)
+}
+
+// The place `key` holds `tile` from now on (null: none); the reference the
+// device had on what was there is the caller's to release.
+fn place(device: *Device, key: u64, tile: ?*Tile) -> bool {
+    device.*.lastKnown = false
+    if tile == null {
+        _ = device.*.tiles.remove(key)
+        return true
+    }
+    return device.*.tiles.put(key, @intFromPtr(tile.?))
+}
+
+fn note(device: *Device, key: u64, tile: ?*Tile) -> void {
+    if !device.*.recording { return }
+    if device.*.touched.contains(key) { return }
+    if !device.*.touched.put(key, device.*.mementos.count()) { return }
+    if !device.*.mementos.append(Memento.{ .key = key, .before = tile, .after = null }) {
+        _ = device.*.touched.remove(key)
+        return
+    }
+    retain(tile)
+}
+
+// ---------------------------------------------------------------------------
+// Making and ending
+
+// A device of nothing but `default_pixel`, at (0, 0). Null without memory.
+pub fn create(allocator: Allocator, default_pixel: u32) -> ?*Device {
+    const memory = allocator.alloc(@sizeOf(Device), 16)
+    if memory == null { return null }
+    const device: *Device = unsafe { @ptrCast(*Device, memory.?) }
+    device.*.allocator = allocator
+    device.*.tiles = std.AutoHashMap(u64, usize).init(allocator)
+    device.*.defaultPixel = default_pixel
+    device.*.x = 0
+    device.*.y = 0
+    device.*.lastKey = 0
+    device.*.lastTile = 0
+    device.*.lastKnown = false
+    device.*.recording = false
+    device.*.touched = std.AutoHashMap(u64, usize).init(allocator)
+    device.*.mementos = std.ArrayList(Memento).init(allocator)
+    device.*.startX = 0
+    device.*.startY = 0
+    device.*.startDefault = default_pixel
+    return device
+}
+
+fn releaseAll(device: *Device) -> void {
+    var values = device.*.tiles.valueIterator()
+    while true {
+        const value = values.next()
+        if value == null { break }
+        release(device.*.allocator, tileAt(value.?.*))
+    }
+    device.*.tiles.clearRetainingCapacity()
+    device.*.lastKnown = false
+}
+
+pub fn destroy(device: *Device) -> void {
+    if device.*.recording { _ = rollback(device) }
+    releaseAll(device)
+    device.*.tiles.deinit()
+    device.*.touched.deinit()
+    device.*.mementos.deinit()
+    const allocator = device.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, device), @sizeOf(Device), 16) }
+}
+
+// Another device with the same pixels at the same place: the tiles are
+// shared until one of the two is written. Null without memory.
+pub fn copy(device: *Device) -> ?*Device {
+    const made = create(device.*.allocator, device.*.defaultPixel)
+    if made == null { return null }
+    const other = made.?
+    other.*.x = device.*.x
+    other.*.y = device.*.y
+    if !other.*.tiles.ensureTotalCapacity(device.*.tiles.count()) {
+        destroy(other)
+        return null
+    }
+    var entries = device.*.tiles.iterator()
+    while true {
+        const entry = entries.next()
+        if entry == null { break }
+        const tile = tileAt(entry.?.value.*)
+        if other.*.tiles.put(entry.?.key.*, entry.?.value.*) { tile.*.refs += 1 }
+    }
+    return other
+}
+
+// `device` shows what `source` shows (tiles shared, the place and the
+// default taken over). Recorded like any other write.
+pub fn assign(device: *Device, source: *Device) -> bool {
+    clear(device)
+    device.*.defaultPixel = source.*.defaultPixel
+    device.*.x = source.*.x
+    device.*.y = source.*.y
+    var entries = source.*.tiles.iterator()
+    var whole = true
+    while true {
+        const entry = entries.next()
+        if entry == null { break }
+        const key = entry.?.key.*
+        const tile = tileAt(entry.?.value.*)
+        note(device, key, null)
+        if place(device, key, tile) { tile.*.refs += 1 } else { whole = false }
+    }
+    return whole
+}
+
+// ---------------------------------------------------------------------------
+// By tile
+
+// The 4096 pixels of tile (tx, ty) (device-local tile numbers: pixel
+// (x, y) of the image is in tile ((x - device.x) >> 6, (y - device.y) >> 6)
+// at ((x - device.x) & 63, (y - device.y) & 63)). Null: all default.
+pub fn tileRead(device: *Device, tx: i32, ty: i32) -> ?[*]const u32 {
+    const tile = lookup(device, tileKey(tx, ty))
+    if tile == null { return null }
+    return tilePixels(tile.?)
+}
+
+// The same to write (made of the default when not there yet; the device's
+// own copy when it was shared). Null only without memory.
+pub fn tileWrite(device: *Device, tx: i32, ty: i32) -> ?[*]u32 {
+    const key = tileKey(tx, ty)
+    const tile = lookup(device, key)
+    note(device, key, tile)
+    if tile == null {
+        const made = newTile(device, device.*.defaultPixel)
+        if made == null { return null }
+        if !place(device, key, made) {
+            release(device.*.allocator, made)
+            return null
+        }
+        return tilePixels(made.?)
+    }
+    if tile.?.*.refs > 1 {
+        const own = copyOfTile(device, tile.?)
+        if own == null { return null }
+        if !place(device, key, own) {
+            release(device.*.allocator, own)
+            return null
+        }
+        release(device.*.allocator, tile)
+        return tilePixels(own.?)
+    }
+    return tilePixels(tile.?)
+}
+
+// Tile (tx, ty) is all default again.
+pub fn dropTile(device: *Device, tx: i32, ty: i32) -> void {
+    const key = tileKey(tx, ty)
+    const tile = lookup(device, key)
+    if tile == null { return }
+    note(device, key, tile)
+    _ = place(device, key, null)
+    release(device.*.allocator, tile)
+}
+
+pub fn tileCount(device: *Device) -> usize { return device.*.tiles.count() }
+
+// Whether any tile lies in `area` (false: all of it is the default).
+pub fn touches(device: *Device, area: Rect) -> bool {
+    if geom.isEmpty(area) || device.*.tiles.count() == 0 { return false }
+    const left = area.x - device.*.x
+    const top = area.y - device.*.y
+    const tx1 = (left + area.width - 1) >> 6
+    const ty1 = (top + area.height - 1) >> 6
+    var ty = top >> 6
+    while ty <= ty1 {
+        var tx = left >> 6
+        while tx <= tx1 {
+            if lookup(device, tileKey(tx, ty)) != null { return true }
+            tx += 1
+        }
+        ty += 1
+    }
+    return false
+}
+
+// The keys of all tiles there are (tileKey; in no order), added to `into`.
+pub fn keys(device: *Device, into: *std.ArrayList(u64)) -> bool {
+    var all = device.*.tiles.keyIterator()
+    while true {
+        const key = all.next()
+        if key == null { break }
+        if !into.append(key.?.*) { return false }
+    }
+    return true
+}
+
+// The image's rectangle tile (tx, ty) covers.
+pub fn tileArea(device: *Device, tx: i32, ty: i32) -> Rect {
+    return geom.rect(tx * TILE + device.*.x, ty * TILE + device.*.y, TILE, TILE)
+}
+
+// ---------------------------------------------------------------------------
+// By pixel and by rectangle
+
+pub fn pixel(device: *Device, x: i32, y: i32) -> u32 {
+    const lx = x - device.*.x
+    const ly = y - device.*.y
+    const tile = lookup(device, tileKey(lx >> 6, ly >> 6))
+    if tile == null { return device.*.defaultPixel }
+    return tilePixels(tile.?)[@intCast(usize, ((ly & 63) << 6) | (lx & 63))]
+}
+
+pub fn setPixel(device: *Device, x: i32, y: i32, value: u32) -> void {
+    const lx = x - device.*.x
+    const ly = y - device.*.y
+    const pixels = tileWrite(device, lx >> 6, ly >> 6)
+    if pixels == null { return }
+    pixels.?[@intCast(usize, ((ly & 63) << 6) | (lx & 63))] = value
+}
+
+// The pixels of `area` into `into`, `stride` words from one row to the
+// next (the default where there is no tile).
+pub fn readRect(device: *Device, area: Rect, into: [*]u32, stride: usize) -> void {
+    if geom.isEmpty(area) { return }
+    const left = area.x - device.*.x
+    const top = area.y - device.*.y
+    const right = left + area.width
+    const bottom = top + area.height
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * TILE)
+        const row1 = smaller(bottom, ty * TILE + TILE)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * TILE)
+            const col1 = smaller(right, tx * TILE + TILE)
+            const span = @intCast(usize, col1 - col0)
+            const source = tileRead(device, tx, ty)
+            var row = row0
+            while row < row1 {
+                const target = into + (@intCast(usize, row - top) * stride + @intCast(usize, col0 - left))
+                if source == null {
+                    fillWords(target, span, device.*.defaultPixel)
+                } else {
+                    copyWords(target, source.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63)), span)
+                }
+                row += 1
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+}
+
+// The same as the device was at begin() (while a change is open; the same
+// as readRect otherwise, and the place it sat at then is not looked at):
+// what a stroke that weighs its dabs against the layer before it reads.
+pub fn readRectBefore(device: *Device, area: Rect, into: [*]u32, stride: usize) -> void {
+    if !device.*.recording {
+        readRect(device, area, into, stride)
+        return
+    }
+    if geom.isEmpty(area) { return }
+    const left = area.x - device.*.x
+    const top = area.y - device.*.y
+    const right = left + area.width
+    const bottom = top + area.height
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * TILE)
+        const row1 = smaller(bottom, ty * TILE + TILE)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * TILE)
+            const col1 = smaller(right, tx * TILE + TILE)
+            const span = @intCast(usize, col1 - col0)
+            const key = tileKey(tx, ty)
+            var source = tileRead(device, tx, ty)
+            const noted = device.*.touched.get(key)
+            if noted != null {
+                const before = device.*.mementos.items()[noted.?].before
+                source = null
+                if before != null { source = tilePixels(before.?) }
+            }
+            var row = row0
+            while row < row1 {
+                const target = into + (@intCast(usize, row - top) * stride + @intCast(usize, col0 - left))
+                if source == null {
+                    fillWords(target, span, device.*.startDefault)
+                } else {
+                    copyWords(target, source.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63)), span)
+                }
+                row += 1
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+}
+
+// The pixels of `area` from `from` (`stride` words a row). False when
+// memory ran out (what was written stays).
+pub fn writeRect(device: *Device, area: Rect, from: [*]const u32, stride: usize) -> bool {
+    if geom.isEmpty(area) { return true }
+    const left = area.x - device.*.x
+    const top = area.y - device.*.y
+    const right = left + area.width
+    const bottom = top + area.height
+    var whole = true
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * TILE)
+        const row1 = smaller(bottom, ty * TILE + TILE)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * TILE)
+            const col1 = smaller(right, tx * TILE + TILE)
+            const span = @intCast(usize, col1 - col0)
+            const target = tileWrite(device, tx, ty)
+            if target == null {
+                whole = false
+            } else {
+                var row = row0
+                while row < row1 {
+                    const source = from + (@intCast(usize, row - top) * stride + @intCast(usize, col0 - left))
+                    copyWords(target.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63)), source, span)
+                    row += 1
+                }
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+    return whole
+}
+
+// Every pixel of `area` is `value`. False when memory ran out.
+pub fn fill(device: *Device, area: Rect, value: u32) -> bool {
+    if geom.isEmpty(area) { return true }
+    const left = area.x - device.*.x
+    const top = area.y - device.*.y
+    const right = left + area.width
+    const bottom = top + area.height
+    var whole = true
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * TILE)
+        const row1 = smaller(bottom, ty * TILE + TILE)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * TILE)
+            const col1 = smaller(right, tx * TILE + TILE)
+            if value == device.*.defaultPixel && col1 - col0 == TILE && row1 - row0 == TILE {
+                dropTile(device, tx, ty)
+            } else if value == device.*.defaultPixel && tileRead(device, tx, ty) == null {
+                // Nothing there and nothing to be there.
+            } else {
+                const target = tileWrite(device, tx, ty)
+                if target == null {
+                    whole = false
+                } else {
+                    var row = row0
+                    while row < row1 {
+                        fillWords(target.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63)), @intCast(usize, col1 - col0), value)
+                        row += 1
+                    }
+                }
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+    return whole
+}
+
+// `area` is the default again.
+pub fn clearRect(device: *Device, area: Rect) -> void {
+    _ = fill(device, area, device.*.defaultPixel)
+}
+
+// Nothing but the default anywhere.
+pub fn clear(device: *Device) -> void {
+    var values = device.*.tiles.iterator()
+    while true {
+        const entry = values.next()
+        if entry == null { break }
+        const tile = tileAt(entry.?.value.*)
+        note(device, entry.?.key.*, tile)
+        release(device.*.allocator, tile)
+    }
+    device.*.tiles.clearRetainingCapacity()
+    device.*.lastKnown = false
+}
+
+// What every pixel without a tile is. Recorded by a change.
+pub fn setDefault(device: *Device, value: u32) -> void { device.*.defaultPixel = value }
+
+pub fn moveTo(device: *Device, x: i32, y: i32) -> void {
+    device.*.x = x
+    device.*.y = y
+}
+
+pub fn moveBy(device: *Device, dx: i32, dy: i32) -> void {
+    device.*.x += dx
+    device.*.y += dy
+}
+
+// The image's rectangle around every tile there is (empty: none).
+pub fn extent(device: *Device) -> Rect {
+    var all = device.*.tiles.keyIterator()
+    var any = false
+    var x0: i32 = 0
+    var y0: i32 = 0
+    var x1: i32 = 0
+    var y1: i32 = 0
+    while true {
+        const key = all.next()
+        if key == null { break }
+        const tx = keyX(key.?.*)
+        const ty = keyY(key.?.*)
+        if !any {
+            x0 = tx
+            x1 = tx
+            y0 = ty
+            y1 = ty
+            any = true
+        } else {
+            if tx < x0 { x0 = tx }
+            if tx > x1 { x1 = tx }
+            if ty < y0 { y0 = ty }
+            if ty > y1 { y1 = ty }
+        }
+    }
+    if !any { return geom.empty() }
+    return geom.rect(x0 * TILE + device.*.x, y0 * TILE + device.*.y, (x1 - x0 + 1) * TILE, (y1 - y0 + 1) * TILE)
+}
+
+// The image's rectangle around every pixel that is not the default
+// (empty: there is none).
+pub fn exactBounds(device: *Device) -> Rect {
+    var all = device.*.tiles.iterator()
+    var any = false
+    var x0: i32 = 0
+    var y0: i32 = 0
+    var x1: i32 = 0
+    var y1: i32 = 0
+    const blank = device.*.defaultPixel
+    while true {
+        const entry = all.next()
+        if entry == null { break }
+        const left = keyX(entry.?.key.*) * TILE
+        const top = keyY(entry.?.key.*) * TILE
+        // A tile inside what is known already adds nothing.
+        if any && left >= x0 && top >= y0 && left + TILE - 1 <= x1 && top + TILE - 1 <= y1 { continue }
+        const pixels = tilePixels(tileAt(entry.?.value.*))
+        var row: i32 = 0
+        while row < TILE {
+            var column: i32 = 0
+            while column < TILE {
+                if pixels[@intCast(usize, (row << 6) | column)] != blank {
+                    const x = left + column
+                    const y = top + row
+                    if !any {
+                        x0 = x
+                        x1 = x
+                        y0 = y
+                        y1 = y
+                        any = true
+                    } else {
+                        if x < x0 { x0 = x }
+                        if x > x1 { x1 = x }
+                        if y < y0 { y0 = y }
+                        if y > y1 { y1 = y }
+                    }
+                }
+                column += 1
+            }
+            row += 1
+        }
+    }
+    if !any { return geom.empty() }
+    return geom.rect(x0 + device.*.x, y0 + device.*.y, x1 - x0 + 1, y1 - y0 + 1)
+}
+
+// Whether every pixel is the default.
+pub fn isBlank(device: *Device) -> bool {
+    return geom.isEmpty(exactBounds(device))
+}
+
+// The bytes the device's tiles take (shared ones counted whole).
+pub fn bytes(device: *Device) -> usize { return device.*.tiles.count() * @sizeOf(Tile) }
+
+// ---------------------------------------------------------------------------
+// Changes
+
+// From now on the device keeps what it overwrites, until commit() or
+// rollback(). (A begin() while one is open keeps the one open.)
+pub fn begin(device: *Device) -> void {
+    if device.*.recording { return }
+    device.*.recording = true
+    device.*.startX = device.*.x
+    device.*.startY = device.*.y
+    device.*.startDefault = device.*.defaultPixel
+}
+
+pub fn isRecording(device: *Device) -> bool { return device.*.recording }
+
+// The image's rectangle what was written since begin() covers so far.
+pub fn pendingArea(device: *Device) -> Rect {
+    var area = geom.empty()
+    for memento in device.*.mementos.items() {
+        area = geom.unite(area, geom.rect(keyX(memento.key) * TILE + device.*.x, keyY(memento.key) * TILE + device.*.y, TILE, TILE))
+    }
+    return area
+}
+
+fn forget(device: *Device) -> void {
+    device.*.recording = false
+    device.*.mementos.clearRetainingCapacity()
+    device.*.touched.clearRetainingCapacity()
+}
+
+// Ends what begin() started. The change, to undo and redo it with apply()
+// (the caller's, to end with destroyChange()); null when nothing is
+// different (or memory ran out: then it cannot be undone). Tiles that
+// became all default are dropped.
+pub fn commit(device: *Device) -> ?*Change {
+    if !device.*.recording { return null }
+    const allocator = device.*.allocator
+    const list = device.*.mementos.items()
+    const moved = device.*.x != device.*.startX || device.*.y != device.*.startY
+    const recoloured = device.*.defaultPixel != device.*.startDefault
+    // What each place holds now; a place that did not change is let go.
+    var kept: usize = 0
+    var index: usize = 0
+    while index < list.length {
+        var now = lookup(device, list[index].key)
+        if now != null && now.?.*.refs == 1 && uniform(now.?, device.*.defaultPixel) {
+            _ = place(device, list[index].key, null)
+            release(allocator, now)
+            now = null
+        }
+        const before = list[index].before
+        const same = (before == null && now == null) || (before != null && now != null && @intFromPtr(before.?) == @intFromPtr(now.?))
+        if same {
+            release(allocator, before)
+        } else {
+            retain(now)
+            list[kept] = Memento.{ .key = list[index].key, .before = before, .after = now }
+            kept += 1
+        }
+        index += 1
+    }
+    if kept == 0 && !moved && !recoloured {
+        forget(device)
+        return null
+    }
+    const memory = allocator.alloc(@sizeOf(Change), 16)
+    var entries: ?[*]u8 = null
+    if kept > 0 { entries = allocator.alloc(kept * @sizeOf(Memento), 16) }
+    if memory == null || (kept > 0 && entries == null) {
+        // Not to be undone: the references go, the pixels stay.
+        index = 0
+        while index < kept {
+            release(allocator, list[index].before)
+            release(allocator, list[index].after)
+            index += 1
+        }
+        if memory != null { allocator.free(memory.?, @sizeOf(Change), 16) }
+        if entries != null { allocator.free(entries.?, kept * @sizeOf(Memento), 16) }
+        forget(device)
+        return null
+    }
+    const change: *Change = unsafe { @ptrCast(*Change, memory.?) }
+    change.*.allocator = allocator
+    change.*.count = kept
+    unsafe { change.*.entries = @ptrFromInt([*]Memento, if kept > 0 { @intFromPtr(entries.?) } else { 16 }) }
+    change.*.beforeX = device.*.startX
+    change.*.beforeY = device.*.startY
+    change.*.afterX = device.*.x
+    change.*.afterY = device.*.y
+    change.*.beforeDefault = device.*.startDefault
+    change.*.afterDefault = device.*.defaultPixel
+    var area = geom.empty()
+    index = 0
+    while index < kept {
+        change.*.entries[index] = list[index]
+        const tx = keyX(list[index].key) * TILE
+        const ty = keyY(list[index].key) * TILE
+        area = geom.unite(area, geom.rect(tx + device.*.x, ty + device.*.y, TILE, TILE))
+        if moved { area = geom.unite(area, geom.rect(tx + device.*.startX, ty + device.*.startY, TILE, TILE)) }
+        index += 1
+    }
+    if moved {
+        const here = extent(device)
+        area = geom.unite(area, here)
+        area = geom.unite(area, geom.moved(here, device.*.startX - device.*.x, device.*.startY - device.*.y))
+    }
+    change.*.area = area
+    forget(device)
+    return change
+}
+
+// Ends what begin() started by putting everything back. The image's
+// rectangle that looks different again.
+pub fn rollback(device: *Device) -> Rect {
+    if !device.*.recording { return geom.empty() }
+    const allocator = device.*.allocator
+    var area = geom.empty()
+    const moved = device.*.x != device.*.startX || device.*.y != device.*.startY
+    if moved { area = extent(device) }
+    const list = device.*.mementos.items()
+    device.*.recording = false
+    var index: usize = 0
+    while index < list.length {
+        const key = list[index].key
+        const now = lookup(device, key)
+        const before = list[index].before
+        area = geom.unite(area, geom.rect(keyX(key) * TILE + device.*.x, keyY(key) * TILE + device.*.y, TILE, TILE))
+        // The reference the memento held becomes the device's again.
+        _ = place(device, key, before)
+        release(allocator, now)
+        index += 1
+    }
+    device.*.x = device.*.startX
+    device.*.y = device.*.startY
+    device.*.defaultPixel = device.*.startDefault
+    if moved { area = geom.unite(area, extent(device)) }
+    forget(device)
+    return area
+}
+
+// Puts the state before `change` back (`undo`) or the one after it. The
+// image's rectangle that looks different.
+pub fn apply(device: *Device, change: *Change, undo: bool) -> Rect {
+    const allocator = device.*.allocator
+    var index: usize = 0
+    while index < change.*.count {
+        const entry = change.*.entries[index]
+        const wanted = if undo { entry.before } else { entry.after }
+        const now = lookup(device, entry.key)
+        const same = (wanted == null && now == null) || (wanted != null && now != null && @intFromPtr(wanted.?) == @intFromPtr(now.?))
+        if !same {
+            if place(device, entry.key, wanted) {
+                retain(wanted)
+                release(allocator, now)
+            }
+        }
+        index += 1
+    }
+    if undo {
+        device.*.x = change.*.beforeX
+        device.*.y = change.*.beforeY
+        device.*.defaultPixel = change.*.beforeDefault
+    } else {
+        device.*.x = change.*.afterX
+        device.*.y = change.*.afterY
+        device.*.defaultPixel = change.*.afterDefault
+    }
+    device.*.lastKnown = false
+    return change.*.area
+}
+
+// The bytes a change keeps alive (its tiles counted whole).
+pub fn changeBytes(change: *Change) -> usize {
+    var total: usize = @sizeOf(Change) + change.*.count * @sizeOf(Memento)
+    var index: usize = 0
+    while index < change.*.count {
+        if change.*.entries[index].before != null { total += @sizeOf(Tile) }
+        index += 1
+    }
+    return total
+}
+
+pub fn destroyChange(change: *Change) -> void {
+    const allocator = change.*.allocator
+    var index: usize = 0
+    while index < change.*.count {
+        release(allocator, change.*.entries[index].before)
+        release(allocator, change.*.entries[index].after)
+        index += 1
+    }
+    if change.*.count > 0 { unsafe { allocator.free(@ptrCast([*]u8, change.*.entries), change.*.count * @sizeOf(Memento), 16) } }
+    unsafe { allocator.free(@ptrCast([*]u8, change), @sizeOf(Change), 16) }
+}

@@ -1,0 +1,554 @@
+// nebula core: what was done to an image, to undo and redo it. A step is
+// what one undo takes back: one command, or all those recorded between
+// begin() and end() (a step may hold pixels of several layers, a new layer
+// and its pixels, ...). A command keeps what it needs to go both ways:
+//
+//   pixels     a layer's (a mask's) device.Change
+//   selection  the selection's device.Change and whether there was one
+//   added      a node put into the tree (undone: out again, kept here)
+//   removed    a node taken out (kept here until redone or forgotten)
+//   moved      a node elsewhere in the tree
+//   props      a node's name, flags, opacity, blend mode, parameters
+//   geometry   the image's size and resolution
+//   custom     anything else: a function that goes both ways
+//
+// Recording a command forgets what was undone before it; more than
+// `limit` steps forget the oldest. Whoever does something records it
+// after doing it (core/ops.mlx has the usual things done and recorded).
+const std = @import("std")
+const device_module = @import("./device.mlx")
+const node_module = @import("./node.mlx")
+const geom = @import("./geom.mlx")
+const image_module = @import("./image.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Rect = geom.Rect
+pub const Node = node_module.Node
+pub const Props = node_module.Props
+pub const Change = device_module.Change
+pub const Image = image_module.Image
+
+pub const PIXELS: u8 = 0
+pub const SELECTION: u8 = 1
+pub const ADDED: u8 = 2
+pub const REMOVED: u8 = 3
+pub const MOVED: u8 = 4
+pub const PROPS: u8 = 5
+pub const GEOMETRY: u8 = 6
+pub const CUSTOM: u8 = 7
+
+pub const NAME: usize = 64
+
+// A custom command going back (`undo`) or forth; the image's rectangle
+// that looks different.
+pub const Perform = fn(context: usize, image: *Image, undo: bool) -> Rect
+// The command is forgotten: frees what `context` holds.
+pub const Discard = fn(context: usize) -> void
+
+pub const Command = struct {
+    kind: u8
+    // Commands of one step share its number.
+    step: u32
+    name: [64]u8
+    nameLength: usize
+    node: u32
+    change: ?*Change
+    // A node out of the tree that this command keeps alive.
+    held: ?*Node
+    parent: u32
+    index: usize
+    toParent: u32
+    toIndex: usize
+    before: ?*Props
+    after: ?*Props
+    widthBefore: i32
+    heightBefore: i32
+    widthAfter: i32
+    heightAfter: i32
+    resolutionBefore: f64
+    resolutionAfter: f64
+    context: usize
+    perform: ?Perform
+    discard: ?Discard
+}
+
+pub const History = struct {
+    allocator: Allocator
+    commands: std.ArrayList(Command)
+    // commands[0 .. done) are done, the rest undone.
+    done: usize
+    nextStep: u32
+    // The step begin() opened (0: none), how many begin()s deep, its name.
+    open: u32
+    depth: usize
+    openName: [64]u8
+    openNameLength: usize
+    // Steps kept.
+    limit: usize
+    // Counted up at every step recorded, undone and redone.
+    serial: u64
+}
+
+pub fn create(allocator: Allocator) -> ?*History {
+    const memory = allocator.alloc(@sizeOf(History), 16)
+    if memory == null { return null }
+    const history: *History = unsafe { @ptrCast(*History, memory.?) }
+    history.*.allocator = allocator
+    history.*.commands = std.ArrayList(Command).init(allocator)
+    history.*.done = 0
+    history.*.nextStep = 1
+    history.*.open = 0
+    history.*.depth = 0
+    history.*.openNameLength = 0
+    history.*.limit = 200
+    history.*.serial = 0
+    return history
+}
+
+fn forget(history: *History, command: *Command) -> void {
+    if command.*.change != null { device_module.destroyChange(command.*.change.?) }
+    if command.*.held != null { node_module.destroy(command.*.held.?) }
+    if command.*.before != null { unsafe { history.*.allocator.free(@ptrCast([*]u8, command.*.before.?), @sizeOf(Props), 16) } }
+    if command.*.after != null { unsafe { history.*.allocator.free(@ptrCast([*]u8, command.*.after.?), @sizeOf(Props), 16) } }
+    if command.*.kind == CUSTOM && command.*.discard != null { command.*.discard.?(command.*.context) }
+    command.*.change = null
+    command.*.held = null
+    command.*.before = null
+    command.*.after = null
+}
+
+// Forgets everything (the image stays as it is).
+pub fn clear(history: *History) -> void {
+    const list = history.*.commands.items()
+    var index: usize = 0
+    while index < list.length {
+        forget(history, &list[index])
+        index += 1
+    }
+    history.*.commands.clearRetainingCapacity()
+    history.*.done = 0
+    history.*.open = 0
+    history.*.depth = 0
+}
+
+pub fn destroy(history: *History) -> void {
+    clear(history)
+    history.*.commands.deinit()
+    const allocator = history.*.allocator
+    unsafe { allocator.free(@ptrCast([*]u8, history), @sizeOf(History), 16) }
+}
+
+fn setName(into: *[64]u8, text: []const u8) -> usize {
+    var length: usize = 0
+    while length < text.length && length < NAME {
+        into.*[length] = text[length]
+        length += 1
+    }
+    return length
+}
+
+// What is recorded from now until end() is one step called `name`
+// (begin() inside it: part of the same step).
+pub fn begin(history: *History, name: []const u8) -> void {
+    if history.*.depth == 0 {
+        history.*.open = history.*.nextStep
+        history.*.nextStep += 1
+        history.*.openNameLength = setName(&history.*.openName, name)
+    }
+    history.*.depth += 1
+}
+
+pub fn end(history: *History) -> void {
+    if history.*.depth == 0 { return }
+    history.*.depth -= 1
+    if history.*.depth == 0 { history.*.open = 0 }
+}
+
+fn blank(kind: u8) -> Command {
+    return Command.{
+        .kind = kind,
+        .step = 0,
+        .name = undefined,
+        .nameLength = 0,
+        .node = 0,
+        .change = null,
+        .held = null,
+        .parent = 0,
+        .index = 0,
+        .toParent = 0,
+        .toIndex = 0,
+        .before = null,
+        .after = null,
+        .widthBefore = 0,
+        .heightBefore = 0,
+        .widthAfter = 0,
+        .heightAfter = 0,
+        .resolutionBefore = 0.0,
+        .resolutionAfter = 0.0,
+        .context = 0,
+        .perform = null,
+        .discard = null,
+    }
+}
+
+// How many steps there are (done and undone).
+pub fn stepCount(history: *History) -> usize {
+    const list = history.*.commands.items()
+    var count: usize = 0
+    var last: u32 = 0
+    for command in list {
+        if command.step != last {
+            count += 1
+            last = command.step
+        }
+    }
+    return count
+}
+
+// How many of them are done.
+pub fn stepsDone(history: *History) -> usize {
+    const list = history.*.commands.items()
+    var count: usize = 0
+    var last: u32 = 0
+    var index: usize = 0
+    while index < history.*.done {
+        if list[index].step != last {
+            count += 1
+            last = list[index].step
+        }
+        index += 1
+    }
+    return count
+}
+
+// The name of step `number` (0: the oldest).
+pub fn stepName(history: *History, number: usize) -> []const u8 {
+    const list = history.*.commands.items()
+    var count: usize = 0
+    var last: u32 = 0
+    var index: usize = 0
+    while index < list.length {
+        if list[index].step != last {
+            if count == number {
+                const bytes: [*]const u8 = &list[index].name
+                return bytes[0..list[index].nameLength]
+            }
+            count += 1
+            last = list[index].step
+        }
+        index += 1
+    }
+    return ""
+}
+
+fn record(history: *History, name: []const u8, given: *const Command) -> bool {
+    // What was undone is gone for good.
+    const list = history.*.commands.items()
+    var index = history.*.done
+    while index < list.length {
+        forget(history, &list[index])
+        index += 1
+    }
+    _ = history.*.commands.resize(history.*.done)
+    var command = given.*
+    if history.*.open != 0 {
+        command.step = history.*.open
+        const bytes: [*]const u8 = &history.*.openName
+        command.nameLength = setName(&command.name, bytes[0..history.*.openNameLength])
+    } else {
+        command.step = history.*.nextStep
+        history.*.nextStep += 1
+        command.nameLength = setName(&command.name, name)
+    }
+    if !history.*.commands.append(command) {
+        forget(history, &command)
+        return false
+    }
+    history.*.done = history.*.commands.count()
+    history.*.serial += 1
+    // The oldest steps go when there are too many.
+    while stepCount(history) > history.*.limit && history.*.limit > 0 {
+        const all = history.*.commands.items()
+        const first = all[0].step
+        if first == history.*.open { break }
+        var dropped: usize = 0
+        while dropped < all.length && all[dropped].step == first {
+            forget(history, &all[dropped])
+            dropped += 1
+        }
+        var at: usize = 0
+        while at + dropped < all.length {
+            all[at] = all[at + dropped]
+            at += 1
+        }
+        _ = history.*.commands.resize(all.length - dropped)
+        history.*.done -= dropped
+    }
+    return true
+}
+
+// The pixels of node `node` changed by `change` (the history's from now
+// on).
+pub fn pixels(history: *History, name: []const u8, node: u32, change: *Change) -> void {
+    var command = blank(PIXELS)
+    command.node = node
+    command.change = change
+    _ = record(history, name, &command)
+}
+
+// The selection changed by `change` (null: only whether there is one),
+// and whether there was and is one.
+pub fn selection(history: *History, name: []const u8, change: ?*Change, was: bool, is: bool) -> void {
+    var command = blank(SELECTION)
+    command.change = change
+    command.widthBefore = if was { 1 } else { 0 }
+    command.widthAfter = if is { 1 } else { 0 }
+    _ = record(history, name, &command)
+}
+
+// `node` was put into the tree (it is there now).
+pub fn added(history: *History, name: []const u8, node: *Node) -> void {
+    var command = blank(ADDED)
+    command.node = node.*.id
+    if node.*.parent != null {
+        command.parent = node.*.parent.?.*.id
+        const index = node_module.indexIn(node.*.parent.?, node)
+        if index != null { command.index = index.? }
+    }
+    _ = record(history, name, &command)
+}
+
+// `node` was taken out of `parent`, where it was child number `index` (it
+// is in no tree now, and the history's from now on).
+pub fn removed(history: *History, name: []const u8, node: *Node, parent: u32, index: usize) -> void {
+    var command = blank(REMOVED)
+    command.node = node.*.id
+    command.held = node
+    command.parent = parent
+    command.index = index
+    _ = record(history, name, &command)
+}
+
+pub fn moved(history: *History, name: []const u8, node: u32, from_parent: u32, from_index: usize, to_parent: u32, to_index: usize) -> void {
+    var command = blank(MOVED)
+    command.node = node
+    command.parent = from_parent
+    command.index = from_index
+    command.toParent = to_parent
+    command.toIndex = to_index
+    _ = record(history, name, &command)
+}
+
+fn keptProps(history: *History, from: *const Props) -> ?*Props {
+    const memory = history.*.allocator.alloc(@sizeOf(Props), 16)
+    if memory == null { return null }
+    const kept: *Props = unsafe { @ptrCast(*Props, memory.?) }
+    kept.* = from.*
+    return kept
+}
+
+pub fn props(history: *History, name: []const u8, node: u32, before: *const Props, after: *const Props) -> void {
+    var command = blank(PROPS)
+    command.node = node
+    command.before = keptProps(history, before)
+    command.after = keptProps(history, after)
+    if command.before == null || command.after == null {
+        forget(history, &command)
+        return
+    }
+    _ = record(history, name, &command)
+}
+
+pub fn geometry(history: *History, name: []const u8, width_before: i32, height_before: i32, resolution_before: f64, width_after: i32, height_after: i32, resolution_after: f64) -> void {
+    var command = blank(GEOMETRY)
+    command.widthBefore = width_before
+    command.heightBefore = height_before
+    command.resolutionBefore = resolution_before
+    command.widthAfter = width_after
+    command.heightAfter = height_after
+    command.resolutionAfter = resolution_after
+    _ = record(history, name, &command)
+}
+
+pub fn custom(history: *History, name: []const u8, context: usize, perform: Perform, discard: ?Discard) -> void {
+    var command = blank(CUSTOM)
+    command.context = context
+    command.perform = perform
+    command.discard = discard
+    _ = record(history, name, &command)
+}
+
+pub fn canUndo(history: *History) -> bool { return history.*.done > 0 && history.*.depth == 0 }
+
+pub fn canRedo(history: *History) -> bool { return history.*.done < history.*.commands.count() && history.*.depth == 0 }
+
+// What the next undo takes back ("" when there is nothing).
+pub fn undoName(history: *History) -> []const u8 {
+    if history.*.done == 0 { return "" }
+    const list = history.*.commands.items()
+    const step = list[history.*.done - 1].step
+    var index = history.*.done - 1
+    while index > 0 && list[index - 1].step == step { index -= 1 }
+    const bytes: [*]const u8 = &list[index].name
+    return bytes[0..list[index].nameLength]
+}
+
+pub fn redoName(history: *History) -> []const u8 {
+    const list = history.*.commands.items()
+    if history.*.done >= list.length { return "" }
+    const bytes: [*]const u8 = &list[history.*.done].name
+    return bytes[0..list[history.*.done].nameLength]
+}
+
+// The image's rectangle a node shows in (what is to be drawn again when
+// the node comes, goes or changes how it shows).
+pub fn footprint(image: *Image, node: *Node) -> Rect {
+    const kind = node.*.kind
+    if node_module.isMask(kind) {
+        if node.*.parent == null { return image_module.bounds(image) }
+        return footprint(image, node.*.parent.?)
+    }
+    if kind == node_module.FILL || kind == node_module.FILTER || kind == node_module.CLONE { return image_module.bounds(image) }
+    if kind == node_module.GROUP {
+        var area = geom.empty()
+        for child in node.*.children.items() {
+            if !node_module.isMask(child.*.kind) { area = geom.unite(area, footprint(image, child)) }
+        }
+        return area
+    }
+    var area = geom.empty()
+    if node.*.device != null { area = device_module.extent(node.*.device.?) }
+    if node.*.overlay != null { area = geom.unite(area, device_module.extent(node.*.overlay.?)) }
+    if node.*.substitute != null { area = geom.unite(area, device_module.extent(node.*.substitute.?)) }
+    return area
+}
+
+fn perform(image: *Image, command: *Command, undo: bool) -> Rect {
+    const root = image.*.root
+    if command.*.kind == PIXELS {
+        const node = node_module.find(root, command.*.node)
+        if node == null || node.?.*.device == null || command.*.change == null { return geom.empty() }
+        const area = device_module.apply(node.?.*.device.?, command.*.change.?, undo)
+        // A mask's or a filter layer's own change shows wherever its
+        // layer does not hide it; the area it names is the place.
+        image_module.damage(image, area)
+        return area
+    }
+    if command.*.kind == SELECTION {
+        var area = image_module.bounds(image)
+        if command.*.change != null { area = device_module.apply(image.*.selection, command.*.change.?, undo) }
+        image.*.selected = if undo { command.*.widthBefore != 0 } else { command.*.widthAfter != 0 }
+        image_module.selectionChanged(image)
+        return area
+    }
+    if command.*.kind == ADDED || command.*.kind == REMOVED {
+        // Out of the tree when an adding is undone or a removing redone.
+        const out = (command.*.kind == ADDED) == undo
+        if out {
+            const node = node_module.find(root, command.*.node)
+            if node == null { return geom.empty() }
+            const area = footprint(image, node.?)
+            node_module.detach(node.?)
+            command.*.held = node
+            image_module.damage(image, area)
+            return area
+        }
+        if command.*.held == null { return geom.empty() }
+        const parent = node_module.find(root, command.*.parent)
+        if parent == null { return geom.empty() }
+        if !node_module.insert(parent.?, command.*.held.?, command.*.index) { return geom.empty() }
+        const area = footprint(image, command.*.held.?)
+        command.*.held = null
+        image_module.damage(image, area)
+        return area
+    }
+    if command.*.kind == MOVED {
+        const node = node_module.find(root, command.*.node)
+        const parent = node_module.find(root, if undo { command.*.parent } else { command.*.toParent })
+        if node == null || parent == null { return geom.empty() }
+        const old_parent = node.?.*.parent
+        var old_index: usize = 0
+        if old_parent != null {
+            const found = node_module.indexIn(old_parent.?, node.?)
+            if found != null { old_index = found.? }
+        }
+        node_module.detach(node.?)
+        if !node_module.insert(parent.?, node.?, if undo { command.*.index } else { command.*.toIndex }) {
+            // Back where it was.
+            if old_parent != null { _ = node_module.insert(old_parent.?, node.?, old_index) }
+            return geom.empty()
+        }
+        const area = footprint(image, node.?)
+        image_module.damage(image, area)
+        return area
+    }
+    if command.*.kind == PROPS {
+        const node = node_module.find(root, command.*.node)
+        if node == null || command.*.before == null || command.*.after == null { return geom.empty() }
+        var area = footprint(image, node.?)
+        node_module.setProps(node.?, if undo { command.*.before.? } else { command.*.after.? })
+        area = geom.unite(area, footprint(image, node.?))
+        image_module.damage(image, area)
+        return area
+    }
+    if command.*.kind == GEOMETRY {
+        image.*.width = if undo { command.*.widthBefore } else { command.*.widthAfter }
+        image.*.height = if undo { command.*.heightBefore } else { command.*.heightAfter }
+        image.*.resolution = if undo { command.*.resolutionBefore } else { command.*.resolutionAfter }
+        device_module.clear(image.*.projection)
+        image_module.damageAll(image)
+        // Whoever shows the projection starts over.
+        image.*.updateSerial += 17
+        return image_module.bounds(image)
+    }
+    if command.*.kind == CUSTOM && command.*.perform != null {
+        const area = command.*.perform.?(command.*.context, image, undo)
+        image_module.damage(image, area)
+        return area
+    }
+    return geom.empty()
+}
+
+// Takes the last step back. The image's rectangle that looks different
+// (also damaged in the image); empty when there was nothing to undo.
+pub fn undo(history: *History, image: *Image) -> Rect {
+    if !canUndo(history) { return geom.empty() }
+    const list = history.*.commands.items()
+    const step = list[history.*.done - 1].step
+    var area = geom.empty()
+    while history.*.done > 0 && list[history.*.done - 1].step == step {
+        history.*.done -= 1
+        area = geom.unite(area, perform(image, &list[history.*.done], true))
+    }
+    history.*.serial += 1
+    image_module.settleActive(image)
+    image_module.touch(image)
+    return area
+}
+
+pub fn redo(history: *History, image: *Image) -> Rect {
+    if !canRedo(history) { return geom.empty() }
+    const list = history.*.commands.items()
+    const step = list[history.*.done].step
+    var area = geom.empty()
+    while history.*.done < list.length && list[history.*.done].step == step {
+        area = geom.unite(area, perform(image, &list[history.*.done], false))
+        history.*.done += 1
+    }
+    history.*.serial += 1
+    image_module.settleActive(image)
+    image_module.touch(image)
+    return area
+}
+
+// Undoes or redoes until `wanted` steps are done.
+pub fn jump(history: *History, image: *Image, wanted: usize) -> Rect {
+    var area = geom.empty()
+    while stepsDone(history) > wanted && canUndo(history) {
+        area = geom.unite(area, undo(history, image))
+    }
+    while stepsDone(history) < wanted && canRedo(history) {
+        area = geom.unite(area, redo(history, image))
+    }
+    return area
+}

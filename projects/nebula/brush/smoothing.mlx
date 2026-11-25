@@ -1,0 +1,1175 @@
+// nebula brush: what stands between the pointer and the stroke. The raw
+// points the canvas gets from the mouse or the pen go in, the points a
+// stroke is fed with come out. The pointer of this system tells whole
+// pixels, no pressure and no time (the canvas stamps each event with
+// std.time.milliseconds()), so a raw line is a staircase: this is what
+// makes it look drawn.
+//
+//     const smoother = smoothing.create(allocator, &options).?    // or init() on one kept in heap memory
+//     smoothing.reset(smoother)                                   // pen down: a new stroke
+//     var count = smoothing.push(smoother, &raw, out, CAPACITY)   // every motion
+//     count = smoothing.tick(smoother, now, out, CAPACITY)        // time passing without motion
+//     count = smoothing.tick(smoother, now, out, CAPACITY)        // pen up: how long it rested,
+//     count = smoothing.finish(smoother, out, CAPACITY)           // then what is still owed
+//     while smoothing.busy(smoother) { count = smoothing.drain(smoother, out, CAPACITY) }
+//
+// Each call writes the points to feed the stroke with now, in order, at
+// most `capacity` of them, and returns how many. What did not fit is not
+// lost: the smoother makes its points one at a time and stops where the
+// room ends, so whatever call comes next (drain() takes nothing in)
+// continues there, and busy() says that something waits. Only the raw
+// points wait inside, QUEUE of them at most; a caller that keeps pushing
+// without ever taking has the newest waiting one replaced by the one
+// pushed (the motion is merged, the line still ends where the pen is).
+// After finish() has given everything the smoother takes nothing until
+// reset().
+//
+// The modes (Options.mode):
+//   NONE        the points pass, without those that say nothing new.
+//   BASIC       the corners of the line through the raw points are cut:
+//               from the middle of one raw segment to the middle of the
+//               next goes a quadratic curve with the raw point between as
+//               its control, in steps of at most Options.step. Half a raw
+//               segment behind the pen.
+//   WEIGHTED    every point is the average of the raw points before it,
+//               each weighed by a bell curve (sigma Options.distance) of
+//               how far back along the line it is.
+//   STABILIZER  the pointer is sampled every 5 ms whatever the rate of
+//               its events and the brush is the average of the last
+//               Options.sampleCount samples; tick() lets it catch up
+//               while the pen rests. With Options.delayDistance the brush
+//               hangs on a rope of that length instead: it stays while
+//               the pointer is nearer and is pulled along at that
+//               distance when it is further (the rope then is what
+//               steadies the line; the samples only steady the sensors).
+//   PIXEL       pixel art: every pixel on the way, at its centre, without
+//               the corner pixel of an L (one pixel behind the pen, for a
+//               pixel is known to be no corner only when the next came).
+//
+// Pressure for a device that has none (Options.simulatePressure): slow is
+// thick, fast is thin. The speed is taken from the raw points, evened out
+// over time; with Options.taper the line starts thin and finish() lets it
+// run out in the pen's direction with falling pressure, the further the
+// faster the pen was (so tick() before finish() matters: a pen that
+// rested ends blunt). A stroke whose raw points bring pressure is left
+// alone. Options.pressureCurve, the tablet's response, is applied to every
+// pressure that leaves.
+//
+// The times that come out never run back: the stroke takes its speed from
+// place and time.
+//
+// Not done: the rotation of a pen is carried along, never averaged (an
+// angle does not average like a length); the dead zone of the stabilizer
+// replaces the average of the places instead of adding to it.
+const std = @import("std")
+const math = @import("std.math")
+const point_module = @import("./point.mlx")
+
+pub const Point = point_module.Point
+pub const Allocator = std.allocator.Allocator
+
+pub const NONE: u8 = 0
+pub const BASIC: u8 = 1
+pub const WEIGHTED: u8 = 2
+pub const STABILIZER: u8 = 3
+pub const PIXEL: u8 = 4
+pub const MODES: usize = 5
+
+// Options.simulatePressure: the pressure is what the raw points bring, or
+// made from the pen's speed.
+pub const PRESSURE_GIVEN: u8 = 0
+pub const PRESSURE_BY_SPEED: u8 = 1
+
+// Raw points that can wait for room in `out`.
+pub const QUEUE: usize = 256
+// The most samples the stabilizer averages, and the raw points the
+// weighted average looks back over.
+pub const SAMPLES: usize = 256
+
+// All lengths are pixels of the image, as the raw points are: see
+// forZoom() for lengths meant on the screen.
+pub const Options = struct {
+    mode: u8
+    // How coarse the raw points are: the pointer's whole pixel in pixels
+    // of the image (forZoom() sets it); 0 for a pen that tells fractions.
+    grain: f64
+    // BASIC: the furthest two points that come out are apart.
+    step: f64
+    // WEIGHTED: the sigma of the bell curve (below 0.01: none, the points pass).
+    distance: f64
+    // The distance is meant on the screen: forZoom() divides it by the zoom.
+    scalable: bool
+    // WEIGHTED, 0 to 1: how fast the end of the line closes up to the pen
+    // at finish(): the bell curve shrinks by this part with every closing
+    // point; 1 goes straight there, 0 leaves the end where it is.
+    tailAggressiveness: f64
+    // WEIGHTED: the pressure is averaged as the places are.
+    smoothPressure: bool
+    // STABILIZER: how many samples (5 ms each) are averaged, 1 to SAMPLES.
+    sampleCount: u32
+    // STABILIZER: the length of the rope (0: none, the average).
+    delayDistance: f64
+    // STABILIZER: at finish() the line runs on to the pointer.
+    finishLine: bool
+    // STABILIZER: pressure and tilt are the average of the samples too.
+    stabilizeSensors: bool
+    // PRESSURE_GIVEN or PRESSURE_BY_SPEED.
+    simulatePressure: u8
+    // The device is a pen: its pressure is never made up.
+    hasPressure: bool
+    // The speed, pixels in a millisecond, from which on the simulated
+    // pressure is the least.
+    speedForMinimum: f64
+    // The least simulated pressure, 0 to 1.
+    minimumPressure: f64
+    // Simulated pressure starts at the least and ends there.
+    taper: bool
+    // How long the start's taper is and the end's at most.
+    taperLength: f64
+    // The tablet's response: 256 entries, the pressure that leaves for a
+    // pressure of index / 255 (between entries a straight line); null:
+    // as it is. Must stay where it is while the smoother is used.
+    pressureCurve: ?[*]const f32
+}
+
+// What a new document draws with.
+pub fn defaults() -> Options {
+    return Options.{
+        .mode = BASIC,
+        .grain = 1.0,
+        .step = 1.0,
+        .distance = 15.0,
+        .scalable = true,
+        .tailAggressiveness = 0.15,
+        .smoothPressure = false,
+        .sampleCount = 50,
+        .delayDistance = 0.0,
+        .finishLine = true,
+        .stabilizeSensors = true,
+        .simulatePressure = PRESSURE_GIVEN,
+        .hasPressure = false,
+        .speedForMinimum = 2.0,
+        .minimumPressure = 0.2,
+        .taper = true,
+        .taperLength = 24.0,
+        .pressureCurve = null,
+    }
+}
+
+// The options for a canvas shown at `zoom` (screen pixels for one of the
+// image): what the hand does on the screen (the rope, the speed that
+// thins the line, the taper, and the weighted distance when it is
+// `scalable`) becomes pixels of the image. The step of BASIC stays: it
+// is the image's fineness.
+pub fn forZoom(options: *const Options, zoom: f64) -> Options {
+    var scaled = options.*
+    if !(zoom > 0.0) { return scaled }
+    scaled.grain = 1.0 / zoom
+    if scaled.scalable { scaled.distance = scaled.distance / zoom }
+    scaled.delayDistance = scaled.delayDistance / zoom
+    scaled.speedForMinimum = scaled.speedForMinimum / zoom
+    scaled.taperLength = scaled.taperLength / zoom
+    return scaled
+}
+
+// A mode's name for people.
+pub fn title(mode: u8, german: bool) -> []const u8 {
+    if mode == BASIC { return if german { "Einfach" } else { "Basic" } }
+    if mode == WEIGHTED { return if german { "Gewichtet" } else { "Weighted" } }
+    if mode == STABILIZER { return if german { "Stabilisator" } else { "Stabilizer" } }
+    if mode == PIXEL { return if german { "Pixelgenau" } else { "Pixel perfect" } }
+    return if german { "Keine" } else { "None" }
+}
+
+// The stabilizer's clock: a sample every so many milliseconds.
+const PERIOD: f64 = 5.0
+// A pointer silent for this long rested (its events come only while it
+// moves): the stabilizer's samples of that time are where it was, not on
+// the way to where it went then, and BASIC's curve closes up to it.
+const REST_GAP: f64 = 100.0
+// The time, milliseconds, over which the pen's speed is evened out: the
+// stamps are whole milliseconds and the places whole pixels, one step
+// alone says little.
+const SPEED_SETTLE: f64 = 80.0
+// The closing points of a line are stamped as if drawn at the pen's last
+// speed, but not slower than this (pixels in a millisecond).
+const SLOWEST: f64 = 0.05
+// How far behind the line's end the point lies from which its direction
+// is taken.
+const DIRECTION_REACH: f64 = 4.0
+// The end's taper is as long as the pen would have gone in this time.
+const TAPER_TIME: f64 = 60.0
+const TAPER_STEP: f64 = 2.0
+const TAPER_POINTS: f64 = 16.0
+// WEIGHTED: the closing points at most, and the sigma below which the
+// next one is the pen itself.
+const TAIL_POINTS: usize = 24
+const TAIL_END: f64 = 0.5
+// BASIC: the curve bends around raw points at least this many grains
+// apart: nearer ones are the steps of a staircase.
+const BASIC_SPAN: f64 = 6.0
+// A weight below this part of the newest point's ends the look back.
+const WEIGHT_CUT: f64 = 0.01
+// No single raw segment makes more points than this.
+const RUN_LIMIT: usize = 1048576
+// Raw points outside these are not points (and a NaN is none).
+const PLACE_LIMIT: f64 = 1.0e9
+const TIME_LIMIT: f64 = 1.0e15
+
+const EVENT_RAW: u8 = 0
+const EVENT_TICK: u8 = 1
+
+// What the smoother is in the middle of making points from.
+const RUN_IDLE: u8 = 0
+// runA itself.
+const RUN_POINT: u8 = 1
+// The curve from runA over the control runB to runC.
+const RUN_CURVE: u8 = 2
+// The samples due between runA and runC (or resting at runC).
+const RUN_SAMPLES: u8 = 3
+// The pointer's way from runA to runC, the brush on its rope behind.
+const RUN_ROPE: u8 = 4
+// The pixels of the line to the pen's pixel.
+const RUN_PIXELS: u8 = 5
+// The weighted average closing up to the pen.
+const RUN_TAIL: u8 = 6
+// The line running out from runA in the direction (runB.x, runB.y).
+const RUN_TAPER: u8 = 7
+
+const STAGE_DRAWING: u8 = 0
+// finish() was called: the mode's own end is due,
+const STAGE_TAIL: u8 = 1
+// then the taper,
+const STAGE_TAPER: u8 = 2
+// then nothing until reset().
+const STAGE_DONE: u8 = 3
+
+pub const Smoother = struct {
+    options: Options
+
+    // The raw points (and ticks: only their time counts) not yet taken
+    // in, a ring.
+    events: [QUEUE]Point
+    eventKinds: [QUEUE]u8
+    eventFirst: usize
+    eventCount: usize
+
+    stage: u8
+    // A raw point was taken in.
+    started: bool
+    // The raw point being taken in, and the one before it.
+    event: Point
+    latest: Point
+    // Until when the pen is known to have been at `latest`.
+    restedUntil: f64
+    // A raw point brought pressure: nothing is simulated in this stroke.
+    real: bool
+
+    // The pen's speed, pixels in a millisecond, evened out; when it was
+    // last measured and the way gone since without time passing.
+    speed: f64
+    speedTime: f64
+    speedOwed: f64
+
+    run: u8
+    runIndex: usize
+    runCount: usize
+    runA: Point
+    runB: Point
+    runC: Point
+
+    // What left last (as it left), its pressure before the curve, how
+    // many left, how long the line is, and a point trailing behind its
+    // end for the direction.
+    lastOut: Point
+    lastPlain: f64
+    outCount: usize
+    travelled: f64
+    anchorX: f64
+    anchorY: f64
+    // The points now leaving are the end's taper: their pressure is set.
+    closing: bool
+    taperWay: f64
+
+    // BASIC: the raw point the curve last bent around, the middle it has
+    // reached, and whether there was a first segment.
+    control: Point
+    middle: Point
+    curved: bool
+
+    // WEIGHTED: the raw points, newest before ringNext, each with its
+    // distance to the one before. STABILIZER: the samples, sampleCount of
+    // them always.
+    ring: [SAMPLES]Point
+    ringGap: [SAMPLES]f64
+    ringNext: usize
+    ringCount: usize
+    tailSigma: f64
+
+    // STABILIZER: the time of the newest sample, how many of the newest
+    // are alike, until when samples are due, whether they rest at runC
+    // (instead of going from runA to it) and whether they go on until
+    // all are alike; the brush on the rope and the sensors it carries.
+    sampleTime: f64
+    alike: usize
+    sampleUntil: f64
+    sampleRests: bool
+    sampleCloses: bool
+    brush: Point
+    steady: Point
+
+    // PIXEL: the pen's pixel, the last pixel that left, the one held
+    // back, and the line being walked.
+    pixelX: i64
+    pixelY: i64
+    beforeX: i64
+    beforeY: i64
+    holding: bool
+    held: Point
+    heldX: i64
+    heldY: i64
+    lineX: i64
+    lineY: i64
+    lineError: i64
+    lineAcross: i64
+    lineDown: i64
+    lineStepX: i64
+    lineStepY: i64
+}
+
+// A smoother in heap memory, ready for a stroke; null without memory.
+pub fn create(allocator: Allocator, options: *const Options) -> ?*Smoother {
+    const memory = allocator.alloc(@sizeOf(Smoother), 16)
+    if memory == null { return null }
+    const smoother: *Smoother = unsafe { @ptrCast(*Smoother, memory.?) }
+    init(smoother, options)
+    return smoother
+}
+
+pub fn destroy(allocator: Allocator, smoother: *Smoother) -> void {
+    unsafe { allocator.free(@ptrCast([*]u8, smoother), @sizeOf(Smoother), 16) }
+}
+
+// Makes a smoother of memory the caller keeps (heap memory: it is tens of
+// KiB), for these options: values that make no sense become the nearest
+// that do. Again between strokes for other options.
+pub fn init(smoother: *Smoother, options: *const Options) -> void {
+    smoother.*.options = options.*
+    const own = &smoother.*.options
+    if own.*.mode > PIXEL { own.*.mode = NONE }
+    if !(own.*.grain > 0.0) { own.*.grain = 0.0 }
+    if !(own.*.step >= 0.01) { own.*.step = 1.0 }
+    if !(own.*.distance >= 0.01) { own.*.distance = 0.0 }
+    own.*.tailAggressiveness = unit(own.*.tailAggressiveness)
+    if own.*.sampleCount == 0 { own.*.sampleCount = 1 }
+    if own.*.sampleCount > @intCast(u32, SAMPLES) { own.*.sampleCount = @intCast(u32, SAMPLES) }
+    if !(own.*.delayDistance > 0.0) { own.*.delayDistance = 0.0 }
+    if own.*.simulatePressure > PRESSURE_BY_SPEED { own.*.simulatePressure = PRESSURE_GIVEN }
+    if !(own.*.speedForMinimum > 0.0) { own.*.speedForMinimum = 2.0 }
+    own.*.minimumPressure = unit(own.*.minimumPressure)
+    if !(own.*.taperLength > 0.0) { own.*.taperLength = 0.0 }
+    reset(smoother)
+}
+
+// Forgets the stroke (also what of it still waited): the next raw point
+// starts a new one. Two strokes of the same points come out the same.
+pub fn reset(smoother: *Smoother) -> void {
+    smoother.*.eventFirst = 0
+    smoother.*.eventCount = 0
+    smoother.*.stage = STAGE_DRAWING
+    smoother.*.started = false
+    smoother.*.restedUntil = 0.0
+    smoother.*.real = false
+    smoother.*.speed = 0.0
+    smoother.*.speedTime = 0.0
+    smoother.*.speedOwed = 0.0
+    smoother.*.run = RUN_IDLE
+    smoother.*.runIndex = 0
+    smoother.*.runCount = 0
+    smoother.*.lastPlain = 0.0
+    smoother.*.outCount = 0
+    smoother.*.travelled = 0.0
+    smoother.*.anchorX = 0.0
+    smoother.*.anchorY = 0.0
+    smoother.*.closing = false
+    smoother.*.taperWay = 0.0
+    smoother.*.curved = false
+    smoother.*.ringNext = 0
+    smoother.*.ringCount = 0
+    smoother.*.tailSigma = 0.0
+    smoother.*.sampleTime = 0.0
+    smoother.*.alike = 0
+    smoother.*.sampleUntil = 0.0
+    smoother.*.sampleRests = false
+    smoother.*.sampleCloses = false
+    smoother.*.holding = false
+}
+
+// Takes one raw point (one that is no place or no time, a NaN or beyond
+// 1e9 pixels, is left out; a time before the last one counts as the last
+// one) and writes the points to feed the stroke with now: 0 to `capacity`.
+pub fn push(smoother: *Smoother, raw: *const Point, out: [*]Point, capacity: usize) -> usize {
+    if smoother.*.stage == STAGE_DRAWING && within(raw.*.x, PLACE_LIMIT) && within(raw.*.y, PLACE_LIMIT) && within(raw.*.time, TIME_LIMIT) {
+        const slot = slotFor(smoother, EVENT_RAW)
+        if slot < QUEUE {
+            const waiting = &smoother.*.events[slot]
+            waiting.* = raw.*
+            // A sensor that says nothing says: full pressure, upright.
+            waiting.*.pressure = if raw.*.pressure == raw.*.pressure { unit(raw.*.pressure) } else { 1.0 }
+            if !within(raw.*.tiltX, 1.0e9) { waiting.*.tiltX = 0.0 }
+            if !within(raw.*.tiltY, 1.0e9) { waiting.*.tiltY = 0.0 }
+            if !within(raw.*.rotation, 1.0e9) { waiting.*.rotation = 0.0 }
+        }
+    }
+    return drain(smoother, out, capacity)
+}
+
+// Time passed without motion, it is `time` now: the stabilizer's average
+// goes on toward the resting pointer, and the pen's speed falls. Writes
+// the points that makes, 0 to `capacity`.
+pub fn tick(smoother: *Smoother, time: f64, out: [*]Point, capacity: usize) -> usize {
+    if smoother.*.stage == STAGE_DRAWING && within(time, TIME_LIMIT) {
+        const slot = slotFor(smoother, EVENT_TICK)
+        if slot < QUEUE { smoother.*.events[slot].time = time }
+    }
+    return drain(smoother, out, capacity)
+}
+
+// The pen lifted: writes what is still owed so that the line ends where
+// the pen ended (BASIC: the last half segment; WEIGHTED: the closing up,
+// unless tailAggressiveness is 0; STABILIZER: the way to the pointer when
+// finishLine is on; PIXEL: the pixel held back), then the taper's closing
+// points beyond it. Call it (or drain()) again while busy().
+pub fn finish(smoother: *Smoother, out: [*]Point, capacity: usize) -> usize {
+    if smoother.*.stage == STAGE_DRAWING { smoother.*.stage = STAGE_TAIL }
+    return drain(smoother, out, capacity)
+}
+
+// Writes points that waited for room, 0 to `capacity`, taking nothing in.
+pub fn drain(smoother: *Smoother, out: [*]Point, capacity: usize) -> usize {
+    var count: usize = 0
+    while count < capacity {
+        const place = &out[count]
+        if !produce(smoother, place) { break }
+        if deliver(smoother, place) { count += 1 }
+    }
+    return count
+}
+
+// Whether points wait (or may: the last ones can turn out to say nothing
+// new) for a call with room.
+pub fn busy(smoother: *const Smoother) -> bool {
+    return smoother.*.run != RUN_IDLE || smoother.*.eventCount != 0 || smoother.*.stage == STAGE_TAIL || smoother.*.stage == STAGE_TAPER
+}
+
+inline fn unit(value: f64) -> f64 {
+    return if value >= 1.0 { 1.0 } else if value > 0.0 { value } else { 0.0 }
+}
+
+inline fn within(value: f64, limit: f64) -> bool {
+    return value > -limit && value < limit
+}
+
+inline fn length(dx: f64, dy: f64) -> f64 {
+    return math.sqrt(dx * dx + dy * dy)
+}
+
+// How many steps a way of `ratio` steps' length takes: whole, at least
+// one, at most RUN_LIMIT.
+fn pieces(ratio: f64) -> usize {
+    if !(ratio > 1.0) { return 1 }
+    if ratio >= @floatFromInt(f64, RUN_LIMIT) { return RUN_LIMIT }
+    return @intFromFloat(usize, math.ceil(ratio))
+}
+
+// Whether this stroke's pressure is made from its speed.
+fn simulated(s: *const Smoother) -> bool {
+    return s.*.options.simulatePressure == PRESSURE_BY_SPEED && !s.*.options.hasPressure && !s.*.real
+}
+
+// The speed the closing points of a line are stamped with.
+fn pace(s: *const Smoother) -> f64 {
+    return if s.*.speed > SLOWEST { s.*.speed } else { SLOWEST }
+}
+
+// The place in the ring of waiting events for one more, QUEUE when it is
+// not to be kept. A full ring gives its newest place again (see the
+// header), but not to a tick over a raw point: time passes anyway.
+fn slotFor(s: *Smoother, kind: u8) -> usize {
+    var slot: usize = 0
+    if s.*.eventCount == QUEUE {
+        slot = (s.*.eventFirst + QUEUE - 1) & (QUEUE - 1)
+        if kind == EVENT_TICK && s.*.eventKinds[slot] == EVENT_RAW { return QUEUE }
+    } else {
+        slot = (s.*.eventFirst + s.*.eventCount) & (QUEUE - 1)
+        s.*.eventCount += 1
+    }
+    s.*.eventKinds[slot] = kind
+    return slot
+}
+
+// Makes the next point that is due into `into`; false when none is.
+fn produce(s: *Smoother, into: *Point) -> bool {
+    while true {
+        if s.*.run != RUN_IDLE {
+            if step(s, into) { return true }
+        } else if s.*.eventCount != 0 {
+            admit(s)
+        } else if s.*.stage == STAGE_TAIL {
+            endMode(s)
+        } else if s.*.stage == STAGE_TAPER {
+            endTaper(s)
+        } else {
+            return false
+        }
+    }
+}
+
+// One step of what is being made; true when it made a point.
+fn step(s: *Smoother, into: *Point) -> bool {
+    const run = s.*.run
+    if run == RUN_POINT {
+        into.* = s.*.runA
+        s.*.run = RUN_IDLE
+        return true
+    }
+    if run == RUN_CURVE { return curveStep(s, into) }
+    if run == RUN_SAMPLES {
+        if !takeSample(s) {
+            s.*.run = RUN_IDLE
+            return false
+        }
+        average(s, into)
+        return true
+    }
+    if run == RUN_ROPE { return ropeStep(s, into) }
+    if run == RUN_PIXELS { return pixelStep(s, into) }
+    if run == RUN_TAIL { return tailStep(s, into) }
+    return taperStep(s, into)
+}
+
+// Takes the oldest waiting event in.
+fn admit(s: *Smoother) -> void {
+    const slot = s.*.eventFirst
+    const kind = s.*.eventKinds[slot]
+    if s.*.started && s.*.options.mode == BASIC && s.*.events[slot].time - s.*.latest.time >= REST_GAP && basicRest(s) {
+        // The event waits until the curve has closed up to where the pen
+        // rested before it.
+        return
+    }
+    s.*.event = s.*.events[slot]
+    s.*.eventFirst = (slot + 1) & (QUEUE - 1)
+    s.*.eventCount -= 1
+    const raw = &s.*.event
+    if kind == EVENT_TICK {
+        if !s.*.started || !(raw.*.time > s.*.restedUntil) { return }
+        measure(s, s.*.latest.x, s.*.latest.y, raw.*.time)
+        if s.*.options.mode == STABILIZER { stabilizerRest(s, raw.*.time) }
+        s.*.restedUntil = raw.*.time
+        return
+    }
+    if s.*.started && raw.*.time < s.*.restedUntil { raw.*.time = s.*.restedUntil }
+    measure(s, raw.*.x, raw.*.y, raw.*.time)
+    if raw.*.pressure < 1.0 {
+        s.*.real = true
+    } else if simulated(s) {
+        const least = s.*.options.minimumPressure
+        raw.*.pressure = least + (1.0 - least) * unit(1.0 - s.*.speed / s.*.options.speedForMinimum)
+    }
+    const mode = s.*.options.mode
+    if mode == BASIC {
+        basicPoint(s)
+    } else if mode == WEIGHTED {
+        weightedPoint(s)
+    } else if mode == STABILIZER {
+        stabilizerPoint(s)
+    } else if mode == PIXEL {
+        pixelPoint(s)
+    } else {
+        s.*.runA = raw.*
+        s.*.run = RUN_POINT
+    }
+    s.*.latest = raw.*
+    s.*.restedUntil = raw.*.time
+    s.*.started = true
+}
+
+// The pen is at (x, y) at `time`: what that says of its speed. Ways gone
+// in no time wait for time to pass.
+fn measure(s: *Smoother, x: f64, y: f64, time: f64) -> void {
+    if !s.*.started {
+        s.*.speedTime = time
+        return
+    }
+    const way = s.*.speedOwed + length(x - s.*.latest.x, y - s.*.latest.y)
+    const passed = time - s.*.speedTime
+    if !(passed > 0.0) {
+        s.*.speedOwed = way
+        return
+    }
+    s.*.speed += (way / passed - s.*.speed) * (1.0 - math.exp(-passed / SPEED_SETTLE))
+    s.*.speedOwed = 0.0
+    s.*.speedTime = time
+}
+
+// A point on its way out: its time never runs back, its pressure gets the
+// start's taper and the tablet's curve. False for one that says nothing
+// new (place, pressure and how the pen is held as the one before).
+fn deliver(s: *Smoother, point: *Point) -> bool {
+    var pressure = unit(point.*.pressure)
+    var gone: f64 = 0.0
+    if s.*.outCount != 0 {
+        if !(point.*.time >= s.*.lastOut.time) { point.*.time = s.*.lastOut.time }
+        gone = length(point.*.x - s.*.lastOut.x, point.*.y - s.*.lastOut.y)
+    }
+    if !s.*.closing && s.*.options.taper && simulated(s) {
+        const along = s.*.travelled + gone
+        const least = s.*.options.minimumPressure
+        if along < s.*.options.taperLength && pressure > least {
+            pressure = least + (pressure - least) * along / s.*.options.taperLength
+        }
+    }
+    const plain = pressure
+    if s.*.options.pressureCurve != null { pressure = curved(s.*.options.pressureCurve.?, pressure) }
+    if s.*.outCount != 0 {
+        const last = &s.*.lastOut
+        if point.*.x == last.*.x && point.*.y == last.*.y && pressure == last.*.pressure && point.*.tiltX == last.*.tiltX && point.*.tiltY == last.*.tiltY && point.*.rotation == last.*.rotation { return false }
+        // The trailing point follows so that it stays DIRECTION_REACH
+        // behind on a straight way.
+        const part = gone / (gone + DIRECTION_REACH)
+        s.*.anchorX += (point.*.x - s.*.anchorX) * part
+        s.*.anchorY += (point.*.y - s.*.anchorY) * part
+    } else {
+        s.*.anchorX = point.*.x
+        s.*.anchorY = point.*.y
+    }
+    point.*.pressure = pressure
+    s.*.travelled += gone
+    s.*.lastOut = point.*
+    s.*.lastPlain = plain
+    s.*.outCount += 1
+    return true
+}
+
+// The table's answer to a pressure of 0 to 1.
+fn curved(table: [*]const f32, pressure: f64) -> f64 {
+    const place = pressure * 255.0
+    const index = @intFromFloat(usize, place)
+    if index >= 255 { return unit(@floatCast(f64, table[255])) }
+    const low = @floatCast(f64, table[index])
+    const high = @floatCast(f64, table[index + 1])
+    return unit(low + (high - low) * (place - @floatFromInt(f64, index)))
+}
+
+// ---------------------------------------------------------------------------
+// BASIC
+
+fn basicPoint(s: *Smoother) -> void {
+    const raw = &s.*.event
+    if !s.*.started {
+        s.*.control = raw.*
+        s.*.middle = raw.*
+        s.*.runA = raw.*
+        s.*.run = RUN_POINT
+        return
+    }
+    // A raw point that near to the last one the curve bent around says
+    // more of the pointer's grid than of the hand's way: the curve waits
+    // for one further off (finish() ends at the pen all the same).
+    const off = length(raw.*.x - s.*.control.x, raw.*.y - s.*.control.y)
+    if off == 0.0 || off < s.*.options.grain * BASIC_SPAN { return }
+    s.*.runA = s.*.middle
+    s.*.runC = point_module.between(&s.*.control, raw, 0.5)
+    if s.*.curved {
+        s.*.runB = s.*.control
+    } else {
+        // The first half segment is straight.
+        s.*.runB = point_module.between(&s.*.runA, &s.*.runC, 0.5)
+        s.*.curved = true
+    }
+    s.*.middle = s.*.runC
+    s.*.control = raw.*
+    startCurve(s)
+}
+
+// The curve's way from the middle it reached to the pen: it leaves the
+// middle toward the last bend, as it arrived, and turns to the pen evenly
+// over its length (bending at the bend itself would put the whole turn
+// into the last pixels: a hook where the pen happened to stop). Straight
+// when there was no bend yet. False when the curve is at the pen already.
+fn basicClose(s: *Smoother) -> bool {
+    if s.*.middle.x == s.*.latest.x && s.*.middle.y == s.*.latest.y { return false }
+    s.*.runA = s.*.middle
+    s.*.runC = s.*.latest
+    s.*.runB = point_module.between(&s.*.runA, &s.*.runC, 0.5)
+    const toward = length(s.*.control.x - s.*.runA.x, s.*.control.y - s.*.runA.y)
+    if s.*.curved && toward > 0.0 {
+        const part = 0.5 * length(s.*.runC.x - s.*.runA.x, s.*.runC.y - s.*.runA.y) / toward
+        s.*.runB.x = s.*.runA.x + (s.*.control.x - s.*.runA.x) * part
+        s.*.runB.y = s.*.runA.y + (s.*.control.y - s.*.runA.y) * part
+    }
+    startCurve(s)
+    return true
+}
+
+// The pen rested: the curve closes up to it, and what comes then starts
+// there as a new line would (where the hand stops, a corner is meant).
+// False when there was nothing to close.
+fn basicRest(s: *Smoother) -> bool {
+    if !basicClose(s) { return false }
+    s.*.middle = s.*.latest
+    s.*.control = s.*.latest
+    s.*.curved = false
+    return true
+}
+
+// The curve from runA over runB to runC in so many steps that no two of
+// its points are further apart than the step: a quadratic curve moves at
+// most twice its longer leg for the whole of its parameter.
+fn startCurve(s: *Smoother) -> void {
+    const first = length(s.*.runB.x - s.*.runA.x, s.*.runB.y - s.*.runA.y)
+    const second = length(s.*.runC.x - s.*.runB.x, s.*.runC.y - s.*.runB.y)
+    const longer = if first > second { first } else { second }
+    s.*.runCount = pieces(2.0 * longer / s.*.options.step)
+    s.*.runIndex = 0
+    s.*.run = RUN_CURVE
+}
+
+fn curveStep(s: *Smoother, into: *Point) -> bool {
+    const index = s.*.runIndex + 1
+    s.*.runIndex = index
+    if index >= s.*.runCount {
+        into.* = s.*.runC
+        s.*.run = RUN_IDLE
+        return true
+    }
+    const u = @floatFromInt(f64, index) / @floatFromInt(f64, s.*.runCount)
+    const a = &s.*.runA
+    const b = &s.*.runB
+    const c = &s.*.runC
+    const wa = (1.0 - u) * (1.0 - u)
+    const wb = 2.0 * u * (1.0 - u)
+    const wc = u * u
+    into.*.x = a.*.x * wa + b.*.x * wb + c.*.x * wc
+    into.*.y = a.*.y * wa + b.*.y * wb + c.*.y * wc
+    into.*.pressure = a.*.pressure * wa + b.*.pressure * wb + c.*.pressure * wc
+    into.*.tiltX = a.*.tiltX * wa + b.*.tiltX * wb + c.*.tiltX * wc
+    into.*.tiltY = a.*.tiltY * wa + b.*.tiltY * wb + c.*.tiltY * wc
+    into.*.rotation = a.*.rotation * wa + b.*.rotation * wb + c.*.rotation * wc
+    into.*.time = a.*.time * wa + b.*.time * wb + c.*.time * wc
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// WEIGHTED
+
+fn weightedPoint(s: *Smoother) -> void {
+    const raw = &s.*.event
+    s.*.runA = raw.*
+    s.*.run = RUN_POINT
+    if s.*.options.distance == 0.0 { return }
+    if s.*.started && raw.*.x == s.*.latest.x && raw.*.y == s.*.latest.y {
+        // The pen stayed: the newest raw point as it is now, not one more
+        // (the same place twice would count twice).
+        s.*.ring[(s.*.ringNext + SAMPLES - 1) & (SAMPLES - 1)] = raw.*
+    } else {
+        const slot = s.*.ringNext
+        s.*.ring[slot] = raw.*
+        s.*.ringGap[slot] = if s.*.started { length(raw.*.x - s.*.latest.x, raw.*.y - s.*.latest.y) } else { 0.0 }
+        s.*.ringNext = (slot + 1) & (SAMPLES - 1)
+        if s.*.ringCount < SAMPLES { s.*.ringCount += 1 }
+    }
+    weigh(s, &s.*.runA, s.*.options.distance)
+}
+
+// The average of the raw points, each weighed by the bell curve of
+// `sigma` over its distance back along the line from the newest, into
+// the place (and, when it is smoothed, the pressure) of `into`.
+fn weigh(s: *Smoother, into: *Point, sigma: f64) -> void {
+    const scale = 0.5 / (sigma * sigma)
+    var index = (s.*.ringNext + SAMPLES - 1) & (SAMPLES - 1)
+    var left = s.*.ringCount
+    var back: f64 = 0.0
+    var total: f64 = 0.0
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var pressure: f64 = 0.0
+    while left > 0 {
+        const weight = math.exp(-back * back * scale)
+        if weight < WEIGHT_CUT { break }
+        const entry = &s.*.ring[index]
+        total += weight
+        x += entry.*.x * weight
+        y += entry.*.y * weight
+        pressure += entry.*.pressure * weight
+        back += s.*.ringGap[index]
+        index = (index + SAMPLES - 1) & (SAMPLES - 1)
+        left -= 1
+    }
+    if !(total > 0.0) { return }
+    into.*.x = x / total
+    into.*.y = y / total
+    if s.*.options.smoothPressure { into.*.pressure = pressure / total }
+}
+
+// One closing point: the average under a bell curve shrunk once more, or,
+// when that is as good as none, the pen's place itself.
+fn tailStep(s: *Smoother, into: *Point) -> bool {
+    s.*.tailSigma = s.*.tailSigma * (1.0 - s.*.options.tailAggressiveness)
+    s.*.runIndex += 1
+    into.* = s.*.latest
+    if s.*.tailSigma < TAIL_END || s.*.runIndex >= TAIL_POINTS {
+        s.*.run = RUN_IDLE
+    } else {
+        weigh(s, into, s.*.tailSigma)
+    }
+    into.*.time = s.*.lastOut.time + length(into.*.x - s.*.lastOut.x, into.*.y - s.*.lastOut.y) / pace(s)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// STABILIZER
+
+fn stabilizerPoint(s: *Smoother) -> void {
+    const raw = &s.*.event
+    const count = @intCast(usize, s.*.options.sampleCount)
+    if !s.*.started {
+        // The window is full of the first point: the brush starts there.
+        var index: usize = 0
+        while index < count {
+            s.*.ring[index] = raw.*
+            index += 1
+        }
+        s.*.ringNext = 0
+        s.*.alike = count
+        s.*.sampleTime = raw.*.time
+        s.*.brush = raw.*
+        s.*.runA = raw.*
+        s.*.run = RUN_POINT
+        return
+    }
+    // The samples of the time since: on the way from where the pointer
+    // was to where it is, or where it was when it rested.
+    s.*.sampleUntil = raw.*.time
+    s.*.sampleCloses = false
+    s.*.sampleRests = raw.*.time - s.*.restedUntil > REST_GAP
+    s.*.runA = s.*.latest
+    s.*.runA.time = s.*.restedUntil
+    if s.*.sampleRests { s.*.runC = s.*.latest } else { s.*.runC = raw.* }
+    if s.*.options.delayDistance == 0.0 {
+        s.*.run = RUN_SAMPLES
+        return
+    }
+    if s.*.options.stabilizeSensors {
+        while takeSample(s) { }
+        average(s, &s.*.steady)
+    }
+    if raw.*.x == s.*.latest.x && raw.*.y == s.*.latest.y { return }
+    s.*.runC = raw.*
+    // Steps short against the rope: the brush's way behind a pointer
+    // going straight is a curve.
+    const fine = s.*.options.delayDistance / 8.0
+    s.*.runCount = pieces(length(raw.*.x - s.*.latest.x, raw.*.y - s.*.latest.y) / (if fine > 0.5 { fine } else { 0.5 }))
+    s.*.runIndex = 0
+    s.*.run = RUN_ROPE
+}
+
+// The pointer rested until `time`.
+fn stabilizerRest(s: *Smoother, time: f64) -> void {
+    s.*.sampleUntil = time
+    s.*.sampleCloses = false
+    s.*.sampleRests = true
+    s.*.runC = s.*.latest
+    if s.*.options.delayDistance == 0.0 {
+        s.*.run = RUN_SAMPLES
+    } else if s.*.options.stabilizeSensors {
+        while takeSample(s) { }
+    }
+}
+
+fn alikeSamples(a: *const Point, b: *const Point) -> bool {
+    return a.*.x == b.*.x && a.*.y == b.*.y && a.*.pressure == b.*.pressure && a.*.tiltX == b.*.tiltX && a.*.tiltY == b.*.tiltY
+}
+
+// Puts the next sample into the window when one is due; false when none
+// is: the samples are over.
+fn takeSample(s: *Smoother) -> bool {
+    const count = @intCast(usize, s.*.options.sampleCount)
+    const newest = if s.*.ringNext == 0 { count - 1 } else { s.*.ringNext - 1 }
+    // A window full of the place the pointer rests at changes no more.
+    const settled = s.*.sampleRests && s.*.alike >= count && alikeSamples(&s.*.ring[newest], &s.*.runC)
+    const due = s.*.sampleTime + PERIOD
+    if s.*.sampleCloses {
+        if settled { return false }
+    } else {
+        if !(due <= s.*.sampleUntil) { return false }
+        if settled {
+            s.*.sampleTime += math.floor((s.*.sampleUntil - s.*.sampleTime) / PERIOD) * PERIOD
+            return false
+        }
+    }
+    const slot = &s.*.ring[s.*.ringNext]
+    if s.*.sampleRests {
+        slot.* = s.*.runC
+    } else {
+        const span = s.*.runC.time - s.*.runA.time
+        const part = if span > 0.0 { unit((due - s.*.runA.time) / span) } else { 1.0 }
+        slot.* = point_module.between(&s.*.runA, &s.*.runC, part)
+        if part >= 1.0 { slot.* = s.*.runC }
+    }
+    slot.*.time = due
+    s.*.alike = if alikeSamples(slot, &s.*.ring[newest]) { s.*.alike + 1 } else { 1 }
+    if s.*.alike > count { s.*.alike = count }
+    s.*.ringNext = if s.*.ringNext + 1 >= count { 0 } else { s.*.ringNext + 1 }
+    s.*.sampleTime = due
+    return true
+}
+
+// The newest sample with the place (and, when they are stabilized, the
+// pressure and tilt) of the window's average into `into`. A window of
+// alike samples gives exactly them.
+fn average(s: *Smoother, into: *Point) -> void {
+    const count = @intCast(usize, s.*.options.sampleCount)
+    into.* = s.*.ring[if s.*.ringNext == 0 { count - 1 } else { s.*.ringNext - 1 }]
+    if s.*.alike >= count { return }
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var pressure: f64 = 0.0
+    var tilt_x: f64 = 0.0
+    var tilt_y: f64 = 0.0
+    var index: usize = 0
+    while index < count {
+        const sample = &s.*.ring[index]
+        x += sample.*.x
+        y += sample.*.y
+        pressure += sample.*.pressure
+        tilt_x += sample.*.tiltX
+        tilt_y += sample.*.tiltY
+        index += 1
+    }
+    const all = @floatFromInt(f64, count)
+    into.*.x = x / all
+    into.*.y = y / all
+    if s.*.options.stabilizeSensors {
+        into.*.pressure = pressure / all
+        into.*.tiltX = tilt_x / all
+        into.*.tiltY = tilt_y / all
+    }
+}
+
+// The pointer one step further on its way from runA to runC; the brush
+// follows when the rope is taut.
+fn ropeStep(s: *Smoother, into: *Point) -> bool {
+    const index = s.*.runIndex + 1
+    s.*.runIndex = index
+    var part: f64 = 1.0
+    if index >= s.*.runCount {
+        s.*.run = RUN_IDLE
+    } else {
+        part = @floatFromInt(f64, index) / @floatFromInt(f64, s.*.runCount)
+    }
+    var x = s.*.runC.x
+    var y = s.*.runC.y
+    if part < 1.0 {
+        x = s.*.runA.x + (x - s.*.runA.x) * part
+        y = s.*.runA.y + (y - s.*.runA.y) * part
+    }
+    const dx = x - s.*.brush.x
+    const dy = y - s.*.brush.y
+    const far = length(dx, dy)
+    const rope = s.*.options.delayDistance
+    if !(far > rope) { return false }
+    const pull = (far - rope) / far
+    s.*.brush.x += dx * pull
+    s.*.brush.y += dy * pull
+    into.* = point_module.between(&s.*.runA, &s.*.runC, part)
+    into.*.x = s.*.brush.x
+    into.*.y = s.*.brush.y
+    if s.*.options.stabilizeSensors {
+        into.*.pressure = s.*.steady.pressure
+        into.*.tiltX = s.*.steady.tiltX
+        into.*.tiltY = s.*.steady.tiltY
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// PIXEL
+
+inline fn pixelOf(place: f64) -> i64 {
+    return @intFromFloat(i64, math.floor(place))
+}
+
+inline fn centre(pixel: i64) -> f64 {
+    return @floatFromInt(f64, pixel) + 0.5
+}
+
+fn pixelPoint(s: *Smoother) -> void {
+    const raw = &s.*.event
+    const x = pixelOf(raw.*.x)
+    const y = pixelOf(raw.*.y)
+    if !s.*.started {
+        s.*.pixelX = x
+        s.*.pixelY = y
+        s.*.beforeX = x
+        s.*.beforeY = y
+        s.*.holding = false
+        s.*.runA = raw.*
+        s.*.runA.x = centre(x)
+        s.*.runA.y = centre(y)
+        s.*.run = RUN_POINT
+        return
+    }
+    if x == s.*.pixelX && y == s.*.pixelY { return }
+    // The line of pixels from the pen's pixel to this one, every pixel
+    // touching the next (the classic walk with a whole error term).
+    const across = if x > s.*.pixelX { x - s.*.pixelX } else { s.*.pixelX - x }
+    const down = if y > s.*.pixelY { y - s.*.pixelY } else { s.*.pixelY - y }
+    s.*.lineX = s.*.pixelX
+    s.*.lineY = s.*.pixelY
+    s.*.lineAcross = across
+    s.*.lineDown = down
+    s.*.lineStepX = if x > s.*.pixelX { 1 } else { -1 }
+    s.*.lineStepY = if y > s.*.pixelY { 1 } else { -1 }
+    s.*.lineError = across - down
+    s.*.runA = s.*.latest
+    s.*.runC = raw.*
+    s.*.runCount = @intCast(usize, if across > down { across } else { down })
+    s.*.runIndex = 0
+    s.*.pixelX = x
+    s.*.pixelY = y
+    s.*.run = RUN_PIXELS
+}
+
+// The line's next pixel. It is held back until the one after it shows
+// whether it is the corner of an L (one step along a row or column in,
+// one along the other out): then it is dropped and the line goes
+// diagonally past it. What leaves is the pixel held before.
+fn pixelStep(s: *Smoother, into: *Point) -> bool {
+    const twice = s.*.lineError * 2
+    if twice >= -s.*.lineDown {
+        s.*.lineError -= s.*.lineDown
+        s.*.lineX += s.*.lineStepX
+    }
+    if twice <= s.*.lineAcross {
+        s.*.lineError += s.*.lineAcross
+        s.*.lineY += s.*.lineStepY
+    }
+    const index = s.*.runIndex + 1
+    s.*.runIndex = index
+    if index >= s.*.runCount { s.*.run = RUN_IDLE }
+    const x = s.*.lineX
+    const y = s.*.lineY
+    var leaves = false
+    if s.*.holding {
+        const straight_in = s.*.beforeX == s.*.heldX || s.*.beforeY == s.*.heldY
+        const straight_out = x == s.*.heldX || y == s.*.heldY
+        if !(straight_in && straight_out && s.*.beforeX != x && s.*.beforeY != y) {
+            into.* = s.*.held
+            s.*.beforeX = s.*.heldX
+            s.*.beforeY = s.*.heldY
+            leaves = true
+        }
+    }
+    s.*.held = point_module.between(&s.*.runA, &s.*.runC, @floatFromInt(f64, index) / @floatFromInt(f64, s.*.runCount))
+    s.*.held.x = centre(x)
+    s.*.held.y = centre(y)
+    s.*.heldX = x
+    s.*.heldY = y
+    s.*.holding = true
+    return leaves
+}
+
+// ---------------------------------------------------------------------------
+// The end of a stroke
+
+// What the mode still owes of the line.
+fn endMode(s: *Smoother) -> void {
+    s.*.stage = STAGE_TAPER
+    if !s.*.started {
+        s.*.stage = STAGE_DONE
+        return
+    }
+    const mode = s.*.options.mode
+    if mode == BASIC {
+        _ = basicClose(s)
+    } else if mode == WEIGHTED {
+        if s.*.options.distance == 0.0 || s.*.options.tailAggressiveness == 0.0 { return }
+        if s.*.lastOut.x == s.*.latest.x && s.*.lastOut.y == s.*.latest.y { return }
+        s.*.tailSigma = s.*.options.distance
+        s.*.runIndex = 0
+        s.*.run = RUN_TAIL
+    } else if mode == STABILIZER {
+        if !s.*.options.finishLine { return }
+        if s.*.options.delayDistance == 0.0 {
+            // As if the pointer rested until the window is full of it.
+            s.*.sampleCloses = true
+            s.*.sampleRests = true
+            s.*.runC = s.*.latest
+            s.*.run = RUN_SAMPLES
+        } else {
+            const far = length(s.*.latest.x - s.*.brush.x, s.*.latest.y - s.*.brush.y)
+            if far == 0.0 { return }
+            s.*.brush.x = s.*.latest.x
+            s.*.brush.y = s.*.latest.y
+            s.*.runA = s.*.latest
+            if s.*.options.stabilizeSensors {
+                s.*.runA.pressure = s.*.steady.pressure
+                s.*.runA.tiltX = s.*.steady.tiltX
+                s.*.runA.tiltY = s.*.steady.tiltY
+            }
+            s.*.runA.time = s.*.lastOut.time + far / pace(s)
+            s.*.run = RUN_POINT
+        }
+    } else if mode == PIXEL {
+        if !s.*.holding { return }
+        s.*.holding = false
+        s.*.runA = s.*.held
+        s.*.run = RUN_POINT
+    }
+}
+
+// The line runs out past its end, thinner and thinner: as far as the pen
+// would have gone in TAPER_TIME, the taper's length at most, nowhere when
+// the pen rested or the line is as thin as it gets already. Not for
+// pixel art, whose points are pixels.
+fn endTaper(s: *Smoother) -> void {
+    s.*.stage = STAGE_DONE
+    if !s.*.options.taper || !simulated(s) || s.*.options.mode == PIXEL || s.*.outCount == 0 { return }
+    if !(s.*.lastPlain > s.*.options.minimumPressure + 0.01) { return }
+    var way = s.*.speed * TAPER_TIME
+    if way > s.*.options.taperLength { way = s.*.options.taperLength }
+    const dx = s.*.lastOut.x - s.*.anchorX
+    const dy = s.*.lastOut.y - s.*.anchorY
+    const reach = length(dx, dy)
+    if !(way >= 1.0) || !(reach > 0.000001) { return }
+    s.*.runA = s.*.lastOut
+    s.*.runA.pressure = s.*.lastPlain
+    s.*.runB.x = dx / reach
+    s.*.runB.y = dy / reach
+    s.*.taperWay = way
+    const points = math.ceil(way / TAPER_STEP)
+    s.*.runCount = @intFromFloat(usize, if points > TAPER_POINTS { TAPER_POINTS } else { points })
+    s.*.runIndex = 0
+    s.*.closing = true
+    s.*.run = RUN_TAPER
+}
+
+fn taperStep(s: *Smoother, into: *Point) -> bool {
+    const index = s.*.runIndex + 1
+    s.*.runIndex = index
+    var part: f64 = 1.0
+    if index >= s.*.runCount {
+        s.*.run = RUN_IDLE
+    } else {
+        part = @floatFromInt(f64, index) / @floatFromInt(f64, s.*.runCount)
+    }
+    const way = s.*.taperWay * part
+    const least = s.*.options.minimumPressure
+    into.* = s.*.runA
+    into.*.x = s.*.runA.x + s.*.runB.x * way
+    into.*.y = s.*.runA.y + s.*.runB.y * way
+    into.*.pressure = if part < 1.0 { s.*.runA.pressure + (least - s.*.runA.pressure) * part } else { least }
+    into.*.time = s.*.runA.time + way / pace(s)
+    return true
+}
