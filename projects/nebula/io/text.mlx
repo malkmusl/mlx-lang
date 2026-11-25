@@ -644,22 +644,26 @@ pub fn parseInt(text: []const u8, into: *i64) -> bool {
 // How deep elements may nest (as deep as std.xml reads them).
 pub const XML_DEPTH: usize = 64
 
+// (Under 1 KiB, so that a caller's local one stays in its frame: a
+// larger local is a new value of the arena at every call.)
 pub const XmlWriter = struct {
     out: *std.ArrayList(u8)
     // Spaces a level.
     indent: usize
     depth: usize
     // Where each open element's name is in `out` (its closing tag is
-    // copied from there).
-    nameAt: [64]usize
-    nameLength: [64]usize
+    // copied from there): its place (below 4 GiB) and length (below 64
+    // KiB; a longer name fails the writer).
+    nameAt: [64]u32
+    nameLength: [64]u16
     // Whether each open element has text in it: what follows the text is
     // written right behind it, not on lines of its own.
     hasText: [64]bool
     // The innermost element's start tag is still open: attributes go in.
     tagOpen: bool
     // Memory ran out, or something was asked for that cannot be written
-    // (an attribute outside a start tag, a 65th level, a close too many).
+    // (an attribute outside a start tag, a 65th level, a close too many,
+    // a name of 64 KiB, a document of 4 GiB).
     failed: bool
 }
 
@@ -747,15 +751,17 @@ pub fn xmlRaw(writer: *XmlWriter, line: []const u8) -> void {
 // Opens the element `name` (inside the one open now): attributes may
 // follow, then text or other elements, then xmlClose().
 pub fn xmlOpen(writer: *XmlWriter, name: []const u8) -> void {
-    if writer.*.depth >= XML_DEPTH {
+    if writer.*.depth >= XML_DEPTH || name.length > 65535 {
         writer.*.failed = true
         return
     }
     closeTag(writer, true)
     if onOwnLine(writer) { putIndent(writer, writer.*.depth) }
     putByte(writer, 60)
-    writer.*.nameAt[writer.*.depth] = writer.*.out.*.count()
-    writer.*.nameLength[writer.*.depth] = name.length
+    const at = writer.*.out.*.count()
+    if at > 0xFFFFFFFF { writer.*.failed = true }
+    writer.*.nameAt[writer.*.depth] = @intCast(u32, at & 0xFFFFFFFF)
+    writer.*.nameLength[writer.*.depth] = @intCast(u16, name.length)
     writer.*.hasText[writer.*.depth] = false
     put(writer, name)
     writer.*.depth += 1
@@ -795,6 +801,7 @@ fn roomFor(writer: *XmlWriter, most: usize) -> ?[*]u8 {
     return writer.*.out.*.items().pointer + writer.*.out.*.count()
 }
 
+// A whole number as an attribute.
 pub fn xmlAttributeInt(writer: *XmlWriter, name: []const u8, value: i64) -> void {
     if !attributeStart(writer, name) { return }
     const room = roomFor(writer, 24)
@@ -840,8 +847,8 @@ pub fn xmlClose(writer: *XmlWriter) -> void {
         put(writer, "</")
         // (Byte by byte: the list may move while it grows.)
         var index: usize = 0
-        while index < writer.*.nameLength[level] && !writer.*.failed {
-            putByte(writer, writer.*.out.*.items()[writer.*.nameAt[level] + index])
+        while index < @intCast(usize, writer.*.nameLength[level]) && !writer.*.failed {
+            putByte(writer, writer.*.out.*.items()[@intCast(usize, writer.*.nameAt[level]) + index])
             index += 1
         }
         putByte(writer, 62)
@@ -924,6 +931,8 @@ pub fn attributeFloat(document: []const u8, offset: usize, name: []const u8, int
     return raw != null && parseFloat(raw.?, into)
 }
 
+// The attribute as a whole number into `into` (false: not there, or not
+// one; `into` is not written then).
 pub fn attributeInt(document: []const u8, offset: usize, name: []const u8, into: *i64) -> bool {
     const raw = attributeOf(document, offset, name)
     return raw != null && parseInt(raw.?, into)
@@ -936,6 +945,8 @@ pub fn attributeFloatOr(document: []const u8, offset: usize, name: []const u8, f
     return value
 }
 
+// The attribute as a whole number, `fallback` when it is not there or
+// no number.
 pub fn attributeIntOr(document: []const u8, offset: usize, name: []const u8, fallback: i64) -> i64 {
     var value = fallback
     _ = attributeInt(document, offset, name, &value)
@@ -1046,14 +1057,20 @@ pub const Contents = struct {
     allocator: Allocator
 }
 
+// Whether std.fs can take `path`: not empty, below 4096 bytes, no NUL.
+fn usablePath(path: []const u8) -> bool {
+    if path.length == 0 || path.length + 1 > std.fs.PATH_MAX { return false }
+    for byte in path {
+        if byte == 0 { return false }
+    }
+    return true
+}
+
 // `path` as std.fs wants it: a copy with a NUL behind it (length + 1
 // bytes, given back with releasePath). Null without memory and for a path
-// std.fs cannot take: empty, 4096 bytes and more, a NUL inside.
+// std.fs cannot take (usablePath).
 fn terminated(allocator: Allocator, path: []const u8) -> ?[*]u8 {
-    if path.length == 0 || path.length + 1 > std.fs.PATH_MAX { return null }
-    for byte in path {
-        if byte == 0 { return null }
-    }
+    if !usablePath(path) { return null }
     const memory = allocator.alloc(path.length + 1, 1)
     if memory == null { return null }
     std.mem.copy(memory.?, path.pointer, path.length)
@@ -1065,25 +1082,42 @@ fn releasePath(allocator: Allocator, name: [*]u8, path: []const u8) -> void {
     allocator.free(name, path.length + 1, 1)
 }
 
+// What readFile() asks std.fs (on the heap: a local record handed to
+// std.fs would be a new value of the arena at every call).
+const Opening = struct {
+    known: std.fs.Stat
+    file: std.fs.File
+}
+
 // The whole file at `path` into `into` (to be given back with freeFile()
-// after FileStatus.ok, and only then).
+// after FileStatus.ok, and only then). notFound also for a path that can
+// name no file (empty, 4096 bytes or more, a NUL in it).
 pub fn readFile(allocator: Allocator, path: []const u8, into: *Contents) -> FileStatus {
     into.*.length = 0
     into.*.capacity = 0
     into.*.allocator = allocator
+    if !usablePath(path) { return FileStatus.notFound }
+    const record = allocator.alloc(@sizeOf(Opening), 16)
+    if record == null { return FileStatus.noMemory }
+    const opening: *Opening = unsafe { @ptrCast(*Opening, record.?) }
     const name = terminated(allocator, path)
-    if name == null { return FileStatus.notFound }
-    var known: std.fs.Stat = undefined
-    const found = std.fs.status(name.?, &known)
-    var file = std.fs.File.{ .descriptor = -1 }
-    if found == 0 && known.mode & 61440 != 16384 { file = std.fs.open(name.?, std.fs.READ_ONLY, 0) }
+    if name == null {
+        allocator.free(record.?, @sizeOf(Opening), 16)
+        return FileStatus.noMemory
+    }
+    const found = std.fs.status(name.?, &opening.*.known)
+    opening.*.file = std.fs.File.{ .descriptor = -1 }
+    if found == 0 && opening.*.known.mode & 61440 != 16384 { opening.*.file = std.fs.open(name.?, std.fs.READ_ONLY, 0) }
     releasePath(allocator, name.?, path)
+    const file = opening.*.file
+    const said = opening.*.known.size
+    allocator.free(record.?, @sizeOf(Opening), 16)
     // (No such file, or no such folder on the way to it.)
     if found == -2 || found == -20 { return FileStatus.notFound }
     if !std.fs.isValid(file) { return FileStatus.notReadable }
     // One byte more than the file is said to have: the read that finds
     // the end then needs no more room.
-    var capacity: usize = if known.size > 0 { @bitCast(usize, known.size) + 1 } else { 4096 }
+    var capacity: usize = if found == 0 && said > 0 { @bitCast(usize, said) + 1 } else { 4096 }
     var memory = allocator.alloc(capacity, 16)
     var status = FileStatus.ok
     var length: usize = 0
@@ -1115,6 +1149,7 @@ pub fn readFile(allocator: Allocator, path: []const u8, into: *Contents) -> File
     return FileStatus.ok
 }
 
+// Gives back what readFile() read (twice does no harm).
 pub fn freeFile(contents: *Contents) -> void {
     if contents.*.capacity != 0 { contents.*.allocator.free(contents.*.bytes, contents.*.capacity, 16) }
     contents.*.length = 0
