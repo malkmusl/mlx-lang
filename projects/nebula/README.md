@@ -1,0 +1,126 @@
+# Nebula
+
+Nebula is the painting program of the Mlx desktop: layers, brushes,
+selections, filters, transforms and the file formats painters use, in one
+program written in Mlx on `std` alone. The same sources build one
+standalone executable for each system: `nebula` for Linux, and
+`--target=x86_64-brixos` for brixOS, where it runs on the native
+interface (its bundle is
+[`projects/desktop/apps/Nebula.app`](../desktop/apps/Nebula.app/app.ini),
+id `org.mlx.nebula`, the program brixOS opens pictures with).
+
+![Painting: strokes of the freehand brush, a rectangle and an ellipse;
+the colour wheel, the brush's options and the layers on the
+right](screenshots/painting.png)
+
+<table>
+<tr>
+<td width="50%"><img src="screenshots/filter-menu.png" alt="The Filter menu open over a stroke"><br>
+<b>Menus.</b> The menu bar's lists come from the actions' tables; the
+filters are grouped as their registry groups them.</td>
+<td width="50%"><img src="screenshots/german-selection.png" alt="The German interface with an elliptic selection being made"><br>
+<b>German.</b> Every text is English and German (the locale, or the
+setting); here the elliptic selection with its marching ants.</td>
+</tr>
+</table>
+
+The pictures are frames of `nebula --script` (no window; see
+[Scripts](#scripts)). In a window on the desktop the bars and dockers are
+the desktop's glass, as its other apps are; a script's picture has no
+alpha, so it does not show that.
+
+## What is there
+
+- **Engine** ([`core/`](core/)): images of layers in 64 x 64 tiles that
+  share memory until written (a copy is free, undo is the tiles kept);
+  paint, group, fill, filter, clone, vector and file layers and masks;
+  130 blend modes; the projection redrawn only where something changed;
+  a history of named steps; selections as masks (combine, grow, shrink,
+  feather, border); transforms (free, perspective, warp, cage, liquify,
+  mesh); flood and enclose fill; gradients; palettes; a rasterizer for
+  paths.
+- **Brushes** ([`brush/`](brush/)): tips (automatic and predefined),
+  sensors and curves for 24 options, smoothing and stabilizer, and the
+  engines: pixel, eraser, smudge, clone, filter, deform, quick, sketch,
+  spray, hairy, shape, particle, hatching, curve, grid, dyna.
+- **Filters** ([`filters/`](filters/)): adjustments (levels, curves, HSV,
+  colour balance, ...), blurs, sharpening and noise reduction, edges and
+  emboss, artistic, map, gradient map, palettize; generators (noise,
+  patterns, gradients).
+- **Window** ([`ui/`](ui/), [`app/`](app/)): menu bar, toolbar,
+  toolbox, document tabs, status bar, dock areas with tabbed dockers
+  (colour, palette, tool options, brush presets, layers, history,
+  overview, channels, histogram, grid, timeline), dialogs and a file
+  dialog of its own, shortcuts and settings kept in
+  `~/.config/mlx/nebula.conf`.
+- **Tools** ([`tools/`](tools/)): brushes, shapes, selections, move,
+  transform, crop, fills, gradient, colour sampler, smart patch, text,
+  zoom, pan, measure, view rotation, assistants.
+- **Files** ([`io/`](io/)): PNG, JPEG, WebP, BMP, TGA, PNM, QOI read and
+  written; ORA, KRA, PSD, GIF and TIFF.
+- **Animation** ([`core/animation.mlx`](core/animation.mlx)): keys on
+  layers, holds, onion skin, PNG sequence export.
+
+## Building and running
+
+    ./mlx --quiet projects/nebula/main.mlx -o nebula
+    ./mlx --quiet --target=x86_64-brixos projects/nebula/main.mlx -o nebula-brixos
+    ./nebula
+
+`./mlx build` builds it with the desktop (`mlx-out/bin/nebula`) and puts
+it into the brixOS image as Nebula.app. `MLX_CANVAS=cpu` is what Nebula
+draws with anyway (it says `nebula: drawing on the cpu`).
+
+## Tests
+
+    projects/nebula/test.sh            # all; or test.sh 01 32 ... by number
+    tools/check_nebula.sh              # the tests, both builds, a script, a window
+
+Every test is a program `tests/NN_name.mlx` that exits 13 when all is
+well, built for Linux and for brixOS and run here. `tools/check_nebula.sh`
+also plays a script without a window and drives the program in a window
+under `tools/wayland-test-host`: the canvas shows, a stroke paints,
+Ctrl+Z takes it back.
+
+## Scripts
+
+`nebula --script FILE` plays input without a window, one step a line:
+`size W H`, `new W H RRGGBB`, `color RRGGBB`, `tool KEY`, `drag X0 Y0 X1 Y1
+[STEPS]`, `click X Y`, `key Ctrl+Z`, `type TEXT`, `action KEY`, `wait MS`,
+`german`, `expect X Y AARRGGBB`, `expect-note TEXT`, `shot FILE.png` and
+more ([`app/script.mlx`](app/script.mlx) lists them). The pictures above
+are made so.
+
+## To do
+
+Nebula is not finished. What is known to be open:
+
+- [ ] **Tests with the new compiler.** mlx4 now traps narrow integer
+      overflow and keeps constant tables as one image. With it, 42_io_formats,
+      50_kit (does not build for brixOS), 54_menus, 57_chrome and
+      58_settings fail; most likely arithmetic that overflowed silently
+      before. To be fixed one by one.
+- [ ] **54_menus check 212 and 57_chrome check 51** (the history docker's
+      rows) fail since the menus are filled with the real actions and the
+      file actions exist; the tests are to follow the program.
+- [ ] **Reviews of wave 4.** The tools, dockers, actions, layered formats,
+      the further brush engines, the assistants and the animation are
+      written; their adversarial reviews were stopped part way. Each
+      package's test is to be run and its gaps read.
+- [ ] **brixOS.** Built for it, not yet looked at on it (QEMU, as
+      `tools/check_brix_apps.sh` starts apps). The glass is to be checked
+      there.
+- [ ] **The desktop's look beyond its glass**: Comet has a header and a
+      prism stripe; Nebula still has a classic menu bar and toolbar.
+- [ ] **Canvas settings**: the ground's brightness, the checkerboard, the
+      pixel grid and the cursor from the settings (canvasview still has its
+      own).
+- [ ] **Faster repaint while painting**: canvasview.refresh exists, the
+      loop still draws the whole window (the status bar's pointer field
+      has to come along).
+- [ ] **Compiler, further:** 64-bit arithmetic does not trap on overflow;
+      constant expressions that overflow their type compile; `<<` cuts the
+      bits it shifts out; `std.io.printFmt` with an empty tuple does not
+      link.
+- [ ] **std**: std.fs's path locals take 4 KiB of the value arena a call
+      (settings saves); `+| -| *|` were fixed for narrow types only.
