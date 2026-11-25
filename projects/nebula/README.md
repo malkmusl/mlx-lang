@@ -24,7 +24,12 @@ setting); here the elliptic selection with its marching ants.</td>
 </tr>
 </table>
 
-The pictures are frames of `nebula --script` (no window; see
+![Nebula on brixOS under QEMU: started from the launcher, a stroke
+painted with the mouse; the top bar and the dock show it with its
+icon](screenshots/brixos.png)
+
+The picture above is brixOS's desktop in QEMU (1024 x 768). The others
+are frames of `nebula --script` (no window; see
 [Scripts](#scripts)). In a window on the desktop the bars and dockers are
 the desktop's glass, as its other apps are; a script's picture has no
 alpha, so it does not show that.
@@ -107,9 +112,10 @@ Nebula is not finished. What is known to be open:
       the further brush engines, the assistants and the animation are
       written; their adversarial reviews were stopped part way. Each
       package's test is to be run and its gaps read.
-- [ ] **brixOS.** Built for it, not yet looked at on it (QEMU, as
-      `tools/check_brix_apps.sh` starts apps). The glass is to be checked
-      there.
+- [ ] **brixOS.** It runs there (the picture above: launcher, top bar,
+      dock, painting); its window opens at 1280 x 800, larger than a
+      1024 x 768 screen: it is to open at the screen's size. A check of its
+      own (as `tools/check_brix_apps.sh`) is to come.
 - [ ] **The desktop's look beyond its glass**: Comet has a header and a
       prism stripe; Nebula still has a classic menu bar and toolbar.
 - [ ] **Canvas settings**: the ground's brightness, the checkerboard, the
