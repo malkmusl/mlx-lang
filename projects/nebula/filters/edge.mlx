@@ -9,10 +9,14 @@
 //
 //     offset + (sum of weight * neighbour) / divisor      rounded, held to 0..255
 //
-//     var blur = edge.Separable.{ .along = ONES[0..], .across = ONES[0..], .center = 0, .divisor = 9, .offset = 0, .channels = edge.COLOR }
+//     const blur = edge.Separable.{ .along = ONES[0..], .across = ONES[0..], .center = 0, .divisor = 9, .offset = 0, .channels = edge.COLOR }
 //     _ = edge.convolveSeparable(pixels, width, height, stride, &blur)
 //
 // What the two agree on:
+//
+//   Whole numbers. The sums are exact and divided once, halves rounding
+//   upward: a picture filtered in parts (each with the filter's margin
+//   around it) is the picture filtered whole, bit for bit.
 //
 //   Convolution. The weights are written as one reads them in a book (and
 //   as Krita shows its kernels) and meet the picture turned by half a
@@ -82,12 +86,20 @@
 //   channels' differences), and a difference that leaves 0..255 is held
 //   there, not folded back.
 //
+// Time: a kernel is added up three weights a turn over a whole row; a row
+// of equal weights (a box) and one that falls evenly through zero (a ramp:
+// Prewitt's slope) are running sums instead, as the high pass's boxes
+// are. Not done: Sobel's and Simple's kernels are added up weight by
+// weight at every radius (63 weights each way at radius 100, a tenth of
+// the speed at radius 1).
+//
 // Without memory for the working rows a filter leaves the pixels as they
 // are.
 const math = @import("std.math")
 const types = @import("./types.mlx")
 const pixel = @import("../core/pixel.mlx")
 const scratch = @import("../core/scratch.mlx")
+const table = @import("../core/table.mlx")
 
 pub const Params = types.Params
 
@@ -481,6 +493,32 @@ pub fn convolve3(pixels: [*]u32, width: usize, height: usize, stride: usize, ker
     return true
 }
 
+// How a row of weights is added up: weight by weight, or by running sums
+// where the weights are all the same (a box) or fall evenly through zero
+// in the middle (a ramp, the slope kernel of Prewitt): a sum is then made
+// from the one before it, whatever the kernel's length.
+const TAPS: u32 = 0
+const FLAT: u32 = 1
+const RAMP: u32 = 2
+
+// Which of these a kernel is (a short one is quicker weight by weight).
+// A box's weight is any of its weights; what a ramp falls by from weight
+// to weight is the weight before its middle one.
+fn shapeOf(weights: []const i32) -> u32 {
+    if weights.length < 5 { return TAPS }
+    const reach = weights.length / 2
+    const step = weights[reach - 1]
+    var flat = weights[0] != 0
+    var ramp = step != 0
+    var index: usize = 0
+    while index < weights.length {
+        if weights[index] != weights[0] { flat = false }
+        if @intCast(i64, weights[index]) != @intCast(i64, step) * (@intCast(i64, reach) - @intCast(i64, index)) { ramp = false }
+        index += 1
+    }
+    return if flat { FLAT } else if ramp { RAMP } else { TAPS }
+}
+
 // One separable kernel going down a picture: the rows it needs wait
 // filtered along in `ring`, and advance() adds them up across.
 const Stream = struct {
@@ -491,6 +529,8 @@ const Stream = struct {
     count: usize
     along: []const i32
     across: []const i32
+    alongShape: u32
+    acrossShape: u32
     // One row spread out, as far as `along` reaches.
     wide: [*]i32
     // The last across.length rows filtered along, each in the place of
@@ -498,6 +538,10 @@ const Stream = struct {
     ring: [*]i32
     // Rows filtered so far.
     filled: usize
+    // A box or a ramp across: the plain sum of the window's rows, and
+    // after it (a ramp) their sum weighed by their distance below the
+    // middle.
+    run: [*]i64
     // The sums of the row made last.
     sums: [*]i64
 }
@@ -509,72 +553,216 @@ fn open(stream: *Stream, pool: *scratch.Pool, width: usize, height: usize, form:
     const values = valuesOf(form)
     const wide = scratch.ints(pool, (width + along.length - 1) * values)
     const ring = scratch.ints(pool, across.length * width * values)
+    const run = longs(pool, width * values * 2)
     const sums = longs(pool, width * values)
-    if wide == null || ring == null || sums == null { return false }
+    if wide == null || ring == null || run == null || sums == null { return false }
     stream.*.width = width
     stream.*.height = height
     stream.*.form = form
     stream.*.count = width * values
     stream.*.along = along
     stream.*.across = across
+    stream.*.alongShape = shapeOf(along)
+    stream.*.acrossShape = shapeOf(across)
     stream.*.wide = wide.?
     stream.*.ring = ring.?
+    stream.*.run = run.?
     stream.*.sums = sums.?
     stream.*.filled = 0
     return true
 }
 
-// The filtered row that weight `tap` of `across` meets for row `y`: the
-// first weight the row furthest below, none beyond the picture's ends.
-inline fn ringRow(stream: *const Stream, y: usize, tap: usize) -> [*]const i32 {
+// Row `number` of the picture, filtered along, as the ring holds it (a
+// row beyond the picture's ends is its end row).
+inline fn ringRow(stream: *const Stream, number: usize) -> [*]i32 {
+    const last = stream.*.height - 1
+    return stream.*.ring + ((if number > last { last } else { number }) % stream.*.across.length) * stream.*.count
+}
+
+// The filtered row that weight `tap` of `across` meets for row `y`.
+inline fn below(stream: *const Stream, y: usize, tap: usize) -> [*]const i32 {
+    const reach = stream.*.across.length / 2
+    return ringRow(stream, if y + reach < tap { 0 } else { y + reach - tap })
+}
+
+// A box along a row: each sum the one a pixel before it, plus the value
+// that comes into the window, minus the one that leaves.
+fn boxAlong(into: [*]i32, wide: [*]const i32, width: usize, values: usize, taps: usize, weight: i32) -> void {
+    var value: usize = 0
+    while value < values {
+        var sum: i32 = 0
+        var tap: usize = 0
+        while tap < taps {
+            sum = sum +% wide[tap * values + value]
+            tap += 1
+        }
+        into[value] = sum *% weight
+        var at = values + value
+        while at < width * values {
+            sum = sum +% wide[at + (taps - 1) * values] -% wide[at - values]
+            into[at] = sum *% weight
+            at += values
+        }
+        value += 1
+    }
+}
+
+// A ramp along a row: the values of the window weighed by their distance
+// ahead of the middle. Moving on a pixel, every value is one nearer: the
+// weighed sum loses the window's plain sum once, the value that leaves
+// had `reach` taken off too much, the one that comes in starts at reach.
+fn rampAlong(into: [*]i32, wide: [*]const i32, width: usize, values: usize, taps: usize, step: i32) -> void {
+    const reach = @intCast(i32, taps / 2)
+    var value: usize = 0
+    while value < values {
+        var plain_sum: i32 = 0
+        var weighed: i32 = 0
+        var tap: usize = 0
+        while tap < taps {
+            const here = wide[tap * values + value]
+            plain_sum = plain_sum +% here
+            weighed = weighed +% here *% (@intCast(i32, tap) - reach)
+            tap += 1
+        }
+        into[value] = weighed *% step
+        var at = values + value
+        while at < width * values {
+            const comes = wide[at + (taps - 1) * values]
+            const leaves = wide[at - values]
+            plain_sum = plain_sum +% comes -% leaves
+            weighed = weighed +% leaves *% reach +% comes *% (reach + 1) -% plain_sum
+            into[at] = weighed *% step
+            at += values
+        }
+        value += 1
+    }
+}
+
+// The next row of the picture into the ring: spread out and filtered
+// along.
+fn fill(stream: *Stream, pixels: [*]const u32, stride: usize) -> void {
+    const along = stream.*.along
+    const values = valuesOf(stream.*.form)
+    const count = stream.*.count
+    const into = ringRow(stream, stream.*.filled)
+    spread(pixels + stream.*.filled * stride, stream.*.width, along.length / 2, stream.*.form, stream.*.wide)
+    stream.*.filled += 1
+    if stream.*.alongShape == FLAT {
+        boxAlong(into, stream.*.wide, stream.*.width, values, along.length, along[0])
+        return
+    }
+    if stream.*.alongShape == RAMP {
+        rampAlong(into, stream.*.wide, stream.*.width, values, along.length, along[along.length / 2 - 1])
+        return
+    }
+    var more = false
+    var tap: usize = 0
+    while tap < along.length {
+        // Weight `tap` meets the pixel along.length - 1 - tap further
+        // into the spread row. A group cut short by the kernel's end
+        // is filled up with weights of zero.
+        const second = if tap + 1 < along.length { tap + 1 } else { tap }
+        const third = if tap + 2 < along.length { tap + 2 } else { tap }
+        const wa = along[tap]
+        const wb = if tap + 1 < along.length { along[tap + 1] } else { 0 }
+        const wc = if tap + 2 < along.length { along[tap + 2] } else { 0 }
+        if wa != 0 || wb != 0 || wc != 0 || (tap + 3 >= along.length && !more) {
+            const far = along.length - 1
+            sum32(into, stream.*.wide + (far - tap) * values, wa, stream.*.wide + (far - second) * values, wb, stream.*.wide + (far - third) * values, wc, count, more)
+            more = true
+        }
+        tap += 3
+    }
+}
+
+// into[i] += row[i] * weight.
+fn add64(into: [*]i64, row: [*]const i32, weight: i64, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        into[index] = into[index] +% @intCast(i64, row[index]) *% weight
+        index += 1
+    }
+}
+
+// A box or a ramp across the rows for row `y`: the window's plain sum
+// (and for a ramp its sum weighed by the rows' distance below the middle)
+// from those of the row above. The row that leaves the window is taken
+// off before the row that comes into it is filled into the ring: at full
+// stride the two have the same place there.
+fn slideDown(stream: *Stream, pixels: [*]const u32, stride: usize, y: usize) -> void {
+    const count = stream.*.count
     const reach = stream.*.across.length / 2
     const last = stream.*.height - 1
-    const from = if y + reach < tap { 0 } else if y + reach - tap > last { last } else { y + reach - tap }
-    return stream.*.ring + (from % stream.*.across.length) * stream.*.count
+    const ramp = stream.*.acrossShape == RAMP
+    const plain_sum = stream.*.run
+    const weighed = stream.*.run + count
+    var index: usize = 0
+    if y == 0 {
+        while stream.*.filled <= reach && stream.*.filled <= last { fill(stream, pixels, stride) }
+        while index < count * 2 {
+            plain_sum[index] = 0
+            index += 1
+        }
+        // The rows above the picture are its first row.
+        add64(plain_sum, ringRow(stream, 0), @intCast(i64, reach + 1), count)
+        if ramp { add64(weighed, ringRow(stream, 0), -@intCast(i64, reach * (reach + 1) / 2), count) }
+        var distance: usize = 1
+        while distance <= reach {
+            add64(plain_sum, ringRow(stream, distance), 1, count)
+            if ramp { add64(weighed, ringRow(stream, distance), @intCast(i64, distance), count) }
+            distance += 1
+        }
+    } else {
+        const leaves = ringRow(stream, if y < reach + 1 { 0 } else { y - reach - 1 })
+        add64(plain_sum, leaves, -1, count)
+        if ramp { add64(weighed, leaves, @intCast(i64, reach), count) }
+        if stream.*.filled <= y + reach && stream.*.filled <= last { fill(stream, pixels, stride) }
+        const comes = ringRow(stream, y + reach)
+        add64(plain_sum, comes, 1, count)
+        if ramp {
+            add64(weighed, comes, @intCast(i64, reach + 1), count)
+            index = 0
+            while index < count {
+                weighed[index] = weighed[index] -% plain_sum[index]
+                index += 1
+            }
+        }
+    }
+    // A box weighs every row alike; a ramp's first weight meets the row
+    // furthest below, and the weight before the middle one, which meets
+    // the row just below, is what a row of distance weighs.
+    const from = if ramp { weighed } else { plain_sum }
+    const factor = @intCast(i64, if ramp { stream.*.across[reach - 1] } else { stream.*.across[0] })
+    index = 0
+    while index < count {
+        stream.*.sums[index] = from[index] *% factor
+        index += 1
+    }
 }
 
 // stream.sums becomes the kernel's sums for row `y`; the rows are asked
 // for from the top down, each before its pixels are written.
 fn advance(stream: *Stream, pixels: [*]const u32, stride: usize, y: usize) -> void {
-    const count = stream.*.count
-    const along = stream.*.along
-    const across = stream.*.across
-    const values = valuesOf(stream.*.form)
-    const last = stream.*.height - 1
-    const needed = if y + across.length / 2 < last { y + across.length / 2 } else { last }
-    while stream.*.filled <= needed {
-        spread(pixels + stream.*.filled * stride, stream.*.width, along.length / 2, stream.*.form, stream.*.wide)
-        const into = stream.*.ring + (stream.*.filled % across.length) * count
-        var more = false
-        var tap: usize = 0
-        while tap < along.length {
-            // Weight `tap` meets the pixel along.length - 1 - tap further
-            // into the spread row. A group cut short by the kernel's end
-            // is filled up with weights of zero.
-            const second = if tap + 1 < along.length { tap + 1 } else { tap }
-            const third = if tap + 2 < along.length { tap + 2 } else { tap }
-            const wa = along[tap]
-            const wb = if tap + 1 < along.length { along[tap + 1] } else { 0 }
-            const wc = if tap + 2 < along.length { along[tap + 2] } else { 0 }
-            if wa != 0 || wb != 0 || wc != 0 || (tap + 3 >= along.length && !more) {
-                const far = along.length - 1
-                sum32(into, stream.*.wide + (far - tap) * values, wa, stream.*.wide + (far - second) * values, wb, stream.*.wide + (far - third) * values, wc, count, more)
-                more = true
-            }
-            tap += 3
-        }
-        stream.*.filled += 1
+    if stream.*.acrossShape != TAPS {
+        slideDown(stream, pixels, stride, y)
+        return
     }
+    const count = stream.*.count
+    const across = stream.*.across
+    const reach = across.length / 2
+    while stream.*.filled <= y + reach && stream.*.filled < stream.*.height { fill(stream, pixels, stride) }
     var more = false
     var tap: usize = 0
     while tap < across.length {
+        // Weight `tap` meets the row reach - tap below this one: the
+        // first weight the row furthest below.
         const second = if tap + 1 < across.length { tap + 1 } else { tap }
         const third = if tap + 2 < across.length { tap + 2 } else { tap }
         const wa = across[tap]
         const wb = if tap + 1 < across.length { across[tap + 1] } else { 0 }
         const wc = if tap + 2 < across.length { across[tap + 2] } else { 0 }
         if wa != 0 || wb != 0 || wc != 0 || (tap + 3 >= across.length && !more) {
-            sum64(stream.*.sums, ringRow(stream, y, tap), @intCast(i64, wa), ringRow(stream, y, second), @intCast(i64, wb), ringRow(stream, y, third), @intCast(i64, wc), count, more)
+            sum64(stream.*.sums, below(stream, y, tap), @intCast(i64, wa), below(stream, y, second), @intCast(i64, wb), below(stream, y, third), @intCast(i64, wc), count, more)
             more = true
         }
         tap += 3
@@ -1253,4 +1441,9 @@ const FILTERS = [14]types.Info{
     types.Info.{ .id = EMBOSS, .key = "emboss", .name = "Emboss with Variable Depth", .german = "Relief mit variabler Tiefe", .category = types.EMBOSS, .params = EMBOSS_PARAMS[0..], .margin = one, .apply = emboss },
 }
 
-pub fn list() -> []const types.Info { return FILTERS[0..] }
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+pub fn list() -> []const types.Info {
+    if kept.address != 0 { return table.rows(types.Info, &kept) }
+    return table.keep(types.Info, &kept, FILTERS[0..])
+}

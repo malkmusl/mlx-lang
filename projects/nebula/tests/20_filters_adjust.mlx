@@ -1,0 +1,1546 @@
+// nebula's Adjust filters (filters/adjust.mlx) and their curves
+// (filters/curves.mlx), through the registry: every filter is listed
+// with an id and a key of its own, initial values inside their ranges
+// and no margin; the curve arithmetic by itself (the spline through
+// hand-computed points, what is outside the points, texts that are no
+// curve, several curves in one text, writing one); exact pixels for each
+// filter (Invert twice; Levels' input range, gamma, output range and
+// channels; Gamma and Exposure; Brightness/Contrast; the Colour
+// Adjustment curves, each channel, composed, on alpha and on lightness;
+// Cross-channel with each kind of driver and target; HSV/HSL Adjustment
+// turning red into green, taking the colour out, colorizing; the six
+// greys of Desaturate; Threshold; Colour Balance; Auto Contrast and
+// Normalize Range; Burn and Dodge; Slope/Offset/Power; Colour
+// Temperature; Sepia; Transparency); every filter at neutral numbers is
+// the picture bit for bit; every filter at its parameters' extremes and
+// with NaN on 1x1, 1xN, Nx1 and 257x130 pictures that are transparent,
+// opaque or mixed, with a stride wider than the picture (the words
+// beside it stay) and the alpha left alone by all that are not about
+// alpha; a picture filtered whole equals the same filtered in blocks of
+// 256; the same numbers give the same pixels; 50 applications take no
+// memory of the value arena and leave the scratch pool as it was. Prints
+// megapixels per second. Exits 13.
+const std = @import("std")
+const math = @import("std.math")
+const turns = @import("std.turns")
+const filters = @import("../filters/registry.mlx")
+const types = @import("../filters/types.mlx")
+const adjust = @import("../filters/adjust.mlx")
+const curves = @import("../filters/curves.mlx")
+const color = @import("../core/color.mlx")
+const pixel = @import("../core/pixel.mlx")
+const scratch = @import("../core/scratch.mlx")
+const node = @import("../core/node.mlx")
+
+const SENTINEL: u32 = 0xDEADBEEF
+
+const CLEAR: u32 = 0
+const SOLID: u32 = 1
+const MIXED: u32 = 2
+
+const COUNT: usize = 19
+
+const MINE = [19]u16{ adjust.INVERT, adjust.BRIGHTNESS_CONTRAST, adjust.LEVELS, adjust.CURVES, adjust.CROSS_CHANNEL, adjust.HSV_ADJUSTMENT, adjust.COLOR_BALANCE, adjust.DESATURATE, adjust.THRESHOLD, adjust.AUTO_CONTRAST, adjust.BURN, adjust.DODGE, adjust.SLOPE_OFFSET_POWER, adjust.EXPOSURE, adjust.GAMMA, adjust.COLOR_TEMPERATURE, adjust.SEPIA, adjust.NORMALIZE_RANGE, adjust.TRANSPARENCY }
+
+// Curves for the filters that take them as text.
+const ALL_CURVES = "rgb:0,0;0.5,0.75;1,1|r:0,0.2;1,0.8|g:0,1;1,0|b:0.5,0.5|a:0,0;1,0.5|l:0,0.1;0.5,0.6;1,1"
+const COLOR_CURVES = "rgb:0,0;0.5,0.75;1,1|r:0,0.2;1,0.8|l:0,0.1;0.5,0.6;1,1"
+const CROSS_CURVE = "0,0;0.3,1;0.6,0.2;1,0.9"
+
+fn words(count: usize) -> [*]u32 {
+    const memory = std.heap.allocator().alloc(count * 4, 16).?
+    unsafe { return @ptrCast([*]u32, memory) }
+}
+
+// A generator of its own (xorshift): the same seed, the same picture.
+fn next(state: *u64) -> u32 {
+    var x = state.*
+    x ^= x << 13
+    x ^= x >> 7
+    x ^= x << 17
+    state.* = x
+    return @intCast(u32, x >> 32)
+}
+
+// A picture of noise: transparent with colour left in it, opaque, or
+// every pixel one of transparent, opaque, translucent.
+fn noise(pixels: [*]u32, width: usize, height: usize, stride: usize, kind: u32, seed: u64) -> void {
+    var state: u64 = seed *% 0x9E3779B97F4A7C15 +% 88172645463325252
+    if state == 0 { state = 1 }
+    var y: usize = 0
+    while y < height {
+        var x: usize = 0
+        while x < width {
+            const value = next(&state)
+            var made = value & 0x00FFFFFF
+            if kind == SOLID {
+                made |= 0xFF000000
+            } else if kind == MIXED {
+                const pick = next(&state) & 3
+                if pick == 1 { made |= 0xFF000000 }
+                if pick >= 2 { made = value }
+            }
+            pixels[y * stride + x] = made
+            x += 1
+        }
+        y += 1
+    }
+}
+
+fn copy(into: [*]u32, from: [*]const u32, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        into[index] = from[index]
+        index += 1
+    }
+}
+
+fn same(a: [*]const u32, b: [*]const u32, count: usize) -> bool {
+    var index: usize = 0
+    while index < count {
+        if a[index] != b[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+fn bars(text: []const u8) -> usize {
+    var count: usize = 0
+    for byte in text {
+        if byte == 124 { count += 1 }
+    }
+    return count
+}
+
+fn near(a: u32, b: u32, slack: u32) -> bool {
+    return if a > b { a - b <= slack } else { b - a <= slack }
+}
+
+fn close(a: f64, b: f64, slack: f64) -> bool {
+    const apart = if a > b { a - b } else { b - a }
+    return apart <= slack
+}
+
+// One pixel through a filter.
+fn through(params: *const filters.Params, cell: [*]u32, value: u32) -> u32 {
+    cell[0] = value
+    if !filters.apply(params, cell, 1, 1, 1) { return 0x12345678 }
+    return cell[0]
+}
+
+fn rgb(r: u32, g: u32, b: u32) -> u32 {
+    return pixel.rgb(r, g, b)
+}
+
+// Numbers that do something, for each filter: what the checks of blocks,
+// of repeating and of memory run with. Curves here has no alpha curve.
+fn lively(id: u16, params: *filters.Params) -> void {
+    filters.defaults(id, params)
+    if id == adjust.BRIGHTNESS_CONTRAST {
+        params.*.values[0] = 20.0
+        params.*.values[1] = 30.0
+    } else if id == adjust.LEVELS {
+        params.*.values[0] = 30.0
+        params.*.values[1] = 220.0
+        params.*.values[2] = 1.4
+        params.*.values[3] = 10.0
+        params.*.values[4] = 240.0
+    } else if id == adjust.CURVES {
+        node.setParamsText(params, COLOR_CURVES)
+    } else if id == adjust.CROSS_CHANNEL {
+        node.setParamsText(params, CROSS_CURVE)
+    } else if id == adjust.HSV_ADJUSTMENT {
+        params.*.values[0] = @floatFromInt(f64, adjust.MODEL_HSY)
+        params.*.values[1] = 40.0
+        params.*.values[2] = 30.0
+        params.*.values[3] = -10.0
+    } else if id == adjust.COLOR_BALANCE {
+        params.*.values[0] = 30.0
+        params.*.values[4] = -40.0
+        params.*.values[8] = 55.0
+    } else if id == adjust.DESATURATE {
+        params.*.values[0] = @floatFromInt(f64, adjust.BY_LUMINOSITY_709)
+    } else if id == adjust.THRESHOLD {
+        params.*.values[0] = 100.0
+    } else if id == adjust.SLOPE_OFFSET_POWER {
+        params.*.values[0] = @floatFromInt(f64, 0xFFE0C0A0)
+        params.*.values[1] = @floatFromInt(f64, 0xFF101820)
+        params.*.values[2] = @floatFromInt(f64, 0xFFF0E0D0)
+    } else if id == adjust.EXPOSURE {
+        params.*.values[0] = 0.7
+    } else if id == adjust.GAMMA {
+        params.*.values[0] = 1.8
+    } else if id == adjust.COLOR_TEMPERATURE {
+        params.*.values[0] = 40.0
+        params.*.values[1] = -20.0
+    } else if id == adjust.SEPIA {
+        params.*.values[1] = 60.0
+    } else if id == adjust.TRANSPARENCY {
+        params.*.values[0] = 70.0
+        params.*.values[1] = 10.0
+    }
+}
+
+// A choice as the filter reads it.
+fn heldChoice(value: f64, high: f64, initial: f64) -> u32 {
+    if value != value { return @intFromFloat(u32, initial) }
+    const held = if value < 0.0 { 0.0 } else if value > high { high } else { value }
+    return @intFromFloat(u32, held + 0.5)
+}
+
+// Whether the filter changes alpha with these numbers.
+fn aboutAlpha(params: *const filters.Params) -> bool {
+    if params.*.id == adjust.TRANSPARENCY { return true }
+    if params.*.id == adjust.LEVELS { return heldChoice(params.*.values[5], 5.0, 0.0) == adjust.LEVELS_ALPHA }
+    if params.*.id == adjust.CROSS_CHANNEL { return heldChoice(params.*.values[1], 6.0, 1.0) == adjust.CROSS_ALPHA }
+    if params.*.id == adjust.CURVES {
+        if params.*.textLength > node.TEXT { return true }
+        const text = node.paramsText(params)
+        return curves.section(text, "a").length != 0 || curves.section(text, "alpha").length != 0
+    }
+    return false
+}
+
+// Every filter of the module is in the registry, once, and says of itself
+// what the dialog and the files need.
+fn wiring() -> u8 {
+    if adjust.list().length != COUNT { return 1 }
+    var index: usize = 0
+    while index < COUNT {
+        const id = MINE[index]
+        const found = filters.find(id)
+        if found == null { return 2 }
+        const info = found.?
+        if info.*.id != id || id < 1 || id > 99 { return 3 }
+        if info.*.category != types.ADJUST { return 4 }
+        if info.*.key.length == 0 || info.*.name.length == 0 || info.*.german.length == 0 { return 5 }
+        const named = filters.byKey(info.*.key)
+        if named == null || named.?.*.id != id { return 6 }
+        var params: filters.Params = undefined
+        filters.defaults(id, &params)
+        // Each pixel from itself alone.
+        if info.*.margin != null || filters.margin(&params) != 0 { return 7 }
+        if params.id != id || params.textLength != 0 { return 8 }
+        var texts: usize = 0
+        var place: usize = 0
+        while place < info.*.params.length {
+            const param = &info.*.params[place]
+            if param.*.name.length == 0 || param.*.german.length == 0 { return 9 }
+            if params.values[place] != param.*.initial { return 11 }
+            if param.*.kind == types.TEXT {
+                texts += 1
+                if param.*.low != 0.0 || param.*.high != 0.0 || param.*.initial != 0.0 { return 10 }
+            } else {
+                if !(param.*.low < param.*.high) || param.*.initial < param.*.low || param.*.initial > param.*.high { return 10 }
+            }
+            if param.*.kind == types.CHOICE {
+                const choices = @intFromFloat(usize, param.*.high) + 1
+                if param.*.low != 0.0 || bars(param.*.choices) + 1 != choices || bars(param.*.choicesGerman) + 1 != choices { return 12 }
+            } else if param.*.choices.length != 0 || param.*.choicesGerman.length != 0 {
+                return 12
+            }
+            if param.*.kind == types.BOOL && (param.*.low != 0.0 || param.*.high != 1.0) { return 16 }
+            if param.*.kind == types.COLOR && (param.*.low != 0.0 || param.*.high != 4294967295.0) { return 17 }
+            place += 1
+        }
+        // params.text is one text.
+        if texts > 1 || info.*.params.length > 32 { return 13 }
+        index += 1
+    }
+    const all = filters.count()
+    var first: usize = 0
+    while first < all {
+        var second = first + 1
+        while second < all {
+            const a = filters.at(first).?
+            const b = filters.at(second).?
+            if a.*.id == b.*.id || std.text.same(a.*.key, b.*.key) { return 14 }
+            second += 1
+        }
+        first += 1
+    }
+    // The names files know them by.
+    if filters.byKey("invert").?.*.id != adjust.INVERT || filters.byKey("levels").?.*.id != adjust.LEVELS { return 15 }
+    if filters.byKey("perchannel").?.*.id != adjust.CURVES || filters.byKey("crosschannel").?.*.id != adjust.CROSS_CHANNEL { return 15 }
+    if filters.byKey("hsvadjustment").?.*.id != adjust.HSV_ADJUSTMENT || filters.byKey("colorbalance").?.*.id != adjust.COLOR_BALANCE { return 15 }
+    if filters.byKey("desaturate").?.*.id != adjust.DESATURATE || filters.byKey("threshold").?.*.id != adjust.THRESHOLD { return 15 }
+    if filters.byKey("autocontrast").?.*.id != adjust.AUTO_CONTRAST || filters.byKey("burn").?.*.id != adjust.BURN { return 15 }
+    if filters.byKey("dodge").?.*.id != adjust.DODGE || filters.byKey("asc-cdl").?.*.id != adjust.SLOPE_OFFSET_POWER { return 15 }
+    if filters.byKey("brightnesscontrast").?.*.id != adjust.BRIGHTNESS_CONTRAST { return 15 }
+    if filters.INVERT != 1 || adjust.INVERT != 1 { return 18 }
+    return 0
+}
+
+// The curve arithmetic by itself.
+fn curveChecks() -> u8 {
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const taken = curves.take(pool)
+    if taken == null { return 20 }
+    const curve = taken.?
+    // No points: every value its own.
+    if !curves.isIdentity(curve) || curves.value(curve, 0.3) != 0.3 || curves.value(curve, -1.0) != 0.0 || curves.value(curve, 7.0) != 1.0 { return 20 }
+
+    // The diagonal is every value exactly.
+    if !curves.parse(curve, "0,0;1,1") || curve.*.count != 2 || !curves.isIdentity(curve) { return 21 }
+    var byte: usize = 0
+    while byte < 256 {
+        const x = @floatFromInt(f64, byte) / 255.0
+        if curves.value(curve, x) != x { return 22 }
+        byte += 1
+    }
+    if curves.value(curve, 0.25) != 0.25 || curves.value(curve, -3.0) != 0.0 || curves.value(curve, 3.0) != 1.0 { return 22 }
+
+    // The natural spline through (0,0), (0.5,0.75), (1,1): its bend at
+    // the middle point is -3, so the left piece is 1.75 x - x^3 and the
+    // right one 0.75 + t - 1.5 t^2 + t^3 (t = x - 0.5).
+    if !curves.parse(curve, "0,0;0.5,0.75;1,1") || curve.*.count != 3 || curves.isIdentity(curve) { return 23 }
+    if curves.value(curve, 0.0) != 0.0 || curves.value(curve, 1.0) != 1.0 || !close(curves.value(curve, 0.5), 0.75, 1.0e-12) { return 23 }
+    if !close(curves.value(curve, 0.25), 0.421875, 1.0e-12) || !close(curves.value(curve, 0.75), 0.921875, 1.0e-12) { return 23 }
+    if !close(curve.*.bend[1], -3.0, 1.0e-12) || curve.*.bend[0] != 0.0 || curve.*.bend[2] != 0.0 { return 23 }
+    var step: usize = 1
+    var before = curves.value(curve, 0.0)
+    while step <= 1000 {
+        const now = curves.value(curve, @floatFromInt(f64, step) / 1000.0)
+        if now < before { return 24 }
+        before = now
+        step += 1
+    }
+    // The order of the points in the text says nothing.
+    const sorted = curves.value(curve, 0.3)
+    if !curves.parse(curve, "1,1;0,0;0.5,0.75") || curves.value(curve, 0.3) != sorted || curve.*.x[1] != 0.5 { return 25 }
+
+    // Four points: the spline goes through each, and its slope has no
+    // corner there (the same from both sides).
+    if !curves.parse(curve, "0,0.1;0.3,0.6;0.6,0.4;1,0.9") || curve.*.count != 4 { return 26 }
+    if !close(curves.value(curve, 0.3), 0.6, 1.0e-12) || !close(curves.value(curve, 0.6), 0.4, 1.0e-12) || curves.value(curve, 0.0) != 0.1 || curves.value(curve, 1.0) != 0.9 { return 26 }
+    const tiny: f64 = 1.0e-6
+    const from_left = (curves.value(curve, 0.3) - curves.value(curve, 0.3 - tiny)) / tiny
+    const from_right = (curves.value(curve, 0.3 + tiny) - curves.value(curve, 0.3)) / tiny
+    if !close(from_left, from_right, 1.0e-4) { return 26 }
+
+    // Outside the points the curve stays at the nearest point's height;
+    // through two points it is a straight line; one point is its height.
+    if !curves.parse(curve, "0.2,0.3;0.8,0.9") { return 27 }
+    if curves.value(curve, 0.0) != 0.3 || curves.value(curve, 0.1) != 0.3 || curves.value(curve, 1.0) != 0.9 || curves.value(curve, 0.85) != 0.9 { return 27 }
+    if !close(curves.value(curve, 0.5), 0.6, 1.0e-12) || curves.isIdentity(curve) { return 27 }
+    if !curves.parse(curve, "0.5,0.25") || curves.value(curve, 0.0) != 0.25 || curves.value(curve, 0.9) != 0.25 || !curves.isLevel(curve, 0.25) { return 27 }
+    if curves.value(curve, math.nan()) != 0.25 { return 27 }
+
+    // What is no curve.
+    if curves.parse(curve, "") || curve.*.count != 0 || curves.value(curve, 0.4) != 0.4 { return 28 }
+    if curves.parse(curve, "abc") || curves.parse(curve, "0.5") || curves.parse(curve, ";") || curves.parse(curve, ",1") { return 28 }
+    if !curves.parse(curve, "0,0;x") || curve.*.count != 1 { return 29 }
+    if !curves.parse(curve, "0,0;0.5,") || curve.*.count != 1 { return 29 }
+    if !curves.parse(curve, " 0 , 0 ; .5 , 1. ; 1 , +0.5 ; ") || curve.*.count != 3 || curve.*.y[1] != 1.0 || curve.*.y[2] != 0.5 { return 29 }
+    // Two points at one x: the first stays. Numbers outside 0..1 are held.
+    if !curves.parse(curve, "0,0;0,1;1,1;1.00001,0") || curve.*.count != 2 || curve.*.y[0] != 0.0 || curve.*.y[1] != 1.0 { return 30 }
+    if !curves.parse(curve, "-1,2;2,-1") || curve.*.count != 2 || curve.*.x[0] != 0.0 || curve.*.y[0] != 1.0 || curve.*.x[1] != 1.0 || curve.*.y[1] != 0.0 { return 31 }
+    if curves.value(curve, 0.25) != 0.75 { return 31 }
+    // A spline that swings beyond 0..1 is held there.
+    if !curves.parse(curve, "0,0;0.1,1;0.2,0;0.6,1;1,0") { return 32 }
+    step = 0
+    while step <= 1000 {
+        const now = curves.value(curve, @floatFromInt(f64, step) / 1000.0)
+        if !(now >= 0.0 && now <= 1.0) { return 32 }
+        step += 1
+    }
+    // More points than a curve has: the first 64 count.
+    var long: [600]u8 = undefined
+    const text: [*]u8 = &long
+    var length: usize = 0
+    var point: usize = 0
+    while point < 70 {
+        length = std.text.append(text, length, 600, "0.")
+        length = std.text.appendByte(text, length, 600, @intCast(u8, 48 + point / 10))
+        length = std.text.appendByte(text, length, 600, @intCast(u8, 48 + point % 10))
+        length = std.text.append(text, length, 600, ",0.5;")
+        point += 1
+    }
+    if !curves.parse(curve, text[0..length]) || curve.*.count != curves.POINTS || !curves.isLevel(curve, 0.5) { return 33 }
+    if curves.add(curve, 0.995, 0.1) { return 33 }
+    if curves.value(curve, 0.333) != 0.5 && !close(curves.value(curve, 0.333), 0.5, 1.0e-9) { return 33 }
+
+    // add() keeps the order and the curve ready; identity() and clear().
+    curves.identity(curve)
+    if !curves.isIdentity(curve) || !curves.add(curve, 0.5, 0.75) || curves.add(curve, 0.5, 0.1) || curves.add(curve, math.nan(), 0.1) { return 34 }
+    if curve.*.count != 3 || !close(curves.value(curve, 0.25), 0.421875, 1.0e-12) { return 34 }
+    curves.clear(curve)
+    if curve.*.count != 0 || !curves.isIdentity(curve) { return 34 }
+
+    // Several curves in one text.
+    const several = "rgb:0,0;1,1| a : 0,0;1,0.5|l:|r:0,1;1,0|r:0,0;1,1"
+    if !std.text.same(curves.section(several, "rgb"), "0,0;1,1") || !std.text.same(curves.section(several, "a"), " 0,0;1,0.5") { return 35 }
+    if !std.text.same(curves.section(several, "r"), "0,1;1,0") || curves.section(several, "l").length != 0 || curves.section(several, "g").length != 0 { return 35 }
+    if curves.section("", "r").length != 0 || curves.section("0,0;1,1", "r").length != 0 || curves.section("|||", "r").length != 0 { return 35 }
+
+    // Written as it is read.
+    if !curves.parse(curve, "0,0;0.25,0.1234;0.5,1;1,0.05") { return 36 }
+    length = curves.format(curve, text, 600)
+    if !std.text.same(text[0..length], "0,0;0.25,0.1234;0.5,1;1,0.05") { return 36 }
+    if curves.format(curve, text, 40) != 15 || curves.format(curve, text, 3) != 0 { return 36 }
+
+    // A table of the curve.
+    const table = scratch.doubles(pool, 5).?
+    curves.identity(curve)
+    _ = curves.add(curve, 0.5, 0.75)
+    curves.fill(curve, table, 5)
+    if table[0] != 0.0 || table[4] != 1.0 || !close(table[2], 0.75, 1.0e-12) || !close(table[1], 0.421875, 1.0e-12) { return 37 }
+    scratch.release(pool, mark)
+    return 0
+}
+
+// Invert, the filter core's tests use.
+fn inverting(cell: [*]u32, work: [*]u32, keep: [*]u32) -> u8 {
+    var params: filters.Params = undefined
+    filters.defaults(adjust.INVERT, &params)
+    if through(&params, cell, 0xFF102030) != 0xFFEFDFCF || through(&params, cell, 0x40FFFFFF) != 0x40000000 || through(&params, cell, 0x00000000) != 0x00FFFFFF { return 40 }
+    noise(work, 100, 50, 100, MIXED, 9)
+    copy(keep, work, 5000)
+    if !filters.apply(&params, work, 100, 50, 100) || same(work, keep, 5000) { return 41 }
+    if !filters.apply(&params, work, 100, 50, 100) || !same(work, keep, 5000) { return 42 }
+    return 0
+}
+
+// Levels, Gamma, Exposure, Brightness/Contrast.
+fn tones(cell: [*]u32) -> u8 {
+    var params: filters.Params = undefined
+    // Input 64..192 spread over everything.
+    filters.defaults(adjust.LEVELS, &params)
+    params.values[0] = 64.0
+    params.values[1] = 192.0
+    if through(&params, cell, pixel.gray(64)) != pixel.gray(0) || through(&params, cell, pixel.gray(192)) != pixel.gray(255) { return 45 }
+    if !near(pixel.red(through(&params, cell, pixel.gray(128))), 128, 1) || through(&params, cell, pixel.gray(100)) != pixel.gray(72) { return 45 }
+    if through(&params, cell, pixel.gray(10)) != pixel.gray(0) || through(&params, cell, pixel.gray(250)) != pixel.gray(255) { return 45 }
+    if through(&params, cell, 0x80406420) != 0x8000480 { return 46 }
+    var value: u32 = 0
+    var before: u32 = 0
+    while value < 256 {
+        const now = pixel.red(through(&params, cell, pixel.gray(value)))
+        if now < before { return 46 }
+        before = now
+        value += 1
+    }
+    // A gamma of 2 is the square root: mid grey 128 becomes
+    // 255 * sqrt(128 / 255) = 180.67.
+    filters.defaults(adjust.LEVELS, &params)
+    params.values[2] = 2.0
+    if through(&params, cell, pixel.gray(128)) != pixel.gray(181) || through(&params, cell, pixel.gray(0)) != pixel.gray(0) || through(&params, cell, pixel.gray(255)) != pixel.gray(255) { return 47 }
+    params.values[2] = 0.5
+    if through(&params, cell, pixel.gray(128)) != pixel.gray(64) { return 47 }
+    // The output range: 0..255 laid between 50 and 200, and turned around.
+    filters.defaults(adjust.LEVELS, &params)
+    params.values[3] = 50.0
+    params.values[4] = 200.0
+    if through(&params, cell, pixel.gray(0)) != pixel.gray(50) || through(&params, cell, pixel.gray(255)) != pixel.gray(200) || through(&params, cell, pixel.gray(51)) != pixel.gray(80) { return 48 }
+    params.values[3] = 255.0
+    params.values[4] = 0.0
+    if through(&params, cell, 0x7F102030) != 0x7FEFDFCF { return 48 }
+    // An input white not above the black is a step.
+    filters.defaults(adjust.LEVELS, &params)
+    params.values[0] = 100.0
+    params.values[1] = 100.0
+    if through(&params, cell, pixel.gray(100)) != pixel.gray(0) || through(&params, cell, pixel.gray(101)) != pixel.gray(255) { return 49 }
+    params.values[1] = 20.0
+    if through(&params, cell, pixel.gray(100)) != pixel.gray(0) || through(&params, cell, pixel.gray(101)) != pixel.gray(255) { return 49 }
+    // One channel, the alpha, the luma.
+    filters.defaults(adjust.LEVELS, &params)
+    params.values[0] = 64.0
+    params.values[1] = 192.0
+    params.values[5] = @floatFromInt(f64, adjust.LEVELS_RED)
+    if through(&params, cell, 0x80646464) != 0x80486464 { return 50 }
+    params.values[5] = @floatFromInt(f64, adjust.LEVELS_GREEN)
+    if through(&params, cell, 0x80646464) != 0x80644864 { return 50 }
+    params.values[5] = @floatFromInt(f64, adjust.LEVELS_BLUE)
+    if through(&params, cell, 0x80646464) != 0x80646448 { return 50 }
+    params.values[5] = @floatFromInt(f64, adjust.LEVELS_ALPHA)
+    if through(&params, cell, 0x64123456) != 0x48123456 || through(&params, cell, 0xFF123456) != 0xFF123456 { return 51 }
+    // What the alpha levels make fully transparent is stored as 0; what
+    // was transparent keeps what it had.
+    if through(&params, cell, 0x30123456) != 0 || through(&params, cell, 0x00123456) != 0x00123456 { return 51 }
+    params.values[5] = @floatFromInt(f64, adjust.LEVELS_LUMA)
+    // On greys the luma is the grey.
+    if through(&params, cell, 0x80646464) != 0x80484848 || through(&params, cell, pixel.gray(192)) != pixel.gray(255) { return 52 }
+    // A colour gets the luma the curve asks for, and stays the colour:
+    // (200, 100, 50) has luma 124, which becomes 120: all three less by 4.
+    const moved = through(&params, cell, rgb(200, 100, 50))
+    if !near(pixel.luma(moved), 120, 1) || !near(pixel.red(moved), 196, 1) || !near(pixel.green(moved), 96, 1) || !near(pixel.blue(moved), 46, 1) { return 52 }
+    // A dark red cannot get darker channels than none: luma 0 is black.
+    if through(&params, cell, rgb(120, 20, 10)) != rgb(0, 0, 0) { return 52 }
+
+    // Gamma by itself.
+    filters.defaults(adjust.GAMMA, &params)
+    params.values[0] = 2.0
+    if through(&params, cell, 0x55800040) != 0x55B50080 { return 53 }
+    if through(&params, cell, pixel.gray(255)) != pixel.gray(255) { return 53 }
+    params.values[0] = 0.5
+    if through(&params, cell, pixel.gray(128)) != pixel.gray(64) { return 53 }
+
+    // Exposure: one stop is twice the light, 128 -> 175.56, 64 -> 90.13;
+    // a stop less 128 -> 92.37.
+    filters.defaults(adjust.EXPOSURE, &params)
+    params.values[0] = 1.0
+    if through(&params, cell, 0x33804000) != 0x33B05A00 || through(&params, cell, pixel.gray(200)) != pixel.gray(255) { return 54 }
+    if pixel.red(through(&params, cell, pixel.gray(128))) != color.srgb8(color.linear8(128) * 2.0) { return 54 }
+    params.values[0] = -1.0
+    if through(&params, cell, pixel.gray(128)) != pixel.gray(92) || through(&params, cell, pixel.gray(0)) != pixel.gray(0) { return 54 }
+    params.values[0] = 5.0
+    if through(&params, cell, pixel.gray(60)) != pixel.gray(255) { return 54 }
+
+    // Brightness: toward white v + (1 - v) b, toward black v (1 + b).
+    filters.defaults(adjust.BRIGHTNESS_CONTRAST, &params)
+    params.values[0] = 40.0
+    if through(&params, cell, 0x996400FF) != 0x99A266FF { return 55 }
+    params.values[0] = -50.0
+    if through(&params, cell, pixel.gray(100)) != pixel.gray(50) { return 55 }
+    params.values[0] = 100.0
+    if through(&params, cell, pixel.gray(3)) != pixel.gray(255) { return 55 }
+    params.values[0] = -100.0
+    if through(&params, cell, pixel.gray(250)) != pixel.gray(0) { return 55 }
+    // Contrast: a line through middle grey with the slope
+    // tan((c + 1) pi / 4): at 50 it is 2.414, 100 -> 61.1; at -50 it is
+    // 0.414, 100 -> 116.1; at -100 all is middle grey, at 100 black or
+    // white.
+    filters.defaults(adjust.BRIGHTNESS_CONTRAST, &params)
+    params.values[1] = 50.0
+    if through(&params, cell, pixel.gray(100)) != pixel.gray(61) || through(&params, cell, pixel.gray(200)) != pixel.gray(255) { return 56 }
+    params.values[1] = -50.0
+    if through(&params, cell, pixel.gray(100)) != pixel.gray(116) { return 56 }
+    params.values[1] = -100.0
+    if through(&params, cell, pixel.gray(37)) != pixel.gray(128) || through(&params, cell, pixel.gray(255)) != pixel.gray(128) { return 56 }
+    params.values[1] = 100.0
+    if through(&params, cell, pixel.gray(127)) != pixel.gray(0) || through(&params, cell, pixel.gray(128)) != pixel.gray(255) { return 56 }
+    // Both: (150/255 + 0.2 (1 - 150/255) - 0.5) tan(1.3 pi/4) + 0.5 is 198.49.
+    params.values[0] = 20.0
+    params.values[1] = 30.0
+    if through(&params, cell, pixel.gray(150)) != pixel.gray(198) { return 57 }
+    return 0
+}
+
+fn curved(text: []const u8, cell: [*]u32, value: u32) -> u32 {
+    var params: filters.Params = undefined
+    filters.defaults(adjust.CURVES, &params)
+    node.setParamsText(&params, text)
+    return through(&params, cell, value)
+}
+
+// The Colour Adjustment curves.
+fn bends(cell: [*]u32) -> u8 {
+    // The identity, however it is written, is the pixel.
+    if curved("rgb:0,0;1,1", cell, 0x80123456) != 0x80123456 || curved("rgb:0,0;0.3,0.3;1,1|a:0,0;1,1|l:0,0;1,1", cell, 0x00123456) != 0x00123456 { return 65 }
+    // (0,0), (0.5,0.75), (1,1) lifts the middle: 128 -> 191.75,
+    // 64 -> 107.97, 191 -> 234.97, the ends stay, and it only rises.
+    const lift = "rgb:0,0;0.5,0.75;1,1"
+    if !near(pixel.red(curved(lift, cell, pixel.gray(128))), 191, 2) || curved(lift, cell, pixel.gray(128)) != pixel.gray(192) { return 66 }
+    if curved(lift, cell, pixel.gray(0)) != pixel.gray(0) || curved(lift, cell, pixel.gray(255)) != pixel.gray(255) { return 66 }
+    if curved(lift, cell, 0x7740BF80) != 0x776CEBC0 { return 66 }
+    if curved("all:0,0;0.5,0.75;1,1", cell, 0x7740BF80) != 0x776CEBC0 { return 66 }
+    var value: u32 = 0
+    var before: u32 = 0
+    while value < 256 {
+        const now = pixel.green(curved(lift, cell, pixel.gray(value)))
+        if now < before || now < value { return 67 }
+        before = now
+        value += 1
+    }
+    // A channel's own curve is that channel's alone.
+    if curved("r:0,0;0.5,0.75;1,1", cell, 0x80808080) != 0x80C08080 || curved("red:0,0;0.5,0.75;1,1", cell, 0x80808080) != 0x80C08080 { return 68 }
+    if curved("g:0,1;1,0", cell, 0x80102030) != 0x8010DF30 || curved("b:0,0.5;1,0.5", cell, 0x80102030) != 0x80102080 { return 68 }
+    if curved("green:0,1;1,0|blue:0,0.5;1,0.5", cell, 0x80102030) != 0x8010DF80 { return 68 }
+    // "rgb" first, then the channel's own: 128 is lifted to 0.75195,
+    // and red's curve halves that: 95.9.
+    if curved("rgb:0,0;0.5,0.75;1,1|r:0,0;1,0.5", cell, pixel.gray(128)) != rgb(96, 192, 192) { return 69 }
+    // The alpha curve: halved, the colour kept; what becomes fully
+    // transparent is 0; what was transparent stays what it was.
+    if curved("a:0,0;1,0.5", cell, 0xFF123456) != 0x80123456 || curved("alpha:0,0;1,0.5", cell, 0x64123456) != 0x32123456 { return 70 }
+    if curved("a:0,0;0.5,0;1,1", cell, 0x40123456) != 0 || curved("a:0,0;0.5,0;1,1", cell, 0x00123456) != 0x00123456 { return 70 }
+    if curved("a:0,1;1,1", cell, 0x00123456) != 0xFF123456 { return 70 }
+    if curved("a:0,0;1,0.5|g:0,1;1,0", cell, 0xFF102030) != 0x8010DF30 { return 70 }
+    // The lightness curve moves the luma and keeps the colour: greys go
+    // where the curve says, (200, 100, 50) of luma 124 gets luma 189
+    // (0.75 - 0.0155 + ...: the curve at 124/255 is 0.7417), 65 more in
+    // every channel as far as there is room.
+    if curved("l:0,0;0.5,0.75;1,1", cell, pixel.gray(128)) != pixel.gray(192) || curved("lightness:0,0;0.5,0.75;1,1", cell, 0x55404040) != 0x556C6C6C { return 71 }
+    const lit = curved("l:0,0;0.5,0.75;1,1", cell, rgb(200, 100, 50))
+    if !near(pixel.luma(lit), 189, 1) || pixel.red(lit) < pixel.green(lit) || pixel.green(lit) < pixel.blue(lit) || !near(pixel.green(lit), 165, 3) { return 71 }
+    // What is no curve changes nothing.
+    if curved("", cell, 0x80123456) != 0x80123456 || curved("|||", cell, 0x80123456) != 0x80123456 || curved("rgb:", cell, 0x80123456) != 0x80123456 { return 72 }
+    if curved("x:0,1;1,0", cell, 0x80123456) != 0x80123456 || curved("0,1;1,0", cell, 0x80123456) != 0x80123456 || curved("rgb:nan,nan", cell, 0x80123456) != 0x80123456 { return 72 }
+    // A text longer than there is room for is read as far as the room goes.
+    var params: filters.Params = undefined
+    filters.defaults(adjust.CURVES, &params)
+    node.setParamsText(&params, "g:0,1;1,0")
+    params.textLength = 100000
+    var index: usize = 9
+    while index < 256 {
+        params.text[index] = 59
+        index += 1
+    }
+    if through(&params, cell, 0x80102030) != 0x8010DF30 { return 73 }
+    return 0
+}
+
+fn crossed(driver: u32, target: u32, text: []const u8, cell: [*]u32, value: u32) -> u32 {
+    var params: filters.Params = undefined
+    filters.defaults(adjust.CROSS_CHANNEL, &params)
+    params.values[0] = @floatFromInt(f64, driver)
+    params.values[1] = @floatFromInt(f64, target)
+    node.setParamsText(&params, text)
+    return through(&params, cell, value)
+}
+
+// Cross-channel: one channel drives another.
+fn crossing(cell: [*]u32) -> u8 {
+    // Level at the middle, or no curve: the pixel.
+    var driver: u32 = 0
+    while driver < 7 {
+        var target: u32 = 0
+        while target < 7 {
+            if crossed(driver, target, "0,0.5;1,0.5", cell, 0x80C86432) != 0x80C86432 || crossed(driver, target, "", cell, 0x80C86432) != 0x80C86432 { return 165 }
+            if crossed(driver, target, "0.3,0.5", cell, 0x00C86432) != 0x00C86432 || crossed(driver, target, "junk", cell, 0x80C86432) != 0x80C86432 { return 165 }
+            target += 1
+        }
+        driver += 1
+    }
+    // Lightness drives saturation to nothing: the grey of HSL's
+    // lightness, (200 + 50) / 2.
+    if crossed(adjust.CROSS_LIGHTNESS, adjust.CROSS_SATURATION, "0,0;1,0", cell, 0x80C86432) != 0x807D7D7D { return 166 }
+    // Hue drives saturation: out of the cyans only (the curve dips to 0
+    // at hue 0.5 and is 0.5 at red).
+    const dip = "0,0.5;0.3,0.5;0.5,0;0.7,0.5;1,0.5"
+    if crossed(adjust.CROSS_HUE, adjust.CROSS_SATURATION, dip, cell, rgb(0, 255, 255)) != pixel.gray(128) || crossed(adjust.CROSS_HUE, adjust.CROSS_SATURATION, dip, cell, rgb(255, 0, 0)) != rgb(255, 0, 0) { return 167 }
+    // Twice the saturation: (150, 100, 100) has S 0.2 at L 125/255, so
+    // its span doubles around 125.
+    if crossed(adjust.CROSS_HUE, adjust.CROSS_SATURATION, "0,1;1,1", cell, rgb(150, 100, 100)) != rgb(175, 75, 75) { return 167 }
+    // Hue drives lightness: colours all the way up are white, a grey has
+    // no hue and stays.
+    if crossed(adjust.CROSS_HUE, adjust.CROSS_LIGHTNESS, "0,1;1,1", cell, 0x80C86432) != 0x80FFFFFF || crossed(adjust.CROSS_HUE, adjust.CROSS_LIGHTNESS, "0,1;1,1", cell, pixel.gray(77)) != pixel.gray(77) { return 168 }
+    if crossed(adjust.CROSS_HUE, adjust.CROSS_LIGHTNESS, "0,0;1,0", cell, 0x80C86432) != 0x80000000 { return 168 }
+    // A hue turned by half a turn at most: red by a third (the curve's
+    // 5/6 is 2/3 of the way up) is green, by a half cyan.
+    if crossed(adjust.CROSS_SATURATION, adjust.CROSS_HUE, "0,1;1,1", cell, rgb(255, 0, 0)) != rgb(0, 255, 255) { return 169 }
+    // Red drives blue: the more red, the more blue is added.
+    const rising = "0,0.5;1,1"
+    if crossed(adjust.CROSS_RED, adjust.CROSS_BLUE, rising, cell, rgb(255, 0, 10)) != rgb(255, 0, 255) || crossed(adjust.CROSS_RED, adjust.CROSS_BLUE, rising, cell, rgb(0, 0, 10)) != rgb(0, 0, 10) { return 170 }
+    if crossed(adjust.CROSS_RED, adjust.CROSS_BLUE, rising, cell, rgb(128, 0, 10)) != rgb(128, 0, 138) { return 170 }
+    if crossed(adjust.CROSS_GREEN, adjust.CROSS_RED, "0,0.5;1,0", cell, rgb(200, 255, 7)) != rgb(0, 255, 7) || crossed(adjust.CROSS_BLUE, adjust.CROSS_GREEN, rising, cell, rgb(1, 2, 255)) != rgb(1, 255, 255) { return 170 }
+    // The alpha as what is driven: gone where the picture is saturated,
+    // and what is gone is 0; a grey keeps its alpha.
+    if crossed(adjust.CROSS_SATURATION, adjust.CROSS_ALPHA, "0,0.5;1,0", cell, 0xFFFF0000) != 0 || crossed(adjust.CROSS_SATURATION, adjust.CROSS_ALPHA, "0,0.5;1,0", cell, 0xC8808080) != 0xC8808080 { return 171 }
+    if crossed(adjust.CROSS_LIGHTNESS, adjust.CROSS_ALPHA, "0,0.5;1,1", cell, 0x40FFFFFF) != 0xFFFFFFFF { return 171 }
+    // The alpha as the driver: opaque pixels get red, transparent ones
+    // nothing.
+    if crossed(adjust.CROSS_ALPHA, adjust.CROSS_RED, rising, cell, 0xFF102030) != 0xFFFF2030 || crossed(adjust.CROSS_ALPHA, adjust.CROSS_RED, rising, cell, 0x00102030) != 0x00102030 { return 172 }
+    return 0
+}
+
+fn tuned(model: u32, hue: f64, saturation: f64, lightness: f64, colorize: bool, cell: [*]u32, value: u32) -> u32 {
+    var params: filters.Params = undefined
+    filters.defaults(adjust.HSV_ADJUSTMENT, &params)
+    params.values[0] = @floatFromInt(f64, model)
+    params.values[1] = hue
+    params.values[2] = saturation
+    params.values[3] = lightness
+    params.values[4] = if colorize { 1.0 } else { 0.0 }
+    return through(&params, cell, value)
+}
+
+const SAMPLES = [8]u32{ 0xFFC86432, 0x80FF0000, 0xFF10F020, 0x403030C0, 0xFFE0E010, 0xFF7F807F, 0xFF010203, 0xFFFDFEFF }
+
+// HSV/HSL Adjustment in its four models.
+fn hues(cell: [*]u32) -> u8 {
+    var model: u32 = 0
+    while model < 4 {
+        const kind = @intCast(u8, model)
+        // A third of a turn: red is green, green blue, blue red.
+        const green = tuned(model, 120.0, 0.0, 0.0, false, cell, 0x80FF0000)
+        if model == adjust.MODEL_HSY {
+            // HSY keeps red's luma: a green as light as the red was.
+            if green >> 24 != 0x80 || pixel.red(green) != 0 || pixel.blue(green) != 0 || !near(pixel.green(green), 130, 1) { return 85 }
+        } else {
+            if green != 0x8000FF00 { return 85 }
+            if tuned(model, -120.0, 0.0, 0.0, false, cell, 0xFFFF0000) != 0xFF0000FF || tuned(model, 120.0, 0.0, 0.0, false, cell, 0xFF0000FF) != 0xFFFF0000 { return 86 }
+            if tuned(model, 180.0, 0.0, 0.0, false, cell, 0xFFFF0000) != 0xFF00FFFF || tuned(model, -180.0, 0.0, 0.0, false, cell, 0xFFFF0000) != 0xFF00FFFF { return 86 }
+            if tuned(model, 60.0, 0.0, 0.0, false, cell, 0xFFFF0000) != 0xFFFFFF00 { return 86 }
+        }
+        // Greys have no hue to turn.
+        if tuned(model, 77.0, 0.0, 0.0, false, cell, pixel.gray(99)) != pixel.gray(99) { return 87 }
+        var index: usize = 0
+        while index < 8 {
+            const sample = SAMPLES[index]
+            var r: f64 = 0.0
+            var g: f64 = 0.0
+            var b: f64 = 0.0
+            color.toRgb(sample, &r, &g, &b)
+            // No saturation: the grey of the model's lightness.
+            const grey = color.toByte(color.lum(kind, r, g, b))
+            if tuned(model, 0.0, -100.0, 0.0, false, cell, sample) != ((sample & 0xFF000000) | (grey << 16) | (grey << 8) | grey) { return 88 }
+            // No lightness: black. In HSL all of it: white.
+            if tuned(model, 0.0, 0.0, -100.0, false, cell, sample) != (sample & 0xFF000000) { return 89 }
+            if model == adjust.MODEL_HSL && tuned(model, 0.0, 0.0, 100.0, false, cell, sample) != (sample | 0x00FFFFFF) { return 89 }
+            // A turn and back is the colour within a step.
+            const there = tuned(model, 90.0, 0.0, 0.0, false, cell, sample)
+            const back = tuned(model, -90.0, 0.0, 0.0, false, cell, there)
+            if back >> 24 != sample >> 24 || !near(pixel.red(back), pixel.red(sample), 2) || !near(pixel.green(back), pixel.green(sample), 2) || !near(pixel.blue(back), pixel.blue(sample), 2) { return 90 }
+            // Colorize: the hue set (200 degrees, as -160), the model's
+            // lightness kept.
+            const tinted = tuned(model, -160.0, 0.0, 0.0, true, cell, sample)
+            if tinted >> 24 != sample >> 24 { return 91 }
+            var tr: f64 = 0.0
+            var tg: f64 = 0.0
+            var tb: f64 = 0.0
+            color.toRgb(tinted, &tr, &tg, &tb)
+            var h: f64 = 0.0
+            var s: f64 = 0.0
+            var l: f64 = 0.0
+            color.rgbToModel(kind, tr, tg, tb, &h, &s, &l)
+            if !close(l, color.lum(kind, r, g, b), 0.006) { return 92 }
+            // (The hue of a colour whose channels are a few steps apart
+            // is known only roughly.)
+            if color.chroma(tr, tg, tb) > 0.15 && !close(h, 200.0 / 360.0, 0.02) { return 93 }
+            index += 1
+        }
+        model += 1
+    }
+    // Hand-computed, in HSL. (200, 100, 50): L 125, span 150. Half the
+    // saturation: span 75 around 125. Twice: no more than there is room
+    // for, span 250.
+    if tuned(adjust.MODEL_HSL, 0.0, -50.0, 0.0, false, cell, rgb(200, 100, 50)) != rgb(163, 113, 88) && tuned(adjust.MODEL_HSL, 0.0, -50.0, 0.0, false, cell, rgb(200, 100, 50)) != rgb(163, 113, 87) { return 94 }
+    if tuned(adjust.MODEL_HSL, 0.0, 100.0, 0.0, false, cell, rgb(200, 100, 50)) != rgb(250, 83, 0) { return 94 }
+    // HSV: the value is the largest channel. Half of it halves all three;
+    // no saturation is (200, 200, 200).
+    if tuned(adjust.MODEL_HSV, 0.0, 0.0, -50.0, false, cell, rgb(200, 100, 50)) != rgb(100, 50, 25) || tuned(adjust.MODEL_HSV, 0.0, -100.0, 0.0, false, cell, rgb(200, 100, 50)) != rgb(200, 200, 200) { return 95 }
+    // The four greys of (200, 100, 50): max, (max + min) / 2, the
+    // average 116.67, Rec. 601's luma 124.2.
+    if tuned(adjust.MODEL_HSL, 0.0, -100.0, 0.0, false, cell, rgb(200, 100, 50)) != rgb(125, 125, 125) || tuned(adjust.MODEL_HSI, 0.0, -100.0, 0.0, false, cell, rgb(200, 100, 50)) != rgb(117, 117, 117) { return 96 }
+    if tuned(adjust.MODEL_HSY, 0.0, -100.0, 0.0, false, cell, rgb(200, 100, 50)) != rgb(124, 124, 124) { return 96 }
+    // Colorize in HSL at the slider's middle: half saturated. A grey of
+    // 128 with hue 0: span 0.5 around 128/255, (192, 64, 64); the
+    // saturation slider at its ends: none, and all there is room for.
+    if tuned(adjust.MODEL_HSL, 0.0, 0.0, 0.0, true, cell, pixel.gray(128)) != rgb(192, 64, 64) { return 97 }
+    if tuned(adjust.MODEL_HSL, 0.0, -100.0, 0.0, true, cell, rgb(200, 100, 50)) != rgb(125, 125, 125) || tuned(adjust.MODEL_HSL, 120.0, 100.0, 0.0, true, cell, pixel.gray(128)) != rgb(1, 255, 1) { return 97 }
+    // Black and white have no room for a colour in HSL.
+    if tuned(adjust.MODEL_HSL, 33.0, 100.0, 0.0, true, cell, 0xFF000000) != 0xFF000000 || tuned(adjust.MODEL_HSL, 33.0, 100.0, 0.0, true, cell, 0x11FFFFFF) != 0x11FFFFFF { return 97 }
+    return 0
+}
+
+fn grey(method: u32, cell: [*]u32, value: u32) -> u32 {
+    var params: filters.Params = undefined
+    filters.defaults(adjust.DESATURATE, &params)
+    params.values[0] = @floatFromInt(f64, method)
+    return through(&params, cell, value)
+}
+
+// Desaturate and Threshold.
+fn greys(cell: [*]u32) -> u8 {
+    // (200, 100, 50): (200 + 50) / 2 = 125; 0.2126 * 200 + 0.7152 * 100 +
+    // 0.0722 * 50 = 117.65; 0.299 * 200 + 0.587 * 100 + 0.114 * 50 =
+    // 124.2; 350 / 3 = 116.67; 50; 200.
+    const sample: u32 = 0x80C86432
+    if grey(adjust.BY_LIGHTNESS, cell, sample) != 0x807D7D7D { return 105 }
+    if grey(adjust.BY_LUMINOSITY_709, cell, sample) != 0x80767676 { return 106 }
+    if grey(adjust.BY_LUMINOSITY_601, cell, sample) != 0x807C7C7C { return 107 }
+    if grey(adjust.BY_AVERAGE, cell, sample) != 0x80757575 { return 108 }
+    if grey(adjust.BY_MINIMUM, cell, sample) != 0x80323232 || grey(adjust.BY_MAXIMUM, cell, sample) != 0x80C8C8C8 { return 109 }
+    // A grey is its own grey by every measure; halves round up.
+    var method: u32 = 0
+    while method < 6 {
+        var value: u32 = 0
+        while value < 256 {
+            if grey(method, cell, pixel.gray(value)) != pixel.gray(value) { return 110 }
+            value += 1
+        }
+        method += 1
+    }
+    if grey(adjust.BY_LIGHTNESS, cell, rgb(1, 0, 0)) != pixel.gray(1) || grey(adjust.BY_AVERAGE, cell, rgb(1, 1, 0)) != pixel.gray(1) || grey(adjust.BY_AVERAGE, cell, rgb(1, 0, 0)) != pixel.gray(0) { return 110 }
+    // Pure red, green and blue weigh what the standards say.
+    if grey(adjust.BY_LUMINOSITY_709, cell, rgb(255, 0, 0)) != pixel.gray(54) || grey(adjust.BY_LUMINOSITY_709, cell, rgb(0, 255, 0)) != pixel.gray(182) || grey(adjust.BY_LUMINOSITY_709, cell, rgb(0, 0, 255)) != pixel.gray(18) { return 111 }
+    if grey(adjust.BY_LUMINOSITY_601, cell, rgb(255, 0, 0)) != pixel.gray(76) || grey(adjust.BY_LUMINOSITY_601, cell, rgb(0, 255, 0)) != pixel.gray(150) || grey(adjust.BY_LUMINOSITY_601, cell, rgb(0, 0, 255)) != pixel.gray(29) { return 111 }
+
+    var params: filters.Params = undefined
+    filters.defaults(adjust.THRESHOLD, &params)
+    if params.values[0] != 128.0 { return 112 }
+    if through(&params, cell, pixel.gray(127)) != pixel.gray(0) || through(&params, cell, pixel.gray(128)) != pixel.gray(255) { return 112 }
+    if through(&params, cell, 0x40808080) != 0x40FFFFFF || through(&params, cell, 0x007F7F7F) != 0x00000000 { return 112 }
+    // By the luma: (200, 100, 50) has 124.
+    if through(&params, cell, sample) != 0x80000000 { return 113 }
+    params.values[0] = 124.0
+    if through(&params, cell, sample) != 0x80FFFFFF { return 113 }
+    params.values[0] = 0.0
+    if through(&params, cell, pixel.gray(0)) != pixel.gray(255) { return 114 }
+    params.values[0] = 255.0
+    if through(&params, cell, pixel.gray(254)) != pixel.gray(0) || through(&params, cell, pixel.gray(255)) != pixel.gray(255) { return 114 }
+    return 0
+}
+
+// Colour Balance.
+fn balance(cell: [*]u32) -> u8 {
+    var params: filters.Params = undefined
+    filters.defaults(adjust.COLOR_BALANCE, &params)
+    if through(&params, cell, 0x80C86432) != 0x80C86432 { return 115 }
+    // Red in the midtones, the lightness not put back: mid grey is all
+    // midtone, 128 + 0.5 * 0.7 * 255 = 217.25; black and white are none.
+    params.values[3] = 50.0
+    params.values[9] = 0.0
+    if through(&params, cell, 0x80808080) != 0x80D98080 { return 116 }
+    if through(&params, cell, pixel.gray(0)) != pixel.gray(0) || through(&params, cell, pixel.gray(255)) != pixel.gray(255) { return 116 }
+    // Toward cyan it is less red.
+    params.values[3] = -50.0
+    if through(&params, cell, 0x80808080) != 0x80278080 { return 116 }
+    // With the lightness put back red still is the most, and the middle
+    // of the largest and the smallest channel is where it was.
+    params.values[3] = 50.0
+    params.values[9] = 1.0
+    const kept = through(&params, cell, pixel.gray(128))
+    if pixel.red(kept) <= 128 || pixel.green(kept) >= 128 || pixel.green(kept) != pixel.blue(kept) || !near(pixel.red(kept) + pixel.green(kept), 256, 1) { return 117 }
+    if through(&params, cell, pixel.gray(0)) != pixel.gray(0) || through(&params, cell, pixel.gray(255)) != pixel.gray(255) { return 117 }
+    // The shadows: black gets 0.5 * 0.7 * 255 = 89.25 of blue, mid grey
+    // and white nothing. The highlights the other way around.
+    filters.defaults(adjust.COLOR_BALANCE, &params)
+    params.values[2] = 50.0
+    params.values[9] = 0.0
+    if through(&params, cell, pixel.gray(0)) != rgb(0, 0, 89) || through(&params, cell, pixel.gray(128)) != pixel.gray(128) || through(&params, cell, pixel.gray(255)) != pixel.gray(255) { return 118 }
+    filters.defaults(adjust.COLOR_BALANCE, &params)
+    params.values[7] = -50.0
+    params.values[9] = 0.0
+    if through(&params, cell, pixel.gray(255)) != rgb(255, 166, 255) || through(&params, cell, pixel.gray(128)) != pixel.gray(128) || through(&params, cell, pixel.gray(0)) != pixel.gray(0) { return 119 }
+    // Between the ranges a pixel is part of both: at L = 1/3 (grey 85)
+    // half shadow, half midtone.
+    filters.defaults(adjust.COLOR_BALANCE, &params)
+    params.values[1] = 100.0
+    params.values[9] = 0.0
+    if !near(pixel.green(through(&params, cell, pixel.gray(85))), 85 + 89, 1) { return 120 }
+    params.values[4] = 100.0
+    if !near(pixel.green(through(&params, cell, pixel.gray(85))), 85 + 178, 1) && pixel.green(through(&params, cell, pixel.gray(85))) != 255 { return 120 }
+    return 0
+}
+
+// Auto Contrast and Normalize Range.
+fn ranges(cell: [*]u32, work: [*]u32, keep: [*]u32) -> u8 {
+    var params: filters.Params = undefined
+    filters.defaults(adjust.AUTO_CONTRAST, &params)
+    // Greys from 50 to 200 become 0 to 255; a transparent pixel, however
+    // light the colour left in it, counts for nothing.
+    work[0] = pixel.gray(50)
+    work[1] = pixel.gray(125)
+    work[2] = 0x80C8C8C8
+    work[3] = 0x00FFFFFF
+    work[4] = rgb(200, 100, 50)
+    if !filters.apply(&params, work, 5, 1, 5) { return 125 }
+    if work[0] != pixel.gray(0) || work[1] != pixel.gray(128) || work[2] != 0x80FFFFFF || work[3] >> 24 != 0 || work[4] != rgb(255, 85, 0) { return 125 }
+    // The luma decides, not the channels: pure blue (luma 29) and pure
+    // yellow (226) are the ends.
+    work[0] = rgb(0, 0, 255)
+    work[1] = rgb(255, 255, 0)
+    work[2] = pixel.gray(29)
+    work[3] = pixel.gray(226)
+    if !filters.apply(&params, work, 2, 2, 2) { return 126 }
+    if work[2] != pixel.gray(0) || work[3] != pixel.gray(255) || work[0] != rgb(0, 0, 255) || work[1] != rgb(255, 255, 0) { return 126 }
+    // One luma, nothing to see, or the whole range already: as it is.
+    work[0] = pixel.gray(90)
+    work[1] = 0x80101090
+    work[2] = 0x00123456
+    if !filters.apply(&params, work, 1, 1, 1) || !filters.apply(&params, work + 2, 1, 1, 1) || work[0] != pixel.gray(90) || work[2] != 0x00123456 { return 127 }
+    noise(work, 64, 64, 64, MIXED, 4)
+    work[5] = pixel.gray(0)
+    work[6] = pixel.gray(255)
+    copy(keep, work, 4096)
+    if !filters.apply(&params, work, 64, 64, 64) || !same(work, keep, 4096) { return 127 }
+    // The rectangle handed in is what is measured.
+    work[0] = pixel.gray(50)
+    work[1] = pixel.gray(100)
+    work[2] = pixel.gray(200)
+    if !filters.apply(&params, work, 2, 1, 2) || work[0] != pixel.gray(0) || work[1] != pixel.gray(255) || work[2] != pixel.gray(200) { return 128 }
+
+    // Normalize Range, the channels together: 50..200 over everything,
+    // the hue kept.
+    filters.defaults(adjust.NORMALIZE_RANGE, &params)
+    work[0] = rgb(100, 50, 50)
+    work[1] = 0x40C8963C
+    work[2] = 0x00FF00FF
+    if !filters.apply(&params, work, 3, 1, 3) || work[0] != rgb(85, 0, 0) || work[1] != 0x40FFAA11 || work[2] >> 24 != 0 { return 129 }
+    // Each alone: red 100..200, green 50..150, blue 50..60.
+    params.values[0] = @floatFromInt(f64, adjust.EACH_ALONE)
+    work[0] = rgb(100, 50, 50)
+    work[1] = 0x40C8963C
+    work[2] = rgb(150, 100, 55)
+    if !filters.apply(&params, work, 3, 1, 3) || work[0] != rgb(0, 0, 0) || work[1] != 0x40FFFFFF || work[2] != rgb(128, 128, 128) { return 130 }
+    // A channel that is one value stays.
+    work[0] = rgb(10, 77, 30)
+    work[1] = rgb(20, 77, 30)
+    if !filters.apply(&params, work, 2, 1, 2) || work[0] != rgb(0, 77, 30) || work[1] != rgb(255, 77, 30) { return 131 }
+    params.values[0] = @floatFromInt(f64, adjust.TOGETHER)
+    work[0] = pixel.gray(90)
+    if !filters.apply(&params, work, 1, 1, 1) || work[0] != pixel.gray(90) { return 131 }
+    return 0
+}
+
+fn exposed(id: u16, amount: f64, range: u32, cell: [*]u32, value: u32) -> u32 {
+    var params: filters.Params = undefined
+    filters.defaults(id, &params)
+    params.values[0] = amount
+    params.values[1] = @floatFromInt(f64, range)
+    return through(&params, cell, value)
+}
+
+// Burn, Dodge, Slope/Offset/Power, Colour Temperature, Sepia,
+// Transparency.
+fn others(cell: [*]u32) -> u8 {
+    // With e = 0.5 and c = 128/255. Dodge: shadows e/3 + c (1 - e/3) =
+    // 149.17, midtones c^(1/1.5) = 161.06, highlights c (1 + e/3) =
+    // 149.33. Burn: (c - e/3) / (1 - e/3) = 102.6, c^1.5 = 90.69,
+    // c (1 - e/3) = 106.67.
+    if exposed(adjust.DODGE, 0.5, adjust.SHADOWS, cell, 0x80808080) != 0x80959595 || exposed(adjust.DODGE, 0.5, adjust.MIDTONES, cell, 0x80808080) != 0x80A1A1A1 || exposed(adjust.DODGE, 0.5, adjust.HIGHLIGHTS, cell, 0x80808080) != 0x80959595 { return 135 }
+    if exposed(adjust.BURN, 0.5, adjust.SHADOWS, cell, 0x80808080) != 0x80676767 || exposed(adjust.BURN, 0.5, adjust.MIDTONES, cell, 0x80808080) != 0x805B5B5B || exposed(adjust.BURN, 0.5, adjust.HIGHLIGHTS, cell, 0x80808080) != 0x806B6B6B { return 136 }
+    // What they hold: burnt shadows do not go below black, dodged
+    // highlights not above white; the midtones keep black and white.
+    if exposed(adjust.BURN, 0.5, adjust.SHADOWS, cell, pixel.gray(40)) != pixel.gray(0) || exposed(adjust.DODGE, 0.5, adjust.HIGHLIGHTS, cell, pixel.gray(250)) != pixel.gray(255) { return 137 }
+    if exposed(adjust.BURN, 1.0, adjust.MIDTONES, cell, rgb(0, 255, 128)) != rgb(0, 255, 64) || exposed(adjust.DODGE, 1.0, adjust.MIDTONES, cell, rgb(0, 255, 128)) != rgb(0, 255, 181) { return 137 }
+    // Dodging the shadows lifts black, burning the highlights lowers
+    // white.
+    if exposed(adjust.DODGE, 0.6, adjust.SHADOWS, cell, pixel.gray(0)) != pixel.gray(51) || exposed(adjust.BURN, 0.6, adjust.HIGHLIGHTS, cell, pixel.gray(255)) != pixel.gray(204) { return 137 }
+    var params: filters.Params = undefined
+    filters.defaults(adjust.BURN, &params)
+    if params.values[0] != 0.5 || params.values[1] != 1.0 { return 138 }
+
+    // Slope, Offset, Power: each channel its own numbers, a colour's
+    // channel over 255. Slope (255, 128, 0) on white; offset 64 on black
+    // and held at white; power 128/255 on 64: (64/255)^0.502 = 127.4.
+    filters.defaults(adjust.SLOPE_OFFSET_POWER, &params)
+    params.values[0] = @floatFromInt(f64, 0x00FF8000)
+    if through(&params, cell, 0x80FFFFFF) != 0x80FF8000 || through(&params, cell, rgb(200, 200, 200)) != rgb(200, 100, 0) { return 139 }
+    filters.defaults(adjust.SLOPE_OFFSET_POWER, &params)
+    params.values[1] = @floatFromInt(f64, 0xFF400000)
+    if through(&params, cell, rgb(0, 0, 0)) != rgb(64, 0, 0) || through(&params, cell, rgb(250, 250, 250)) != rgb(255, 250, 250) { return 140 }
+    filters.defaults(adjust.SLOPE_OFFSET_POWER, &params)
+    params.values[2] = @floatFromInt(f64, 0xFFFFFF80)
+    if through(&params, cell, rgb(64, 64, 64)) != rgb(64, 64, 127) || through(&params, cell, rgb(0, 255, 0)) != rgb(0, 255, 0) || through(&params, cell, rgb(0, 0, 255)) != rgb(0, 0, 255) { return 141 }
+    // All three: (100/255 * 128/255 + 64/255) ^ (128/255) = 170.38.
+    params.values[0] = @floatFromInt(f64, 0xFF808080)
+    params.values[1] = @floatFromInt(f64, 0xFF404040)
+    params.values[2] = @floatFromInt(f64, 0xFFFF8080)
+    if through(&params, cell, rgb(100, 100, 100)) != rgb(114, 170, 170) { return 142 }
+    // A power of 0 is 1, whatever the base.
+    params.values[2] = @floatFromInt(f64, 0xFF000000)
+    if through(&params, cell, 0x40000000) != 0x40FFFFFF { return 142 }
+
+    // Colour Temperature: at 50 red's light times sqrt(2), blue's over
+    // it: 128 -> 150.06 and 108.9; green stays. Cooler is the other way.
+    filters.defaults(adjust.COLOR_TEMPERATURE, &params)
+    params.values[0] = 50.0
+    if through(&params, cell, 0x80808080) != 0x80968D6D && through(&params, cell, 0x80808080) != 0x8096806D { return 143 }
+    if through(&params, cell, 0x80808080) != 0x8096806D { return 143 }
+    params.values[0] = -50.0
+    if through(&params, cell, pixel.gray(128)) != rgb(109, 128, 150) { return 143 }
+    params.values[0] = 100.0
+    if through(&params, cell, pixel.gray(128)) != rgb(176, 128, 92) || through(&params, cell, pixel.gray(0)) != pixel.gray(0) { return 143 }
+    // The tint: above 0 less green.
+    filters.defaults(adjust.COLOR_TEMPERATURE, &params)
+    params.values[1] = 100.0
+    if through(&params, cell, pixel.gray(128)) != rgb(128, 92, 128) { return 144 }
+    params.values[1] = -100.0
+    if through(&params, cell, pixel.gray(128)) != rgb(128, 176, 128) { return 144 }
+
+    // Sepia: brown in the middle, black and white at the ends, the luma
+    // kept.
+    filters.defaults(adjust.SEPIA, &params)
+    if params.values[0] != @floatFromInt(f64, 0xFF704214) || params.values[1] != 100.0 { return 145 }
+    const brown = through(&params, cell, 0x80808080)
+    if brown >> 24 != 0x80 || !(pixel.red(brown) > pixel.green(brown) && pixel.green(brown) > pixel.blue(brown)) || !near(pixel.luma(brown), 128, 2) { return 145 }
+    // The tint's channels are 46 and 46 apart; so are the tone's.
+    if !near(pixel.red(brown) - pixel.green(brown), 46, 1) || !near(pixel.green(brown) - pixel.blue(brown), 46, 1) { return 145 }
+    if through(&params, cell, pixel.gray(0)) != pixel.gray(0) || through(&params, cell, pixel.gray(255)) != pixel.gray(255) { return 146 }
+    // A colour of the same luma gives the same tone.
+    if through(&params, cell, rgb(200, 100, 50)) != through(&params, cell, pixel.gray(124)) { return 146 }
+    // Half of it: halfway between the pixel and its tone.
+    params.values[1] = 50.0
+    const half = through(&params, cell, 0x80808080)
+    if half != (0x80000000 | (pixel.lerp(128, pixel.red(brown), 128) << 16) | (pixel.lerp(128, pixel.green(brown), 128) << 8) | pixel.lerp(128, pixel.blue(brown), 128)) { return 147 }
+    // Another colour: a grey tint is Desaturate by luma.
+    params.values[0] = @floatFromInt(f64, 0xFF555555)
+    params.values[1] = 100.0
+    if !near(pixel.red(through(&params, cell, rgb(200, 100, 50))), 124, 1) || pixel.red(through(&params, cell, rgb(200, 100, 50))) != pixel.green(through(&params, cell, rgb(200, 100, 50))) { return 147 }
+
+    // Transparency: the alpha times the opacity, plus the offset.
+    filters.defaults(adjust.TRANSPARENCY, &params)
+    params.values[0] = 50.0
+    if through(&params, cell, 0xFF123456) != 0x80123456 || through(&params, cell, 0xC8123456) != 0x64123456 || through(&params, cell, 0x00123456) != 0x00123456 { return 148 }
+    params.values[0] = 0.0
+    if through(&params, cell, 0xFF123456) != 0 || through(&params, cell, 0x00123456) != 0x00123456 { return 149 }
+    params.values[0] = 400.0
+    if through(&params, cell, 0x64123456) != 0xFF123456 || through(&params, cell, 0x01123456) != 0x04123456 { return 149 }
+    params.values[0] = 150.0
+    params.values[1] = -20.0
+    if through(&params, cell, 0x64123456) != 0x82123456 || through(&params, cell, 0x0A123456) != 0 { return 150 }
+    params.values[0] = 100.0
+    params.values[1] = 10.0
+    if through(&params, cell, 0x00123456) != 0x0A123456 || through(&params, cell, 0xFA123456) != 0xFF123456 { return 150 }
+    params.values[1] = -255.0
+    if through(&params, cell, 0xFF123456) != 0 { return 150 }
+    return 0
+}
+
+// Every filter at numbers that ask for nothing: the picture bit for bit.
+fn neutral(work: [*]u32, keep: [*]u32) -> u8 {
+    const width: usize = 257
+    const height: usize = 130
+    const count = width * height
+    noise(keep, width, height, width, MIXED, 21)
+    // Black and white are in it (Auto Contrast and Normalize Range then
+    // have nothing to spread).
+    keep[3] = pixel.gray(0)
+    keep[4] = pixel.gray(255)
+    var params: filters.Params = undefined
+    var index: usize = 0
+    while index < COUNT {
+        const id = MINE[index]
+        filters.defaults(id, &params)
+        var is_neutral = true
+        if id == adjust.INVERT || id == adjust.DESATURATE || id == adjust.THRESHOLD { is_neutral = false }
+        if id == adjust.BURN || id == adjust.DODGE || id == adjust.SEPIA { params.values[0] = 0.0 }
+        if id == adjust.SEPIA {
+            filters.defaults(id, &params)
+            params.values[1] = 0.0
+        }
+        if is_neutral {
+            copy(work, keep, count)
+            if !filters.apply(&params, work, width, height, width) || !same(work, keep, count) { return 180 }
+        }
+        index += 1
+    }
+    // The choices that are not numbers of an amount do not matter then.
+    var choice: u32 = 0
+    while choice < 7 {
+        copy(work, keep, count)
+        filters.defaults(adjust.LEVELS, &params)
+        params.values[5] = @floatFromInt(f64, choice)
+        if !filters.apply(&params, work, width, height, width) { return 181 }
+        filters.defaults(adjust.HSV_ADJUSTMENT, &params)
+        params.values[0] = @floatFromInt(f64, choice)
+        if !filters.apply(&params, work, width, height, width) { return 181 }
+        filters.defaults(adjust.BURN, &params)
+        params.values[0] = 0.0
+        params.values[1] = @floatFromInt(f64, choice)
+        if !filters.apply(&params, work, width, height, width) { return 181 }
+        params.id = adjust.DODGE
+        if !filters.apply(&params, work, width, height, width) { return 181 }
+        filters.defaults(adjust.COLOR_BALANCE, &params)
+        params.values[9] = @floatFromInt(f64, choice & 1)
+        if !filters.apply(&params, work, width, height, width) { return 181 }
+        filters.defaults(adjust.NORMALIZE_RANGE, &params)
+        params.values[0] = @floatFromInt(f64, choice & 1)
+        if !filters.apply(&params, work, width, height, width) { return 181 }
+        if !same(work, keep, count) { return 181 }
+        choice += 1
+    }
+    // Curves that are the diagonal, a cross curve level at the middle.
+    copy(work, keep, count)
+    filters.defaults(adjust.CURVES, &params)
+    node.setParamsText(&params, "rgb:0,0;1,1|r:0,0;0.5,0.5;1,1|g:0,0;1,1|b:0,0;0.25,0.25;1,1|a:0,0;1,1|l:0,0;1,1")
+    if !filters.apply(&params, work, width, height, width) || !same(work, keep, count) { return 182 }
+    filters.defaults(adjust.CROSS_CHANNEL, &params)
+    node.setParamsText(&params, "0,0.5;0.4,0.5;1,0.5")
+    var driver: u32 = 0
+    while driver < 7 {
+        var target: u32 = 0
+        while target < 7 {
+            params.values[0] = @floatFromInt(f64, driver)
+            params.values[1] = @floatFromInt(f64, target)
+            if !filters.apply(&params, work, width, height, width) || !same(work, keep, count) { return 183 }
+            target += 1
+        }
+        driver += 1
+    }
+    // The models themselves give every colour back: a filter that does
+    // go through them with nothing to do is still the picture (a hue
+    // turned by a whole turn's worth of nothing; a balance of the
+    // highlights on a picture that has none).
+    noise(keep, width, height, width, SOLID, 22)
+    var at: usize = 0
+    while at < count {
+        // Dark colours only: L below 1/3 - 1/8, no highlights and no
+        // midtones in them.
+        keep[at] = 0xFF000000 | ((keep[at] >> 2) & 0x00303030)
+        at += 1
+    }
+    copy(work, keep, count)
+    filters.defaults(adjust.COLOR_BALANCE, &params)
+    params.values[6] = 100.0
+    params.values[4] = -100.0
+    if !filters.apply(&params, work, width, height, width) || !same(work, keep, count) { return 184 }
+    return 0
+}
+
+// One picture of `kind` through a filter, the picture inside a frame of
+// other words: the frame stays; the alpha stays unless the filter is
+// about alpha, and what such a filter makes fully transparent is 0.
+fn trial(params: *const filters.Params, width: usize, height: usize, kind: u32, seed: u64, work: [*]u32, keep: [*]u32) -> bool {
+    const stride = width + 3
+    const count = stride * (height + 2)
+    var index: usize = 0
+    while index < count {
+        work[index] = SENTINEL
+        index += 1
+    }
+    noise(work + stride, width, height, stride, kind, seed)
+    copy(keep, work, count)
+    if !filters.apply(params, work + stride, width, height, stride) { return false }
+    const alpha_filter = aboutAlpha(params)
+    index = 0
+    while index < count {
+        const before = keep[index]
+        const after = work[index]
+        const y = index / stride
+        const x = index % stride
+        if y == 0 || y > height || x >= width {
+            if after != SENTINEL { return false }
+        } else if alpha_filter {
+            if after >> 24 == 0 && before >> 24 != 0 && after != 0 { return false }
+        } else if after >> 24 != before >> 24 {
+            return false
+        }
+        index += 1
+    }
+    return true
+}
+
+const WIDTHS = [4]usize{ 1, 1, 9, 257 }
+const HEIGHTS = [4]usize{ 1, 9, 1, 130 }
+
+fn trials(params: *const filters.Params, work: [*]u32, keep: [*]u32) -> bool {
+    var size: usize = 0
+    while size < 4 {
+        var kind: u32 = CLEAR
+        while kind <= MIXED {
+            if !trial(params, WIDTHS[size], HEIGHTS[size], kind, @intCast(u64, size) * 3 + @intCast(u64, kind) + 1, work, keep) { return false }
+            kind += 1
+        }
+        size += 1
+    }
+    return true
+}
+
+// Every filter at its initial values, at its parameters' ends (all
+// combinations up to four parameters, each alone above that), with each
+// parameter not a number and far outside its range, and the two with a
+// text with curves of every kind and with texts that are none.
+fn sweep(work: [*]u32, keep: [*]u32) -> u8 {
+    var index: usize = 0
+    while index < COUNT {
+        const id = MINE[index]
+        const info = filters.find(id).?
+        const count = info.*.params.length
+        var params: filters.Params = undefined
+        filters.defaults(id, &params)
+        if !trials(&params, work, keep) { return 190 }
+        if count <= 4 {
+            var mask: usize = 0
+            while mask < (@intCast(usize, 1) << @intCast(u6, count)) {
+                var place: usize = 0
+                while place < count {
+                    params.values[place] = if (mask >> @intCast(u6, place)) & 1 != 0 { info.*.params[place].high } else { info.*.params[place].low }
+                    place += 1
+                }
+                if !trials(&params, work, keep) { return 191 }
+                mask += 1
+            }
+        } else {
+            var place: usize = 0
+            while place < count {
+                filters.defaults(id, &params)
+                params.values[place] = info.*.params[place].low
+                if !trials(&params, work, keep) { return 192 }
+                params.values[place] = info.*.params[place].high
+                if !trials(&params, work, keep) { return 193 }
+                place += 1
+            }
+        }
+        var place: usize = 0
+        while place < count {
+            if info.*.params[place].kind != types.TEXT {
+                lively(id, &params)
+                params.values[place] = math.nan()
+                if !trials(&params, work, keep) { return 194 }
+                // Not a number is the initial value: the same pixels.
+                noise(work, 31, 17, 31, MIXED, 5)
+                noise(keep, 31, 17, 31, MIXED, 5)
+                if !filters.apply(&params, work, 31, 17, 31) { return 195 }
+                params.values[place] = info.*.params[place].initial
+                if !filters.apply(&params, keep, 31, 17, 31) || !same(work, keep, 527) { return 195 }
+                // Far outside is the nearest end.
+                lively(id, &params)
+                params.values[place] = 1.0e300
+                noise(work, 31, 17, 31, MIXED, 6)
+                if !filters.apply(&params, work, 31, 17, 31) { return 196 }
+                params.values[place] = info.*.params[place].high
+                noise(keep, 31, 17, 31, MIXED, 6)
+                if !filters.apply(&params, keep, 31, 17, 31) || !same(work, keep, 527) { return 197 }
+                params.values[place] = -math.infinity()
+                noise(work, 31, 17, 31, MIXED, 6)
+                if !filters.apply(&params, work, 31, 17, 31) { return 198 }
+                params.values[place] = info.*.params[place].low
+                noise(keep, 31, 17, 31, MIXED, 6)
+                if !filters.apply(&params, keep, 31, 17, 31) || !same(work, keep, 527) { return 199 }
+            }
+            place += 1
+        }
+        index += 1
+    }
+
+    // The curves, all at once and one by one, and what is no curve.
+    var params: filters.Params = undefined
+    filters.defaults(adjust.CURVES, &params)
+    node.setParamsText(&params, ALL_CURVES)
+    if !trials(&params, work, keep) { return 200 }
+    node.setParamsText(&params, COLOR_CURVES)
+    if !trials(&params, work, keep) { return 200 }
+    node.setParamsText(&params, "a:0,1;0.5,0;1,1")
+    if !trials(&params, work, keep) { return 200 }
+    node.setParamsText(&params, "l:0,1;1,0")
+    if !trials(&params, work, keep) { return 200 }
+    node.setParamsText(&params, "rgb:0,0;0.1,1;0.2,0;0.6,1;1,0|l:0,0;0.1,1;0.2,0;0.6,1;1,0")
+    if !trials(&params, work, keep) { return 200 }
+    node.setParamsText(&params, ":::;;;,,,|||rgb|r:|:0,0;1,1|l:;|a:,")
+    if !trials(&params, work, keep) { return 201 }
+    var at: usize = 0
+    while at < 256 {
+        params.text[at] = if at % 3 == 0 { 57 } else if at % 3 == 1 { 46 } else { 58 }
+        at += 1
+    }
+    params.textLength = 256
+    if !trials(&params, work, keep) { return 201 }
+    params.textLength = 1000000
+    if !trials(&params, work, keep) { return 201 }
+
+    // Every channel driving every other.
+    filters.defaults(adjust.CROSS_CHANNEL, &params)
+    node.setParamsText(&params, CROSS_CURVE)
+    var driver: u32 = 0
+    while driver < 7 {
+        var target: u32 = 0
+        while target < 7 {
+            params.values[0] = @floatFromInt(f64, driver)
+            params.values[1] = @floatFromInt(f64, target)
+            if !trials(&params, work, keep) { return 202 }
+            target += 1
+        }
+        driver += 1
+    }
+    node.setParamsText(&params, "0,1;1,1")
+    params.values[0] = @floatFromInt(f64, adjust.CROSS_LIGHTNESS)
+    params.values[1] = @floatFromInt(f64, adjust.CROSS_HUE)
+    if !trials(&params, work, keep) { return 202 }
+    node.setParamsText(&params, "0,0;1,0")
+    params.values[1] = @floatFromInt(f64, adjust.CROSS_ALPHA)
+    if !trials(&params, work, keep) { return 202 }
+    params.textLength = 1000000
+    if !trials(&params, work, keep) { return 203 }
+
+    // The models and the ranges at lively numbers, colorized too.
+    var choice: u32 = 0
+    while choice < 6 {
+        lively(adjust.HSV_ADJUSTMENT, &params)
+        params.values[0] = @floatFromInt(f64, choice)
+        if !trials(&params, work, keep) { return 204 }
+        params.values[4] = 1.0
+        if !trials(&params, work, keep) { return 204 }
+        lively(adjust.LEVELS, &params)
+        params.values[5] = @floatFromInt(f64, choice)
+        if !trials(&params, work, keep) { return 204 }
+        lively(adjust.DESATURATE, &params)
+        params.values[0] = @floatFromInt(f64, choice)
+        if !trials(&params, work, keep) { return 204 }
+        lively(adjust.COLOR_BALANCE, &params)
+        params.values[9] = @floatFromInt(f64, choice & 1)
+        if !trials(&params, work, keep) { return 204 }
+        choice += 1
+    }
+    return 0
+}
+
+fn landscape(pixels: [*]u32, width: usize, height: usize) -> void {
+    noise(pixels, width, height, width, MIXED, 31)
+    // Runs of one colour, as pictures have them, between the noise.
+    var y: usize = 0
+    while y < height {
+        var x: usize = 0
+        while x < width {
+            if (x / 37 + y / 23) % 3 == 0 { pixels[y * width + x] = 0xFF000000 | @intCast(u32, ((x / 37) * 40503 + (y / 23) * 9973) & 0x00FFFFFF) }
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// The picture filtered whole and in blocks of 256 (no margin: each pixel
+// from itself alone).
+fn pieces(params: *const filters.Params, source: [*]const u32, whole: [*]u32, parts: [*]u32, block: [*]u32, width: usize, height: usize) -> bool {
+    if filters.margin(params) != 0 { return false }
+    copy(whole, source, width * height)
+    if !filters.apply(params, whole, width, height, width) { return false }
+    var top: usize = 0
+    while top < height {
+        const tall = if height - top < 256 { height - top } else { 256 }
+        var left: usize = 0
+        while left < width {
+            const wide = if width - left < 256 { width - left } else { 256 }
+            var y: usize = 0
+            while y < tall {
+                copy(block + y * wide, source + (top + y) * width + left, wide)
+                y += 1
+            }
+            if !filters.apply(params, block, wide, tall, wide) { return false }
+            y = 0
+            while y < tall {
+                copy(parts + (top + y) * width + left, block + y * wide, wide)
+                y += 1
+            }
+            left += 256
+        }
+        top += 256
+    }
+    return same(whole, parts, width * height)
+}
+
+fn blocks(source: [*]u32, whole: [*]u32, parts: [*]u32, block: [*]u32) -> u8 {
+    const width: usize = 600
+    const height: usize = 300
+    landscape(source, width, height)
+    var params: filters.Params = undefined
+    var index: usize = 0
+    while index < COUNT {
+        const id = MINE[index]
+        // Auto Contrast and Normalize Range measure the rectangle they
+        // are handed: they are for whole layers.
+        if id != adjust.AUTO_CONTRAST && id != adjust.NORMALIZE_RANGE {
+            lively(id, &params)
+            if !pieces(&params, source, whole, parts, block, width, height) { return 210 }
+            // And it did something.
+            if same(whole, source, width * height) { return 211 }
+        }
+        index += 1
+    }
+    node.setParamsText(&params, ALL_CURVES)
+    params.id = adjust.CURVES
+    if !pieces(&params, source, whole, parts, block, width, height) { return 212 }
+    var choice: u32 = 0
+    while choice < 7 {
+        lively(adjust.CROSS_CHANNEL, &params)
+        params.values[0] = @floatFromInt(f64, choice)
+        params.values[1] = @floatFromInt(f64, (choice + 3) % 7)
+        if !pieces(&params, source, whole, parts, block, width, height) { return 213 }
+        lively(adjust.LEVELS, &params)
+        params.values[5] = @floatFromInt(f64, choice)
+        if !pieces(&params, source, whole, parts, block, width, height) { return 213 }
+        lively(adjust.HSV_ADJUSTMENT, &params)
+        params.values[0] = @floatFromInt(f64, choice)
+        params.values[4] = @floatFromInt(f64, choice & 1)
+        if !pieces(&params, source, whole, parts, block, width, height) { return 213 }
+        choice += 1
+    }
+    return 0
+}
+
+// The same numbers give the same pixels, and no filter that is not about
+// alpha touches one.
+fn repeats(source: [*]u32, first: [*]u32, second: [*]u32) -> u8 {
+    const width: usize = 300
+    const height: usize = 200
+    const count = width * height
+    landscape(source, width, height)
+    var params: filters.Params = undefined
+    var index: usize = 0
+    while index < COUNT {
+        lively(MINE[index], &params)
+        copy(first, source, count)
+        copy(second, source, count)
+        if !filters.apply(&params, first, width, height, width) || !filters.apply(&params, second, width, height, width) { return 215 }
+        if !same(first, second, count) { return 216 }
+        if !aboutAlpha(&params) {
+            var at: usize = 0
+            while at < count {
+                if first[at] >> 24 != source[at] >> 24 { return 217 }
+                at += 1
+            }
+        }
+        index += 1
+    }
+    return 0
+}
+
+// 50 applications of every filter leave the value arena where it was.
+fn arena(work: [*]u32) -> u8 {
+    // The numbers live in the heap, so that what is measured is the
+    // filters.
+    const memory = std.heap.allocator().alloc(@sizeOf(filters.Params) * COUNT, 16)
+    if memory == null { return 220 }
+    const all: [*]filters.Params = unsafe { @ptrCast([*]filters.Params, memory.?) }
+    var index: usize = 0
+    while index < COUNT {
+        lively(MINE[index], &all[index])
+        index += 1
+    }
+    node.setParamsText(&all[3], ALL_CURVES)
+    // Once before the measuring: the tables that are made at the first
+    // asking are made.
+    index = 0
+    while index < COUNT {
+        noise(work, 64, 64, 64, MIXED, 3)
+        if !filters.apply(&all[index], work, 64, 64, 64) { return 221 }
+        index += 1
+    }
+    const base = turns.locate()
+    const before = turns.used(base)
+    var round: usize = 0
+    while round < 50 {
+        index = 0
+        while index < COUNT {
+            noise(work, 64, 64, 64, if round & 1 == 0 { SOLID } else { MIXED }, 3)
+            if !filters.apply(&all[index], work, 64, 64, 64) { return 222 }
+            index += 1
+        }
+        round += 1
+    }
+    if turns.used(base) - before > 4096 { return 223 }
+    return 0
+}
+
+// Megapixels a second, with one decimal.
+fn report(name: []const u8, count: usize, nanoseconds: usize) -> void {
+    const elapsed = if nanoseconds == 0 { 1 } else { nanoseconds }
+    const tenths = count * 10000 / elapsed
+    _ = std.io.print(name)
+    _ = std.io.print(": ")
+    _ = std.io.writeUnsigned(std.io.stdout(), tenths / 10)
+    _ = std.io.print(".")
+    _ = std.io.writeUnsigned(std.io.stdout(), tenths % 10)
+    _ = std.io.print(" megapixels a second\n")
+}
+
+fn timed(name: []const u8, params: *const filters.Params, pixels: [*]u32, source: [*]const u32, width: usize, height: usize, rounds: usize) -> bool {
+    var spent: usize = 0
+    var round: usize = 0
+    while round < rounds {
+        copy(pixels, source, width * height)
+        const before = std.time.monotonicNanoseconds()
+        if !filters.apply(params, pixels, width, height, width) { return false }
+        spent += std.time.monotonicNanoseconds() - before
+        round += 1
+    }
+    report(name, width * height * rounds, spent)
+    return true
+}
+
+fn speed(pixels: [*]u32, source: [*]u32) -> u8 {
+    const width: usize = 1024
+    const height: usize = 1024
+    var params: filters.Params = undefined
+    noise(source, width, height, width, MIXED, 12)
+    _ = std.io.print("a megapixel of noise\n")
+    lively(adjust.LEVELS, &params)
+    if !timed("  Levels (RGB)", &params, pixels, source, width, height, 8) { return 225 }
+    params.values[5] = @floatFromInt(f64, adjust.LEVELS_ALPHA)
+    if !timed("  Levels (alpha)", &params, pixels, source, width, height, 8) { return 225 }
+    params.values[5] = @floatFromInt(f64, adjust.LEVELS_LUMA)
+    if !timed("  Levels (luma)", &params, pixels, source, width, height, 2) { return 225 }
+    filters.defaults(adjust.CURVES, &params)
+    node.setParamsText(&params, "rgb:0,0;0.5,0.75;1,1|r:0,0.2;1,0.8")
+    if !timed("  Color Adjustment Curves (rgb, r)", &params, pixels, source, width, height, 8) { return 226 }
+    node.setParamsText(&params, ALL_CURVES)
+    if !timed("  Color Adjustment Curves (all six)", &params, pixels, source, width, height, 2) { return 226 }
+    var model: u32 = 0
+    while model < 4 {
+        lively(adjust.HSV_ADJUSTMENT, &params)
+        params.values[0] = @floatFromInt(f64, model)
+        const name = if model == 0 { "  HSV/HSL Adjustment (HSV)" } else if model == 1 { "  HSV/HSL Adjustment (HSL)" } else if model == 2 { "  HSV/HSL Adjustment (HSI)" } else { "  HSV/HSL Adjustment (HSY)" }
+        if !timed(name, &params, pixels, source, width, height, 2) { return 227 }
+        model += 1
+    }
+    lively(adjust.HSV_ADJUSTMENT, &params)
+    params.values[4] = 1.0
+    if !timed("  HSV/HSL Adjustment (HSY, colorize)", &params, pixels, source, width, height, 2) { return 227 }
+    lively(adjust.COLOR_BALANCE, &params)
+    if !timed("  Color Balance", &params, pixels, source, width, height, 2) { return 228 }
+    lively(adjust.CROSS_CHANNEL, &params)
+    if !timed("  Cross-channel (hue drives saturation)", &params, pixels, source, width, height, 2) { return 228 }
+    lively(adjust.DESATURATE, &params)
+    if !timed("  Desaturate (Rec. 709)", &params, pixels, source, width, height, 8) { return 228 }
+    lively(adjust.THRESHOLD, &params)
+    if !timed("  Threshold", &params, pixels, source, width, height, 8) { return 228 }
+    lively(adjust.AUTO_CONTRAST, &params)
+    source[0] = pixel.gray(40)
+    if !timed("  Auto Contrast", &params, pixels, source, width, height, 8) { return 228 }
+    lively(adjust.SEPIA, &params)
+    if !timed("  Sepia (60 %)", &params, pixels, source, width, height, 8) { return 228 }
+    lively(adjust.INVERT, &params)
+    if !timed("  Invert", &params, pixels, source, width, height, 8) { return 228 }
+    // A picture with runs of one colour, as most are.
+    landscape(source, width, height)
+    var y: usize = 0
+    while y < height {
+        var x: usize = 0
+        while x < width {
+            source[y * width + x] = 0xFF000000 | @intCast(u32, ((x / 16) * 40503 + (y / 16) * 9973) & 0x00FFFFFF)
+            x += 1
+        }
+        y += 1
+    }
+    _ = std.io.print("a megapixel of flat squares\n")
+    lively(adjust.HSV_ADJUSTMENT, &params)
+    if !timed("  HSV/HSL Adjustment (HSY)", &params, pixels, source, width, height, 4) { return 229 }
+    lively(adjust.COLOR_BALANCE, &params)
+    if !timed("  Color Balance", &params, pixels, source, width, height, 4) { return 229 }
+    return 0
+}
+
+pub fn main() -> u8 {
+    const pool = scratch.common()
+    const start = scratch.mark(pool)
+    const cell = words(16)
+    const work = words(40000)
+    const keep = words(40000)
+    const large = words(1048576)
+    const source = words(1048576)
+    const parts = words(180000)
+    const block = words(65536)
+
+    var failed = wiring()
+    if failed != 0 { return failed }
+    failed = curveChecks()
+    if failed != 0 { return failed }
+    failed = inverting(cell, work, keep)
+    if failed != 0 { return failed }
+    failed = tones(cell)
+    if failed != 0 { return failed }
+    failed = bends(cell)
+    if failed != 0 { return failed }
+    failed = hues(cell)
+    if failed != 0 { return failed }
+    failed = greys(cell)
+    if failed != 0 { return failed }
+    failed = balance(cell)
+    if failed != 0 { return failed }
+    failed = ranges(cell, work, keep)
+    if failed != 0 { return failed }
+    failed = others(cell)
+    if failed != 0 { return failed }
+    failed = crossing(cell)
+    if failed != 0 { return failed }
+    failed = neutral(work, keep)
+    if failed != 0 { return failed }
+    failed = sweep(work, keep)
+    if failed != 0 { return failed }
+    failed = blocks(source, large, parts, block)
+    if failed != 0 { return failed }
+    failed = repeats(source, large, parts)
+    if failed != 0 { return failed }
+    failed = arena(work)
+    if failed != 0 { return failed }
+    failed = speed(large, source)
+    if failed != 0 { return failed }
+
+    // Whatever the filters took of the scratch pool they gave back.
+    const end = scratch.mark(pool)
+    if end.block != start.block || end.used != start.used { return 230 }
+    return 13
+}
