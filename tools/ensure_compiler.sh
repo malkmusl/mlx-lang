@@ -1058,6 +1058,25 @@ shifts_powers_of_two() {
     return $ok
 }
 
+# Whether $1 gives a module-level const table whose rows hold strings,
+# functions and slices of other tables one read-only image holding their
+# addresses (tests/483_constant_table_addresses_runtime.mlx exits 13: a
+# row, a field, the length, a slice of the table and a walk over it take
+# nothing from the aggregate arena, two slices of it are the same storage,
+# a row's slice is the other table's image).
+reads_constant_tables_with_addresses() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/483_constant_table_addresses_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -1131,6 +1150,7 @@ probes=(
     "ends_statements_after_postfix|a statement ended by a line's last .* or .?"
     "addresses_constants|the address of a module-level constant"
     "shifts_powers_of_two|divisions and products by a constant power of two as shifts and masks"
+    "reads_constant_tables_with_addresses|const tables of strings, functions and slices of other tables read from one read-only image"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

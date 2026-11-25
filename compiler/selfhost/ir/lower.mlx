@@ -130,6 +130,17 @@ const GlobalInit = struct {
     moduleId: usize
 }
 
+// A word of a constant's image that holds an address known when the image
+// is written (staticAddresses): `offset` bytes into the image, the address
+// of `target` (lir.ADDRESS_*) plus `addend`. It becomes a
+// lir.GlobalAddress once the image is a global.
+const PendingAddress = struct {
+    offset: usize
+    kind: u8
+    target: usize
+    addend: usize
+}
+
 pub const LirBuilder = struct {
     lir: *lir.Lir
     loader: *loader_module.Loader
@@ -192,6 +203,14 @@ pub const LirBuilder = struct {
     // nobody asked, NO_IMAGE when it has none; and how many have one.
     constantImages: [*]usize
     constantImageCount: usize
+    // Whether a constant's image may hold addresses (a string's bytes, a
+    // function, another constant's image): only in a program loaded at the
+    // addresses it is linked for, whose image writer puts them there
+    // (setStaticAddresses). The constant's image being written (0: none)
+    // and the words of it noted to hold an address (PendingAddress).
+    staticAddresses: bool
+    staticImageBase: usize
+    pendingAddresses: *vector.Vector
     // The operator or builtin being lowered (for an unsupported form).
     operatorToken: usize
     firstUnsupportedOffset: usize
@@ -246,6 +265,7 @@ pub fn init(
         const address_taken_names = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const address_taken_modules = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const global_inits = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        const pending_addresses = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const symbol_capacity = if symbol_store.*.length > 0 { symbol_store.*.length } else { 1 }
         const lir_symbol_ids = @ptrCast([*]usize, allocator.alloc(symbol_capacity * @sizeOf(usize), @alignOf(usize)).?)
         const constant_images = @ptrCast([*]usize, allocator.alloc(symbol_capacity * @sizeOf(usize), @alignOf(usize)).?)
@@ -260,6 +280,7 @@ pub fn init(
         vector.Vector.initAt(address_taken_names, allocator, @sizeOf(AddressTakenName), @alignOf(AddressTakenName), 64)
         vector.Vector.initAt(address_taken_modules, allocator, @sizeOf(usize), @alignOf(usize), 16)
         vector.Vector.initAt(global_inits, allocator, @sizeOf(GlobalInit), @alignOf(GlobalInit), 16)
+        vector.Vector.initAt(pending_addresses, allocator, @sizeOf(PendingAddress), @alignOf(PendingAddress), 16)
         var symbol_index: usize = 0
         while symbol_index < symbol_capacity {
             lir_symbol_ids[symbol_index] = lir.NONE
@@ -306,6 +327,9 @@ pub fn init(
             .globalInits = global_inits,
             .constantImages = constant_images,
             .constantImageCount = 0,
+            .staticAddresses = false,
+            .staticImageBase = 0,
+            .pendingAddresses = pending_addresses,
             .initImageBase = 0,
             .initSymbolIndex = 0,
             .operatorToken = 0,
@@ -334,6 +358,16 @@ pub fn init(
     }
 }
 
+// Whether the program is loaded at the addresses it is linked for, so that
+// a constant table holding addresses (a string, a function, a slice of
+// another table) can be an image whose words the image writer fills in
+// (constantImageFor). Not a shared object, which is loaded anywhere, nor a
+// kernel, which runs elsewhere than it is linked (brixOS's, in the higher
+// half): there such a table is built where it is used.
+pub fn setStaticAddresses(builder: *LirBuilder, enabled: bool) -> void {
+    builder.*.staticAddresses = enabled
+}
+
 pub fn deinit(builder: *LirBuilder) -> void {
     vector.Vector.deinit(builder.*.bindings.*)
     vector.Vector.deinit(builder.*.bindingComponents.*)
@@ -344,6 +378,7 @@ pub fn deinit(builder: *LirBuilder) -> void {
     vector.Vector.deinit(builder.*.inlineStack.*)
     vector.Vector.deinit(builder.*.addressTakenNames.*)
     vector.Vector.deinit(builder.*.addressTakenModules.*)
+    vector.Vector.deinit(builder.*.pendingAddresses.*)
     unsafe {
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.bindings), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.bindingComponents), @sizeOf(vector.Vector), @alignOf(vector.Vector))
@@ -354,6 +389,7 @@ pub fn deinit(builder: *LirBuilder) -> void {
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.inlineStack), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.addressTakenNames), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.addressTakenModules), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+        builder.*.allocator.free(@ptrCast([*]u8, builder.*.pendingAddresses), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.lirSymbolIds), builder.*.lirSymbolCapacity * @sizeOf(usize), @alignOf(usize))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.typeCache), builder.*.typeCacheCapacity * @sizeOf(NodeTypeCache), @alignOf(NodeTypeCache))
     }
@@ -597,10 +633,15 @@ fn globalIndexFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                     vector.Vector.initAt(&own_bindings, builder.*.allocator, @sizeOf(Binding), @alignOf(Binding), 4)
                     const saved_bindings = builder.*.bindings
                     const components_length = builder.*.bindingComponents.*.length
+                    // (Its addresses are written when the program starts,
+                    // even when it is first named in a constant's image.)
+                    const saved_static_base = builder.*.staticImageBase
+                    builder.*.staticImageBase = 0
                     builder.*.bindings = &own_bindings
                     builder.*.initImageBase = @intFromPtr(target)
                     builder.*.initSymbolIndex = symbol_index
                     const written = writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target)
+                    builder.*.staticImageBase = saved_static_base
                     builder.*.bindings = saved_bindings
                     builder.*.bindingComponents.*.length = components_length
                     vector.Vector.deinit(own_bindings)
@@ -771,6 +812,12 @@ fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, t
         }
         return true
     }
+    if builder.*.staticImageBase != 0 {
+        // A constant's image (constantImageFor): an address known when the
+        // image is written is noted for the image writer.
+        if value_type.*.kind == types_store.Kind.slice { return writeStaticSlice(builder, node_index, value_type.*.lhs, target) }
+        if isAddressType(builder, type_id) { return writeStaticAddress(builder, node_index, type_id, target) }
+    }
     if isAddressType(builder, type_id) {
         // An address (a function, a string's bytes, another global): the
         // word stays zero here and is written when the program starts.
@@ -794,23 +841,159 @@ fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, t
     return true
 }
 
+// A slice in a constant's image (staticImageBase): a string literal, or a
+// constant whose value is one, for a `[]const u8`; or a slice of another
+// constant table that has an image, with bounds known at compile time
+// (`TABLE[0..]`, `TABLE[2..5]`, `module.TABLE[0..]`). Its pointer is
+// noted, its length written; false for another value (the table is then
+// built where it is used).
+fn writeStaticSlice(builder: *LirBuilder, node_index: usize, element_type: usize, target: [*]u8) -> bool {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    var length: usize = 0
+    if node.tag == ast.Tag.slice_expression {
+        const constant = constantTarget(builder, node.lhs)
+        if !constant.0 { return false }
+        const image = constantImageFor(builder, constant.1)
+        const table_type = types_store.Store.get(builder.*.typeStore, symbols_store.Store.get(builder.*.symbolStore, constant.1).*.typeId)
+        if table_type.*.kind != types_store.Kind.array || table_type.*.lhs != element_type { return false }
+        var low: usize = 0
+        var high = table_type.*.bits
+        if node.rhs != ast.NONE {
+            const bound = lowerComptimeValue(builder, node.rhs)
+            if bound.kind != comptime_value.Kind.integer || bound.integer < 0 { return false }
+            low = @intCast(usize, bound.integer)
+        }
+        if node.extra != ast.NONE {
+            const bound = lowerComptimeValue(builder, node.extra)
+            if bound.kind != comptime_value.Kind.integer || bound.integer < 0 { return false }
+            high = @intCast(usize, bound.integer)
+        }
+        if low > high || high > table_type.*.bits { return false }
+        notePendingAddress(builder, target, lir.ADDRESS_GLOBAL, image, low * types_store.Store.sizeOf(builder.*.typeStore, element_type))
+        length = high - low
+    } else {
+        if types_store.Store.sizeOf(builder.*.typeStore, element_type) != 1 { return false }
+        const text = staticString(builder, node_index)
+        if !text.0 { return false }
+        notePendingAddress(builder, target, lir.ADDRESS_STRING, text.1, 0)
+        length = text.2
+    }
+    var byte: usize = 0
+    while byte < 8 {
+        target[8 + byte] = @intCast(u8, (length >> @intCast(u6, byte * 8)) & 255)
+        byte += 1
+    }
+    return true
+}
+
+// An address in a constant's image (staticImageBase): a function, for a
+// function or an optional one (`null` is a zero word, written already).
+// False for another, a pointer among them (the table is then built where
+// it is used).
+fn writeStaticAddress(builder: *LirBuilder, node_index: usize, type_id: usize, target: [*]u8) -> bool {
+    var value = types_store.Store.get(builder.*.typeStore, type_id)
+    if value.*.kind == types_store.Kind.optional && value.*.lhs != 0 { value = types_store.Store.get(builder.*.typeStore, value.*.lhs) }
+    if value.*.kind != types_store.Kind.function { return false }
+    const function = staticFunction(builder, node_index)
+    if !function.0 { return false }
+    notePendingAddress(builder, target, lir.ADDRESS_FUNCTION, function.1, 0)
+    return true
+}
+
+fn notePendingAddress(builder: *LirBuilder, place: [*]u8, kind: u8, target: usize, addend: usize) -> void {
+    var entry = PendingAddress.{ .offset = @intFromPtr(place) - builder.*.staticImageBase, .kind = kind, .target = target, .addend = addend }
+    unsafe { const appended = vector.Vector.appendAt(builder.*.pendingAddresses, @ptrCast([*]const u8, &entry)) }
+}
+
+// The string a value in a constant's image stands for: a string literal,
+// or a module-level constant whose value is one (`.name = NAME`); the
+// literal's index (made now, emitted with the program's others) and its
+// length.
+fn staticString(builder: *LirBuilder, node_index: usize) -> (bool, usize, usize) {
+    const nodes = getNodes(builder)
+    const node = ast_store.Store.get(nodes, node_index)
+    if node.tag == ast.Tag.string_literal {
+        const token_length = tokenLength(builder, node.mainToken)
+        if token_length < 2 { return -> (false, 0, 0) }
+        // (The token has its quotes; the literal is what is between.)
+        var text: [*]const u8 = undefined
+        unsafe { text = @ptrFromInt([*]const u8, @intFromPtr(tokenPointer(builder, node.mainToken)) + 1) }
+        const literal = lir.addStringLiteral(builder.*.lir, text, token_length - 2)
+        return -> (true, literal, lir.getStringLiteral(builder.*.lir, literal).length)
+    }
+    if node.tag != ast.Tag.identifier && node.tag != ast.Tag.field_expression { return -> (false, 0, 0) }
+    const referenced = referencedSymbolIndex(builder, node_index)
+    if !referenced.0 { return -> (false, 0, 0) }
+    const symbol = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
+    if symbol.*.flags & symbol_module.FLAG_CONSTANT == 0 || symbol.*.flags & (symbol_module.FLAG_FUNCTION | symbol_module.FLAG_EXTERN) != 0 { return -> (false, 0, 0) }
+    if symbol.*.declaration == ast.NONE || symbol.*.ownerTypeId != 0 { return -> (false, 0, 0) }
+    // (Read in the constant's own module; only a literal there, so no
+    // chain of names is followed.)
+    const module_id = moduleForSymbol(builder, referenced.1)
+    const previous_module = builder.*.currentModuleId
+    if module_id != previous_module { switchToModule(builder, module_id) }
+    var found = false
+    var literal: usize = 0
+    var length: usize = 0
+    const own_nodes = getNodes(builder)
+    if symbol.*.declaration < own_nodes.*.length {
+        const declaration = ast_store.Store.get(own_nodes, symbol.*.declaration)
+        var value_node = if declaration.tag == ast.Tag.constant_declaration { declaration.rhs } else { ast.NONE }
+        while value_node != ast.NONE && (ast_store.Store.get(own_nodes, value_node).tag == ast.Tag.unsafe_block || ast_store.Store.get(own_nodes, value_node).tag == ast.Tag.unsafe_expression) {
+            value_node = ast_store.Store.get(own_nodes, value_node).lhs
+        }
+        if value_node != ast.NONE && ast_store.Store.get(own_nodes, value_node).tag == ast.Tag.string_literal {
+            const text = staticString(builder, value_node)
+            found = text.0
+            literal = text.1
+            length = text.2
+        }
+    }
+    if module_id != previous_module { switchToModule(builder, previous_module) }
+    return -> (found, literal, length)
+}
+
+// The function a value in a constant's image names (`paint`,
+// `module.paint`, `Type.method`): its LIR symbol. Not an `extern` one: a
+// C library's function has no address until the program is loaded.
+fn staticFunction(builder: *LirBuilder, node_index: usize) -> (bool, usize) {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag != ast.Tag.identifier && node.tag != ast.Tag.field_expression { return -> (false, 0) }
+    const referenced = referencedSymbolIndex(builder, node_index)
+    if !referenced.0 { return -> (false, 0) }
+    const symbol = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
+    if symbol.*.flags & symbol_module.FLAG_FUNCTION == 0 || symbol.*.flags & symbol_module.FLAG_EXTERN != 0 { return -> (false, 0) }
+    const symbol_id = functionSymbolId(builder, referenced.1, symbol, moduleForSymbol(builder, referenced.1))
+    if lir.symbolFlags(builder.*.lir, symbol_id) & lir.SYMBOL_IMPORT != 0 { return -> (false, 0) }
+    return -> (true, symbol_id)
+}
+
 // A module-level `const` is a value built where it is used: every use
 // lowers its initializer again. For a table (an array or struct literal of
 // values known at compile time) that is all of its elements stored one by
 // one to read one of them, in storage of the using function's, or of the
 // aggregate arena, which is never freed, when it is over what a frame
-// takes. Such a constant has one image in the data area instead, as a
-// `var` has: its elements and fields are read from there (lowerPlace:
-// `TABLE[i]`, `TABLE.field`, `TABLE.length`), and where its whole value is
-// used (handed to a function, sliced, copied into a variable) the value is
-// one copy of the image, storage of its own as before: nothing can write
-// into the image, so it is the same value at every use.
+// takes. Such a constant has one image instead, a read-only global: its
+// bytes are code, after the functions, where nothing can write them (a
+// store through a slice of it that sema did not see, in the body of a
+// generic function, faults as one into a string literal does). Its
+// elements and fields are read there (lowerPlace: `TABLE[i]`,
+// `TABLE.field`, `TABLE.length`), as are a slice of it (`TABLE[a..b]`, a
+// `[]const T`) and the elements a `for` walks; where its whole value is
+// used (handed to a function by value, copied into a variable) the value
+// is one copy of the image, storage of its own as before.
+//
+// The image holds an address the image writer knows where the program is
+// loaded at the addresses it is linked for (staticAddresses): a string's
+// bytes, a function, a slice of another table's image (writeStaticSlice,
+// writeStaticAddress; lir.GlobalAddress).
 //
 // The constant's image (a global's index), made the first time it is asked
 // for; lir.NONE when the constant has none: no array or struct, a member
 // of an aggregate, an initializer that is no literal or holds what is not
-// known until the program runs or an address (those are written when the
-// program starts, which a constant must not wait for).
+// known until the program runs or another address (a pointer, any address
+// in a shared object or a kernel: written when the program starts, which a
+// constant must not wait for).
 const NO_IMAGE: usize = lir.NONE - 1
 
 fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
@@ -866,9 +1049,12 @@ fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                 }
                 // The initializer read as its module has it: no local of
                 // the function that happens to use the constant first, no
-                // instance's scope, no owner; and with no image to write
-                // addresses for (initImageBase 0: an address in the value
-                // makes it no image).
+                // instance's scope, no owner; and with no addresses to
+                // write when the program starts (initImageBase 0): those
+                // known when the image is written (a string, a function,
+                // another table's image) are noted in it where the program
+                // is loaded as linked (staticImageBase), any other makes it
+                // no image.
                 var own_bindings: vector.Vector = undefined
                 vector.Vector.initAt(&own_bindings, builder.*.allocator, @sizeOf(Binding), @alignOf(Binding), 4)
                 const saved_bindings = builder.*.bindings
@@ -876,13 +1062,17 @@ fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                 const saved_scope = builder.*.scopeOverride
                 const saved_owner = builder.*.currentMethodOwner
                 const saved_base = builder.*.initImageBase
+                const saved_static_base = builder.*.staticImageBase
                 const inits_before = builder.*.globalInits.*.length
+                const pending_before = builder.*.pendingAddresses.*.length
                 const unsupported_before = builder.*.unsupportedLoweringCount
                 builder.*.bindings = &own_bindings
                 builder.*.scopeOverride = 0
                 builder.*.currentMethodOwner = lir.NONE
                 builder.*.initImageBase = 0
+                builder.*.staticImageBase = if builder.*.staticAddresses { @intFromPtr(target) } else { 0 }
                 const written = writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target)
+                builder.*.staticImageBase = saved_static_base
                 builder.*.initImageBase = saved_base
                 builder.*.globalInits.*.length = inits_before
                 builder.*.currentMethodOwner = saved_owner
@@ -894,8 +1084,18 @@ fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                     var alignment = types_store.Store.alignOf(builder.*.typeStore, symbol.*.typeId)
                     if alignment == 0 { alignment = 1 }
                     const label = lir.globalLabel(builder.*.lir, lir.globalCount(builder.*.lir))
-                    made = lir.addGlobal(builder.*.lir, label.0, label.1, size, alignment, 0, target, size, false, symbol_index)
+                    made = lir.addReadOnlyGlobal(builder.*.lir, label.0, label.1, size, alignment, target, symbol_index)
+                    // (Its own words: a table it names, made while it was
+                    // written, noted its own and took them away.)
+                    var pending = pending_before
+                    while pending < builder.*.pendingAddresses.*.length {
+                        var entry: PendingAddress = undefined
+                        unsafe { entry = @ptrCast(*PendingAddress, vector.Vector.at(builder.*.pendingAddresses.*, pending)).* }
+                        lir.addGlobalAddress(builder.*.lir, made, entry.offset, entry.kind, entry.target, entry.addend)
+                        pending += 1
+                    }
                 }
+                builder.*.pendingAddresses.*.length = pending_before
             }
         }
     }
@@ -2902,7 +3102,10 @@ fn lowerSlice(builder: *LirBuilder, node_index: usize) -> usize {
     const container_type = types_store.Store.get(builder.*.typeStore, container_type_id)
     if (container_type.*.kind != types_store.Kind.array && container_type.*.kind != types_store.Kind.slice && container_type.*.kind != types_store.Kind.many_pointer) { return lir.NONE }
 
-    const base = lowerNode(builder, node.lhs)
+    // (A slice of a constant table with an image is a slice of the image,
+    // a `[]const T` sema lets nothing write through; the image is not
+    // writable either, for a generic function's body sema does not see.)
+    const base = if container_type.*.kind == types_store.Kind.array { lowerPlace(builder, node.lhs) } else { lowerNode(builder, node.lhs) }
     if base == lir.NONE { return lir.NONE }
     const lower_bound = if node.rhs == ast.NONE { lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0)) } else { lowerNode(builder, node.rhs) }
     if lower_bound == lir.NONE { return lir.NONE }
@@ -3595,20 +3798,26 @@ fn lowerIndexAddress(builder: *LirBuilder, node_index: usize) -> usize {
     return lir.addInst(builder.*.lir, address)
 }
 
+// The LIR symbol of function `symbol_index` (declared in `module_id`),
+// made the first time it is named.
+fn functionSymbolId(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
+    var sym_id = if symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] } else { lir.NONE }
+    if sym_id == lir.NONE {
+        const is_entry = (module_id == 0 && isMainName(symbol.*.namePointer, symbol.*.nameLength)) || hasPlainSymbolName(symbol)
+        sym_id = if symbol.*.ownerTypeId == 0 { lir.addModuleSymbol(builder.*.lir, module_id, symbol.*.namePointer, symbol.*.nameLength, is_entry) } else { lir.addMethodSymbol(builder.*.lir, module_id, symbol.*.ownerTypeId, symbol.*.namePointer, symbol.*.nameLength) }
+        recordLinkage(builder, sym_id, symbol)
+        if symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] = sym_id }
+    }
+    return sym_id
+}
+
 fn lowerSymbolValue(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
     if symbol.*.comptimeTag == @intCast(u8, @intFromEnum(comptime_value.Kind.integer)) || symbol.*.comptimeTag == @intCast(u8, @intFromEnum(comptime_value.Kind.boolean)) {
         return lir.addInst(builder.*.lir, lir.constI(lir.NONE, @bitCast(usize, symbol.*.comptimeInteger)))
     }
     if symbol.*.flags & symbol_module.FLAG_FUNCTION != 0 {
-        var sym_id = if symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] } else { lir.NONE }
-        if sym_id == lir.NONE {
-            const is_entry = (module_id == 0 && isMainName(symbol.*.namePointer, symbol.*.nameLength)) || hasPlainSymbolName(symbol)
-            sym_id = if symbol.*.ownerTypeId == 0 { lir.addModuleSymbol(builder.*.lir, module_id, symbol.*.namePointer, symbol.*.nameLength, is_entry) } else { lir.addMethodSymbol(builder.*.lir, module_id, symbol.*.ownerTypeId, symbol.*.namePointer, symbol.*.nameLength) }
-            recordLinkage(builder, sym_id, symbol)
-            if symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] = sym_id }
-        }
         var function_inst = lir.initInst(lir.Opcode.func_sym, lir.NONE)
-        function_inst.arg0 = sym_id
+        function_inst.arg0 = functionSymbolId(builder, symbol_index, symbol, module_id)
         return lir.addInst(builder.*.lir, function_inst)
     }
     if isGlobalSymbol(symbol) { return lowerGlobalValue(builder, symbol_index, symbol) }
@@ -5987,7 +6196,9 @@ fn lowerIterableFor(builder: *LirBuilder, node_index: usize) -> usize {
     const element_type = iterable_type.*.lhs
     var stride = types_store.Store.sizeOf(builder.*.typeStore, element_type)
     if stride == 0 { stride = 1 }
-    const iterable_value = lowerNode(builder, node.lhs)
+    // (A constant table with an image is walked there: its elements are
+    // copied or pointed to, `*const`, one by one.)
+    const iterable_value = if iterable_type.*.kind == types_store.Kind.array { lowerPlace(builder, node.lhs) } else { lowerNode(builder, node.lhs) }
     var length_value: usize = 0
     if iterable_type.*.kind == types_store.Kind.slice {
         var length_extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)

@@ -132,16 +132,27 @@ function or copied into a variable it is storage of that use's own, and
 nothing written there shows in the constant; a slice of it is a `[]const
 T` and a pointer capture over it a `*const T`, which read it and write
 nothing ([Arrays and slices](05-types-and-aggregates.md#arrays-and-slices)).
-A table (an array or struct literal of values known at compile time, no
-addresses among them) is not built anew for that: it has one image in the
-data area, as a `var` has; `TABLE[i]`, `TABLE.field` and `TABLE.length`
-read it there, and a use of the whole value is one copy of it
+A table (an array or struct literal of values known at compile time) is
+not built anew for that: it has one image, in the program's code where
+nothing can write it; `TABLE[i]`, `TABLE.field`, `TABLE.length`, a slice
+`TABLE[a..b]` and the elements `for` walks read it there (two slices of it
+are the same storage), and a use of the whole value is one copy of it
 (`tests/442_constant_table_static_runtime.mlx`; before, every `TABLE[i]`
 of a `const TABLE = [1520]u8{ ... }` stored all of its bytes first, a
 table over what a frame takes in the aggregate arena, which is not freed:
 brixOS's console drew its font so and filled the kernel's arena in 173
-characters). A constant that holds addresses (strings, functions) or
-values not known until the program runs is still built where it is used.
+characters). Its rows may hold strings, functions (and optional ones) and
+slices of other constant tables with bounds known at compile time, in
+nested structs and arrays: the image holds their addresses
+(`tests/483_constant_table_addresses_runtime.mlx`, a table of 48 icons
+with a name and a function each, rows naming slices of other tables and
+another module's; before, reading `ICONS[i].name` copied the whole table
+into the arena, and `ROWS[0..]` put the rows and every table they name
+there at each slicing). In a shared object (`--shared`, `--plugin`,
+Android) and a kernel (`x86_64-freestanding`), which do not run at the
+addresses they are linked for, such a table is built where it is used,
+as is one that holds a pointer or values not known until the program
+runs.
 No module-level `const` has storage of its own: `&LIMIT` (or
 `&module.LIMIT`) is the address of a copy of its value in the function
 that takes it, good for a `*const T` parameter and no identity of the

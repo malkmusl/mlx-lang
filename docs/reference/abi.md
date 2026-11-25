@@ -677,32 +677,59 @@ own copy of such a variable (`R_X86_64_COPY`, as gcc does for `optind` or
 `stdout`), the dynamic linker binds the symbol to that copy, and the slot
 makes the Mlx code read and write the copy too.
 
-A module-level `const` that is a table has such a slot too (`ir/lower.mlx`,
+A module-level `const` that is a table has an image too (`ir/lower.mlx`,
 `constantImageFor`): an array or struct literal, every element given, of
-values known at compile time and no address among them (those would wait
-for `__mlx_init_globals`, which a constant must not). It is made the
-first time the constant is used. `TABLE[i]`, `TABLE.field`, an element of
-an element, `&TABLE[i]` (a pointer to a constant) and `TABLE.length` work
-on the slot's address; nothing the compiler emits writes there. Any other
-use of the constant is its value: an `alloca` of the type and one
-`mem_copy` from the slot, so a callee that is handed it writes into
-storage of that use's own, as when the value was built there element by
-element. A slice of it and a pointer capture over it work on such a copy
-too. Nothing that sema checks writes through them any more: they are a
-`[]const T` and a `*const T` (`sema/declarations.mlx`, the slice
-expression; `tests/443_constant_slices_runtime.mlx`). But the body of a
+values known at compile time. It is made the first time the constant is
+used, as a read-only global (`lir.Global.readOnly`): its bytes are not in
+the data area but in the code, after the functions and before the string
+literals, each at its alignment under its label (`.__mlx_global_N`),
+reached RIP-relative on x86_64 and by `adrp`/`add` on aarch64 as a
+string literal is; the executable's symbol table names the block
+`__mlx_constant_tables`. `TABLE[i]`, `TABLE.field`, an element of an
+element, `&TABLE[i]` (a pointer to a constant), `TABLE.length`, a slice
+`TABLE[a..b]` (a `[]const T`) and the elements `for` walks work on the
+image's address: two slices of it are the same storage, and none of these
+builds the table. Any other use of the constant is its value: an `alloca`
+of the type and one `mem_copy` from the image, so a callee that is handed
+it by value writes into storage of that use's own, as when the value was
+built there element by element. Nothing that sema checks writes through
+a slice of the table or a pointer to it (`sema/declarations.mlx`, the
+slice expression; `tests/443_constant_slices_runtime.mlx`); the body of a
 generic function (an `anytype` or `comptime` parameter) is not checked,
-and one handed such a slice can still store through it: into the copy,
-which is why the copy stays until instantiated bodies are checked (the
-slot's address there would let that store change the table for
-everyone). A constant with addresses
-in it, one whose initializer is no literal, and a member of an aggregate
-are lowered as before: their initializer, where they are used
-(`tests/442_constant_table_static_runtime.mlx`,
+and a store there through such a slice faults (the code is not writable),
+as a store into a string literal's bytes does, where a copy used to take
+it and the table could not change (`ir/lower.mlx`, `lowerSlice`).
+
+The image holds addresses too where the program is loaded at the
+addresses it is linked for (`lower.setStaticAddresses`: an executable for
+x86_64-linux, x86_64-brixos or aarch64-linux, static or dynamically
+linked): a `[]const u8` that is a string literal or a constant whose value
+is one (its pointer and length), a function or an optional one (`null`
+the zero word), and a slice of another constant table that has an image,
+with bounds known at compile time (`A[0..]`, `B[1..3]`,
+`module.TABLE[2..]`: that image's address plus the lower bound's offset,
+and the length), in nested structs and arrays. Each such word is a
+`lir.GlobalAddress` (a string literal, a function's symbol or another
+global, and an addend); the backend notes its place in the code
+(`Emitter.emitReadOnlyGlobals`, `encoder.addCodeAddress`) and the image
+writer puts the address there once it knows where code and data are
+loaded (`encoder.fillCodeAddresses`: `elf64` at `TEXT_VADDR`,
+`elf64_dynamic`'s executable at its base, `elf64_aarch64`). A function
+named only by an image is kept by `ir/function_dce.mlx`. A shared object
+(`--shared`, `--plugin`, aarch64-android's `libmain.so`) is loaded
+anywhere and its writers emit no relocation the loader would apply to
+such a word; a kernel (`x86_64-freestanding`: brixOS's is linked at
+0x400000 and runs in the higher half) runs elsewhere than it is linked.
+There, as for a table holding a pointer (`&x`), a function of a C library
+(an `extern` one, bound when the program is loaded), or a value not known
+until the program runs, and for a member of an aggregate or a constant
+whose initializer is no literal, the constant is lowered as before: its
+initializer, where it is used (`tests/442_constant_table_static_runtime.mlx`,
+`tests/483_constant_table_addresses_runtime.mlx`,
 `tests/333_module_slices_runtime.mlx`).
 
 The address of a module-level constant, `&NAME` (a pointer to a
-constant), is the slot's for a table that has one, so `&TABLE` and
+constant), is the image's for a table that has one, so `&TABLE` and
 `&TABLE[0]` are the same address and stay it (`lowerAddressOf`,
 `tests/444_constant_address_runtime.mlx`); for every other constant it
 is the address of a copy of its value in a slot of the function
