@@ -1095,6 +1095,31 @@ reads_constant_tables_with_addresses() {
     return $ok
 }
 
+# Whether $1 keeps an optional holding its payload's zero apart from null
+# and an absent one null (tests/488_optional_zero_values_runtime.mlx exits
+# 13): an optional float tagged as the integers are (it was its payload
+# alone, so a `?f64` holding 0.0 was null), an inline function's result and
+# an `if`'s or a `match`'s branches made the optional, a local's tag where
+# a pointer to it finds it, `null` for a generic `?T` passed whole; and
+# whether it writes module-level optionals given a float or a struct with
+# their tag (tests/489_optional_zero_globals_runtime.mlx compiles and exits
+# 13; older compilers refused them, MLX-E9001).
+tags_optional_zeros() {
+    local probe test
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=0
+    for test in tests/488_optional_zero_values_runtime.mlx tests/489_optional_zero_globals_runtime.mlx; do
+        local status=1
+        if "$1" --quiet "$test" -o "$probe/probe" > /dev/null 2>&1; then
+            status=0
+            "$probe/probe" > /dev/null 2>&1 || status=$?
+        fi
+        [[ $status -eq 13 ]] || ok=1
+    done
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # The probes with what each one stands for.
 probes=(
     "writes_shared_objects|--shared objects"
@@ -1170,6 +1195,7 @@ probes=(
     "shifts_powers_of_two|divisions and products by a constant power of two as shifts and masks"
     "reads_constant_tables_with_addresses|const tables of strings, functions and slices of other tables read from one read-only image"
     "traps_narrow_overflow|checked arithmetic on i8 to i32 and u8 to u32 trapping at the type's bounds"
+    "tags_optional_zeros|optionals holding zero apart from null (a ?f64 holding 0.0 tagged)"
 )
 
 # What compiler $1 lacks, one feature per line (nothing when it has all).

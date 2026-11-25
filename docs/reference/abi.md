@@ -211,17 +211,39 @@ none) and an optional slice was one word, so its length was lost on the way
 generated Wayland requests (`wl_data_offer.accept`) are such optional
 slices.
 
-An optional of anything but a pointer, a function, a slice or a float is
-tagged: the payload and then a tag, 1 when a value is present. In
-registers the tag is the word after the payload's (`?u32` and `?usize`
-are two words, returned in `rax` and `rdx`); in memory it is the byte
-after the payload's bytes (`@sizeOf(?u32)` is 5, `@sizeOf(?u8)` 2, at the
-payload's alignment), so a `?usize` holding 0 is not null and zeroed
-memory is null. An optional struct, union or array is a memory value like
-its payload: its address, the payload at offset 0 and the tag byte after
-it. `null` becomes the absent value wherever one is wanted, `== null`
-reads the tag, `.?` the payload (`tests/404_optional_zero_runtime.mlx`).
-An optional pointer stays the pointer, null being 0.
+An optional of anything but a pointer, a function or a slice is tagged:
+the payload and then a tag, 1 when a value is present. In registers the
+tag is the word after the payload's (`?u32`, `?usize` and `?f64` are two
+words, returned in `rax` and `rdx`: a `?f64` is not in `xmm0`, its
+payload's bits are the first word); in memory it is the byte after the
+payload's bytes (`@sizeOf(?u32)` is 5, `@sizeOf(?u8)` 2, `@sizeOf(?f64)`
+9, at the payload's alignment), so a `?usize` holding 0 is not null, nor
+a `?f64` holding 0.0 or -0.0 (which keeps its sign), a `?bool` holding
+false or an optional struct whose fields are all zero, and zeroed memory
+is null. An optional struct, union or array is a memory value like its
+payload: its address, the payload at offset 0 and the tag byte after it.
+`null` becomes the absent value wherever one is wanted, `== null` reads
+the tag, `.?` the payload (`tests/404_optional_zero_runtime.mlx`). That
+includes an inline function's result, a generic function's `?T`
+argument after its `T`, and the branches of an `if` or a `match` of
+which one is a `T` and another a `?T`, which makes the whole a `?T`.
+An optional pointer stays the pointer, null being 0; an optional slice
+is null when its pointer is 0, so a slice of length 0 that points
+somewhere (`""`, `buffer[2..2]`) is present. Before, an optional float
+was its payload alone, null being the word 0: `fn give() -> ?f64 {
+return 0.0 }` compared equal to null. And an inline function's `return
+0` as a `?u8` was not made one (the caller read a tag word it did not
+have), `if c { value } else { maybe }` was typed as its first branch,
+`T`, so the else branch's null read as present, and `null` for a
+generic `?T` after `T` was passed as one word
+(`tests/488_optional_zero_values_runtime.mlx`, for each of `?u8`,
+`?i64`, `?bool`, `?f32`, `?f64` 0.0 and -0.0, an optional struct and
+`?[]const u8`: returned, passed, inlined, in locals, `if`s, `match`es,
+fields, array elements and through pointers). A module-level optional
+given a value is written into the data with its tag, a float's bits or a
+struct literal's bytes too (refused before, MLX-E9001); one given `null`
+or `undefined` stays zeroed, absent
+(`tests/489_optional_zero_globals_runtime.mlx`).
 
 A local of several words (a slice, an optional slice, an error union)
 normally lives in one frame slot per word, which the optimizer forwards
@@ -233,7 +255,15 @@ word the local reads back; and `pointer.*` of a pointer to such a type
 loads every word, so `into.*.length` is the length. Before, the words
 were kept apart and the store reached the pointer alone, while the load
 took one word (`tests/303_slice_address_runtime.mlx`, run by
-`tests/run_literals.sh`).
+`tests/run_literals.sh`). The block is laid out as memory has the type:
+a tagged optional's tag is the byte after its payload's bytes (at 1 for a
+`?u8`, at 4 for a `?f32`), stored and loaded as that byte by the local as
+by the pointer; it was the word 8 bytes after the payload, so `at.*` of
+`&local` read no tag and `at.* = null` left the local present. A local
+optional struct, union or array is held by its storage's address as the
+struct itself is, and `&local` is that address; it was the slot holding
+the address, so `at.*` read past it and `at.* = null` overwrote the frame
+(`tests/488_optional_zero_values_runtime.mlx`).
 
 ## Aggregate (struct/array) argument and return classification
 
