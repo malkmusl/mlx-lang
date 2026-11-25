@@ -1,0 +1,565 @@
+// nebula io: PNG for documents, in the engine's straight alpha and without
+// loss: what a layer holds comes back from the file bit for bit, also
+// where alpha is low (std.png's own encoder takes premultiplied pixels,
+// which loses colour there).
+//
+//     var list = std.ArrayList(u8).init(allocator)
+//     if !png.encode(pixels, width, height, stride, true, &list) { ... no memory ... }
+//
+//     var options = png.options(false)          // RGB, laid over white
+//     options.resolution = 300.0                // pHYs
+//     _ = png.encodeDevice(layer, area, &options, &list)
+//
+//     var picture: png.Picture = undefined
+//     if png.decode(bytes, allocator, &picture) == png.Status.ok {
+//         ... picture.pixels[y * picture.width + x] ...
+//         png.free(&picture)
+//     }
+//
+// Writing: 8-bit RGBA, or RGB laid over a matte colour, each row with the
+// filter that leaves the smallest differences, compressed by std.flate
+// as it goes (a zlib stream in IDAT chunks of at most 1 GiB), a pHYs
+// chunk for the resolution and one tEXt chunk when the options ask for
+// them. The rows come from a Source in bands of 64: from a buffer, a
+// Device (encodeDevice: a 100 megapixel layer is never copied whole) or
+// anything else the caller reads from (encodeFrom).
+//
+// Reading: every PNG std.png.read reads (every colour type and depth,
+// palettes, tRNS, Adam7), as straight 0xAARRGGBB words in one heap block
+// of the caller's (free()), 16-bit samples rounded to 8 (not cut), the
+// resolution from pHYs when it is given in metres. A Picture is what the
+// other single-picture formats (io/flat.mlx) read into and write from
+// too. Not read: gamma, colour profiles, text chunks.
+const std = @import("std")
+const flate = @import("std.flate")
+const crc = @import("std.crc")
+const png = @import("std.png")
+const zs = @import("std.flate.stream")
+const geom = @import("../core/geom.mlx")
+const device_module = @import("../core/device.mlx")
+const pixel = @import("../core/pixel.mlx")
+const scratch = @import("../core/scratch.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Rect = geom.Rect
+pub const Device = device_module.Device
+
+// No picture is read with more pixels than this on a side.
+pub const LARGEST: usize = 32768
+
+// What reading a picture (here and in io/flat.mlx) came to.
+pub const Status = enum(u8) {
+    ok,
+    // The bytes are not of this format at all.
+    notThisFormat,
+    // They are, but damaged or cut short.
+    damaged,
+    // Of this format, but of a kind not read here.
+    unsupported,
+    // More than LARGEST pixels on a side.
+    tooLarge,
+    noMemory
+}
+
+// A picture in straight 0xAARRGGBB words, `width` a row, in one block of
+// `allocator`.
+pub const Picture = struct {
+    pixels: [*]u32
+    width: usize
+    height: usize
+    // Pixels an inch the file says (0: it says nothing).
+    resolution: f64
+    allocator: Allocator
+}
+
+// A picture of `width` x `height` (its pixels not set). tooLarge for a
+// side of 0 or more than LARGEST, noMemory without memory.
+pub fn makePicture(picture: *Picture, width: usize, height: usize, allocator: Allocator) -> Status {
+    picture.*.width = 0
+    picture.*.height = 0
+    picture.*.resolution = 0.0
+    picture.*.allocator = allocator
+    if width == 0 || height == 0 || width > LARGEST || height > LARGEST { return Status.tooLarge }
+    const memory = allocator.alloc(width * height * 4, 16)
+    if memory == null { return Status.noMemory }
+    picture.*.pixels = unsafe { @ptrCast([*]u32, memory.?) }
+    picture.*.width = width
+    picture.*.height = height
+    return Status.ok
+}
+
+// Gives the pixels back (a picture of none is left alone).
+pub fn free(picture: *Picture) -> void {
+    if picture.*.width == 0 || picture.*.height == 0 { return }
+    unsafe { picture.*.allocator.free(@ptrCast([*]u8, picture.*.pixels), picture.*.width * picture.*.height * 4, 16) }
+    picture.*.width = 0
+    picture.*.height = 0
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+pub const Options = struct {
+    // RGBA; or RGB, each pixel laid over `matte` first.
+    alpha: bool
+    matte: u32
+    // Pixels an inch, written as pHYs (0: no pHYs).
+    resolution: f64
+    // zlib's 0 (stored) to 9 (smallest); -1 for 6.
+    level: i32
+    // One tEXt chunk: its keyword (1 to 79 bytes of Latin-1; empty: no
+    // chunk) and its text.
+    textKey: []const u8
+    textValue: []const u8
+}
+
+// The usual options: level 6, no pHYs, no text, white under RGB.
+pub fn options(alpha: bool) -> Options {
+    return Options.{ .alpha = alpha, .matte = pixel.WHITE, .resolution = 0.0, .level = 6, .textKey = "", .textValue = "" }
+}
+
+// Where the rows come from: the pixels of `area` (of whatever the context
+// is) into `into`, `stride` words a row.
+pub const Source = fn(context: *anyopaque, area: Rect, into: [*]u32, stride: usize) -> void
+
+const BAND: usize = 64
+// The room given to the compressor at a time, and the most an IDAT chunk
+// holds before the next begins.
+const PIECE: usize = 65536
+const CHUNK_LIMIT: usize = 1073741824
+
+// The chunk types, as their four letters read big-endian.
+const IHDR: u32 = 0x49484452
+const PHYS: u32 = 0x70485973
+const TEXT: u32 = 0x74455874
+const IDAT: u32 = 0x49444154
+const IEND: u32 = 0x49454E44
+
+fn put32(out: *std.ArrayList(u8), value: u32) -> bool {
+    return out.*.append(@intCast(u8, value >> 24)) && out.*.append(@intCast(u8, (value >> 16) & 255)) && out.*.append(@intCast(u8, (value >> 8) & 255)) && out.*.append(@intCast(u8, value & 255))
+}
+
+// A chunk's length (filled in by sealChunk) and type.
+fn openChunk(out: *std.ArrayList(u8), kind: u32) -> bool {
+    return put32(out, 0) && put32(out, kind)
+}
+
+// The chunk opened at `start` ends here: its length and its CRC.
+fn sealChunk(out: *std.ArrayList(u8), start: usize) -> bool {
+    const length = out.*.count() - start - 8
+    const bytes = out.*.items().pointer
+    std.mem.writeU32Big(bytes, start, @intCast(u32, length))
+    return put32(out, crc.crc32(0, bytes + (start + 4), length + 4))
+}
+
+// What an encoding keeps on the heap (the compressor is large).
+const Encoding = struct {
+    deflater: flate.Deflater
+    out: *std.ArrayList(u8)
+    // Where the IDAT chunk being filled starts.
+    chunk: usize
+}
+
+// `length` bytes at `input` through the compressor into the open IDAT
+// chunk (with Flush.finish: and the stream's end). False when memory ran
+// out or the compressor failed.
+fn pump(e: *Encoding, input: [*]const u8, length: usize, flush: flate.Flush) -> bool {
+    const out = e.*.out
+    var consumed: usize = 0
+    while true {
+        if !out.*.ensureUnusedCapacity(PIECE) { return false }
+        const at = out.*.count()
+        const room = out.*.capacity - at
+        var progress: flate.Progress = undefined
+        const status = flate.deflaterRun(&e.*.deflater, input + consumed, length - consumed, out.*.items().pointer + at, room, flush, &progress)
+        consumed += progress.consumed
+        _ = out.*.resize(at + progress.produced)
+        if status == flate.Status.done { return true }
+        if status != flate.Status.ok { return false }
+        // All taken and the room not filled: nothing more is waiting.
+        if flush == flate.Flush.none && consumed == length && progress.produced < room { return true }
+    }
+    return false
+}
+
+// The IDAT chunk ends when it has grown to CHUNK_LIMIT, and another
+// begins: a zlib stream may go on over several.
+fn splitChunk(e: *Encoding) -> bool {
+    if e.*.out.*.count() - e.*.chunk - 8 < CHUNK_LIMIT { return true }
+    if !sealChunk(e.*.out, e.*.chunk) { return false }
+    e.*.chunk = e.*.out.*.count()
+    return openChunk(e.*.out, IDAT)
+}
+
+fn paeth(left: u32, up: u32, corner: u32) -> u32 {
+    const p = @intCast(i32, left) + @intCast(i32, up) - @intCast(i32, corner)
+    const pa = if p > @intCast(i32, left) { p - @intCast(i32, left) } else { @intCast(i32, left) - p }
+    const pb = if p > @intCast(i32, up) { p - @intCast(i32, up) } else { @intCast(i32, up) - p }
+    const pc = if p > @intCast(i32, corner) { p - @intCast(i32, corner) } else { @intCast(i32, corner) - p }
+    if pa <= pb && pa <= pc { return left }
+    if pb <= pc { return up }
+    return corner
+}
+
+// `raw` (one row, `previous` the one above it: zeros for the first)
+// filtered with `filter` (0 none, 1 sub, 2 up, 3 average, 4 Paeth) into
+// `target` behind its filter byte; the sum of the differences' sizes.
+fn filterRow(raw: [*]const u8, previous: [*]const u8, count: usize, step: usize, filter: u32, target: [*]u8) -> usize {
+    target[0] = @intCast(u8, filter)
+    var sum: usize = 0
+    var index: usize = 0
+    while index < count {
+        const value = @intCast(u32, raw[index])
+        const left = if index >= step { @intCast(u32, raw[index - step]) } else { 0 }
+        const up = @intCast(u32, previous[index])
+        var predicted: u32 = 0
+        if filter == 1 {
+            predicted = left
+        } else if filter == 2 {
+            predicted = up
+        } else if filter == 3 {
+            predicted = (left + up) >> 1
+        } else if filter == 4 {
+            const corner = if index >= step { @intCast(u32, previous[index - step]) } else { 0 }
+            predicted = paeth(left, up, corner)
+        }
+        const difference = (value + 256 - predicted) & 255
+        target[index + 1] = @intCast(u8, difference)
+        sum += @intCast(usize, if difference < 128 { difference } else { 256 - difference })
+        index += 1
+    }
+    return sum
+}
+
+// What encodeFrom() does once its memory is there.
+fn encodeRows(e: *Encoding, source: Source, context: *anyopaque, area: Rect, settings: *const Options, band: [*]u32, raw: [*]u8, previous: [*]u8, candidates: [*]u8) -> bool {
+    const out = e.*.out
+    const width = @intCast(usize, area.width)
+    const height = @intCast(usize, area.height)
+    const step: usize = if settings.*.alpha { 4 } else { 3 }
+    const row_bytes = width * step
+    // Signature, IHDR.
+    var ok = put32(out, 0x89504E47) && put32(out, 0x0D0A1A0A)
+    var start = out.*.count()
+    ok = ok && openChunk(out, IHDR) && put32(out, @intCast(u32, width)) && put32(out, @intCast(u32, height))
+    ok = ok && out.*.append(8) && out.*.append(if settings.*.alpha { 6 } else { 2 }) && out.*.append(0) && out.*.append(0) && out.*.append(0)
+    ok = ok && sealChunk(out, start)
+    if ok && settings.*.resolution > 0.0 {
+        // Pixels a metre, rounded; unit 1: the metre.
+        var metre = settings.*.resolution / 0.0254 + 0.5
+        if metre > 2147483647.0 { metre = 2147483647.0 }
+        const per_metre = @intFromFloat(u32, metre)
+        start = out.*.count()
+        ok = openChunk(out, PHYS) && put32(out, per_metre) && put32(out, per_metre) && out.*.append(1) && sealChunk(out, start)
+    }
+    const key = settings.*.textKey
+    if ok && key.length > 0 && key.length < 80 {
+        start = out.*.count()
+        ok = openChunk(out, TEXT) && out.*.appendSlice(key) && out.*.append(0) && out.*.appendSlice(settings.*.textValue) && sealChunk(out, start)
+    }
+    if !ok { return false }
+    e.*.chunk = out.*.count()
+    if !openChunk(out, IDAT) { return false }
+    zs.zero(@intFromPtr(previous), row_bytes)
+    const matte = settings.*.matte
+    var top: usize = 0
+    while top < height {
+        const rows = if height - top < BAND { height - top } else { BAND }
+        source(context, geom.rect(area.x, area.y + @intCast(i32, top), area.width, @intCast(i32, rows)), band, width)
+        var row: usize = 0
+        while row < rows {
+            const line = band + row * width
+            var x: usize = 0
+            var at: usize = 0
+            while x < width {
+                var value = line[x]
+                if !settings.*.alpha && value >> 24 != 255 { value = pixel.over(matte, value, 255) }
+                raw[at] = @intCast(u8, (value >> 16) & 255)
+                raw[at + 1] = @intCast(u8, (value >> 8) & 255)
+                raw[at + 2] = @intCast(u8, value & 255)
+                if step == 4 { raw[at + 3] = @intCast(u8, value >> 24) }
+                at += step
+                x += 1
+            }
+            // The filter that leaves the least.
+            var best: usize = 0
+            var best_sum: usize = 0
+            var filter: u32 = 0
+            while filter < 5 {
+                const sum = filterRow(raw, previous, row_bytes, step, filter, candidates + @intCast(usize, filter) * (row_bytes + 1))
+                if filter == 0 || sum < best_sum {
+                    best_sum = sum
+                    best = @intCast(usize, filter)
+                }
+                filter += 1
+            }
+            if !pump(e, candidates + best * (row_bytes + 1), row_bytes + 1, flate.Flush.none) || !splitChunk(e) { return false }
+            zs.copy(@intFromPtr(previous), @intFromPtr(raw), row_bytes)
+            row += 1
+        }
+        top += rows
+    }
+    if !pump(e, raw, 0, flate.Flush.finish) || !sealChunk(out, e.*.chunk) { return false }
+    start = out.*.count()
+    return openChunk(out, IEND) && sealChunk(out, start)
+}
+
+// The pixels of `area` of whatever `source` reads (with `context`), as a
+// PNG at the end of `into`. False for an empty area and when memory ran
+// out (`into` is then as it was).
+pub fn encodeFrom(source: Source, context: *anyopaque, area: Rect, settings: *const Options, into: *std.ArrayList(u8)) -> bool {
+    if geom.isEmpty(area) || area.width > 0x7FFFFFFF / 4 { return false }
+    const allocator = into.*.allocator
+    const memory = allocator.alloc(@sizeOf(Encoding), 16)
+    if memory == null { return false }
+    const e: *Encoding = unsafe { @ptrCast(*Encoding, memory.?) }
+    e.*.out = into
+    const begun = into.*.count()
+    var ok = flate.deflaterInit(&e.*.deflater, allocator, flate.options(settings.*.level, flate.Format.zlib)) == flate.Status.ok
+    if ok {
+        const width = @intCast(usize, area.width)
+        const row_bytes = width * 4
+        const pool = scratch.common()
+        const mark = scratch.mark(pool)
+        const band = scratch.words(pool, width * BAND)
+        const rows = scratch.bytes(pool, row_bytes * 2 + (row_bytes + 1) * 5)
+        ok = band != null && rows != null
+        if ok {
+            const raw = rows.?
+            ok = encodeRows(e, source, context, area, settings, band.?, raw, raw + row_bytes, raw + row_bytes * 2)
+        }
+        scratch.release(pool, mark)
+        flate.deflaterEnd(&e.*.deflater)
+    }
+    allocator.free(memory.?, @sizeOf(Encoding), 16)
+    if !ok { _ = into.*.resize(begun) }
+    return ok
+}
+
+// A buffer of the caller's as a Source: its rows `stride` words apart,
+// (0, 0) its first pixel.
+const Buffer = struct {
+    pixels: [*]const u32
+    stride: usize
+}
+
+fn readBuffer(context: *anyopaque, area: Rect, into: [*]u32, stride: usize) -> void {
+    const buffer: *Buffer = unsafe { @ptrCast(*Buffer, context) }
+    const width = @intCast(usize, area.width)
+    var row: usize = 0
+    while row < @intCast(usize, area.height) {
+        const from = buffer.*.pixels + ((@intCast(usize, area.y) + row) * buffer.*.stride + @intCast(usize, area.x))
+        zs.copy(@intFromPtr(into + row * stride), @intFromPtr(from), width * 4)
+        row += 1
+    }
+}
+
+fn readDevice(context: *anyopaque, area: Rect, into: [*]u32, stride: usize) -> void {
+    const device: *Device = unsafe { @ptrCast(*Device, context) }
+    device_module.readRect(device, area, into, stride)
+}
+
+// `width` x `height` straight pixels (rows `stride` words apart) as a PNG
+// with `settings` at the end of `into`. False when memory ran out (`into`
+// is then as it was).
+pub fn encodeWith(pixels: [*]const u32, width: usize, height: usize, stride: usize, settings: *const Options, into: *std.ArrayList(u8)) -> bool {
+    if width == 0 || height == 0 || width > 0x7FFFFFFF || height > 0x7FFFFFFF { return false }
+    var buffer = Buffer.{ .pixels = pixels, .stride = stride }
+    return encodeFrom(readBuffer, &buffer, geom.rect(0, 0, @intCast(i32, width), @intCast(i32, height)), settings, into)
+}
+
+// The same with the usual options: RGBA, or RGB over white.
+pub fn encode(pixels: [*]const u32, width: usize, height: usize, stride: usize, with_alpha: bool, into: *std.ArrayList(u8)) -> bool {
+    const settings = options(with_alpha)
+    return encodeWith(pixels, width, height, stride, &settings, into)
+}
+
+// The pixels of `area` of `device` (the image's coordinates) as a PNG,
+// read in bands.
+pub fn encodeDevice(device: *Device, area: Rect, settings: *const Options, into: *std.ArrayList(u8)) -> bool {
+    return encodeFrom(readDevice, device, area, settings, into)
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+// The state of a decoding (on the heap: the reader is large).
+const Decoding = struct {
+    reader: png.read.Reader
+    info: png.read.Info
+    rowBuffer: usize
+    previous: usize
+    rowCapacity: usize
+    pixels: [*]u32
+    width: usize
+    pass: usize
+    row: usize
+    passRows: usize
+    passWidth: usize
+    complete: bool
+}
+
+fn firstPass(width: usize, height: usize, first: usize) -> usize {
+    var pass = first
+    while pass < 7 {
+        if png.rows.passWidth(pass, width) != 0 && png.rows.passHeight(pass, height) != 0 { return pass }
+        pass += 1
+    }
+    return 7
+}
+
+fn startPass(d: *Decoding) -> void {
+    const info = &d.*.info
+    if info.*.interlace == 0 {
+        d.*.passWidth = info.*.width
+        d.*.passRows = info.*.height
+    } else {
+        d.*.passWidth = png.rows.passWidth(d.*.pass, info.*.width)
+        d.*.passRows = png.rows.passHeight(d.*.pass, info.*.height)
+    }
+    d.*.row = 0
+    zs.zero(d.*.previous, d.*.rowCapacity)
+    d.*.reader.rowSize = png.rows.rowBytes(info.*.pixelDepth, d.*.passWidth) + 1
+}
+
+// The rows' memory, once the header is known.
+fn startImage(d: *Decoding, picture: *Picture, allocator: Allocator) -> Status {
+    const info = &d.*.info
+    if info.*.width == 0 || info.*.height == 0 { return Status.damaged }
+    const made = makePicture(picture, info.*.width, info.*.height, allocator)
+    if made != Status.ok { return made }
+    // A row at its widest: 8 bytes a pixel, rounded up to 8 pixels.
+    d.*.rowCapacity = ((info.*.width + 7) & ~@intCast(usize, 7)) * 8 + 64
+    const memory = allocator.alloc(d.*.rowCapacity * 2, 16)
+    if memory == null {
+        free(picture)
+        return Status.noMemory
+    }
+    d.*.rowBuffer = @intFromPtr(memory.?)
+    d.*.previous = d.*.rowBuffer + d.*.rowCapacity
+    zs.zero(d.*.rowBuffer, d.*.rowCapacity * 2)
+    d.*.pixels = picture.*.pixels
+    d.*.width = info.*.width
+    d.*.reader.rowBuffer = d.*.rowBuffer
+    d.*.pass = 0
+    if info.*.interlace != 0 { d.*.pass = firstPass(info.*.width, info.*.height, 0) }
+    startPass(d)
+    return Status.ok
+}
+
+// A row inflated: the filter undone, the row made 8-bit RGBA (16-bit
+// samples rounded), its pixels put in place as words.
+fn takeRow(d: *Decoding) -> bool {
+    const info = &d.*.info
+    const bytes = png.rows.rowBytes(info.*.pixelDepth, d.*.passWidth)
+    const filter = @intCast(usize, zs.get8(d.*.rowBuffer))
+    if filter > 4 { return false }
+    var pixel_bytes = info.*.pixelDepth >> 3
+    if pixel_bytes == 0 { pixel_bytes = 1 }
+    png.rows.unfilter(filter, d.*.rowBuffer + 1, d.*.previous + 1, bytes, pixel_bytes)
+    zs.copy(d.*.previous, d.*.rowBuffer, bytes + 1)
+    var row: png.rows.RowInfo = undefined
+    row.width = d.*.passWidth
+    row.rowBytes = bytes
+    row.colorType = info.*.colorType
+    row.bitDepth = info.*.bitDepth
+    row.channels = info.*.channels
+    row.pixelDepth = info.*.pixelDepth
+    const line = d.*.rowBuffer + 1
+    if row.colorType == 3 {
+        png.rows.expandPalette(&row, line, @intFromPtr(&info.*.palette), @intFromPtr(&info.*.transAlpha), info.*.numTrans)
+    } else {
+        png.rows.expand(&row, line, info.*.numTrans != 0, info.*.transGray, info.*.transRed, info.*.transGreen, info.*.transBlue)
+    }
+    png.rows.scale16(&row, line)
+    png.rows.grayToRgb(&row, line)
+    if row.channels == 3 { png.rows.filler(&row, line, 255, true) }
+    var y = d.*.row
+    var x0: usize = 0
+    var step: usize = 1
+    if info.*.interlace != 0 {
+        y = png.rows.passStartRow(d.*.pass) + d.*.row * png.rows.passRowStep(d.*.pass)
+        x0 = png.rows.passStartColumn(d.*.pass)
+        step = png.rows.passColumnStep(d.*.pass)
+    }
+    const target = d.*.pixels + (y * d.*.width + x0)
+    const source = zs.bytes(line)
+    var index: usize = 0
+    while index < d.*.passWidth {
+        const at = index * 4
+        target[index * step] = (@intCast(u32, source[at + 3]) << 24) | (@intCast(u32, source[at]) << 16) | (@intCast(u32, source[at + 1]) << 8) | @intCast(u32, source[at + 2])
+        index += 1
+    }
+    d.*.row += 1
+    if d.*.row >= d.*.passRows {
+        if info.*.interlace != 0 { d.*.pass = firstPass(info.*.width, info.*.height, d.*.pass + 1) } else { d.*.pass = 7 }
+        if d.*.pass >= 7 {
+            d.*.complete = true
+            d.*.reader.imageComplete = true
+        } else {
+            startPass(d)
+        }
+    }
+    return true
+}
+
+// Pixels an inch from pHYs in pixels a metre: a whole number when that is
+// what was written (72 is written 2835 and reads 72.009: 72 it is).
+fn resolutionOf(per_metre: usize) -> f64 {
+    if per_metre == 0 { return 0.0 }
+    const exact = @floatFromInt(f64, per_metre) * 0.0254
+    const whole = @floor(exact + 0.5)
+    if whole > 0.0 && @intFromFloat(u64, whole / 0.0254 + 0.5) == @intCast(u64, per_metre) { return whole }
+    return exact
+}
+
+pub fn isPng(bytes: []const u8) -> bool {
+    return bytes.length >= 8 && std.mem.readU32Big(bytes.pointer, 0) == 0x89504E47 && std.mem.readU32Big(bytes.pointer, 4) == 0x0D0A1A0A
+}
+
+// The PNG `bytes` into `into` (its pixels to be given back with free()
+// after Status.ok, and only then).
+pub fn decode(bytes: []const u8, allocator: Allocator, into: *Picture) -> Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    if !isPng(bytes) { return Status.notThisFormat }
+    const memory = allocator.alloc(@sizeOf(Decoding), 16)
+    if memory == null { return Status.noMemory }
+    const d: *Decoding = unsafe { @ptrCast(*Decoding, memory.?) }
+    png.read.init(&d.*.reader, &d.*.info, allocator)
+    d.*.rowBuffer = 0
+    d.*.complete = false
+    png.read.give(&d.*.reader, @intFromPtr(bytes.pointer), bytes.length)
+    var status = Status.damaged
+    var ended = false
+    while true {
+        const event = png.read.next(&d.*.reader)
+        if event == png.read.Event.more || event == png.read.Event.failed { break }
+        if event == png.read.Event.info {
+            status = startImage(d, into, allocator)
+            if status != Status.ok { break }
+            status = Status.damaged
+        } else if event == png.read.Event.row {
+            if !takeRow(d) { break }
+        } else if event == png.read.Event.unknown {
+            // An unknown critical chunk cannot be passed over.
+            if d.*.reader.chunkName & 0x20000000 == 0 { break }
+        } else if event == png.read.Event.end {
+            ended = true
+            break
+        }
+    }
+    if ended && d.*.complete { status = Status.ok }
+    if status == Status.ok && d.*.info.valid & png.read.INFO_pHYs != 0 && d.*.info.physUnit == 1 {
+        into.*.resolution = resolutionOf(d.*.info.xPixelsPerUnit)
+    }
+    if d.*.rowBuffer != 0 {
+        allocator.free(zs.bytes(d.*.rowBuffer), d.*.rowCapacity * 2, 16)
+        if status != Status.ok { free(into) }
+    }
+    png.read.deinit(&d.*.reader)
+    allocator.free(memory.?, @sizeOf(Decoding), 16)
+    return status
+}
