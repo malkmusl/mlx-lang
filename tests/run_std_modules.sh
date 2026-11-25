@@ -8,6 +8,9 @@
 #                                       (FIPS 180-4's examples)
 #   tests/350_math_helpers_runtime.mlx  std.math's min, max, clamp,
 #                                       absolute, sqrt and smoothstep
+#   tests/447_math_inverse_runtime.mlx  std.math's sign, lerp, fmod,
+#                                       hypot, the arc and hyperbolic
+#                                       functions and powr
 #   tests/351_random_runtime.mlx        std.random (xoshiro256**'s and
 #                                       splitmix64's reference outputs)
 #   tests/352_terminal_tty_runtime.mlx  std.terminal.tty on a pty of its own

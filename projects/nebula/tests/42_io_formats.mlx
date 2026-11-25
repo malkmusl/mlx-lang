@@ -1,21 +1,714 @@
-// placeholder while writing
+// nebula's picture formats (io/png.mlx, io/flat.mlx, io/formats.mlx):
+// PNG written and read back bit for bit in straight alpha (alpha 1 and
+// 254 under saturated colours, which premultiplied storage destroys),
+// with and without alpha, 1 x 1, 3000 x 2, rows wider apart than the
+// picture, from a Device across tile borders at negative places; our PNG
+// read by std.png (premultiplied, the values expected) and std.png's
+// saveFile read by ours; pHYs both ways; 16-bit samples rounded, not cut,
+// an interlaced PNG and a palette with a transparent entry (PNGs built
+// here); each other format written and read back (BMP, TGA, PPM, PAM,
+// QOI, WebP exactly or with the matte applied; JPEG within its quality's
+// tolerance), small files made by hand (a 2 x 2 BMP, an RLE8
+// BMP, an RLE TGA, a colour-mapped TGA, ASCII PPM and PBM, a 16-bit PGM,
+// a QOI) read as the pixels they hold; every truncation and 400 random
+// byte flips of each format never trap and read no byte past the end
+// (the same answer whatever lies behind); formats.load of a PNG file
+// gives an image of its size, resolution and pixels with one layer
+// "Background", save then load through real files for each writable
+// format, a PNG called .jpg read as a PNG, the status of a missing file,
+// an unknown format, a known one not read yet and a damaged file; a
+// layer exported as PNG at its exact bounds and imported back at a
+// place; the fuzz loops of the decoders written here take nothing of the
+// value arena (std.jpeg's and std.webp's decoders take some at each call,
+// about 6 KiB and 1 KiB: not checked here) and the heap is where it was
+// after each image is destroyed. Exits 13.
 const std = @import("std")
+const crash = @import("std.crash")
+const random = @import("std.random")
+const turns = @import("std.turns")
+const stdpng = @import("std.png")
+const flate = @import("std.flate")
+const crc = @import("std.crc")
 const png = @import("../io/png.mlx")
+const flat = @import("../io/flat.mlx")
+const formats = @import("../io/formats.mlx")
+const text = @import("../io/text.mlx")
+const device = @import("../core/device.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const node = @import("../core/node.mlx")
+const image_module = @import("../core/image.mlx")
+const ops = @import("../core/ops.mlx")
 
-pub fn main() -> u8 {
-    const allocator = std.heap.allocator()
-    var list = std.ArrayList(u8).init(allocator)
-    defer list.deinit()
-    var pixels: [6]u32 = [6]u32{ 0xFF102030, 0x01FF0000, 0xFE00FF00, 0, 0x80123456, 0xFFFFFFFF }
-    if !png.encode(&pixels, 3, 2, 3, true, &list) { return 1 }
+const Bytes = std.ArrayList(u8)
+const Allocator = std.allocator.Allocator
+
+const FOLDER = "nebula_test_42"
+
+// A pixel of a pattern: every alpha, colours from saturated to dull, the
+// colour of a pixel of alpha 0 left out (no image keeps it).
+fn patternPixel(generator: *random.Xoshiro256) -> u32 {
+    const value = @intCast(u32, random.next(generator) & 0xFFFFFFFF)
+    const kind = value & 7
+    var result = value
+    if kind == 0 { result = value | 0xFF000000 }
+    if kind == 1 { result = (value & 0x00FFFFFF) | 0x01000000 }
+    if kind == 2 { result = (value & 0x00FF00FF) | 0xFE000000 }
+    if kind == 3 { result = 0xFE00FF00 | (value & 255) }
+    if result >> 24 == 0 { result = 0 }
+    return result
+}
+
+fn makePattern(picture: *png.Picture, width: usize, height: usize, seed: u64, allocator: Allocator) -> bool {
+    if png.makePicture(picture, width, height, allocator) != png.Status.ok { return false }
+    var generator: random.Xoshiro256 = undefined
+    random.seed(&generator, seed)
+    var index: usize = 0
+    while index < width * height {
+        picture.*.pixels[index] = patternPixel(&generator)
+        index += 1
+    }
+    // The cases premultiplied storage loses, at known places.
+    picture.*.pixels[0] = 0x01FF0000
+    if width * height > 3 {
+        picture.*.pixels[1] = 0xFEFF00FF
+        picture.*.pixels[2] = 0x0100FF00
+        picture.*.pixels[3] = 0xFF000000
+    }
+    return true
+}
+
+fn samePixels(a: *const png.Picture, b: *const png.Picture) -> bool {
+    if a.*.width != b.*.width || a.*.height != b.*.height { return false }
+    var index: usize = 0
+    while index < a.*.width * a.*.height {
+        if a.*.pixels[index] != b.*.pixels[index] { return false }
+        index += 1
+    }
+    return true
+}
+
+// Whether each pixel of `b` is that of `a` laid over `matte`.
+fn sameFlattened(a: *const png.Picture, b: *const png.Picture, matte: u32) -> bool {
+    if a.*.width != b.*.width || a.*.height != b.*.height { return false }
+    var index: usize = 0
+    while index < a.*.width * a.*.height {
+        const value = a.*.pixels[index]
+        const expected = if value >> 24 == 255 { value } else { pixel.over(matte, value, 255) | 0xFF000000 }
+        if b.*.pixels[index] != expected { return false }
+        index += 1
+    }
+    return true
+}
+
+fn channelNear(a: u32, b: u32, tolerance: u32) -> bool {
+    return if a > b { a - b <= tolerance } else { b - a <= tolerance }
+}
+
+fn near(a: u32, b: u32, tolerance: u32) -> bool {
+    return channelNear(pixel.alpha(a), pixel.alpha(b), tolerance) && channelNear(pixel.red(a), pixel.red(b), tolerance) && channelNear(pixel.green(a), pixel.green(b), tolerance) && channelNear(pixel.blue(a), pixel.blue(b), tolerance)
+}
+
+// A picture that is smooth (what JPEG keeps well): gradients.
+fn makeSmooth(picture: *png.Picture, width: usize, height: usize, allocator: Allocator) -> bool {
+    if png.makePicture(picture, width, height, allocator) != png.Status.ok { return false }
+    var y: usize = 0
+    while y < height {
+        var x: usize = 0
+        while x < width {
+            const r = @intCast(u32, x * 255 / width)
+            const g = @intCast(u32, y * 255 / height)
+            picture.*.pixels[y * width + x] = 0xFF000000 | (r << 16) | (g << 8) | 128
+            x += 1
+        }
+        y += 1
+    }
+    return true
+}
+
+// What reading `bytes` with `read` into `picture` comes to, as one
+// number: the status, the size and the pixels. (The record is the
+// caller's: one made here would be a new value of the arena at every call
+// through the function pointer.)
+fn digest(read: formats.Read, bytes: []const u8, allocator: Allocator, picture: *png.Picture) -> u64 {
+    const status = read(bytes, allocator, picture)
+    var sum: u64 = 1 + @intCast(u64, @intFromEnum(status))
+    if status != png.Status.ok { return sum }
+    const width = picture.*.width
+    const height = picture.*.height
+    if width == 0 || height == 0 || width > png.LARGEST || height > png.LARGEST { return 0 }
+    sum = sum *% 31 +% @intCast(u64, width)
+    sum = sum *% 31 +% @intCast(u64, height)
+    var index: usize = 0
+    while index < width * height {
+        sum = sum *% 1000003 +% @intCast(u64, picture.*.pixels[index])
+        index += 1
+    }
+    png.free(picture)
+    return sum
+}
+
+// Every truncation of `file`, and `flips` copies with one byte changed,
+// read with zeros and with ones behind the bytes: the same answer both
+// times (nothing past the end is read), and no trap. `one` and `two` have
+// room for the file and 64 bytes more.
+fn fuzz(read: formats.Read, file: []const u8, one: [*]u8, two: [*]u8, flips: usize, generator: *random.Xoshiro256, allocator: Allocator, picture: *png.Picture) -> bool {
+    const size = file.length
+    var cut: usize = 0
+    while cut < size {
+        std.mem.copy(one, file.pointer, cut)
+        std.mem.copy(two, file.pointer, cut)
+        std.mem.set(one + cut, 0, size + 64 - cut)
+        std.mem.set(two + cut, 255, size + 64 - cut)
+        const left = digest(read, one[0..cut], allocator, picture)
+        if left == 0 || left != digest(read, two[0..cut], allocator, picture) { return false }
+        cut += 1
+    }
+    var round: usize = 0
+    while round < flips {
+        const place = @intCast(usize, random.below(generator, @intCast(u64, size)))
+        const change = @intCast(u8, 1 + random.below(generator, 255))
+        std.mem.copy(one, file.pointer, size)
+        std.mem.copy(two, file.pointer, size)
+        std.mem.set(one + size, 0, 64)
+        std.mem.set(two + size, 255, 64)
+        one[place] = one[place] ^ change
+        two[place] = two[place] ^ change
+        const left = digest(read, one[0..size], allocator, picture)
+        if left == 0 || left != digest(read, two[0..size], allocator, picture) { return false }
+        round += 1
+    }
+    return true
+}
+
+// Whether `bytes` read as a picture of `width` x `height` whose pixels are
+// `expected`.
+fn readsAs(read: formats.Read, bytes: []const u8, width: usize, height: usize, expected: [*]const u32, allocator: Allocator) -> bool {
     var picture: png.Picture = undefined
-    if png.decode(list.items(), allocator, &picture) != png.Status.ok { return 2 }
-    if picture.width != 3 || picture.height != 2 { return 3 }
-    var i: usize = 0
-    while i < 6 {
-        if picture.pixels[i] != pixels[i] { return 4 }
-        i += 1
+    if read(bytes, allocator, &picture) != png.Status.ok { return false }
+    var ok = picture.width == width && picture.height == height
+    var index: usize = 0
+    while ok && index < width * height {
+        if picture.pixels[index] != expected[index] { ok = false }
+        index += 1
     }
     png.free(&picture)
+    return ok
+}
+
+fn put32Big(out: *Bytes, value: u32) -> void {
+    _ = out.*.append(@intCast(u8, value >> 24))
+    _ = out.*.append(@intCast(u8, (value >> 16) & 255))
+    _ = out.*.append(@intCast(u8, (value >> 8) & 255))
+    _ = out.*.append(@intCast(u8, value & 255))
+}
+
+// A PNG chunk of `kind` holding `data`.
+fn chunk(out: *Bytes, kind: []const u8, data: []const u8) -> void {
+    put32Big(out, @intCast(u32, data.length))
+    const start = out.*.count()
+    _ = out.*.appendSlice(kind)
+    _ = out.*.appendSlice(data)
+    put32Big(out, crc.crc32(0, out.*.items().pointer + start, data.length + 4))
+}
+
+// The rest of a PNG made by hand after its chunks before the image data:
+// `raw` (filter bytes and rows) compressed as IDAT, and IEND.
+fn finishPng(out: *Bytes, raw: []const u8, allocator: Allocator) -> bool {
+    const room = flate.compressBound(raw.length, flate.Format.zlib)
+    const memory = allocator.alloc(room, 16)
+    if memory == null { return false }
+    const length = flate.compress(raw.pointer, raw.length, memory.?, room, 6, flate.Format.zlib, allocator)
+    if length != 0 {
+        chunk(out, "IDAT", memory.?[0..length])
+        chunk(out, "IEND", raw[0..0])
+    }
+    allocator.free(memory.?, room, 16)
+    return length != 0
+}
+
+// Adam7's passes: first column, first row, the steps between columns and
+// between rows.
+const PASSES = [7][4]usize{ [4]usize{ 0, 0, 8, 8 }, [4]usize{ 4, 0, 8, 8 }, [4]usize{ 0, 4, 4, 8 }, [4]usize{ 2, 0, 4, 4 }, [4]usize{ 0, 2, 2, 4 }, [4]usize{ 1, 0, 2, 2 }, [4]usize{ 0, 1, 1, 2 } }
+
+// The pixels `image` shows of its one layer, into `into` (a picture of
+// the image's size).
+fn layerPixels(image: *image_module.Image, into: *png.Picture, allocator: Allocator) -> bool {
+    if node.childCount(image.*.root) != 1 { return false }
+    const layer = node.childAt(image.*.root, 0)
+    if layer.*.kind != node.PAINT || !std.text.same(node.nameOf(layer), "Background") { return false }
+    if png.makePicture(into, @intCast(usize, image.*.width), @intCast(usize, image.*.height), allocator) != png.Status.ok { return false }
+    device.readRect(layer.*.device.?, image_module.bounds(image), into.*.pixels, into.*.width)
+    return true
+}
+
+// The path of `name` in the test's folder, in `room`.
+fn pathOf(name: []const u8, room: [*]u8) -> []const u8 {
+    const length = text.join(FOLDER, name, room, 128)
+    return room[0..length]
+}
+
+// An image of one layer showing `picture`.
+fn imageShowing(picture: *const png.Picture, allocator: Allocator) -> ?*image_module.Image {
+    const made = image_module.create(allocator, @intCast(i32, picture.*.width), @intCast(i32, picture.*.height), 150.0)
+    if made == null { return null }
+    const layer = ops.newLayer(made.?, node.PAINT, "Layer", "New layer")
+    if layer == null || !formats.writePicture(layer.?.*.device.?, picture, 0, 0) {
+        image_module.destroy(made.?)
+        return null
+    }
+    // (Written straight into the device: the image is told.)
+    image_module.damageAll(made.?)
+    return made
+}
+
+pub fn main() -> u8 {
+    _ = crash.install()
+    const allocator = std.heap.allocator()
+    var generator: random.Xoshiro256 = undefined
+    random.seed(&generator, 42)
+    var list = Bytes.init(allocator)
+    defer list.deinit()
+
+    // --- PNG, straight and exact: with alpha, every size there is to try.
+    var pattern: png.Picture = undefined
+    if !makePattern(&pattern, 77, 41, 1, allocator) { return 1 }
+    if !png.encode(pattern.pixels, 77, 41, 77, true, &list) { return 2 }
+    var back: png.Picture = undefined
+    if png.decode(list.items(), allocator, &back) != png.Status.ok || !samePixels(&pattern, &back) { return 3 }
+    if back.pixels[0] != 0x01FF0000 || back.pixels[1] != 0xFEFF00FF || back.pixels[2] != 0x0100FF00 || back.resolution != 0.0 { return 4 }
+    png.free(&back)
+    // Without alpha: laid over white (or the options' matte).
+    list.clearRetainingCapacity()
+    if !png.encode(pattern.pixels, 77, 41, 77, false, &list) { return 5 }
+    if list.items()[25] != 2 { return 6 }
+    if png.decode(list.items(), allocator, &back) != png.Status.ok || !sameFlattened(&pattern, &back, pixel.WHITE) { return 7 }
+    png.free(&back)
+    var options = png.options(false)
+    options.matte = 0xFF204060
+    list.clearRetainingCapacity()
+    if !png.encodeWith(pattern.pixels, 77, 41, 77, &options, &list) { return 8 }
+    if png.decode(list.items(), allocator, &back) != png.Status.ok || !sameFlattened(&pattern, &back, 0xFF204060) { return 9 }
+    png.free(&back)
+    // 1 x 1, 3000 x 2, rows of 80 words of which 77 count (a window into
+    // a larger picture), the stored level 0 and the smallest 9.
+    var tiny: [1]u32 = [1]u32{ 0x7F00FFFF }
+    list.clearRetainingCapacity()
+    if !png.encode(&tiny, 1, 1, 1, true, &list) { return 10 }
+    const tiny_pixels: [*]const u32 = &tiny
+    if !readsAs(png.decode, list.items(), 1, 1, tiny_pixels, allocator) { return 11 }
+    var wide: png.Picture = undefined
+    if !makePattern(&wide, 3000, 2, 2, allocator) { return 12 }
+    list.clearRetainingCapacity()
+    if !png.encode(wide.pixels, 3000, 2, 3000, true, &list) || !readsAs(png.decode, list.items(), 3000, 2, wide.pixels, allocator) { return 14 }
+    var framed: png.Picture = undefined
+    if !makePattern(&framed, 80, 41, 3, allocator) { return 15 }
+    list.clearRetainingCapacity()
+    options = png.options(true)
+    options.level = 0
+    if !png.encodeWith(framed.pixels + 2, 77, 41, 80, &options, &list) { return 16 }
+    if png.decode(list.items(), allocator, &back) != png.Status.ok || back.width != 77 { return 17 }
+    var row: usize = 0
+    while row < 41 {
+        var column: usize = 0
+        while column < 77 {
+            if back.pixels[row * 77 + column] != framed.pixels[row * 80 + column + 2] { return 18 }
+            column += 1
+        }
+        row += 1
+    }
+    png.free(&back)
+    options.level = 9
+    list.clearRetainingCapacity()
+    if !png.encodeWith(wide.pixels, 3000, 2, 3000, &options, &list) || !readsAs(png.decode, list.items(), 3000, 2, wide.pixels, allocator) { return 19 }
+    if png.encode(&tiny, 0, 1, 1, true, &list) || png.encode(&tiny, 1, 0, 1, true, &list) { return 20 }
+
+    // --- pHYs both ways: whole numbers come back whole; tEXt is passed by.
+    options = png.options(true)
+    options.resolution = 300.0
+    options.textKey = "Software"
+    options.textValue = "Nebula"
+    list.clearRetainingCapacity()
+    if !png.encodeWith(pattern.pixels, 77, 41, 77, &options, &list) { return 21 }
+    if std.text.find(list.items(), "pHYs") == list.count() || std.text.find(list.items(), "Software\x00Nebula") == list.count() { return 22 }
+    if png.decode(list.items(), allocator, &back) != png.Status.ok || back.resolution != 300.0 || !samePixels(&pattern, &back) { return 23 }
+    png.free(&back)
+    options.resolution = 72.0
+    list.clearRetainingCapacity()
+    if !png.encodeWith(pattern.pixels, 77, 41, 77, &options, &list) || png.decode(list.items(), allocator, &back) != png.Status.ok || back.resolution != 72.0 { return 24 }
+    png.free(&back)
+    options.resolution = 123.4
+    list.clearRetainingCapacity()
+    if !png.encodeWith(pattern.pixels, 77, 41, 77, &options, &list) || png.decode(list.items(), allocator, &back) != png.Status.ok { return 25 }
+    if back.resolution < 123.39 || back.resolution > 123.41 { return 26 }
+    png.free(&back)
+
+    // --- std.png reads ours (premultiplied as it does it) ...
+    list.clearRetainingCapacity()
+    if !png.encode(pattern.pixels, 77, 41, 77, true, &list) { return 27 }
+    var premultiplied: stdpng.Image = undefined
+    if stdpng.decode(&premultiplied, list.items().pointer, list.count(), allocator) != stdpng.Status.ok || premultiplied.width != 77 { return 28 }
+    var index: usize = 0
+    while index < 77 * 41 {
+        const value = pattern.pixels[index]
+        const a = value >> 24
+        var expected = value
+        if a == 0 {
+            expected = 0
+        } else if a != 255 {
+            expected = (a << 24) | (((pixel.red(value) * a + 127) / 255) << 16) | (((pixel.green(value) * a + 127) / 255) << 8) | ((pixel.blue(value) * a + 127) / 255)
+        }
+        if premultiplied.pixels[index] != expected { return 29 }
+        index += 1
+    }
+    // ... and ours reads std.png's saveFile (which takes premultiplied
+    // words and writes them straight, rounded).
+    if !std.fs.makeDirectories(FOLDER, 493) { return 30 }
+    if !stdpng.saveFile("nebula_test_42/std.png\x00".pointer, premultiplied.pixels, 77, 41, 77, true, allocator) { return 31 }
+    var contents: text.Contents = undefined
+    if text.readFile(allocator, "nebula_test_42/std.png", &contents) != text.FileStatus.ok { return 32 }
+    if png.decode(contents.bytes[0..contents.length], allocator, &back) != png.Status.ok { return 33 }
+    index = 0
+    while index < 77 * 41 {
+        const value = premultiplied.pixels[index]
+        const a = value >> 24
+        var expected = value
+        if a != 0 && a != 255 {
+            const r = pixel.smaller(255, (pixel.red(value) * 255 + a / 2) / a)
+            const g = pixel.smaller(255, (pixel.green(value) * 255 + a / 2) / a)
+            const b = pixel.smaller(255, (pixel.blue(value) * 255 + a / 2) / a)
+            expected = (a << 24) | (r << 16) | (g << 8) | b
+        }
+        if back.pixels[index] != expected { return 34 }
+        index += 1
+    }
+    png.free(&back)
+    text.freeFile(&contents)
+    stdpng.deinit(&premultiplied)
+
+    // --- 16-bit samples rounded to 8 (std.png cuts them): a PNG built
+    // here, two RGBA pixels of 16 bits.
+    {
+        var file = Bytes.init(allocator)
+        defer file.deinit()
+        put32Big(&file, 0x89504E47)
+        put32Big(&file, 0x0D0A1A0A)
+        const header = [13]u8{ 0, 0, 0, 2, 0, 0, 0, 1, 16, 6, 0, 0, 0 }
+        chunk(&file, "IHDR", header[0..])
+        const raw = [17]u8{ 0, 0x12, 0xFF, 0x12, 0x80, 0xFF, 0xFF, 0x80, 0x80, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x80, 0xFF, 0xFF }
+        var packed_room: [64]u8 = undefined
+        const packed_length = flate.compress(&raw, 17, &packed_room, 64, 6, flate.Format.zlib, allocator)
+        if packed_length == 0 { return 35 }
+        chunk(&file, "IDAT", packed_room[0..packed_length])
+        chunk(&file, "IEND", header[0..0])
+        const deep = [2]u32{ 0x801312FF, 0xFF000100 }
+        if !readsAs(png.decode, file.items(), 2, 1, &deep, allocator) { return 36 }
+        // Interlaced (Adam7): 5 x 3 RGBA, each pass's rows as they are.
+        var interlaced: png.Picture = undefined
+        if !makePattern(&interlaced, 5, 3, 6, allocator) { return 136 }
+        var rows = Bytes.init(allocator)
+        defer rows.deinit()
+        var pass: usize = 0
+        while pass < 7 {
+            const x0 = PASSES[pass][0]
+            const y0 = PASSES[pass][1]
+            var y = y0
+            while y < 3 && x0 < 5 {
+                _ = rows.append(0)
+                var x = x0
+                while x < 5 {
+                    const value = interlaced.pixels[y * 5 + x]
+                    _ = rows.append(@intCast(u8, (value >> 16) & 255))
+                    _ = rows.append(@intCast(u8, (value >> 8) & 255))
+                    _ = rows.append(@intCast(u8, value & 255))
+                    _ = rows.append(@intCast(u8, value >> 24))
+                    x += PASSES[pass][2]
+                }
+                y += PASSES[pass][3]
+            }
+            pass += 1
+        }
+        file.clearRetainingCapacity()
+        put32Big(&file, 0x89504E47)
+        put32Big(&file, 0x0D0A1A0A)
+        const adam = [13]u8{ 0, 0, 0, 5, 0, 0, 0, 3, 8, 6, 0, 0, 1 }
+        chunk(&file, "IHDR", adam[0..])
+        if !finishPng(&file, rows.items(), allocator) || !readsAs(png.decode, file.items(), 5, 3, interlaced.pixels, allocator) { return 137 }
+        png.free(&interlaced)
+        // A palette with a transparent entry: indices 0 (red, alpha 128) and 1.
+        file.clearRetainingCapacity()
+        put32Big(&file, 0x89504E47)
+        put32Big(&file, 0x0D0A1A0A)
+        const indexed = [13]u8{ 0, 0, 0, 2, 0, 0, 0, 1, 8, 3, 0, 0, 0 }
+        chunk(&file, "IHDR", indexed[0..])
+        chunk(&file, "PLTE", "\xff\x00\x00\x00\x00\xff")
+        chunk(&file, "tRNS", "\x80")
+        const palette_pixels = [2]u32{ 0x80FF0000, 0xFF0000FF }
+        if !finishPng(&file, "\x00\x00\x01", allocator) || !readsAs(png.decode, file.items(), 2, 1, &palette_pixels, allocator) { return 138 }
+    }
+
+    // --- From a device, across tile borders, at negative places, in bands.
+    const layer = device.create(allocator, 0)
+    if layer == null { return 37 }
+    var area = geom.rect(-70, -10, 150, 90)
+    var source: png.Picture = undefined
+    if !makePattern(&source, 150, 90, 4, allocator) { return 38 }
+    if !formats.writePicture(layer.?, &source, -70, -10) { return 39 }
+    list.clearRetainingCapacity()
+    options = png.options(true)
+    if !png.encodeDevice(layer.?, area, &options, &list) || !readsAs(png.decode, list.items(), 150, 90, source.pixels, allocator) { return 40 }
+
+    // --- Each other format written and read back.
+    list.clearRetainingCapacity()
+    if !flat.encodeBmp(&pattern, true, 0, &list) || !readsAs(flat.decodeBmp, list.items(), 77, 41, pattern.pixels, allocator) { return 41 }
+    list.clearRetainingCapacity()
+    if !flat.encodeBmp(&pattern, false, 0xFF808080, &list) || flat.decodeBmp(list.items(), allocator, &back) != png.Status.ok || !sameFlattened(&pattern, &back, 0xFF808080) { return 42 }
+    if back.resolution != 72.0 { return 43 }
+    png.free(&back)
+    list.clearRetainingCapacity()
+    if !flat.encodeTga(&pattern, true, 0, &list) || !readsAs(flat.decodeTga, list.items(), 77, 41, pattern.pixels, allocator) { return 44 }
+    list.clearRetainingCapacity()
+    if !flat.encodeTga(&pattern, false, 0xFF00FF00, &list) || flat.decodeTga(list.items(), allocator, &back) != png.Status.ok || !sameFlattened(&pattern, &back, 0xFF00FF00) { return 45 }
+    png.free(&back)
+    // (A wide picture of runs: they do not cross the rows.)
+    list.clearRetainingCapacity()
+    if !flat.encodeTga(&wide, true, 0, &list) || !readsAs(flat.decodeTga, list.items(), 3000, 2, wide.pixels, allocator) { return 46 }
+    list.clearRetainingCapacity()
+    if !flat.encodePam(&pattern, &list) || !readsAs(flat.decodePnm, list.items(), 77, 41, pattern.pixels, allocator) { return 47 }
+    list.clearRetainingCapacity()
+    if !flat.encodePpm(&pattern, pixel.WHITE, &list) || flat.decodePnm(list.items(), allocator, &back) != png.Status.ok || !sameFlattened(&pattern, &back, pixel.WHITE) { return 48 }
+    png.free(&back)
+    list.clearRetainingCapacity()
+    if !flat.encodeQoi(&pattern, true, 0, &list) || !readsAs(flat.decodeQoi, list.items(), 77, 41, pattern.pixels, allocator) { return 49 }
+    list.clearRetainingCapacity()
+    if !flat.encodeQoi(&wide, true, 0, &list) || !readsAs(flat.decodeQoi, list.items(), 3000, 2, wide.pixels, allocator) { return 50 }
+    list.clearRetainingCapacity()
+    if !flat.encodeQoi(&pattern, false, 0xFF000000, &list) || flat.decodeQoi(list.items(), allocator, &back) != png.Status.ok || !sameFlattened(&pattern, &back, 0xFF000000) { return 51 }
+    png.free(&back)
+    list.clearRetainingCapacity()
+    if !flat.encodeWebp(&pattern, &list) || !readsAs(flat.decodeWebp, list.items(), 77, 41, pattern.pixels, allocator) { return 52 }
+    // JPEG: a smooth picture comes back near, and what is transparent is
+    // the matte.
+    var smooth: png.Picture = undefined
+    if !makeSmooth(&smooth, 96, 64, allocator) { return 53 }
+    list.clearRetainingCapacity()
+    if !flat.encodeJpeg(&smooth, 95, 0, &list) || flat.decodeJpeg(list.items(), allocator, &back) != png.Status.ok || back.width != 96 || back.height != 64 { return 54 }
+    index = 0
+    while index < 96 * 64 {
+        if !near(back.pixels[index], smooth.pixels[index], 10) { return 55 }
+        index += 1
+    }
+    png.free(&back)
+    index = 0
+    while index < 96 * 16 {
+        smooth.pixels[index] = 0
+        index += 1
+    }
+    list.clearRetainingCapacity()
+    if !flat.encodeJpeg(&smooth, 95, 0xFFFF0000, &list) || flat.decodeJpeg(list.items(), allocator, &back) != png.Status.ok { return 56 }
+    if !near(back.pixels[96 * 4 + 40], 0xFFFF0000, 6) || !near(back.pixels[96 * 40 + 40], smooth.pixels[96 * 40 + 40], 10) { return 57 }
+    png.free(&back)
+
+    // --- Small files made by hand.
+    // A BMP of 2 x 2, 24 bits, the bottom row first, rows of 8 bytes.
+    const BMP = [70]u8{ 66, 77, 70, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 24, 0, 0, 0, 0, 0, 16, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0 }
+    const BMP_PIXELS = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF }
+    if !readsAs(flat.decodeBmp, BMP[0..], 2, 2, &BMP_PIXELS, allocator) { return 58 }
+    // RLE8, 4 x 2, two colours: the bottom row a run of 4, the top one 3
+    // indices as they are and a fourth left out (transparent).
+    const RLE = [78]u8{ 66, 77, 78, 0, 0, 0, 0, 0, 0, 0, 62, 0, 0, 0, 40, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 1, 0, 8, 0, 1, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 4, 1, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0 }
+    const RLE_PIXELS = [8]u32{ 0xFF000000, 0xFFFF0000, 0xFF000000, 0, 0xFFFF0000, 0xFFFF0000, 0xFFFF0000, 0xFFFF0000 }
+    if !readsAs(flat.decodeBmp, RLE[0..], 4, 2, &RLE_PIXELS, allocator) { return 59 }
+    // An RLE TGA of 3 x 2, 24 bits, the bottom row first: a run of three
+    // blue pixels, then three as they are.
+    const TGA = [34]u8{ 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 2, 0, 24, 0, 130, 255, 0, 0, 2, 0, 0, 255, 0, 255, 0, 255, 255, 255, 0, 0 }
+    const TGA_PIXELS = [6]u32{ 0xFFFF0000, 0xFF00FF00, 0xFFFFFFFF, 0xFF0000FF, 0xFF0000FF, 0xFF0000FF }
+    if !readsAs(flat.decodeTga, TGA[0..32], 3, 2, &TGA_PIXELS, allocator) { return 60 }
+    // Colour-mapped, 2 x 1, the top row first: map entries red and blue.
+    const MAPPED = [26]u8{ 0, 1, 1, 0, 0, 2, 0, 24, 0, 0, 0, 0, 2, 0, 1, 0, 8, 32, 0, 0, 255, 255, 0, 0, 1, 0 }
+    const MAPPED_PIXELS = [2]u32{ 0xFF0000FF, 0xFFFF0000 }
+    if !readsAs(flat.decodeTga, MAPPED[0..], 2, 1, &MAPPED_PIXELS, allocator) { return 61 }
+    const PPM_PIXELS = [4]u32{ 0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF }
+    if !readsAs(flat.decodePnm, "P3\n# made by hand\n2 2\n255\n255 0 0  0 255 0\n0 0 255  255 255 255\n", 2, 2, &PPM_PIXELS, allocator) { return 62 }
+    const PBM_PIXELS = [3]u32{ 0xFFFFFFFF, 0xFF000000, 0xFFFFFFFF }
+    if !readsAs(flat.decodePnm, "P1 3 1 010", 3, 1, &PBM_PIXELS, allocator) { return 63 }
+    // 16 bits a sample, rounded: 0x12FF of 65535 is 19 of 255 (cut, 18).
+    const PGM_PIXELS = [2]u32{ 0xFF131313, 0xFF000000 }
+    if !readsAs(flat.decodePnm, "P5 2 1 65535\n\x12\xff\x00\x00", 2, 1, &PGM_PIXELS, allocator) { return 64 }
+    // QOI: one pixel as it is, the next a small difference from it.
+    const QOI = [29]u8{ 113, 111, 105, 102, 0, 0, 0, 2, 0, 0, 0, 1, 4, 0, 255, 10, 20, 30, 40, 0x76, 0, 0, 0, 0, 0, 0, 0, 1, 0 }
+    const QOI_PIXELS = [2]u32{ 0x280A141E, 0x280B131E }
+    if !readsAs(flat.decodeQoi, QOI[0..28], 2, 1, &QOI_PIXELS, allocator) { return 65 }
+    // What is not of the format is said to be so, what is damaged too.
+    if flat.decodeBmp("not a bmp at all, no", allocator, &back) != png.Status.notThisFormat || flat.decodeQoi("qoif\x00\x00\x00\x02\x00\x00\x00\x01\x05\x00", allocator, &back) != png.Status.damaged { return 66 }
+    if flat.decodePnm("P6 99999999 2 255\n", allocator, &back) != png.Status.tooLarge || flat.decodePnm("P6 2 2 255\nab", allocator, &back) != png.Status.damaged { return 67 }
+
+    // --- Damage: no trap, nothing read past the end, the arena alone.
+    var small: png.Picture = undefined
+    if !makePattern(&small, 7, 5, 5, allocator) { return 68 }
+    const ROOM: usize = 65536
+    const first_memory = allocator.alloc(ROOM, 16)
+    const second_memory = allocator.alloc(ROOM, 16)
+    if first_memory == null || second_memory == null { return 69 }
+    const one = first_memory.?
+    const two = second_memory.?
+    var file = Bytes.init(allocator)
+    defer file.deinit()
+    var fuzzed: png.Picture = undefined
+    const arena = turns.locate()
+    const arena_before = turns.used(arena)
+    if !png.encode(small.pixels, 7, 5, 7, true, &file) || file.count() + 64 > ROOM { return 70 }
+    if !fuzz(png.decode, file.items(), one, two, 400, &generator, allocator, &fuzzed) { return 71 }
+    file.clearRetainingCapacity()
+    if !flat.encodeBmp(&small, true, 0, &file) || !fuzz(flat.decodeBmp, file.items(), one, two, 400, &generator, allocator, &fuzzed) { return 72 }
+    if !fuzz(flat.decodeBmp, RLE[0..], one, two, 400, &generator, allocator, &fuzzed) { return 73 }
+    file.clearRetainingCapacity()
+    if !flat.encodeTga(&small, true, 0, &file) || !fuzz(flat.decodeTga, file.items(), one, two, 400, &generator, allocator, &fuzzed) { return 74 }
+    if !fuzz(flat.decodeTga, MAPPED[0..], one, two, 400, &generator, allocator, &fuzzed) { return 75 }
+    file.clearRetainingCapacity()
+    if !flat.encodePam(&small, &file) || !fuzz(flat.decodePnm, file.items(), one, two, 400, &generator, allocator, &fuzzed) { return 76 }
+    if !fuzz(flat.decodePnm, "P3\n# made by hand\n2 2\n255\n255 0 0  0 255 0\n0 0 255  255 255 255\n", one, two, 400, &generator, allocator, &fuzzed) { return 77 }
+    file.clearRetainingCapacity()
+    if !flat.encodeQoi(&small, true, 0, &file) || !fuzz(flat.decodeQoi, file.items(), one, two, 400, &generator, allocator, &fuzzed) { return 78 }
+    if turns.used(arena) - arena_before > 65536 { return 79 }
+    // std.jpeg and std.webp: no trap and no byte past the end either.
+    file.clearRetainingCapacity()
+    if !flat.encodeJpeg(&small, 80, 0, &file) || !fuzz(flat.decodeJpeg, file.items(), one, two, 400, &generator, allocator, &fuzzed) { return 80 }
+    file.clearRetainingCapacity()
+    if !flat.encodeWebp(&small, &file) || !fuzz(flat.decodeWebp, file.items(), one, two, 400, &generator, allocator, &fuzzed) { return 81 }
+
+    // --- Loading through formats.
+    var room: [128]u8 = undefined
+    const name_bytes: [*]u8 = &room
+    list.clearRetainingCapacity()
+    options = png.options(true)
+    options.resolution = 300.0
+    if !png.encodeWith(source.pixels, 150, 90, 150, &options, &list) { return 82 }
+    if !text.writeFile(allocator, pathOf("layer.png", name_bytes), list.items()) { return 83 }
+    // Once to settle what is kept for good (the working memory of
+    // core/scratch.mlx), then the heap is where it was each time.
+    var result: formats.LoadResult = undefined
+    if formats.load(allocator, pathOf("layer.png", name_bytes), &result) != formats.Status.ok { return 84 }
+    image_module.destroy(result.image.?)
+    const live = std.heap.liveBytes()
+    if formats.load(allocator, pathOf("layer.png", name_bytes), &result) != formats.Status.ok || result.format != formats.PNG { return 85 }
+    const loaded = result.image.?
+    if loaded.*.width != 150 || loaded.*.height != 90 || loaded.*.resolution != 300.0 || loaded.*.modified { return 86 }
+    if !std.text.same(image_module.pathOf(loaded), "nebula_test_42/layer.png") { return 87 }
+    if !layerPixels(loaded, &back, allocator) || !samePixels(&source, &back) { return 88 }
+    png.free(&back)
+    image_module.destroy(loaded)
+    if std.heap.liveBytes() != live { return 89 }
+    // A PNG called .jpg is a PNG.
+    if !text.writeFile(allocator, pathOf("wrong.jpg", name_bytes), list.items()) { return 90 }
+    if formats.load(allocator, pathOf("wrong.jpg", name_bytes), &result) != formats.Status.ok || result.format != formats.PNG { return 91 }
+    image_module.destroy(result.image.?)
+    // What cannot be loaded, and why.
+    if formats.load(allocator, pathOf("missing.png", name_bytes), &result) != formats.Status.notFound || result.image != null { return 92 }
+    if formats.load(allocator, FOLDER, &result) != formats.Status.notReadable { return 93 }
+    if !text.writeFile(allocator, pathOf("notes.xyz", name_bytes), "just some words") { return 94 }
+    if formats.load(allocator, pathOf("notes.xyz", name_bytes), &result) != formats.Status.unknownFormat { return 95 }
+    if !text.writeFile(allocator, pathOf("layers.psd", name_bytes), "8BPS\x00\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x02\x00\x00\x00\x02\x00\x08\x00\x03") { return 96 }
+    if formats.load(allocator, pathOf("layers.psd", name_bytes), &result) != formats.Status.unsupported { return 97 }
+    if !text.writeFile(allocator, pathOf("cut.png", name_bytes), list.items()[0..list.count() / 2]) { return 98 }
+    if formats.load(allocator, pathOf("cut.png", name_bytes), &result) != formats.Status.damaged || result.image != null { return 99 }
+    if std.heap.liveBytes() != live { return 100 }
+
+    // --- Save, then load, through files, each format that writes.
+    const shown = imageShowing(&pattern, allocator)
+    if shown == null { return 101 }
+    var save_options = formats.saveOptions()
+    save_options.matte = 0xFF336699
+    if formats.save(shown.?, pathOf("saved.png", name_bytes), formats.PNG, &save_options) != formats.Status.ok { return 102 }
+    if formats.load(allocator, pathOf("saved.png", name_bytes), &result) != formats.Status.ok || result.image.?.*.resolution != 150.0 { return 103 }
+    if !layerPixels(result.image.?, &back, allocator) || !samePixels(&pattern, &back) { return 104 }
+    png.free(&back)
+    image_module.destroy(result.image.?)
+    const EXACT = [5]u16{ formats.BMP, formats.TGA, formats.PNM, formats.QOI, formats.WEBP }
+    const EXACT_NAMES = [5][]const u8{ "saved.bmp", "saved.tga", "saved.pam", "saved.qoi", "saved.webp" }
+    var which: usize = 0
+    while which < 5 {
+        if formats.save(shown.?, pathOf(EXACT_NAMES[which], name_bytes), EXACT[which], &save_options) != formats.Status.ok { return 105 }
+        if formats.load(allocator, pathOf(EXACT_NAMES[which], name_bytes), &result) != formats.Status.ok || result.format != EXACT[which] { return 106 }
+        if !layerPixels(result.image.?, &back, allocator) || !samePixels(&pattern, &back) { return 107 }
+        png.free(&back)
+        image_module.destroy(result.image.?)
+        which += 1
+    }
+    // Without alpha: the matte (a .ppm, a PNG asked to keep none).
+    if formats.save(shown.?, pathOf("saved.ppm", name_bytes), formats.PNM, &save_options) != formats.Status.ok { return 108 }
+    if formats.load(allocator, pathOf("saved.ppm", name_bytes), &result) != formats.Status.ok { return 109 }
+    if !layerPixels(result.image.?, &back, allocator) || !sameFlattened(&pattern, &back, 0xFF336699) { return 110 }
+    png.free(&back)
+    image_module.destroy(result.image.?)
+    save_options.alpha = false
+    if formats.save(shown.?, pathOf("flat.png", name_bytes), formats.PNG, &save_options) != formats.Status.ok { return 111 }
+    if formats.load(allocator, pathOf("flat.png", name_bytes), &result) != formats.Status.ok { return 112 }
+    if !layerPixels(result.image.?, &back, allocator) || !sameFlattened(&pattern, &back, 0xFF336699) { return 113 }
+    png.free(&back)
+    image_module.destroy(result.image.?)
+    save_options.alpha = true
+    image_module.destroy(shown.?)
+    // JPEG through a file: near, the matte under what is transparent.
+    const photo = imageShowing(&smooth, allocator)
+    if photo == null { return 114 }
+    if formats.save(photo.?, pathOf("photo.jpg", name_bytes), formats.JPEG, &save_options) != formats.Status.ok { return 115 }
+    if formats.load(allocator, pathOf("photo.jpg", name_bytes), &result) != formats.Status.ok || result.format != formats.JPEG { return 116 }
+    if !layerPixels(result.image.?, &back, allocator) || !near(back.pixels[96 * 4 + 40], 0xFF336699, 6) || !near(back.pixels[96 * 40 + 40], smooth.pixels[96 * 40 + 40], 10) { return 117 }
+    png.free(&back)
+    image_module.destroy(result.image.?)
+    image_module.destroy(photo.?)
+    // What has no writer yet, what is no format at all.
+    const blank = image_module.create(allocator, 4, 4, 72.0)
+    if blank == null { return 118 }
+    if formats.save(blank.?, pathOf("x.ora", name_bytes), formats.ORA, &save_options) != formats.Status.unsupported || formats.save(blank.?, pathOf("x.no", name_bytes), 99, &save_options) != formats.Status.unknownFormat { return 118 }
+    image_module.destroy(blank.?)
+    if std.heap.liveBytes() != live { return 119 }
+
+    // --- The list.
+    if formats.count() != 12 || formats.find(formats.TIFF) == null || formats.find(99) != null { return 120 }
+    const jpeg_info = formats.byPath("Bild.JPE")
+    if jpeg_info == null || jpeg_info.?.*.id != formats.JPEG || jpeg_info.?.*.alpha || formats.byPath("x.unknown") != null { return 121 }
+    const kra = formats.byKey("kra")
+    if kra == null || !kra.?.*.layers || kra.?.*.canRead || kra.?.*.read != null || formats.byKey("nothing") != null { return 122 }
+    if formats.detect("GIF89a......", "x.png") != formats.GIF || formats.detect("anything", "x.webp") != formats.WEBP || formats.detect("anything", "x") != formats.NONE { return 123 }
+    if formats.detect(TGA[0..32], "x") != formats.TGA || formats.detect("PK\x03\x04aaaaaaaaaaaaaaaaaaaaaaaaaamimetypeimage/openraster", "y.zip") != formats.ORA { return 124 }
+    if formats.message(formats.Status.damaged, true).length == 0 || std.text.same(formats.message(formats.Status.damaged, true), formats.message(formats.Status.damaged, false)) { return 125 }
+
+    // --- A layer exported at its exact bounds and imported elsewhere.
+    list.clearRetainingCapacity()
+    var bounds = geom.empty()
+    if !formats.exportDevice(layer.?, 6, &list, &bounds) || !geom.same(bounds, device.exactBounds(layer.?)) { return 126 }
+    const copy = device.create(allocator, 0)
+    if copy == null { return 127 }
+    if formats.importPicture(allocator, list.items(), copy.?, bounds.x + 100, bounds.y - 64) != formats.Status.ok { return 128 }
+    if !geom.same(device.exactBounds(copy.?), geom.moved(bounds, 100, -64)) { return 129 }
+    var y: i32 = 0
+    while y < bounds.height {
+        var x: i32 = 0
+        while x < bounds.width {
+            if device.pixel(copy.?, bounds.x + 100 + x, bounds.y - 64 + y) != device.pixel(layer.?, bounds.x + x, bounds.y + y) { return 130 }
+            x += 1
+        }
+        y += 1
+    }
+    // Nothing in it: one transparent pixel at (0, 0); no tile is made.
+    device.clear(copy.?)
+    list.clearRetainingCapacity()
+    if !formats.exportDevice(copy.?, 6, &list, &bounds) || !geom.same(bounds, geom.rect(0, 0, 1, 1)) { return 131 }
+    if formats.importPicture(allocator, list.items(), copy.?, 5, 5) != formats.Status.ok || device.tileCount(copy.?) != 0 { return 132 }
+    if formats.importPicture(allocator, "nothing", copy.?, 0, 0) != formats.Status.unknownFormat { return 133 }
+    device.destroy(copy.?)
+    device.destroy(layer.?)
+
+    png.free(&pattern)
+    png.free(&wide)
+    png.free(&framed)
+    png.free(&source)
+    png.free(&smooth)
+    png.free(&small)
+    allocator.free(one, ROOM, 16)
+    allocator.free(two, ROOM, 16)
+    if !std.fs.removeTree(FOLDER.pointer) { return 134 }
     return 13
 }

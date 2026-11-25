@@ -1,0 +1,1214 @@
+// nebula io: the single-picture formats besides PNG (io/png.mlx), each
+// read into and written from a png.Picture of straight 0xAARRGGBB words:
+//
+//     var picture: png.Picture = undefined
+//     if flat.decodeBmp(bytes, allocator, &picture) == png.Status.ok {
+//         ...
+//         png.free(&picture)
+//     }
+//     _ = flat.encodeTga(&picture, true, pixel.WHITE, &list)
+//
+//   JPEG  read through std.jpeg (baseline and progressive, any sampling,
+//         grey, CMYK), the EXIF orientation applied; written by std.jpeg's
+//         baseline encoder (4:2:0) at a quality of 1 to 100, laid over a
+//         matte colour (JPEG has no alpha)
+//   WebP  read through std.webp (lossy and lossless; an animation's first
+//         frame); written lossless (std.webp's VP8L encoder, 16384 a side
+//         at most)
+//   BMP   read: 1, 4, 8, 16, 24 and 32 bits, uncompressed, RLE4, RLE8 and
+//         bit fields (alpha too), top-down and bottom-up, the OS/2 header;
+//         written: 24 bits (over the matte) or 32 bits with alpha (a V4
+//         header with bit fields)
+//   TGA   read: true colour (15, 16, 24, 32 bits), grey (8, 16 with
+//         alpha) and colour-mapped, uncompressed and RLE, every origin;
+//         written: 24 or 32 bits, RLE, top-left origin, the TGA 2 footer
+//   PNM   read: PBM, PGM, PPM in ASCII and binary, PAM (1 to 4 channels),
+//         up to 16-bit samples (rounded to 8); written: PPM (binary, over
+//         the matte) and PAM (RGB_ALPHA)
+//   QOI   read and written as the reference does it
+//
+// Every decoder checks every size, offset and count it reads against the
+// bytes it was given before it uses it, and gives a clean Status for
+// what is damaged or cut short; no picture has more than png.LARGEST
+// pixels on a side. Writers append to a std.ArrayList(u8) and leave it as
+// it was when memory runs out. Not done: BMP's JPEG/PNG compression and
+// colour profiles, TGA's postage stamp and extension area (only read
+// past), JPEG's ICC profile and EXIF on writing.
+const std = @import("std")
+const jpeg = @import("std.jpeg")
+const webp = @import("std.webp")
+const zs = @import("std.flate.stream")
+const png_module = @import("./png.mlx")
+const text = @import("./text.mlx")
+const pixel = @import("../core/pixel.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Picture = png_module.Picture
+pub const Status = png_module.Status
+
+const LARGEST: usize = png_module.LARGEST
+
+fn byteAt(bytes: []const u8, at: usize) -> u32 { return @intCast(u32, bytes[at]) }
+fn le16(bytes: []const u8, at: usize) -> usize { return @intCast(usize, std.mem.readU16Little(bytes.pointer, at)) }
+fn le32(bytes: []const u8, at: usize) -> usize { return @intCast(usize, std.mem.readU32Little(bytes.pointer, at)) }
+
+// `value` laid over `matte` when it is not opaque, then opaque.
+fn flattened(value: u32, matte: u32) -> u32 {
+    if value >> 24 == 255 { return value }
+    return pixel.over(matte, value, 255) | 0xFF000000
+}
+
+fn putByte(out: *std.ArrayList(u8), value: usize) -> bool { return out.*.append(@intCast(u8, value & 255)) }
+fn put16(out: *std.ArrayList(u8), value: usize) -> bool { return putByte(out, value) && putByte(out, value >> 8) }
+fn put32(out: *std.ArrayList(u8), value: usize) -> bool { return put16(out, value & 65535) && put16(out, (value >> 16) & 65535) }
+
+// `value` in decimal at the end of `out`.
+fn putNumber(out: *std.ArrayList(u8), value: usize) -> bool {
+    if !out.*.ensureUnusedCapacity(24) { return false }
+    const at = out.*.count()
+    const length = text.formatInt(@intCast(i64, value), out.*.items().pointer + at, 24)
+    return out.*.resize(at + length)
+}
+
+// Pixels a metre as pixels an inch (0 for none), a whole number when
+// that is what was written.
+fn inches(per_metre: usize) -> f64 {
+    if per_metre == 0 || per_metre > 10000000 { return 0.0 }
+    const exact = @floatFromInt(f64, per_metre) * 0.0254
+    const whole = @floor(exact + 0.5)
+    if whole > 0.0 && @intFromFloat(u64, whole / 0.0254 + 0.5) == @intCast(u64, per_metre) { return whole }
+    return exact
+}
+
+// Pixels an inch as pixels a metre (72 an inch when none is known).
+fn metres(resolution: f64) -> usize {
+    if !(resolution > 0.0) || resolution > 100000.0 { return 2835 }
+    return @intFromFloat(usize, resolution / 0.0254 + 0.5)
+}
+
+// ---------------------------------------------------------------------------
+// JPEG
+
+pub fn isJpeg(bytes: []const u8) -> bool {
+    return bytes.length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
+}
+
+// Where the pixel at (x, y) of a picture shown with EXIF `orientation`
+// is in the stored one (`width` x `height` as stored).
+fn storedIndex(orientation: u32, x: usize, y: usize, width: usize, height: usize) -> usize {
+    if orientation == 2 { return y * width + (width - 1 - x) }
+    if orientation == 3 { return (height - 1 - y) * width + (width - 1 - x) }
+    if orientation == 4 { return (height - 1 - y) * width + x }
+    if orientation == 5 { return x * width + y }
+    if orientation == 6 { return (height - 1 - x) * width + y }
+    if orientation == 7 { return (height - 1 - x) * width + (width - 1 - y) }
+    if orientation == 8 { return x * width + (width - 1 - y) }
+    return y * width + x
+}
+
+pub fn decodeJpeg(bytes: []const u8, allocator: Allocator, into: *Picture) -> Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    if !isJpeg(bytes) { return Status.notThisFormat }
+    var decoded: jpeg.Picture = undefined
+    const status = jpeg.decodeRgba(&decoded, bytes.pointer, bytes.length, allocator)
+    if status == jpeg.Status.notJpeg { return Status.notThisFormat }
+    if status == jpeg.Status.unsupported { return Status.unsupported }
+    if status == jpeg.Status.noMemory { return Status.noMemory }
+    if status != jpeg.Status.ok { return Status.damaged }
+    const width = decoded.width
+    const height = decoded.height
+    if width > LARGEST || height > LARGEST {
+        jpeg.deinitPicture(&decoded)
+        return Status.tooLarge
+    }
+    const source = decoded.pixels
+    var orientation = decoded.orientation
+    if orientation < 1 || orientation > 8 { orientation = 1 }
+    const turned = orientation >= 5
+    const made = png_module.makePicture(into, if turned { height } else { width }, if turned { width } else { height }, allocator)
+    if made != Status.ok {
+        jpeg.deinitPicture(&decoded)
+        return made
+    }
+    var y: usize = 0
+    while y < into.*.height {
+        var x: usize = 0
+        while x < into.*.width {
+            const at = storedIndex(orientation, x, y, width, height) * 4
+            into.*.pixels[y * into.*.width + x] = 0xFF000000 | (@intCast(u32, source[at]) << 16) | (@intCast(u32, source[at + 1]) << 8) | @intCast(u32, source[at + 2])
+            x += 1
+        }
+        y += 1
+    }
+    jpeg.deinitPicture(&decoded)
+    return Status.ok
+}
+
+// The picture as a baseline JPEG of `quality` (1 to 100), laid over
+// `matte`. False without memory and for more than 65535 pixels a side.
+pub fn encodeJpeg(picture: *const Picture, quality: u32, matte: u32, into: *std.ArrayList(u8)) -> bool {
+    const width = picture.*.width
+    const height = picture.*.height
+    if width == 0 || height == 0 || width > 65535 || height > 65535 { return false }
+    const allocator = picture.*.allocator
+    const count = width * height
+    // std.jpeg reads premultiplied pixels: opaque ones are the same, the
+    // others are laid over the matte in a copy.
+    var opaque = true
+    var index: usize = 0
+    while index < count && opaque {
+        if picture.*.pixels[index] >> 24 != 255 { opaque = false }
+        index += 1
+    }
+    var copy: ?[*]u8 = null
+    var pixels: [*]const u32 = picture.*.pixels
+    if !opaque {
+        copy = allocator.alloc(count * 4, 16)
+        if copy == null { return false }
+        const words: [*]u32 = unsafe { @ptrCast([*]u32, copy.?) }
+        index = 0
+        while index < count {
+            words[index] = flattened(picture.*.pixels[index], matte)
+            index += 1
+        }
+        pixels = words
+    }
+    const encoder_memory = allocator.alloc(@sizeOf(jpeg.Encoder), 16)
+    const capacity = count * 3 + 2048
+    const begun = into.*.count()
+    var ok = encoder_memory != null && into.*.ensureUnusedCapacity(capacity)
+    if ok {
+        const encoder: *jpeg.Encoder = unsafe { @ptrCast(*jpeg.Encoder, encoder_memory.?) }
+        jpeg.init(encoder, if quality < 1 { 1 } else if quality > 100 { 100 } else { quality })
+        const length = jpeg.encode(encoder, pixels, width, height, width, into.*.items().pointer + begun, capacity)
+        ok = length != 0 && into.*.resize(begun + length)
+    }
+    if encoder_memory != null { allocator.free(encoder_memory.?, @sizeOf(jpeg.Encoder), 16) }
+    if copy != null { allocator.free(copy.?, count * 4, 16) }
+    return ok
+}
+
+// ---------------------------------------------------------------------------
+// WebP
+
+pub fn isWebp(bytes: []const u8) -> bool {
+    return bytes.length >= 12 && std.mem.readU32Big(bytes.pointer, 0) == 0x52494646 && std.mem.readU32Big(bytes.pointer, 8) == 0x57454250
+}
+
+pub fn decodeWebp(bytes: []const u8, allocator: Allocator, into: *Picture) -> Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    if !isWebp(bytes) { return Status.notThisFormat }
+    var decoded: webp.Picture = undefined
+    const status = webp.decodeRgba(&decoded, bytes.pointer, bytes.length, allocator)
+    if status == webp.Status.notWebP { return Status.notThisFormat }
+    if status == webp.Status.unsupported { return Status.unsupported }
+    if status == webp.Status.noMemory { return Status.noMemory }
+    if status != webp.Status.ok { return Status.damaged }
+    const made = png_module.makePicture(into, decoded.width, decoded.height, allocator)
+    if made == Status.ok {
+        const count = decoded.width * decoded.height
+        const source = decoded.pixels
+        var index: usize = 0
+        while index < count {
+            const at = index * 4
+            into.*.pixels[index] = (@intCast(u32, source[at + 3]) << 24) | (@intCast(u32, source[at]) << 16) | (@intCast(u32, source[at + 1]) << 8) | @intCast(u32, source[at + 2])
+            index += 1
+        }
+    }
+    webp.deinitPicture(&decoded)
+    return made
+}
+
+// The picture as a lossless WebP file. False without memory and for more
+// than 16384 pixels a side.
+pub fn encodeWebp(picture: *const Picture, into: *std.ArrayList(u8)) -> bool {
+    if picture.*.width == 0 || picture.*.height == 0 || picture.*.width > 16384 || picture.*.height > 16384 { return false }
+    var bytes: webp.encode.Bytes = undefined
+    webp.encode.initBytes(&bytes, picture.*.allocator)
+    // (The encoder takes straight 0xAARRGGBB words, as the picture is.)
+    var ok = webp.encode.encodeFile(&bytes, @intFromPtr(picture.*.pixels), picture.*.width, picture.*.height, picture.*.width)
+    if ok {
+        const made: [*]const u8 = unsafe { @ptrFromInt([*]const u8, bytes.data) }
+        ok = into.*.appendSlice(made[0..bytes.size])
+    }
+    webp.encode.freeBytes(&bytes)
+    return ok
+}
+
+// ---------------------------------------------------------------------------
+// BMP
+
+pub fn isBmp(bytes: []const u8) -> bool {
+    if bytes.length < 18 || bytes[0] != 66 || bytes[1] != 77 { return false }
+    const header = le32(bytes, 14)
+    return header == 12 || header == 40 || header == 52 || header == 56 || header == 64 || header == 108 || header == 124
+}
+
+// A bit field of a pixel: where it is, how wide, its largest value.
+const Field = struct {
+    shift: u32
+    largest: u64
+}
+
+fn fieldOf(mask: usize) -> Field {
+    if mask == 0 { return Field.{ .shift = 0, .largest = 0 } }
+    var shift: u32 = 0
+    while (mask >> @intCast(u6, shift)) & 1 == 0 { shift += 1 }
+    var largest = @intCast(u64, mask >> @intCast(u6, shift))
+    // Only the field's lowest run of ones counts.
+    var bits: u32 = 0
+    while (largest >> @intCast(u6, bits)) & 1 == 1 && bits < 32 { bits += 1 }
+    largest = (@intCast(u64, 1) << @intCast(u6, bits)) - 1
+    return Field.{ .shift = shift, .largest = largest }
+}
+
+// The field's value in `value` as 0 to 255 (`missing` without a field).
+fn fieldValue(field: Field, value: usize, missing: u32) -> u32 {
+    if field.largest == 0 { return missing }
+    const part = (@intCast(u64, value) >> @intCast(u6, field.shift)) & field.largest
+    return @intCast(u32, (part * 255 + field.largest / 2) / field.largest)
+}
+
+// What a BMP says of itself.
+const BmpHeader = struct {
+    width: usize
+    height: usize
+    topDown: bool
+    depth: usize
+    compression: usize
+    // Where the pixels start, where the palette starts, its entries and
+    // their size.
+    data: usize
+    palette: usize
+    colors: usize
+    entry: usize
+    red: Field
+    green: Field
+    blue: Field
+    alpha: Field
+    resolution: f64
+}
+
+fn bmpHeader(bytes: []const u8, h: *BmpHeader) -> Status {
+    const length = bytes.length
+    const size = le32(bytes, 14)
+    if 14 + size > length { return Status.damaged }
+    h.*.data = le32(bytes, 10)
+    h.*.resolution = 0.0
+    h.*.topDown = false
+    if size == 12 {
+        h.*.width = le16(bytes, 18)
+        h.*.height = le16(bytes, 20)
+        h.*.depth = le16(bytes, 24)
+        h.*.compression = 0
+        h.*.colors = 0
+        h.*.entry = 3
+    } else {
+        const width = @bitCast(i32, @intCast(u32, le32(bytes, 18)))
+        const height = @bitCast(i32, @intCast(u32, le32(bytes, 22)))
+        if width <= 0 || height == 0 || height == -2147483647 - 1 { return Status.damaged }
+        h.*.width = @intCast(usize, width)
+        h.*.topDown = height < 0
+        h.*.height = @intCast(usize, if height < 0 { 0 - height } else { height })
+        h.*.depth = le16(bytes, 28)
+        h.*.compression = le32(bytes, 30)
+        h.*.resolution = inches(le32(bytes, 38))
+        h.*.colors = le32(bytes, 46)
+        h.*.entry = 4
+    }
+    if h.*.width == 0 || h.*.height == 0 { return Status.damaged }
+    if h.*.width > LARGEST || h.*.height > LARGEST { return Status.tooLarge }
+    const depth = h.*.depth
+    if depth != 1 && depth != 4 && depth != 8 && depth != 16 && depth != 24 && depth != 32 { return Status.unsupported }
+    // The masks: after a 40-byte header when they are bit fields (three,
+    // or four with alpha), inside the longer ones.
+    h.*.palette = 14 + size
+    var masks = false
+    if h.*.compression == 3 || h.*.compression == 6 {
+        if depth != 16 && depth != 32 { return Status.damaged }
+        masks = true
+        if size == 40 { h.*.palette += if h.*.compression == 6 { 16 } else { 12 } }
+        if h.*.palette > length || 14 + 40 + 12 > length { return Status.damaged }
+    } else if h.*.compression == 1 {
+        if depth != 8 { return Status.damaged }
+    } else if h.*.compression == 2 {
+        if depth != 4 { return Status.damaged }
+    } else if h.*.compression != 0 {
+        // JPEG or PNG inside, OS/2's Huffman: not read.
+        return Status.unsupported
+    }
+    if masks {
+        h.*.red = fieldOf(le32(bytes, 54))
+        h.*.green = fieldOf(le32(bytes, 58))
+        h.*.blue = fieldOf(le32(bytes, 62))
+        h.*.alpha = fieldOf(0)
+        if (h.*.compression == 6 || size >= 56) && 14 + 40 + 16 <= length { h.*.alpha = fieldOf(le32(bytes, 66)) }
+    } else if depth == 16 {
+        h.*.red = fieldOf(0x7C00)
+        h.*.green = fieldOf(0x03E0)
+        h.*.blue = fieldOf(0x001F)
+        h.*.alpha = fieldOf(0)
+    } else {
+        h.*.red = fieldOf(0x00FF0000)
+        h.*.green = fieldOf(0x0000FF00)
+        h.*.blue = fieldOf(0x000000FF)
+        h.*.alpha = fieldOf(0)
+    }
+    if depth <= 8 {
+        const most = @intCast(usize, 1) << @intCast(u6, depth)
+        if h.*.colors == 0 || h.*.colors > most { h.*.colors = most }
+        // The palette ends where the pixels begin (or the file does).
+        var end = if h.*.data > h.*.palette { h.*.data } else { length }
+        if end > length { end = length }
+        if h.*.palette > end { return Status.damaged }
+        const room = (end - h.*.palette) / h.*.entry
+        if room < h.*.colors { h.*.colors = room }
+        if h.*.colors == 0 { return Status.damaged }
+    } else {
+        h.*.colors = 0
+    }
+    if h.*.data >= length { return Status.damaged }
+    return Status.ok
+}
+
+fn paletteColor(bytes: []const u8, h: *const BmpHeader, index: usize) -> u32 {
+    if index >= h.*.colors { return 0xFF000000 }
+    const at = h.*.palette + index * h.*.entry
+    return 0xFF000000 | (byteAt(bytes, at + 2) << 16) | (byteAt(bytes, at + 1) << 8) | byteAt(bytes, at)
+}
+
+// The row of the picture that stored row `row` (counted from the file's
+// first) is.
+fn bmpRow(h: *const BmpHeader, row: usize) -> usize {
+    return if h.*.topDown { row } else { h.*.height - 1 - row }
+}
+
+fn bmpPlain(bytes: []const u8, h: *const BmpHeader, into: *Picture) -> Status {
+    const width = h.*.width
+    const depth = h.*.depth
+    const stride = ((width * depth + 31) / 32) * 4
+    if h.*.data + stride * h.*.height > bytes.length { return Status.damaged }
+    // 32 bits without an alpha field: alpha is the fourth byte only when
+    // any is not 0 (many writers leave it 0 for opaque).
+    var use_alpha = h.*.alpha.largest != 0
+    var guess = false
+    if depth == 32 && h.*.compression == 0 {
+        guess = true
+        use_alpha = false
+    }
+    var row: usize = 0
+    while row < h.*.height {
+        const line = h.*.data + row * stride
+        const target = into.*.pixels + bmpRow(h, row) * width
+        var x: usize = 0
+        while x < width {
+            var value: u32 = 0
+            if depth == 1 {
+                value = paletteColor(bytes, h, @intCast(usize, (byteAt(bytes, line + x / 8) >> @intCast(u5, 7 - x % 8)) & 1))
+            } else if depth == 4 {
+                value = paletteColor(bytes, h, @intCast(usize, (byteAt(bytes, line + x / 2) >> @intCast(u5, if x % 2 == 0 { 4 } else { 0 })) & 15))
+            } else if depth == 8 {
+                value = paletteColor(bytes, h, @intCast(usize, byteAt(bytes, line + x)))
+            } else if depth == 24 {
+                const at = line + x * 3
+                value = 0xFF000000 | (byteAt(bytes, at + 2) << 16) | (byteAt(bytes, at + 1) << 8) | byteAt(bytes, at)
+            } else {
+                const word = if depth == 16 { le16(bytes, line + x * 2) } else { le32(bytes, line + x * 4) }
+                var a: u32 = 255
+                if guess {
+                    a = @intCast(u32, word >> 24)
+                    if a != 0 { use_alpha = true }
+                } else {
+                    a = fieldValue(h.*.alpha, word, 255)
+                }
+                value = (a << 24) | (fieldValue(h.*.red, word, 0) << 16) | (fieldValue(h.*.green, word, 0) << 8) | fieldValue(h.*.blue, word, 0)
+            }
+            target[x] = value
+            x += 1
+        }
+        row += 1
+    }
+    if guess && !use_alpha {
+        const count = width * h.*.height
+        var index: usize = 0
+        while index < count {
+            into.*.pixels[index] = into.*.pixels[index] | 0xFF000000
+            index += 1
+        }
+    }
+    return Status.ok
+}
+
+// RLE8 and RLE4: runs and stretches of indices, ends of lines and jumps.
+// What they leave out is transparent.
+fn bmpRle(bytes: []const u8, h: *const BmpHeader, into: *Picture) -> Status {
+    const width = h.*.width
+    const height = h.*.height
+    const four = h.*.compression == 2
+    zs.zero(@intFromPtr(into.*.pixels), width * height * 4)
+    var at = h.*.data
+    var x: usize = 0
+    var row: usize = 0
+    while true {
+        if at + 2 > bytes.length { return Status.damaged }
+        const count = @intCast(usize, bytes[at])
+        const second = @intCast(usize, bytes[at + 1])
+        at += 2
+        if count > 0 {
+            var index: usize = 0
+            while index < count {
+                var value = second
+                if four { value = if index % 2 == 0 { second >> 4 } else { second & 15 } }
+                if x < width && row < height { into.*.pixels[bmpRow(h, row) * width + x] = paletteColor(bytes, h, value) }
+                x += 1
+                index += 1
+            }
+        } else if second == 0 {
+            x = 0
+            row += 1
+        } else if second == 1 {
+            return Status.ok
+        } else if second == 2 {
+            if at + 2 > bytes.length { return Status.damaged }
+            x += @intCast(usize, bytes[at])
+            row += @intCast(usize, bytes[at + 1])
+            at += 2
+        } else {
+            // A stretch of `second` indices, padded to a whole word.
+            const stored = if four { (second + 1) / 2 } else { second }
+            if at + stored > bytes.length { return Status.damaged }
+            var index: usize = 0
+            while index < second {
+                var value: usize = 0
+                if four {
+                    const pair = @intCast(usize, bytes[at + index / 2])
+                    value = if index % 2 == 0 { pair >> 4 } else { pair & 15 }
+                } else {
+                    value = @intCast(usize, bytes[at + index])
+                }
+                if x < width && row < height { into.*.pixels[bmpRow(h, row) * width + x] = paletteColor(bytes, h, value) }
+                x += 1
+                index += 1
+            }
+            at += stored + (stored & 1)
+        }
+        // Past the last row nothing more can be drawn.
+        if row >= height { return Status.ok }
+    }
+    return Status.ok
+}
+
+pub fn decodeBmp(bytes: []const u8, allocator: Allocator, into: *Picture) -> Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    if !isBmp(bytes) { return Status.notThisFormat }
+    var h: BmpHeader = undefined
+    const known = bmpHeader(bytes, &h)
+    if known != Status.ok { return known }
+    const made = png_module.makePicture(into, h.width, h.height, allocator)
+    if made != Status.ok { return made }
+    into.*.resolution = h.resolution
+    var status = Status.ok
+    if h.compression == 1 || h.compression == 2 {
+        status = bmpRle(bytes, &h, into)
+    } else {
+        status = bmpPlain(bytes, &h, into)
+    }
+    if status != Status.ok { png_module.free(into) }
+    return status
+}
+
+// The picture as a BMP: 32 bits with alpha (a V4 header with bit fields),
+// or 24 bits laid over `matte`; the rows from the bottom up.
+pub fn encodeBmp(picture: *const Picture, alpha: bool, matte: u32, into: *std.ArrayList(u8)) -> bool {
+    const width = picture.*.width
+    const height = picture.*.height
+    if width == 0 || height == 0 || width > 0x7FFFFFFF || height > 0x7FFFFFFF { return false }
+    const step: usize = if alpha { 4 } else { 3 }
+    const stride = (width * step + 3) & ~@intCast(usize, 3)
+    const header: usize = if alpha { 108 } else { 40 }
+    const data = 14 + header
+    const total = data + stride * height
+    if total > 0xFFFFFFFF { return false }
+    const begun = into.*.count()
+    if !into.*.ensureUnusedCapacity(total) { return false }
+    const per_metre = metres(picture.*.resolution)
+    var ok = putByte(into, 66) && putByte(into, 77) && put32(into, total) && put32(into, 0) && put32(into, data)
+    ok = ok && put32(into, header) && put32(into, width) && put32(into, height) && put16(into, 1) && put16(into, step * 8)
+    ok = ok && put32(into, if alpha { 3 } else { 0 }) && put32(into, stride * height) && put32(into, per_metre) && put32(into, per_metre) && put32(into, 0) && put32(into, 0)
+    if alpha {
+        // The masks, the colour space ("sRGB"), its unused end points and
+        // gamma.
+        ok = ok && put32(into, 0x00FF0000) && put32(into, 0x0000FF00) && put32(into, 0x000000FF) && put32(into, 0xFF000000) && put32(into, 0x73524742)
+        var index: usize = 0
+        while index < 12 && ok {
+            ok = put32(into, 0)
+            index += 1
+        }
+    }
+    if !ok {
+        _ = into.*.resize(begun)
+        return false
+    }
+    const bytes = into.*.items().pointer
+    var at = into.*.count()
+    _ = into.*.resize(total + begun)
+    var row: usize = 0
+    while row < height {
+        const line = picture.*.pixels + (height - 1 - row) * width
+        const end = at + stride
+        var x: usize = 0
+        while x < width {
+            var value = line[x]
+            if !alpha { value = flattened(value, matte) }
+            bytes[at] = @intCast(u8, value & 255)
+            bytes[at + 1] = @intCast(u8, (value >> 8) & 255)
+            bytes[at + 2] = @intCast(u8, (value >> 16) & 255)
+            if alpha { bytes[at + 3] = @intCast(u8, value >> 24) }
+            at += step
+            x += 1
+        }
+        while at < end {
+            bytes[at] = 0
+            at += 1
+        }
+        row += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// TGA
+
+// A TGA has no signature: its header must make sense (the kinds of image
+// and of colour map there are, depths that go with them).
+pub fn isTga(bytes: []const u8) -> bool {
+    if bytes.length < 18 { return false }
+    const map_type = bytes[1]
+    const kind = bytes[2]
+    const depth = bytes[16]
+    if map_type > 1 || le16(bytes, 12) == 0 || le16(bytes, 14) == 0 || bytes[17] & 0xC0 != 0 { return false }
+    const base = kind & 7
+    if kind & 0xF0 != 0 || (base != 1 && base != 2 && base != 3) { return false }
+    if base == 1 {
+        const entry = bytes[7]
+        return map_type == 1 && (depth == 8 || depth == 16) && (entry == 15 || entry == 16 || entry == 24 || entry == 32)
+    }
+    if base == 2 { return depth == 15 || depth == 16 || depth == 24 || depth == 32 }
+    return depth == 8 || depth == 16
+}
+
+// A stored TGA pixel of `depth` bits at `at` as a word (15 and 16 bits:
+// 5 a colour, the top bit alpha when `alpha_bits` says so).
+fn tgaColor(bytes: []const u8, at: usize, depth: usize, alpha_bits: usize, grey: bool) -> u32 {
+    if grey {
+        const value = byteAt(bytes, at)
+        const a = if depth == 16 { byteAt(bytes, at + 1) } else { 255 }
+        return (a << 24) | (value << 16) | (value << 8) | value
+    }
+    if depth == 15 || depth == 16 {
+        const word = @intCast(u32, le16(bytes, at))
+        const r = (word >> 10) & 31
+        const g = (word >> 5) & 31
+        const b = word & 31
+        var a: u32 = 255
+        if depth == 16 && alpha_bits > 0 && word & 0x8000 == 0 { a = 0 }
+        return (a << 24) | (((r << 3) | (r >> 2)) << 16) | (((g << 3) | (g >> 2)) << 8) | ((b << 3) | (b >> 2))
+    }
+    var a: u32 = 255
+    if depth == 32 && alpha_bits > 0 { a = byteAt(bytes, at + 3) }
+    return (a << 24) | (byteAt(bytes, at + 2) << 16) | (byteAt(bytes, at + 1) << 8) | byteAt(bytes, at)
+}
+
+pub fn decodeTga(bytes: []const u8, allocator: Allocator, into: *Picture) -> Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    if !isTga(bytes) { return Status.notThisFormat }
+    const kind = bytes[2] & 7
+    const rle = bytes[2] & 8 != 0
+    const map_first = le16(bytes, 3)
+    const map_length = le16(bytes, 5)
+    const map_entry = @intCast(usize, bytes[7])
+    const width = le16(bytes, 12)
+    const height = le16(bytes, 14)
+    const depth = @intCast(usize, bytes[16])
+    const descriptor = bytes[17]
+    const alpha_bits = @intCast(usize, descriptor & 15)
+    const right_to_left = descriptor & 0x10 != 0
+    const top_down = descriptor & 0x20 != 0
+    if width > LARGEST || height > LARGEST { return Status.tooLarge }
+    var at = 18 + @intCast(usize, bytes[0])
+    // The colour map, when there is one, follows the image's name.
+    const map_at = at
+    const map_bytes = (map_entry + 7) / 8
+    if bytes[1] == 1 { at += map_length * map_bytes }
+    if at > bytes.length { return Status.damaged }
+    if kind == 1 && map_length == 0 { return Status.damaged }
+    const made = png_module.makePicture(into, width, height, allocator)
+    if made != Status.ok { return made }
+    const pixel_bytes = (depth + 7) / 8
+    const count = width * height
+    var done: usize = 0
+    // An RLE packet's pixel and how many more it repeats.
+    var repeat: usize = 0
+    var raw: usize = 0
+    var held: u32 = 0
+    var status = Status.ok
+    while done < count {
+        var value: u32 = 0
+        if rle && repeat > 0 {
+            value = held
+            repeat -= 1
+        } else {
+            if rle && raw == 0 {
+                if at >= bytes.length {
+                    status = Status.damaged
+                    break
+                }
+                const head = @intCast(usize, bytes[at])
+                at += 1
+                if head & 128 != 0 {
+                    repeat = head & 127
+                } else {
+                    raw = (head & 127) + 1
+                }
+            }
+            if at + pixel_bytes > bytes.length {
+                status = Status.damaged
+                break
+            }
+            if kind == 1 {
+                const index = if pixel_bytes == 2 { le16(bytes, at) } else { @intCast(usize, bytes[at]) }
+                if index < map_first || index - map_first >= map_length || map_at + (index - map_first + 1) * map_bytes > bytes.length {
+                    status = Status.damaged
+                    break
+                }
+                value = tgaColor(bytes, map_at + (index - map_first) * map_bytes, map_entry, alpha_bits, false)
+            } else {
+                value = tgaColor(bytes, at, depth, alpha_bits, kind == 3)
+            }
+            at += pixel_bytes
+            if rle {
+                if raw > 0 {
+                    raw -= 1
+                } else {
+                    held = value
+                }
+            }
+        }
+        // Where the pixel goes: rows from the bottom unless the descriptor
+        // says from the top, columns from the left unless it says not.
+        const row = done / width
+        const column = done % width
+        const y = if top_down { row } else { height - 1 - row }
+        const x = if right_to_left { width - 1 - column } else { column }
+        into.*.pixels[y * width + x] = value
+        done += 1
+    }
+    if status != Status.ok { png_module.free(into) }
+    return status
+}
+
+// Pixel `x` of `line` as it is written: with alpha, or over the matte.
+fn tgaPixel(line: [*]const u32, x: usize, alpha: bool, matte: u32) -> u32 {
+    return if alpha { line[x] } else { flattened(line[x], matte) }
+}
+
+fn putTgaPixel(out: *std.ArrayList(u8), value: u32, alpha: bool) -> bool {
+    var ok = putByte(out, @intCast(usize, value & 255)) && putByte(out, @intCast(usize, (value >> 8) & 255)) && putByte(out, @intCast(usize, (value >> 16) & 255))
+    if alpha { ok = ok && putByte(out, @intCast(usize, value >> 24)) }
+    return ok
+}
+
+// The picture as an RLE TGA of 32 bits (with alpha) or 24 (laid over
+// `matte`), the first row at the top, packets within a row, and the TGA 2
+// footer (no extension area). False without memory and for more than
+// 65535 pixels a side.
+pub fn encodeTga(picture: *const Picture, alpha: bool, matte: u32, into: *std.ArrayList(u8)) -> bool {
+    const width = picture.*.width
+    const height = picture.*.height
+    if width == 0 || height == 0 || width > 65535 || height > 65535 { return false }
+    const begun = into.*.count()
+    var ok = putByte(into, 0) && putByte(into, 0) && putByte(into, 10) && put16(into, 0) && put16(into, 0) && putByte(into, 0)
+    ok = ok && put16(into, 0) && put16(into, 0) && put16(into, width) && put16(into, height) && putByte(into, if alpha { 32 } else { 24 })
+    ok = ok && putByte(into, 0x20 | (if alpha { 8 } else { 0 }))
+    var row: usize = 0
+    while row < height && ok {
+        const line = picture.*.pixels + row * width
+        var x: usize = 0
+        while x < width && ok {
+            const first = tgaPixel(line, x, alpha, matte)
+            // A run of the same pixel, or a stretch up to where the next
+            // run begins.
+            var run: usize = 1
+            while x + run < width && run < 128 && tgaPixel(line, x + run, alpha, matte) == first { run += 1 }
+            if run >= 2 {
+                ok = putByte(into, 128 + run - 1) && putTgaPixel(into, first, alpha)
+                x += run
+            } else {
+                var stretch: usize = 1
+                while x + stretch < width && stretch < 128 {
+                    if x + stretch + 1 < width && tgaPixel(line, x + stretch, alpha, matte) == tgaPixel(line, x + stretch + 1, alpha, matte) { break }
+                    stretch += 1
+                }
+                ok = putByte(into, stretch - 1)
+                var index: usize = 0
+                while index < stretch && ok {
+                    ok = putTgaPixel(into, tgaPixel(line, x + index, alpha, matte), alpha)
+                    index += 1
+                }
+                x += stretch
+            }
+        }
+        row += 1
+    }
+    // Footer: no extension area, no developer area, the signature.
+    ok = ok && put32(into, 0) && put32(into, 0) && into.*.appendSlice("TRUEVISION-XFILE.") && putByte(into, 0)
+    if !ok { _ = into.*.resize(begun) }
+    return ok
+}
+
+// ---------------------------------------------------------------------------
+// PNM: PBM, PGM, PPM (P1 to P6) and PAM (P7)
+
+pub fn isPnm(bytes: []const u8) -> bool {
+    if bytes.length < 3 || bytes[0] != 80 || bytes[1] < 49 || bytes[1] > 55 { return false }
+    const after = bytes[2]
+    return after == 32 || after == 9 || after == 10 || after == 13 || after == 35
+}
+
+fn isSpaceByte(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12 }
+
+// Reads text from a PNM header and its ASCII data: `at` moves on.
+const Scanner = struct {
+    at: usize
+}
+
+// Past blanks and comments (# to the end of the line).
+fn skipBlanks(bytes: []const u8, scanner: *Scanner) -> void {
+    while scanner.*.at < bytes.length {
+        const byte = bytes[scanner.*.at]
+        if byte == 35 {
+            while scanner.*.at < bytes.length && bytes[scanner.*.at] != 10 && bytes[scanner.*.at] != 13 { scanner.*.at += 1 }
+        } else if isSpaceByte(byte) {
+            scanner.*.at += 1
+        } else {
+            return
+        }
+    }
+}
+
+// The next whole number (null: none there, or one too large to be a size
+// or a sample: more than 2^31 - 1).
+fn nextNumber(bytes: []const u8, scanner: *Scanner) -> ?usize {
+    skipBlanks(bytes, scanner)
+    var value: usize = 0
+    var digits: usize = 0
+    while scanner.*.at < bytes.length && bytes[scanner.*.at] >= 48 && bytes[scanner.*.at] <= 57 {
+        value = value * 10 + @intCast(usize, bytes[scanner.*.at] - 48)
+        if value > 2147483647 { return null }
+        digits += 1
+        scanner.*.at += 1
+    }
+    if digits == 0 { return null }
+    return value
+}
+
+// The next word (of a PAM header line) as where it is: `start` and the
+// scanner's place after it.
+fn nextWord(bytes: []const u8, scanner: *Scanner) -> usize {
+    skipBlanks(bytes, scanner)
+    const start = scanner.*.at
+    while scanner.*.at < bytes.length && !isSpaceByte(bytes[scanner.*.at]) { scanner.*.at += 1 }
+    return start
+}
+
+fn wordIs(bytes: []const u8, start: usize, end: usize, wanted: []const u8) -> bool {
+    return end - start == wanted.length && std.mem.eql(bytes.pointer + start, wanted.pointer, wanted.length)
+}
+
+// A sample of 0 to `largest` as 0 to 255, rounded.
+fn scaled(value: usize, largest: usize) -> u32 {
+    const clamped = if value > largest { largest } else { value }
+    if largest == 255 { return @intCast(u32, clamped) }
+    return @intCast(u32, (clamped * 255 + largest / 2) / largest)
+}
+
+pub fn decodePnm(bytes: []const u8, allocator: Allocator, into: *Picture) -> Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    if !isPnm(bytes) { return Status.notThisFormat }
+    const kind = bytes[1] - 48
+    var scanner = Scanner.{ .at = 2 }
+    var width: usize = 0
+    var height: usize = 0
+    var largest: usize = 1
+    var depth: usize = 1
+    if kind == 7 {
+        // PAM: WIDTH, HEIGHT, DEPTH, MAXVAL, TUPLTYPE lines, then ENDHDR.
+        var seen: usize = 0
+        while true {
+            const start = nextWord(bytes, &scanner)
+            const end = scanner.at
+            if start == end { return Status.damaged }
+            if wordIs(bytes, start, end, "ENDHDR") { break }
+            if wordIs(bytes, start, end, "TUPLTYPE") {
+                while scanner.at < bytes.length && bytes[scanner.at] != 10 { scanner.at += 1 }
+                continue
+            }
+            const number = nextNumber(bytes, &scanner)
+            if number == null { return Status.damaged }
+            if wordIs(bytes, start, end, "WIDTH") {
+                width = number.?
+                seen = seen | 1
+            } else if wordIs(bytes, start, end, "HEIGHT") {
+                height = number.?
+                seen = seen | 2
+            } else if wordIs(bytes, start, end, "DEPTH") {
+                depth = number.?
+                seen = seen | 4
+            } else if wordIs(bytes, start, end, "MAXVAL") {
+                largest = number.?
+                seen = seen | 8
+            } else {
+                return Status.damaged
+            }
+        }
+        if seen != 15 { return Status.damaged }
+        if depth < 1 || depth > 4 { return Status.unsupported }
+        // ENDHDR ends its line.
+        if scanner.at >= bytes.length || bytes[scanner.at] != 10 { return Status.damaged }
+        scanner.at += 1
+    } else {
+        const w = nextNumber(bytes, &scanner)
+        const h = nextNumber(bytes, &scanner)
+        if w == null || h == null { return Status.damaged }
+        width = w.?
+        height = h.?
+        if kind != 1 && kind != 4 {
+            const most = nextNumber(bytes, &scanner)
+            if most == null { return Status.damaged }
+            largest = most.?
+        }
+        depth = if kind == 3 || kind == 6 { 3 } else { 1 }
+        // Binary data begins after one blank.
+        if kind >= 4 {
+            if scanner.at >= bytes.length || !isSpaceByte(bytes[scanner.at]) { return Status.damaged }
+            scanner.at += 1
+        }
+    }
+    if width == 0 || height == 0 || largest == 0 || largest > 65535 { return Status.damaged }
+    if width > LARGEST || height > LARGEST { return Status.tooLarge }
+    const sample_bytes: usize = if largest > 255 { 2 } else { 1 }
+    const count = width * height
+    if kind >= 5 && scanner.at + count * depth * sample_bytes > bytes.length { return Status.damaged }
+    if kind == 4 && scanner.at + ((width + 7) / 8) * height > bytes.length { return Status.damaged }
+    const made = png_module.makePicture(into, width, height, allocator)
+    if made != Status.ok { return made }
+    var index: usize = 0
+    while index < count {
+        // (Scalars: no array is made for each pixel.)
+        var red: u32 = 0
+        var green: u32 = 0
+        var blue: u32 = 0
+        var opacity: u32 = 255
+        if kind == 1 || kind == 4 {
+            var bit: usize = 0
+            if kind == 4 {
+                const x = index % width
+                const at = scanner.at + (index / width) * ((width + 7) / 8) + x / 8
+                bit = @intCast(usize, (bytes[at] >> @intCast(u3, 7 - x % 8)) & 1)
+            } else {
+                skipBlanks(bytes, &scanner)
+                if scanner.at >= bytes.length || (bytes[scanner.at] != 48 && bytes[scanner.at] != 49) {
+                    png_module.free(into)
+                    return Status.damaged
+                }
+                bit = @intCast(usize, bytes[scanner.at] - 48)
+                scanner.at += 1
+            }
+            // (In a PBM 1 is black.)
+            red = if bit == 1 { 0 } else { 255 }
+            green = red
+            blue = red
+        } else {
+            var channel: usize = 0
+            while channel < depth {
+                var value: usize = 0
+                if kind <= 3 {
+                    const number = nextNumber(bytes, &scanner)
+                    if number == null {
+                        png_module.free(into)
+                        return Status.damaged
+                    }
+                    value = number.?
+                } else if sample_bytes == 2 {
+                    value = @intCast(usize, std.mem.readU16Big(bytes.pointer, scanner.at))
+                    scanner.at += 2
+                } else {
+                    value = @intCast(usize, bytes[scanner.at])
+                    scanner.at += 1
+                }
+                const sample = scaled(value, largest)
+                // One or two channels are grey (and alpha), three or four
+                // red, green, blue (and alpha).
+                if channel == 0 {
+                    red = sample
+                    green = sample
+                    blue = sample
+                } else if channel == 1 && depth == 2 {
+                    opacity = sample
+                } else if channel == 1 {
+                    green = sample
+                } else if channel == 2 {
+                    blue = sample
+                } else {
+                    opacity = sample
+                }
+                channel += 1
+            }
+        }
+        into.*.pixels[index] = (opacity << 24) | (red << 16) | (green << 8) | blue
+        index += 1
+    }
+    return Status.ok
+}
+
+// The picture as a binary PPM (P6), laid over `matte`.
+pub fn encodePpm(picture: *const Picture, matte: u32, into: *std.ArrayList(u8)) -> bool {
+    return encodeNetpbm(picture, false, matte, into)
+}
+
+// The picture as a PAM (P7) of RGB_ALPHA.
+pub fn encodePam(picture: *const Picture, into: *std.ArrayList(u8)) -> bool {
+    return encodeNetpbm(picture, true, 0, into)
+}
+
+fn encodeNetpbm(picture: *const Picture, alpha: bool, matte: u32, into: *std.ArrayList(u8)) -> bool {
+    const width = picture.*.width
+    const height = picture.*.height
+    if width == 0 || height == 0 { return false }
+    const begun = into.*.count()
+    var ok = true
+    if alpha {
+        ok = into.*.appendSlice("P7\nWIDTH ") && putNumber(into, width) && into.*.appendSlice("\nHEIGHT ") && putNumber(into, height)
+        ok = ok && into.*.appendSlice("\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n")
+    } else {
+        ok = into.*.appendSlice("P6\n") && putNumber(into, width) && putByte(into, 32) && putNumber(into, height) && into.*.appendSlice("\n255\n")
+    }
+    const step: usize = if alpha { 4 } else { 3 }
+    const count = width * height
+    ok = ok && into.*.ensureUnusedCapacity(count * step)
+    if !ok {
+        _ = into.*.resize(begun)
+        return false
+    }
+    var at = into.*.count()
+    _ = into.*.resize(at + count * step)
+    const bytes = into.*.items().pointer
+    var index: usize = 0
+    while index < count {
+        var value = picture.*.pixels[index]
+        if !alpha { value = flattened(value, matte) }
+        bytes[at] = @intCast(u8, (value >> 16) & 255)
+        bytes[at + 1] = @intCast(u8, (value >> 8) & 255)
+        bytes[at + 2] = @intCast(u8, value & 255)
+        if alpha { bytes[at + 3] = @intCast(u8, value >> 24) }
+        at += step
+        index += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// QOI (the "Quite OK Image" format, as its reference reads and writes it)
+
+const QOI_INDEX: u8 = 0x00
+const QOI_DIFF: u8 = 0x40
+const QOI_LUMA: u8 = 0x80
+const QOI_RUN: u8 = 0xC0
+const QOI_RGB: u8 = 0xFE
+const QOI_RGBA: u8 = 0xFF
+
+pub fn isQoi(bytes: []const u8) -> bool {
+    return bytes.length >= 14 && std.mem.readU32Big(bytes.pointer, 0) == 0x716F6966
+}
+
+fn qoiHash(value: u32) -> usize {
+    const r = (value >> 16) & 255
+    const g = (value >> 8) & 255
+    const b = value & 255
+    const a = value >> 24
+    return @intCast(usize, (r * 3 + g * 5 + b * 7 + a * 11) % 64)
+}
+
+pub fn decodeQoi(bytes: []const u8, allocator: Allocator, into: *Picture) -> Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    if !isQoi(bytes) { return Status.notThisFormat }
+    const width = @intCast(usize, std.mem.readU32Big(bytes.pointer, 4))
+    const height = @intCast(usize, std.mem.readU32Big(bytes.pointer, 8))
+    const channels = bytes[12]
+    if width == 0 || height == 0 || (channels != 3 && channels != 4) || bytes[13] > 1 { return Status.damaged }
+    if width > LARGEST || height > LARGEST { return Status.tooLarge }
+    // The stream ends with seven zeros and a one: what is before them.
+    if bytes.length < 14 + 8 { return Status.damaged }
+    const end = bytes.length - 8
+    const made = png_module.makePicture(into, width, height, allocator)
+    if made != Status.ok { return made }
+    var seen: [64]u32 = undefined
+    var slot: usize = 0
+    while slot < 64 {
+        seen[slot] = 0
+        slot += 1
+    }
+    var r: u32 = 0
+    var g: u32 = 0
+    var b: u32 = 0
+    var a: u32 = 255
+    var run: usize = 0
+    var at: usize = 14
+    const count = width * height
+    var index: usize = 0
+    while index < count {
+        if run > 0 {
+            run -= 1
+        } else {
+            if at >= end {
+                png_module.free(into)
+                return Status.damaged
+            }
+            const first = bytes[at]
+            at += 1
+            if first == QOI_RGB || first == QOI_RGBA {
+                const more: usize = if first == QOI_RGB { 3 } else { 4 }
+                if at + more > end {
+                    png_module.free(into)
+                    return Status.damaged
+                }
+                r = byteAt(bytes, at)
+                g = byteAt(bytes, at + 1)
+                b = byteAt(bytes, at + 2)
+                if more == 4 { a = byteAt(bytes, at + 3) }
+                at += more
+            } else if first & 0xC0 == QOI_INDEX {
+                const value = seen[@intCast(usize, first)]
+                a = value >> 24
+                r = (value >> 16) & 255
+                g = (value >> 8) & 255
+                b = value & 255
+            } else if first & 0xC0 == QOI_DIFF {
+                r = (r + ((@intCast(u32, first) >> 4) & 3) + 254) & 255
+                g = (g + ((@intCast(u32, first) >> 2) & 3) + 254) & 255
+                b = (b + (@intCast(u32, first) & 3) + 254) & 255
+            } else if first & 0xC0 == QOI_LUMA {
+                if at >= end {
+                    png_module.free(into)
+                    return Status.damaged
+                }
+                const second = byteAt(bytes, at)
+                at += 1
+                // The green difference (-32 to 31), red and blue's against it (-8 to 7).
+                const green = (@intCast(u32, first) & 63) + 224
+                g = (g + green) & 255
+                r = (r + green + 248 + ((second >> 4) & 15)) & 255
+                b = (b + green + 248 + (second & 15)) & 255
+            } else {
+                run = @intCast(usize, first & 63)
+            }
+            const value = (a << 24) | (r << 16) | (g << 8) | b
+            seen[qoiHash(value)] = value
+        }
+        into.*.pixels[index] = (a << 24) | (r << 16) | (g << 8) | b
+        index += 1
+    }
+    return Status.ok
+}
+
+// The picture as QOI: RGBA, or RGB laid over `matte`.
+pub fn encodeQoi(picture: *const Picture, alpha: bool, matte: u32, into: *std.ArrayList(u8)) -> bool {
+    const width = picture.*.width
+    const height = picture.*.height
+    if width == 0 || height == 0 || width > 0xFFFFFFFF || height > 0xFFFFFFFF { return false }
+    const begun = into.*.count()
+    const count = width * height
+    // The most it can take: a byte more than the pixel for each, the
+    // header and the end.
+    if !into.*.ensureUnusedCapacity(count * (if alpha { 5 } else { 4 }) + 22) { return false }
+    var ok = putByte(into, 113) && putByte(into, 111) && putByte(into, 105) && putByte(into, 102)
+    ok = ok && putByte(into, width >> 24) && putByte(into, width >> 16) && putByte(into, width >> 8) && putByte(into, width)
+    ok = ok && putByte(into, height >> 24) && putByte(into, height >> 16) && putByte(into, height >> 8) && putByte(into, height)
+    ok = ok && putByte(into, if alpha { 4 } else { 3 }) && putByte(into, 0)
+    var seen: [64]u32 = undefined
+    var slot: usize = 0
+    while slot < 64 {
+        seen[slot] = 0
+        slot += 1
+    }
+    var previous: u32 = 0xFF000000
+    var run: usize = 0
+    var index: usize = 0
+    while index < count && ok {
+        var value = picture.*.pixels[index]
+        if !alpha { value = flattened(value, matte) }
+        if value == previous {
+            run += 1
+            if run == 62 || index == count - 1 {
+                ok = putByte(into, @intCast(usize, QOI_RUN) | (run - 1))
+                run = 0
+            }
+        } else {
+            if run > 0 {
+                ok = putByte(into, @intCast(usize, QOI_RUN) | (run - 1))
+                run = 0
+            }
+            const slot_of = qoiHash(value)
+            if seen[slot_of] == value {
+                ok = ok && putByte(into, slot_of)
+            } else {
+                seen[slot_of] = value
+                if value >> 24 == previous >> 24 {
+                    // Differences as the reference takes them: signed bytes.
+                    const vr = @intCast(i32, @bitCast(i8, @intCast(u8, (((value >> 16) & 255) -% ((previous >> 16) & 255)) & 255)))
+                    const vg = @intCast(i32, @bitCast(i8, @intCast(u8, (((value >> 8) & 255) -% ((previous >> 8) & 255)) & 255)))
+                    const vb = @intCast(i32, @bitCast(i8, @intCast(u8, ((value & 255) -% (previous & 255)) & 255)))
+                    const vg_r = vr - vg
+                    const vg_b = vb - vg
+                    if vr > -3 && vr < 2 && vg > -3 && vg < 2 && vb > -3 && vb < 2 {
+                        ok = ok && putByte(into, @intCast(usize, QOI_DIFF) | @intCast(usize, (vr + 2) << 4 | (vg + 2) << 2 | (vb + 2)))
+                    } else if vg_r > -9 && vg_r < 8 && vg > -33 && vg < 32 && vg_b > -9 && vg_b < 8 {
+                        ok = ok && putByte(into, @intCast(usize, QOI_LUMA) | @intCast(usize, vg + 32)) && putByte(into, @intCast(usize, (vg_r + 8) << 4 | (vg_b + 8)))
+                    } else {
+                        ok = ok && putByte(into, @intCast(usize, QOI_RGB)) && putByte(into, @intCast(usize, (value >> 16) & 255)) && putByte(into, @intCast(usize, (value >> 8) & 255)) && putByte(into, @intCast(usize, value & 255))
+                    }
+                } else {
+                    ok = ok && putByte(into, @intCast(usize, QOI_RGBA)) && putByte(into, @intCast(usize, (value >> 16) & 255)) && putByte(into, @intCast(usize, (value >> 8) & 255)) && putByte(into, @intCast(usize, value & 255)) && putByte(into, @intCast(usize, value >> 24))
+                }
+            }
+        }
+        previous = value
+        index += 1
+    }
+    var zero: usize = 0
+    while zero < 7 && ok {
+        ok = putByte(into, 0)
+        zero += 1
+    }
+    ok = ok && putByte(into, 1)
+    if !ok { _ = into.*.resize(begun) }
+    return ok
+}

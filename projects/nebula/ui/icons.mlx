@@ -23,12 +23,15 @@
 // middle, so what is symmetric on the grid stays so.
 //
 // The kept pictures are bounded (CACHE_PICTURES of them and CACHE_BYTES of
-// pixels at most: the one drawn longest ago goes first). On a canvas of
-// no pixels (a layout pass) nothing is drawn and nothing made. Nebula
-// draws on the CPU; on a GPU canvas a picture goes as an image, and one
-// that took the memory of another may show the other until the host
-// forgets its images (not handled here: there is no window of Nebula's on
-// the GPU).
+// pixels at most: the one drawn longest ago goes first), and none is more
+// than LARGEST pixels a side, so that each is a block of less than 32 KiB
+// (brixOS makes every larger block a memory region of its own, and a
+// process has 256); an icon larger than that is its picture of LARGEST
+// pixels scaled up. On a canvas of no pixels (a layout pass) nothing is
+// drawn and nothing made. Nebula draws on the CPU; on a GPU canvas a
+// picture goes as an image, and one that took the memory of another may
+// show the other until the host forgets its images (not handled here:
+// there is no window of Nebula's on the GPU).
 const std = @import("std")
 const math = @import("std.math")
 const leaks = @import("std.leaks")
@@ -460,7 +463,10 @@ var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
 
 fn rows() -> []const Icon {
     if kept.address != 0 { return table.rows(Icon, &kept) }
-    return table.keep(Icon, &kept, ICONS[0..])
+    const copy = table.keep(Icon, &kept, ICONS[0..])
+    // Kept until the program ends: not what a leak check should report.
+    if kept.address != 0 { unsafe { leaks.keep(@ptrFromInt([*]u8, kept.address)) } }
+    return copy
 }
 
 // How many icons there are: their numbers are 0 to count() - 1.
@@ -490,11 +496,12 @@ pub fn named(key: []const u8) -> u16 {
 
 // The most pictures kept and the most bytes of pixels they take together.
 pub const CACHE_PICTURES: usize = 384
-pub const CACHE_BYTES: usize = 8388608
+pub const CACHE_BYTES: usize = 2097152
 
-// A picture is kept at most this many pixels a side; a larger icon is the
-// picture of this size drawn larger.
-const LARGEST: i32 = 256
+// A picture is kept at most this many pixels a side (90 x 90 x 4 bytes:
+// just below 32 KiB); a larger icon is the picture of this size drawn
+// larger.
+pub const LARGEST: i32 = 90
 
 // The places a key may hash to (a power of two, more than twice the
 // pictures: a search always ends at a free one).
@@ -701,11 +708,12 @@ pub fn release() -> void {
 // Drawing
 
 // Draws `icon` at (x, y), `size` pixels square, in `color` (a canvas
-// colour: premultiplied) over what is there. Nothing for a number that is
-// no icon, a size below 1, a colour of no alpha, and on a canvas of no
-// pixels.
+// colour: premultiplied) over what is there, faded by the canvas's
+// opacity. Nothing (and no picture made) for a number that is no icon, a
+// size below 1, a colour of no alpha, a canvas at opacity 0, a canvas of
+// no pixels, and an icon all off a canvas of pixels.
 pub fn draw(canvas: *Canvas, icon: u16, x: i32, y: i32, size: i32, color: u32) -> void {
-    if size <= 0 || (color >> 24) == 0 || @intCast(usize, icon) >= COUNT { return }
+    if size <= 0 || (color >> 24) == 0 || canvas.*.opacity == 0 || @intCast(usize, icon) >= COUNT { return }
     if canvas.*.device == 0 {
         // A layout pass's canvas, or all of the icon off the canvas: no
         // picture is made for what will not show.
@@ -718,11 +726,15 @@ pub fn draw(canvas: *Canvas, icon: u16, x: i32, y: i32, size: i32, color: u32) -
     const side = if size > LARGEST { LARGEST } else { size }
     const picture = pictureOf(kept.?, icon, @intCast(usize, side), color)
     if picture == null { return }
-    if canvas.*.device != 0 || side != size {
+    if canvas.*.device != 0 {
         canvas_module.drawImage(canvas, imageOf(picture.?), x, y, size, 255)
         return
     }
-    copy(canvas, picture.?.*.image.pixels, side, x, y)
+    if side == size {
+        copy(canvas, picture.?.*.image.pixels, side, x, y)
+    } else {
+        stretch(canvas, picture.?.*.image.pixels, side, x, y, size)
+    }
 }
 
 fn imageOf(picture: *Picture) -> *png.Image {
@@ -734,6 +746,13 @@ fn imageOf(picture: *Picture) -> *png.Image {
 pub fn drawFor(context: usize, canvas: *Canvas, x: i32, y: i32, size: i32, color: u32) -> void {
     if context >= COUNT { return }
     draw(canvas, @intCast(u16, context), x, y, size, color)
+}
+
+// A picture's pixel `word` laid over the canvas's `under`.
+inline fn onto(under: u32, word: u32, swap: bool, opacity: u32) -> u32 {
+    const own = if swap { (word & 0xFF00FF00) | ((word & 0xFF0000) >> 16) | ((word & 0xFF) << 16) } else { word }
+    if opacity == 255 && (word >> 24) == 255 { return own }
+    return canvas_module.over(under, own, opacity)
 }
 
 // The picture's pixels over the canvas's, the part of it that is on the
@@ -759,16 +778,110 @@ fn copy(canvas: *Canvas, source: [*]const u32, side: i32, x: i32, y: i32) -> voi
         const end = from + @intCast(usize, column_end - column_start)
         while from < end {
             const word = source[from]
-            if word != 0 {
-                const own = if swap { (word & 0xFF00FF00) | ((word & 0xFF0000) >> 16) | ((word & 0xFF) << 16) } else { word }
-                if opacity == 255 && (word >> 24) == 255 {
-                    pixels[at] = own
-                } else {
-                    pixels[at] = canvas_module.over(pixels[at], own, opacity)
-                }
-            }
+            if word != 0 { pixels[at] = onto(pixels[at], word, swap, opacity) }
             at += 1
             from += 1
+        }
+        row += 1
+    }
+}
+
+// Where the middle of pixel `index` of `size` falls on a picture `side`
+// pixels wide, in 256ths of its pixels from the first one's middle (0 at
+// least).
+fn sampleAt(index: i64, side: i64, size: i64) -> i64 {
+    const place = (2 * index + 1) * side * 128 / size - 128
+    return if place < 0 { 0 } else { place }
+}
+
+// Two of a pixel's channels in a 64-bit word, 32 bits apart: blue and
+// red, green and alpha. Four of them weighed by up to 65536 together, and
+// half of that added for rounding, stay below 2^24 in their half.
+inline fn blueRed(pixel_word: u32) -> u64 {
+    const word = @intCast(u64, pixel_word)
+    return (word & 0xFF) | ((word & 0xFF0000) << 16)
+}
+
+inline fn greenAlpha(pixel_word: u32) -> u64 {
+    const word = @intCast(u64, pixel_word)
+    return ((word >> 8) & 0xFF) | ((word >> 24) << 32)
+}
+
+// Half of 65536 in each half of such a word: the mix rounds to nearest.
+const HALVES: u64 = 0x0000800000008000
+
+// The picture (side x side) scaled up to `size` over the canvas's pixels,
+// the part of it that is on the canvas: each pixel the four of the
+// picture nearest to where it falls, mixed by how near (its colours are
+// premultiplied, so mixing them is right), each channel rounded. The
+// places are worked in 64 bits: an icon far off the canvas and very
+// large does not fit 32. Where a column samples is the same in every
+// row: sampleAt() without its division, the quotient and remainder of
+// one column carried to the next.
+fn stretch(canvas: *Canvas, source: [*]const u32, side: i32, x: i32, y: i32, size: i32) -> void {
+    const opacity = if canvas.*.opacity > 255 { 255 } else { canvas.*.opacity }
+    if opacity == 0 { return }
+    const left = @intCast(i64, x)
+    const top = @intCast(i64, y)
+    const wide = @intCast(i64, size)
+    const across = @intCast(i64, side)
+    const width = @intCast(i64, canvas.*.width)
+    const height = @intCast(i64, canvas.*.height)
+    const row_start = if top < 0 { 0 - top } else { 0 }
+    const row_end = if wide < height - top { wide } else { height - top }
+    const column_start = if left < 0 { 0 - left } else { 0 }
+    const column_end = if wide < width - left { wide } else { width - left }
+    if column_end <= column_start || row_end <= row_start { return }
+    const pixels = canvas.*.pixels
+    const swap = canvas.*.swapRedBlue
+    const last = across - 1
+    // Column c samples at (2c + 1) * side * 128 / size - 128: from one
+    // column to the next the dividend grows by 256 * side.
+    const step = 256 * across
+    const step_whole = step / wide
+    const step_part = step % wide
+    const first = (2 * column_start + 1) * across * 128
+    const first_whole = first / wide
+    const first_part = first % wide
+    var row = row_start
+    while row < row_end {
+        const sy = sampleAt(row, across, wide)
+        const y0 = sy >> 8
+        const y1 = if y0 < last { y0 + 1 } else { last }
+        const fy = @intCast(u64, sy & 255)
+        const upper = @intCast(usize, y0 * across)
+        const lower = @intCast(usize, y1 * across)
+        var at = @intCast(usize, top + row) * canvas.*.stride + @intCast(usize, left + column_start)
+        var whole = first_whole
+        var part = first_part
+        var column = column_start
+        while column < column_end {
+            const sx = if whole < 128 { 0 } else { whole - 128 }
+            const x0 = @intCast(usize, sx >> 8)
+            const x1 = if x0 < @intCast(usize, last) { x0 + 1 } else { x0 }
+            const a = source[upper + x0]
+            const b = source[upper + x1]
+            const c = source[lower + x0]
+            const d = source[lower + x1]
+            if (a | b | c | d) != 0 {
+                const fx = @intCast(u64, sx & 255)
+                const wa = (256 - fx) * (256 - fy)
+                const wb = fx * (256 - fy)
+                const wc = (256 - fx) * fy
+                const wd = fx * fy
+                const low = blueRed(a) * wa + blueRed(b) * wb + blueRed(c) * wc + blueRed(d) * wd + HALVES
+                const high = greenAlpha(a) * wa + greenAlpha(b) * wb + greenAlpha(c) * wc + greenAlpha(d) * wd + HALVES
+                const word = @intCast(u32, ((low >> 16) & 0xFF) | (((high >> 16) & 0xFF) << 8) | (((low >> 48) & 0xFF) << 16) | (((high >> 48) & 0xFF) << 24))
+                if word != 0 { pixels[at] = onto(pixels[at], word, swap, opacity) }
+            }
+            whole += step_whole
+            part += step_part
+            if part >= wide {
+                whole += 1
+                part -= wide
+            }
+            at += 1
+            column += 1
         }
         row += 1
     }
@@ -779,9 +892,8 @@ fn copy(canvas: *Canvas, source: [*]const u32, side: i32, x: i32, y: i32) -> voi
 
 // The grid the pictures are written on.
 const UNITS: f64 = 24.0
-// A stroke's width on it, and that of a thin one (a ruler's ticks).
+// A stroke's width on it.
 const STROKE: f64 = 2.0
-const THIN: f64 = 1.2
 // A point that lies this close to the middle between two places it could
 // be fitted to goes to the outer one.
 const TIE: f64 = 0.0001
@@ -888,15 +1000,13 @@ fn edge(g: *Glyph, value: f64) -> f64 {
     return snapAbout(raw(g, value), g.*.middle, 0.0, true)
 }
 
-// Strokes as wide as `units` of the grid from now on.
-fn strokeWidth(g: *Glyph, units: f64) -> void {
-    g.*.stroke = pixelsOf(g, units)
+// Strokes STROKE units of the grid wide, in whole pixels, and the
+// lattice their middle lines lie on.
+fn strokes(g: *Glyph) -> void {
+    g.*.stroke = pixelsOf(g, STROKE)
     const halves = g.*.stroke / 2.0
     g.*.lattice = halves - @floor(halves)
 }
-
-fn thin(g: *Glyph) -> void { strokeWidth(g, THIN) }
-fn normal(g: *Glyph) -> void { strokeWidth(g, STROKE) }
 
 // The figure in the shape goes into the picture: added (where two figures
 // lie over each other the picture has the larger of them, so that strokes
@@ -1080,9 +1190,7 @@ fn sample(g: *Glyph, kind: u8, t: f64) -> void {
 fn strokePath(g: *Glyph, kind: u8, steps: i64, width: f64, round: bool) -> void {
     const shape = shapeOf(g)
     const radius = width / 2.0
-    var caps = @intFromFloat(i64, @ceil(radius * 3.2))
-    if caps < 4 { caps = 4 }
-    if caps > 32 { caps = 32 }
+    const caps = @intFromFloat(i64, math.min(math.max(@ceil(radius * 3.2), 4.0), 32.0))
     var step: i64 = 0
     while step <= steps {
         sample(g, kind, vector.toFloat(step) / vector.toFloat(steps))
@@ -1310,9 +1418,9 @@ fn spot(g: *Glyph, value: f64) -> f64 {
 }
 
 // The filled paths that follow continue strokes: their points lie where
-// a stroke's would.
+// a stroke's would (until then, and in every new picture, on pixel
+// edges).
 fn fillOnStrokes(g: *Glyph) -> void { g.*.fillLattice = g.*.lattice }
-fn fillOnEdges(g: *Glyph) -> void { g.*.fillLattice = 0.0 }
 
 fn fillFrom(g: *Glyph, x: f64, y: f64) -> void {
     g.*.penX = spot(g, x)
@@ -1543,7 +1651,7 @@ fn render(kept: *Cache, icon: u16, side: usize, color: u32, pixels: [*]u32) -> b
     g.*.movedY = 0.0
     g.*.startX = 0.0
     g.*.startY = 0.0
-    normal(g)
+    strokes(g)
     var index: usize = 0
     while index < cells {
         g.*.cover[index] = 0
@@ -3388,25 +3496,24 @@ fn bullet(g: *Glyph) -> void {
 // becomes is filled.
 
 fn selectAdd(g: *Glyph) -> void {
-    block(g, 3.0, 3.0, 13.0, 13.0, 2.0)
-    block(g, 8.0, 8.0, 13.0, 13.0, 2.0)
+    block(g, 3.0, 3.0, 12.0, 12.0, 2.0)
+    block(g, 9.0, 9.0, 12.0, 12.0, 2.0)
 }
 
 fn selectSubtract(g: *Glyph) -> void {
-    block(g, 3.0, 3.0, 13.0, 13.0, 2.0)
-    window(g, 7.0, 7.0, 15.0, 15.0, 3.0)
-    frame(g, 9.0, 9.0, 11.0, 11.0, 1.0)
+    block(g, 3.0, 3.0, 12.0, 12.0, 2.0)
+    window(g, 8.0, 8.0, 14.0, 14.0, 3.0)
+    frame(g, 10.0, 10.0, 10.0, 10.0, 1.0)
 }
 
 fn selectIntersect(g: *Glyph) -> void {
-    frame(g, 4.0, 4.0, 11.0, 11.0, 1.0)
-    frame(g, 9.0, 9.0, 11.0, 11.0, 1.0)
+    frame(g, 4.0, 4.0, 10.0, 10.0, 1.0)
+    frame(g, 10.0, 10.0, 10.0, 10.0, 1.0)
     block(g, 9.0, 9.0, 6.0, 6.0, 0.0)
 }
 
 fn selectSymmetric(g: *Glyph) -> void {
-    block(g, 3.0, 3.0, 13.0, 13.0, 2.0)
-    block(g, 8.0, 8.0, 13.0, 13.0, 2.0)
-    window(g, 7.0, 7.0, 10.0, 10.0, 0.0)
-    frame(g, 9.0, 9.0, 6.0, 6.0, 0.0)
+    block(g, 3.0, 3.0, 12.0, 12.0, 2.0)
+    block(g, 9.0, 9.0, 12.0, 12.0, 2.0)
+    window(g, 9.0, 9.0, 6.0, 6.0, 0.0)
 }

@@ -1227,12 +1227,17 @@ can use it too.
   2 ulps below 1e-290), down among the subnormals and up to the largest
   double, and for a negative base, whose power has its sign when `y` is
   odd (`powr(-2.0, 3.0)` is -8). A negative base with a fractional `y`
-  is NaN; a fractional `y`, a `y` from 2^53 on and the powers of zero
-  and the infinities are `pow`'s, with the base's sign for an odd `y`.
+  is NaN; 1 and -1 to any whole power are 1 or -1, also to the infinite
+  ones (as in C: `pow`'s `exp(y ln x)` would make infinity times 0); a
+  fractional `y`, a `y` from 2^53 on and the powers of zero and the
+  infinities are `pow`'s, with the base's sign for an odd `y`.
 - `sign(x)` is -1, 0 or 1 (0 for either zero, NaN for NaN).
   `lerp(a, b, t)` is the straight line from `a` at 0 to `b` at 1 and on
-  past both: exactly `b` at 1, which `a + (b - a)` alone can miss, and
-  exactly `a` wherever the two are the same.
+  past both, the way C++'s `std::lerp` draws it: exactly `a` at 0 and
+  `b` at 1 (which `a + (b - a) t` alone can miss), exactly `a` wherever
+  the two are the same, between them for t in 0..1 and never turning
+  back as t grows; ends of opposite signs are weighted, `(1 - t) a + t b`,
+  so `lerp(-1e308, 1e308, 0.5)` is 0 where `b - a` would overflow.
 - `fmod(x, y)` is C's remainder: the sign of `x`, smaller than `|y|`,
   and exact (the largest 2^k `|y|` that fits is taken away until less
   than `|y|` is left, each step without rounding), so
@@ -1291,8 +1296,11 @@ pub fn main() -> u8 {
 
 (`tests/447_math_inverse_runtime.mlx`: these and the cases with signed
 zeros, infinities and NaN bit for bit, the functions against the
-correctly rounded doubles at over 160 arguments, and the identities that
-tie them to `sin`, `cos`, `tan` and `exp` over sweeps of a few thousand)
+correctly rounded doubles at over 160 arguments, the identities that
+tie them to `sin`, `cos`, `tan` and `exp` over sweeps of a few thousand,
+`fmod`, `lerp` and `powr` against integer arithmetic, `lerp`'s bounds
+and direction, and the rising functions across the seams of their
+pieces)
 
 ## Encodings (`std.base64`)
 

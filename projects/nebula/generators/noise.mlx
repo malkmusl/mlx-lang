@@ -1,0 +1,502 @@
+// nebula generators: noise. Simplex noise in two and in four dimensions
+// over a seeded permutation (Ken Perlin's simplex grid, worked out as
+// Stefan Gustavson describes it), a lattice noise that repeats after a
+// whole number of cells (what the built-in patterns' grain, wood and
+// clouds are made of), and the Simplex Noise generator of a fill layer.
+//
+// A permutation is PERMUTATION bytes of the caller's (0..255 shuffled
+// by the seed, twice over so that no index needs a wrap, then the same
+// modulo 12 for the plane's directions); the noise functions read it
+// and keep nothing:
+//
+//     const table = scratch.bytes(pool, noise.PERMUTATION)
+//     noise.permute(table.?, 1234)
+//     const value = noise.simplex2(table.?, x * 0.05, y * 0.05)    // -1..1
+//
+// The Simplex Noise generator (SIMPLEX_PARAMS) makes grey (or, with
+// "Colour", each channel of its own) from octaves of 2D simplex noise.
+// Its frequency counts features across the image's longer side, so the
+// picture keeps its look when the image is scaled. "Tileable" makes it
+// repeat at the image's edges: each axis is then a circle in a 4D noise
+// (x to the first two coordinates, y to the last two), and a pixel
+// depends on its place modulo the image's size alone, so the column
+// after the last is the first one bit for bit. Every pixel comes from
+// its own place only: a picture made in pieces is the picture made at
+// once.
+//
+// The helpers at the end (numberOf, isOn, colorOf) are how every
+// generator reads its numbers; patterns.mlx and registry.mlx use them
+// too. A
+// generator's description is a constant table, read at run time only
+// through a copy in heap memory (core/table.mlx): handing on a row of
+// the constant table itself copies the whole table into the value arena
+// each time.
+const math = @import("std.math")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const scratch = @import("../core/scratch.mlx")
+const device_module = @import("../core/device.mlx")
+const types = @import("../filters/types.mlx")
+const table_module = @import("../core/table.mlx")
+
+pub const Params = types.Params
+pub const Rect = geom.Rect
+
+// The bytes of a permutation.
+pub const PERMUTATION: usize = 1024
+// Where its bytes modulo 12 start (a division a corner less).
+const TWELFTHS: usize = 512
+
+// (sqrt(3) - 1) / 2 and (3 - sqrt(3)) / 6: the skew of the plane to its
+// grid of triangles and back.
+const F2: f64 = 0.36602540378443865
+const G2: f64 = 0.21132486540518713
+// (sqrt(5) - 1) / 4 and (5 - sqrt(5)) / 20: the same in four dimensions.
+const F4: f64 = 0.30901699437494745
+const G4: f64 = 0.1381966011250105
+
+// Beyond this a coordinate has no fraction left: the noise is 0 there
+// (and no conversion to an integer can go wrong).
+const LIMIT: f64 = 1000000000000000.0
+
+// ---------------------------------------------------------------------------
+// The permutation
+
+// The next number of a SplitMix64 sequence: every seed, also 0, gives a
+// sequence of its own.
+fn mixed(state: *u64) -> u64 {
+    state.* +%= 0x9E3779B97F4A7C15
+    var z = state.*
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB
+    return z ^ (z >> 31)
+}
+
+// Fills `into` (PERMUTATION bytes) with 0..255 in an order the seed
+// decides, twice, and that modulo 12.
+pub fn permute(into: [*]u8, seed: u64) -> void {
+    var index: usize = 0
+    while index < 256 {
+        into[index] = @intCast(u8, index)
+        index += 1
+    }
+    var state = seed
+    index = 255
+    while index > 0 {
+        const other = @intCast(usize, mixed(&state) % @intCast(u64, index + 1))
+        const kept = into[index]
+        into[index] = into[other]
+        into[other] = kept
+        index -= 1
+    }
+    index = 0
+    while index < 256 {
+        into[256 + index] = into[index]
+        index += 1
+    }
+    index = 0
+    while index < 512 {
+        into[TWELFTHS + index] = into[index] % 12
+        index += 1
+    }
+}
+
+// The permutation's byte at `index` (below PERMUTATION) as an index.
+inline fn at(table: [*]const u8, index: usize) -> usize {
+    return @intCast(usize, table[index])
+}
+
+// A whole number of the grid as an index of 0..255.
+inline fn wrapped(whole: f64) -> usize {
+    return @intCast(usize, @intFromFloat(i64, whole) & 255)
+}
+
+// ---------------------------------------------------------------------------
+// Simplex noise
+
+// The 12 directions of Perlin's 3D set seen in the plane, as Gustavson
+// uses them: (±1, ±1), (±1, 0) twice and (0, ±1) twice, by `h` (0..11,
+// a byte of the permutation's second half); worked out instead of read
+// from a table, the dot product with (x, y).
+inline fn dot2(h: usize, x: f64, y: f64) -> f64 {
+    const sx = if h & 1 != 0 { -x } else { x }
+    if h < 4 { return sx + (if h & 2 != 0 { -y } else { y }) }
+    if h < 8 { return sx }
+    return if h & 1 != 0 { -y } else { y }
+}
+
+// What one corner of a triangle adds at the offset (x, y) from it.
+inline fn corner2(hash: usize, x: f64, y: f64) -> f64 {
+    var t = 0.5 - x * x - y * y
+    if t <= 0.0 { return 0.0 }
+    t = t * t
+    return t * t * dot2(hash, x, y)
+}
+
+// 2D simplex noise at (x, y) over the permutation `table`: about -1..1,
+// smooth, a feature about every unit. 0 where a coordinate is no number
+// or beyond 10^15.
+pub fn simplex2(table: [*]const u8, x: f64, y: f64) -> f64 {
+    const skew = (x + y) * F2
+    const fi = @floor(x + skew)
+    const fj = @floor(y + skew)
+    if !(fi > -LIMIT && fi < LIMIT && fj > -LIMIT && fj < LIMIT) { return 0.0 }
+    const unskew = (fi + fj) * G2
+    const x0 = x - (fi - unskew)
+    const y0 = y - (fj - unskew)
+    // Which of the cell's two triangles: the middle corner is one step
+    // along x or along y.
+    var i1: usize = 0
+    var j1: usize = 1
+    if x0 > y0 {
+        i1 = 1
+        j1 = 0
+    }
+    const x1 = x0 - @floatFromInt(f64, i1) + G2
+    const y1 = y0 - @floatFromInt(f64, j1) + G2
+    const x2 = x0 - 1.0 + 2.0 * G2
+    const y2 = y0 - 1.0 + 2.0 * G2
+    const ii = wrapped(fi)
+    const jj = wrapped(fj)
+    const h0 = at(table, TWELFTHS + ii + at(table, jj))
+    const h1 = at(table, TWELFTHS + ii + i1 + at(table, jj + j1))
+    const h2 = at(table, TWELFTHS + ii + 1 + at(table, jj + 1))
+    return 70.0 * (corner2(h0, x0, y0) + corner2(h1, x1, y1) + corner2(h2, x2, y2))
+}
+
+inline fn signed(negative: bool, value: f64) -> f64 {
+    return if negative { -value } else { value }
+}
+
+// The 32 directions of 4D simplex noise (one coordinate 0, the others
+// ±1), by `hash` % 32: which one is 0 in the top two bits, the signs of
+// the other three in the low three; the dot product with (x, y, z, w).
+inline fn dot4(hash: usize, x: f64, y: f64, z: f64, w: f64) -> f64 {
+    const h = hash & 31
+    const zero = h >> 3
+    const first = h & 4 != 0
+    const second = h & 2 != 0
+    const third = h & 1 != 0
+    if zero == 0 { return signed(first, y) + signed(second, z) + signed(third, w) }
+    if zero == 1 { return signed(first, x) + signed(second, z) + signed(third, w) }
+    if zero == 2 { return signed(first, x) + signed(second, y) + signed(third, w) }
+    return signed(first, x) + signed(second, y) + signed(third, z)
+}
+
+inline fn corner4(hash: usize, x: f64, y: f64, z: f64, w: f64) -> f64 {
+    var t = 0.6 - x * x - y * y - z * z - w * w
+    if t <= 0.0 { return 0.0 }
+    t = t * t
+    return t * t * dot4(hash, x, y, z, w)
+}
+
+inline fn step(rank: usize, least: usize) -> usize {
+    return if rank >= least { 1 } else { 0 }
+}
+
+// 4D simplex noise over the permutation `table`: about -1..1. What the
+// tileable generator reads two circles from.
+pub fn simplex4(table: [*]const u8, x: f64, y: f64, z: f64, w: f64) -> f64 {
+    const skew = (x + y + z + w) * F4
+    const fi = @floor(x + skew)
+    const fj = @floor(y + skew)
+    const fk = @floor(z + skew)
+    const fl = @floor(w + skew)
+    if !(fi > -LIMIT && fi < LIMIT && fj > -LIMIT && fj < LIMIT && fk > -LIMIT && fk < LIMIT && fl > -LIMIT && fl < LIMIT) { return 0.0 }
+    const unskew = (fi + fj + fk + fl) * G4
+    const x0 = x - (fi - unskew)
+    const y0 = y - (fj - unskew)
+    const z0 = z - (fk - unskew)
+    const w0 = w - (fl - unskew)
+    // The order of the four offsets decides the simplex: count for each
+    // how many of the others it is larger than.
+    var rx: usize = 0
+    var ry: usize = 0
+    var rz: usize = 0
+    var rw: usize = 0
+    if x0 > y0 { rx += 1 } else { ry += 1 }
+    if x0 > z0 { rx += 1 } else { rz += 1 }
+    if x0 > w0 { rx += 1 } else { rw += 1 }
+    if y0 > z0 { ry += 1 } else { rz += 1 }
+    if y0 > w0 { ry += 1 } else { rw += 1 }
+    if z0 > w0 { rz += 1 } else { rw += 1 }
+    const i1 = step(rx, 3)
+    const j1 = step(ry, 3)
+    const k1 = step(rz, 3)
+    const l1 = step(rw, 3)
+    const i2 = step(rx, 2)
+    const j2 = step(ry, 2)
+    const k2 = step(rz, 2)
+    const l2 = step(rw, 2)
+    const i3 = step(rx, 1)
+    const j3 = step(ry, 1)
+    const k3 = step(rz, 1)
+    const l3 = step(rw, 1)
+    const ii = wrapped(fi)
+    const jj = wrapped(fj)
+    const kk = wrapped(fk)
+    const ll = wrapped(fl)
+    const h0 = at(table, ii + at(table, jj + at(table, kk + at(table, ll))))
+    const h1 = at(table, ii + i1 + at(table, jj + j1 + at(table, kk + k1 + at(table, ll + l1))))
+    const h2 = at(table, ii + i2 + at(table, jj + j2 + at(table, kk + k2 + at(table, ll + l2))))
+    const h3 = at(table, ii + i3 + at(table, jj + j3 + at(table, kk + k3 + at(table, ll + l3))))
+    const h4 = at(table, ii + 1 + at(table, jj + 1 + at(table, kk + 1 + at(table, ll + 1))))
+    var sum = corner4(h0, x0, y0, z0, w0)
+    sum += corner4(h1, x0 - @floatFromInt(f64, i1) + G4, y0 - @floatFromInt(f64, j1) + G4, z0 - @floatFromInt(f64, k1) + G4, w0 - @floatFromInt(f64, l1) + G4)
+    sum += corner4(h2, x0 - @floatFromInt(f64, i2) + 2.0 * G4, y0 - @floatFromInt(f64, j2) + 2.0 * G4, z0 - @floatFromInt(f64, k2) + 2.0 * G4, w0 - @floatFromInt(f64, l2) + 2.0 * G4)
+    sum += corner4(h3, x0 - @floatFromInt(f64, i3) + 3.0 * G4, y0 - @floatFromInt(f64, j3) + 3.0 * G4, z0 - @floatFromInt(f64, k3) + 3.0 * G4, w0 - @floatFromInt(f64, l3) + 3.0 * G4)
+    sum += corner4(h4, x0 - 1.0 + 4.0 * G4, y0 - 1.0 + 4.0 * G4, z0 - 1.0 + 4.0 * G4, w0 - 1.0 + 4.0 * G4)
+    return 27.0 * sum
+}
+
+// ---------------------------------------------------------------------------
+// Lattice noise that repeats
+
+// `value` modulo `period` (above 0), never below 0.
+inline fn around(value: i64, period: i64) -> i64 {
+    const rest = value % period
+    return if rest < 0 { rest + period } else { rest }
+}
+
+inline fn fade(t: f64) -> f64 {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+// Perlin's gradient noise at (x, y) on a grid of unit cells that repeats
+// after `period_x` cells across and `period_y` down (each at least 1):
+// about -1..1, and lattice(x + period_x, y) is lattice(x, y). A tile of
+// N pixels with a cell of N / period pixels has no seam.
+pub fn lattice(table: [*]const u8, x: f64, y: f64, period_x: i32, period_y: i32) -> f64 {
+    const fi = @floor(x)
+    const fj = @floor(y)
+    if !(fi > -LIMIT && fi < LIMIT && fj > -LIMIT && fj < LIMIT) { return 0.0 }
+    const px = @intCast(i64, if period_x < 1 { 1 } else { period_x })
+    const py = @intCast(i64, if period_y < 1 { 1 } else { period_y })
+    const i0 = around(@intFromFloat(i64, fi), px)
+    const j0 = around(@intFromFloat(i64, fj), py)
+    const i1 = @intCast(usize, around(i0 + 1, px) & 255)
+    const j1 = @intCast(usize, around(j0 + 1, py) & 255)
+    const ia = @intCast(usize, i0 & 255)
+    const ja = @intCast(usize, j0 & 255)
+    const fx = x - fi
+    const fy = y - fj
+    const n00 = dot2(at(table, TWELFTHS + ia + at(table, ja)), fx, fy)
+    const n10 = dot2(at(table, TWELFTHS + i1 + at(table, ja)), fx - 1.0, fy)
+    const n01 = dot2(at(table, TWELFTHS + ia + at(table, j1)), fx, fy - 1.0)
+    const n11 = dot2(at(table, TWELFTHS + i1 + at(table, j1)), fx - 1.0, fy - 1.0)
+    const u = fade(fx)
+    const v = fade(fy)
+    const top = n00 + (n10 - n00) * u
+    const bottom = n01 + (n11 - n01) * u
+    return top + (bottom - top) * v
+}
+
+// ---------------------------------------------------------------------------
+// What the generators share
+
+// Number `place` of a generator as it is used: held to the range its
+// row of `rows` gives, the row's initial value for what is no number
+// (0 for a place the rows do not describe).
+pub fn numberOf(params: *const Params, rows: []const types.Param, place: usize) -> f64 {
+    if place >= rows.length || place >= 32 { return 0.0 }
+    const value = params.*.values[place]
+    const row = &rows[place]
+    if value != value { return row.*.initial }
+    if value < row.*.low { return row.*.low }
+    if value > row.*.high { return row.*.high }
+    return value
+}
+
+// A number of kind types.BOOL as the flag it stands for (0.5 and more:
+// on). (Written with literals on purpose: today's compiler hands a bool
+// made by comparing two floats to a function in a float register, and
+// the call then reads every later argument from the wrong place.)
+pub fn isOn(value: f64) -> bool {
+    if value >= 0.5 { return true }
+    return false
+}
+
+// A number of kind types.COLOR as the pixel it stands for.
+pub fn colorOf(value: f64) -> u32 {
+    if !(value > 0.0) { return 0 }
+    if value >= 4294967295.0 { return 0xFFFFFFFF }
+    return @intFromFloat(u32, value)
+}
+
+// ---------------------------------------------------------------------------
+// The Simplex Noise generator
+
+pub const SIMPLEX_NOISE: u16 = 3
+
+pub const SIMPLEX_PARAMS = [8]types.Param{
+    types.Param.{ .name = "Frequency", .german = "Frequenz", .kind = types.FLOAT, .low = 0.1, .high = 200.0, .initial = 4.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Octaves", .german = "Oktaven", .kind = types.INT, .low = 1.0, .high = 8.0, .initial = 1.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Persistence", .german = "Persistenz", .kind = types.FLOAT, .low = 0.0, .high = 1.0, .initial = 0.5, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Ratio x", .german = "Verhältnis x", .kind = types.FLOAT, .low = 0.01, .high = 10.0, .initial = 1.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Ratio y", .german = "Verhältnis y", .kind = types.FLOAT, .low = 0.01, .high = 10.0, .initial = 1.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Seed", .german = "Startwert", .kind = types.INT, .low = 0.0, .high = 2147483647.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Tileable", .german = "Kachelbar", .kind = types.BOOL, .low = 0.0, .high = 1.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Colour", .german = "Farbig", .kind = types.BOOL, .low = 0.0, .high = 1.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+}
+
+var simplex_kept: table_module.Kept = table_module.Kept.{ .address = 0, .length = 0 }
+
+fn simplexRows() -> []const types.Param {
+    if simplex_kept.address != 0 { return table_module.rows(types.Param, &simplex_kept) }
+    return table_module.keep(types.Param, &simplex_kept, SIMPLEX_PARAMS[0..])
+}
+
+// How the generator's numbers came out for one picture.
+const Setup = struct {
+    octaves: usize
+    persistence: f64
+    // Plain: what a pixel's centre is multiplied by on each axis.
+    // Tileable: the radius of each axis' circle.
+    scaleX: f64
+    scaleY: f64
+    tileable: bool
+    width: i64
+    height: i64
+}
+
+// A pixel's channel, 0..1: octaves of noise at (a, b) (plain), or at
+// the point (a, b) of the column's circle and (c, d) of the row's
+// (tileable).
+fn channelAt(setup: *const Setup, table: [*]const u8, a: f64, b: f64, c: f64, d: f64) -> f64 {
+    var sum: f64 = 0.0
+    var total: f64 = 0.0
+    var amplitude: f64 = 1.0
+    var size: f64 = 1.0
+    var octave: usize = 0
+    while octave < setup.*.octaves {
+        // (Each octave a little aside of the others, so that their
+        // features do not line up at the origin.)
+        const aside = @floatFromInt(f64, octave) * 17.31
+        var value: f64 = 0.0
+        if setup.*.tileable {
+            value = simplex4(table, a * size + aside, b * size, c * size + aside, d * size)
+        } else {
+            value = simplex2(table, a * size + aside, b * size + aside)
+        }
+        sum += value * amplitude
+        total += amplitude
+        amplitude *= setup.*.persistence
+        size *= 2.0
+        octave += 1
+    }
+    if !(total > 0.0) { return 0.5 }
+    return sum / total * 0.5 + 0.5
+}
+
+inline fn byteOf(value: f64) -> u32 {
+    if !(value > 0.0) { return 0 }
+    if value >= 1.0 { return 255 }
+    return @intFromFloat(u32, value * 255.0 + 0.5)
+}
+
+// `value` modulo `period` as the centre of that pixel, 0..1 of the period.
+inline fn turnOf(value: i64, period: i64) -> f64 {
+    return (@floatFromInt(f64, around(value, period)) + 0.5) / @floatFromInt(f64, period)
+}
+
+// The Simplex Noise generator's pixels of `area` (the image is
+// `image_width` x `image_height`) into `into`, `stride` words a row.
+// Without working memory the area is transparent.
+pub fn renderSimplex(params: *const Params, area_x: i32, area_y: i32, area_width: i32, area_height: i32, into: [*]u32, stride: usize, image_width: i32, image_height: i32) -> void {
+    const area = geom.rect(area_x, area_y, area_width, area_height)
+    if geom.isEmpty(area) { return }
+    const width = @intCast(usize, area.width)
+    const height = @intCast(usize, area.height)
+    const rows = simplexRows()
+    const frequency = numberOf(params, rows, 0)
+    const octaves = numberOf(params, rows, 1)
+    const persistence = numberOf(params, rows, 2)
+    const ratio_x = numberOf(params, rows, 3)
+    const ratio_y = numberOf(params, rows, 4)
+    const seed = numberOf(params, rows, 5)
+    const tileable = isOn(numberOf(params, rows, 6))
+    const colored = isOn(numberOf(params, rows, 7))
+    const image_w = if image_width < 1 { 1 } else { image_width }
+    const image_h = if image_height < 1 { 1 } else { image_height }
+    const side = @floatFromInt(f64, if image_w > image_h { image_w } else { image_h })
+    var setup: Setup = undefined
+    setup.octaves = @intFromFloat(usize, octaves + 0.5)
+    setup.persistence = persistence
+    setup.tileable = tileable
+    setup.width = @intCast(i64, image_w)
+    setup.height = @intCast(i64, image_h)
+    if tileable {
+        // A circle whose length is as many features as the plain noise
+        // has across the image.
+        setup.scaleX = frequency * ratio_x * @floatFromInt(f64, image_w) / side / math.tau
+        setup.scaleY = frequency * ratio_y * @floatFromInt(f64, image_h) / side / math.tau
+    } else {
+        setup.scaleX = frequency * ratio_x / side
+        setup.scaleY = frequency * ratio_y / side
+    }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const tables = scratch.bytes(pool, PERMUTATION * 3)
+    // Per column of the area: the circle's two coordinates (tileable).
+    const columns = scratch.doubles(pool, width * 2)
+    if tables == null || columns == null {
+        var row: usize = 0
+        while row < height {
+            device_module.fillWords(into + row * stride, width, 0)
+            row += 1
+        }
+        scratch.release(pool, mark)
+        return
+    }
+    const base = @intFromFloat(u64, seed)
+    permute(tables.?, base)
+    if colored {
+        permute(tables.? + PERMUTATION, base +% 0x5DEECE66D)
+        permute(tables.? + PERMUTATION * 2, base +% 0x2545F4914F6CDD1D)
+    }
+    var column: usize = 0
+    while column < width {
+        const x = @intCast(i64, area.x) + @intCast(i64, column)
+        if tileable {
+            const angle = turnOf(x, setup.width) * math.tau
+            columns.?[column * 2] = math.cos(angle) * setup.scaleX
+            columns.?[column * 2 + 1] = math.sin(angle) * setup.scaleX
+        } else {
+            columns.?[column * 2] = (@floatFromInt(f64, x) + 0.5) * setup.scaleX
+            columns.?[column * 2 + 1] = 0.0
+        }
+        column += 1
+    }
+    var row: usize = 0
+    while row < height {
+        const y = @intCast(i64, area.y) + @intCast(i64, row)
+        var c: f64 = 0.0
+        var d: f64 = 0.0
+        if tileable {
+            const angle = turnOf(y, setup.height) * math.tau
+            c = math.cos(angle) * setup.scaleY
+            d = math.sin(angle) * setup.scaleY
+        } else {
+            c = (@floatFromInt(f64, y) + 0.5) * setup.scaleY
+        }
+        const target = into + row * stride
+        column = 0
+        while column < width {
+            // Tileable: the column's circle and the row's; plain: the
+            // column's x and the row's y.
+            const a = columns.?[column * 2]
+            const b = if tileable { columns.?[column * 2 + 1] } else { c }
+            const red = byteOf(channelAt(&setup, tables.?, a, b, c, d))
+            if colored {
+                const green = byteOf(channelAt(&setup, tables.? + PERMUTATION, a, b, c, d))
+                const blue = byteOf(channelAt(&setup, tables.? + PERMUTATION * 2, a, b, c, d))
+                target[column] = pixel.pack(255, red, green, blue)
+            } else {
+                target[column] = pixel.pack(255, red, red, red)
+            }
+            column += 1
+        }
+        row += 1
+    }
+    scratch.release(pool, mark)
+}
