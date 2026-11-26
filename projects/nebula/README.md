@@ -112,12 +112,16 @@ Nebula is not finished. What is known to be open:
       Most are likely arithmetic that overflowed silently before, or
       tests that still assume the opaque dock and the menus before the
       real actions; to be fixed one by one.
-- [ ] **Compiler: 50_kit for brixOS.** With the new mlx4,
-      `--target=x86_64-brixos` refuses std/src/demangle.mlx:238 ("return
-      value does not match function type", then std/src/crash.mlx:1210)
-      when building tests/50_kit.mlx, while nebula itself and the other
-      tests build for brixOS; the old mlx4 built it. A regression of one
-      of the four fixes, to be found.
+- [ ] **Compiler: a limit near 3820 functions.** `--target=x86_64-brixos`
+      refuses tests/50_kit.mlx (std/src/demangle.mlx:238 "return value
+      does not match function type", then std/src/crash.mlx:1210) as soon
+      as the program has 3821 functions or more ("functions discovered"
+      without --quiet): with 3820 it builds, and one function added
+      anywhere (`fn probeExtra(value: usize) -> usize { return value + 1 }`
+      at the end of std/bootstrap/text.mlx) brings the error back. The
+      old mlx4 does the same: not one of the four fixes, but a capacity
+      in sema (the call resolves to the wrong type), to be found. Nebula
+      itself builds for brixOS.
 - [ ] **std.crash** prints no report for 56_filedialog's crash.
 - [ ] **The colour body**: the colour panel to grow in the 3D shape (or a
       large view on a double click); drawing sharp takes some hundred
