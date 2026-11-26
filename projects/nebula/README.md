@@ -100,18 +100,15 @@ are made so.
 
 Nebula is not finished. What is known to be open:
 
-- [ ] **Tests with the new compiler.** The working tree builds with the
-      mlx4 that traps narrow integer overflow, tags optional floats and
-      keeps constant tables as one image. With it 42 of the 54 tests pass;
-      these fail: 42_io_formats (97), 54_menus (212), 55_dialogs (10),
-      56_filedialog (crashes, signal 11, no crash report printed),
-      57_chrome (51, the history docker's rows), 58_settings (64),
-      63_tools_transform (235), 66_docker_layers (133), 67_docker_color
-      (237, the palette's scrolling), 68_docker_brushes (122),
-      69_dockers_misc (124), and 50_kit does not compile for brixOS.
-      Most are likely arithmetic that overflowed silently before, or
-      tests that still assume the opaque dock and the menus before the
-      real actions; to be fixed one by one.
+- [ ] **Five tests are red.** With the new mlx4 49 of the 54 tests pass.
+      Open: 50_kit (does not compile for brixOS: the compiler limit
+      below), 56_filedialog (crashes, signal 11, no crash report),
+      57_chrome (51: the history docker's rows), 63_tools_transform (235:
+      the script step `key Enter` fails; the test still has its
+      reviewer's DEBUG lines) and 67_docker_color (237: the palette's
+      scrolling). The others failed on tests that still expected the
+      opaque docks, the menus before the real actions and formats before
+      the layered ones, and one real overflow (the kit's slider, fixed).
 - [ ] **Compiler: a limit near 3820 functions.** `--target=x86_64-brixos`
       refuses tests/50_kit.mlx (std/src/demangle.mlx:238 "return value
       does not match function type", then std/src/crash.mlx:1210) as soon
