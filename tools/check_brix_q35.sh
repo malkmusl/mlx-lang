@@ -87,8 +87,8 @@ type_line() {
 
 # First boot: enumeration, and the AHCI disk found, formatted and written.
 boot
-wait_for '^brixOS: 2 processors, 1 more started$' || true
-grep -q '^brixOS: 2 processors, 1 more started$' <(output) || fail "ACPI/SMP did not bring up the second processor on Q35"
+wait_for '^brixOS: smp: 2 processors listed, 2 running$' || true
+grep -q '^brixOS: smp: 2 processors listed, 2 running$' <(output) || fail "ACPI/SMP did not bring up the second processor on Q35"
 echo "ok   ACPI and SMP bring up the second processor on the Q35 chipset"
 
 # PCI across every bus: the AHCI, Ethernet and xHCI controllers the real

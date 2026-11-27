@@ -5,7 +5,9 @@
 # the kernel (brix_ap), each with a trap stack, TSS and block of its own
 # and its local APIC timer, and run processes beside the first one (the
 # kernel itself on one processor at a time, by its lock): a pipeline's
-# programs, background jobs, a shell restart while others run.
+# programs, background jobs, a shell restart while others run; sysinfo
+# says how many processors ran programs. (tools/check_brix_smp_many.sh:
+# 8, 16 and 64 processors, each one busy.)
 #
 #   tools/check_brix_smp.sh [compiler]
 set -euo pipefail
@@ -38,7 +40,7 @@ echo "ok   the kernel and the image (with the trampoline) build"
     sleep 2
 } | timeout 32 qemu-system-x86_64 -m 256M -smp 4 -cpu max -display none -serial stdio \
     -kernel "$work/brix.img" 2>&1 | tr -d '\r' > "$work/serial.txt" || true
-grep -aq '^brixOS: 4 processors, 3 more started$' "$work/serial.txt" || fail "the other processors did not start"
+grep -aq '^brixOS: smp: 4 processors listed, 4 running$' "$work/serial.txt" || fail "the other processors did not start"
 for cpu in 1 2 3; do
     grep -aq "^brixOS: processor $cpu runs$" "$work/serial.txt" || fail "processor $cpu does not run the kernel"
 done
@@ -55,4 +57,9 @@ grep -aq '^processors: 4$' "$work/serial.txt" || fail "sysinfo does not say 4 pr
 grep -aEq '^waits for the kernel: [0-9]+\.[0-9]{3} ms in all; the longest [0-9]+\.[0-9]{3} ms \(behind [^)]*\); in the last 10 to 20 s [0-9]+\.[0-9]{3} ms \(behind [^)]*\)$' "$work/serial.txt" || fail "sysinfo does not say the waits for the kernel and their holders"
 grep -aEq "^idle processors' waits for the kernel: [0-9]+\.[0-9]{3} ms\$" "$work/serial.txt" || fail "sysinfo does not say the idle processors' waits"
 echo "ok   sysinfo says how long processors waited for the kernel, and behind what"
+# Where the programs ran (system_info's words after the record's): every
+# processor's time, two of them at least ran some (the pipelines above).
+grep -aEq '^processors that ran programs: [2-4] of 4; the least [0-9]+\.[0-9]{3} s, the most [0-9]+\.[0-9]{3} s$' "$work/serial.txt" || fail "sysinfo does not say where the programs ran"
+grep -aEq '^processor times: 0:[0-9.]+ s 1:[0-9.]+ s 2:[0-9.]+ s 3:[0-9.]+ s$' "$work/serial.txt" || fail "sysinfo does not say each processor's time"
+echo "ok   sysinfo says each processor's time running programs"
 echo PASS

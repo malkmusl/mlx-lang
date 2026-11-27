@@ -26,19 +26,43 @@ layout and copy on write:
         -drive file=mlx-out/bin/brix/disk.img,format=raw,if=virtio
     tools/check_brix.sh        # the same, typed at, checked
 
-With `-smp N`, the kernel finds the processors in ACPI's MADT and starts
-the others through the local APIC (INIT and startup IPIs naming the
-trampoline's page, image/ap.mlx, kernel/smp.mlx): they reach long mode on
-the boot page tables, take a number each (the trampoline's counter), go
-on in the blob's code64 (the kernel's GDT and IDT, a TSS and a block of
-their own, layout.PerCpu, as the kernel's GS base: trap stack, arena,
-number) and come into the kernel at brix_ap ("brixOS: 4 processors, 3
-more started", "brixOS: processor 1 runs"; tools/check_brix_smp.sh). Up
-to Memory.MAX_CPUS (8) run the kernel; more stay halted. Each
-processor's arena (mlx4's aggregate arena, 4 MiB of the kernel's 32) is
-loaded into r14 and r15 at each entry to the kernel; an idle processor,
-which stays in the kernel, releases each round of its loop's
-(Scheduler.switchTo: smp.arenaMark, arenaRelease).
+With `-smp N`, the kernel finds the processors in ACPI's MADT
+(kernel/processors.mlx reads its local APIC and x2APIC entries) and
+starts every one the firmware lists as on, however many: a 64-core
+machine runs 64, a board with two large processors up to
+Memory.MAX_CPUS (256; x2APIC ids beyond 255 too, the local APICs put
+into x2APIC mode where the firmware left them in the other). Processors
+listed as off are not started, nor those the firmware may bring on later
+("online capable": counted, as Linux counts them possible).
+/system/settings/processors (a number) lets fewer run. What each one
+needs is made at boot for the processors found (kernel/smp.mlx): a trap
+stack of 64 pages with a page above it for its block (layout.PerCpu:
+trap stack, arena, number; the kernel's GS base) and its TSS, a TSS
+descriptor in a GDT the kernel makes for all of them (the blob's GDTR64
+points at it), and its share of the aggregate arena (mlx4's r14 and
+r15, the kernel's 32 MiB at 80 MiB: the first processor keeps the first
+4 MiB the boot runs in, the others divide the rest, 4 MiB each up to
+eight, 512 KiB at least, those past what the region holds at that from
+the frames: at 256 processors 56 shares in the region and 199 of the
+frames; a system call takes a few KiB of it). The others are started at
+once (INIT to each, then two startup IPIs naming the trampoline's page,
+image/ap.mlx): they reach long mode on the boot page tables, say their
+local APIC id and take a number each (the trampoline's counter, which
+the kernel closes after a second: one that never answers holds up
+nothing, is said in the log, and one that comes later halts there), go
+on in the blob's code64 with their block's address (the kernel's GDT
+and IDT, their TSS, their block) and come into the kernel at brix_ap
+("brixOS: smp: 4 processors listed, 4 running", "brixOS: processor 1
+runs"; tools/check_brix_smp.sh with four, check_brix_smp_many.sh with 8,
+16 and 64, each one busy). With 64: 63 trap stacks and blocks (16 MiB),
+seven arenas of the frames (3.5 MiB) and a process table of 142
+(Scheduler.LEAST + PER_PROCESSOR for each further processor). An idle
+processor, which stays in the kernel, releases each round of its loop's
+arena (Scheduler.switchTo: smp.arenaMark, arenaRelease). Programs learn
+the count from system_info (std.os.processorCount; the Linux layer's
+sched_getaffinity gives the same processors), and system_info has each
+processor's time running programs after its record (sysinfo:
+"processors that ran programs: 64 of 64").
 
 The kernel runs on one processor at a time: every entry (brix_trap,
 brix_ap) takes the kernel lock (smp.mlx; an interrupt while the kernel
@@ -54,8 +78,20 @@ the clock at boot); the PIC's interrupts (the serial line, the disks)
 reach the first one only, so another processor polls a disk request.
 On the way out of the kernel a processor that leaves a process runnable
 (ready, or a blocked one whose wait is over) while another idles wakes
-that one with an IPI (Vector.WAKE); an idle processor also looks again
-at its timer's tick. A process ending or the shell restarting on one
+that one with an IPI (Vector.WAKE), one for each such process beyond
+those a processor was woken for already (smp.waking: 63 idle ones are
+not woken one after the other for one process); which idle is a set of
+256 bits (processors.Mask), looked through a word at a time. An idle
+processor other than the first stops its timer (it is woken by the IPI;
+a wait's deadline less than a time slice away is one idle processor's
+to wake for, a later one the first processor's PIT tick finds). A time
+slice's end on a processor while no process waits for one (smp's hint,
+worked out after every slice's end and after every entry while it says
+nothing waits) is taken without the kernel's lock: the process goes on,
+and 63 busy processors do not queue for the kernel a hundred times a
+second each; a processor that waits for the lock for such a tick leaves
+the queue when the hint turns. While a processor idles, a slice's end
+does not take a waiting process from it (no musical chairs). A process ending or the shell restarting on one
 processor leaves the processes running on others alone (they end as
 usual).
 
