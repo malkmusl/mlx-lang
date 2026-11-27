@@ -1,0 +1,727 @@
+// The driver's graphics commands (stage (c), the study's 4.4 and 8.2 (c)):
+// rendering (dynamic rendering, VK_KHR_dynamic_rendering, and the render
+// passes and framebuffers of Vulkan 1.0 and VK_KHR_create_renderpass2 on
+// it), the vertex and index buffers, viewport, scissor and blend
+// constants, the draws, the clear and the copy of an image into a buffer.
+// They write into the command buffer's stream (commands.mlx) what RADV
+// writes on a GENERAL queue of GFX8:
+//
+// - vkCmdBeginRendering (and a render pass's begin: its dependency from
+//   VK_SUBPASS_EXTERNAL first, as a barrier with its colour attachments'
+//   images): the colour targets' registers (radv_emit_fb_color_state on
+//   GFX8: CB_COLORn_BASE and the ten after it, CB_COLORn_DCC_BASE; a
+//   target without a view CB_COLORn_INFO COLOR_INVALID) and the window
+//   scissor of the render area (radv_cmd_buffer_begin_rendering:
+//   PA_SC_WINDOW_SCISSOR_TL and _BR); then each attachment whose load
+//   operation is CLEAR is cleared (below).
+// - vkCmdEndRendering: nothing (the application's barrier flushes the
+//   colour block: radv_src_access_flush); a render pass's end applies its
+//   dependency to VK_SUBPASS_EXTERNAL as a barrier, the implicit one
+//   among it (image.mlx), which flushes the colour block.
+// - a draw (radv_before_draw's order when it waits for idle: the states,
+//   the owed flush, the shaders' pointers, the draw):
+//     the pipeline's words when it changed (graphics.mlx);
+//     the state the draw reads when it changed: VGT_PRIMITIVE_TYPE (SET_
+//     UCONFIG_REG with the index 1), PA_SU_SC_MODE_CNTL, PA_CL_CLIP_CNTL
+//     (DX_CLIP_SPACE_DEF, DX_LINEAR_ATTR_CLIP_ENA: radv_emit_clipping
+//     with depth clip on), VGT_MULTI_PRIM_IB_RESET_EN 0, DB_DEPTH_CONTROL
+//     0, CB_COLOR_CONTROL, CB_TARGET_MASK, CB_BLEND0 .. 7_CONTROL,
+//     SPI_BARYC_CNTL (FRONT_FACE_ALL_BITS), PA_SC_AA_CONFIG 0 and
+//     PA_SC_MODE_CNTL_0 (VPORT_SCISSOR_ENABLE: radv_emit_rasterization_
+//     samples with one sample), DB_SHADER_CONTROL (Z_ORDER EARLY_Z_THEN_
+//     LATE_Z: radv_shader_info.c for a fragment shader that writes no
+//     memory, depth or mask), the blend constants (CB_BLEND_RED ..), the
+//     viewport (PA_CL_VPORT_*: radv_get_viewport_xform; PA_SC_VPORT_ZMIN_0
+//     0 and _ZMAX_0 1, radv's RADV_DEPTH_CLAMP_MODE_ZERO_TO_ONE), the
+//     guard band (radv_write_guardband: (32767 - |translate|) / max(|scale|,
+//     0.5) for x and y, discard 1.0) and the scissor (radv_write_scissors:
+//     the scissor within the viewport's rectangle);
+//     the owed flush;
+//     the vertex shader's user data words 2 .. 9 (the vertex buffers'
+//     descriptors' table, uploaded: binding b's four words at 16 * b,
+//     RADV's radv_write_vertex_descriptors for GFX8 with a stride and its
+//     buffer's bytes from the bound offset, NUM_FORMAT UINT and DATA_FORMAT
+//     32; the base vertex, the first instance; set 0; the push constants'
+//     block, uploaded) and the fragment shader's 2 .. 5 (set 0, the push
+//     block);
+//     NUM_INSTANCES; for indices INDEX_TYPE when the stream does not have
+//     the type yet, and DRAW_INDEX_2 (the buffer's indices from the bound
+//     offset and firstIndex, the count of those there: radv_cs_emit_draw_
+//     indexed_packet, DI_SRC_SEL_DMA), else DRAW_INDEX_AUTO (DI_SRC_SEL_
+//     AUTO_INDEX), after which INDEX_TYPE is sent again before the next
+//     indexed draw.
+// - vkCmdClearAttachments and a CLEAR load operation: a rectangle drawn
+//   for each attachment and rectangle by clear.mlx's shaders, its colour
+//   in their push block, its viewport and scissor the rectangle (so the
+//   pixels whose centres it holds), the target mask that attachment's;
+//   the application's state is written again before its next draw.
+// - vkCmdCopyImageToBuffer: the image's rows, each a copy engine packet
+//   (DMA_DATA, memory to memory: the image is linear), with the owed flush
+//   and RAW_WAIT before the first as commands.mlx's copies; the copy
+//   engine waited for at the next barrier with a transfer source or at the
+//   end.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const device = @import("./device.mlx")
+const memory = @import("./memory.mlx")
+const pipeline = @import("./pipeline.mlx")
+const commands = @import("./commands.mlx")
+const packets = @import("./packets.mlx")
+const gp = @import("./graphics_packets.mlx")
+const graphics = @import("./graphics.mlx")
+const image = @import("./image.mlx")
+const clear = @import("./clear.mlx")
+
+const CommandBufferObject = commands.CommandBufferObject
+const DeviceObject = device.DeviceObject
+
+// What changed since the stream last had it.
+pub const Dirty = struct {
+    pub const PIPELINE: u32 = 0x1
+    pub const VIEWPORT: u32 = 0x2
+    pub const SCISSOR: u32 = 0x4
+    pub const BLEND_CONSTANTS: u32 = 0x8
+    pub const FIXED: u32 = 0x10
+    pub const INDEX: u32 = 0x20
+}
+
+fn put(cb: *CommandBufferObject, word: u32) -> void { commands.put(cb, word) }
+
+fn context(cb: *CommandBufferObject, offset: usize, count: u32) -> void {
+    put(cb, packets.header(packets.PKT3_SET_CONTEXT_REG, count, false))
+    put(cb, @intCast(u32, (offset - packets.CONTEXT_START) / 4))
+}
+
+fn contextOne(cb: *CommandBufferObject, offset: usize, value: u32) -> void {
+    context(cb, offset, 1)
+    put(cb, value)
+}
+
+fn floatWord(value: f32) -> u32 { return @bitCast(u32, value) }
+
+fn ownerOf(cb: *CommandBufferObject) -> *DeviceObject { return device.deviceOf(cb.*.device) }
+
+// ---------------------------------------------------------------------------
+// Rendering
+
+const MOST_COLOUR_WORDS: usize = 8 * (13 + 3) + 6
+
+// The colour targets' registers and the window scissor.
+fn emitTargets(cb: *CommandBufferObject) -> void {
+    const d = &cb.*.draw
+    if !commands.reserve(cb, MOST_COLOUR_WORDS) { return }
+    var t: usize = 0
+    while t < 8 {
+        const at = gp.CB_COLOR0_BASE + gp.CB_COLOR_STRIDE * t
+        if t < @intCast(usize, d.*.targetCount) && d.*.views[t] != 0 {
+            const view = image.viewOf(d.*.views[t])
+            const img = image.imageOf(view.*.image)
+            const base = @intCast(u32, img.*.address >> 8)
+            const tiles = img.*.pitch / 8 - 1
+            const slice = img.*.pitch * img.*.rows / 64 - 1
+            const swap = if img.*.format == vk.Format.b8g8r8a8Unorm { gp.SWAP_ALT } else { gp.SWAP_STD }
+            const info = packets.put(gp.CB_COLOR0_INFO__FORMAT, gp.COLOR_8_8_8_8) | packets.put(gp.CB_COLOR0_INFO__NUMBER_TYPE, gp.NUMBER_UNORM) | packets.put(gp.CB_COLOR0_INFO__COMP_SWAP, swap) | gp.CB_COLOR0_INFO__BLEND_CLAMP | gp.CB_COLOR0_INFO__SIMPLE_FLOAT
+            context(cb, at, 11)
+            put(cb, base)
+            put(cb, packets.put(gp.CB_COLOR0_PITCH__TILE_MAX, tiles) | packets.put(gp.CB_COLOR0_PITCH__FMASK_TILE_MAX, tiles))
+            put(cb, packets.put(gp.CB_COLOR0_SLICE__TILE_MAX, slice))
+            put(cb, 0)
+            put(cb, info)
+            put(cb, packets.put(gp.CB_COLOR0_ATTRIB__TILE_MODE_INDEX, image.LINEAR_TILE_MODE) | packets.put(gp.CB_COLOR0_ATTRIB__FMASK_TILE_MODE_INDEX, image.LINEAR_TILE_MODE))
+            put(cb, 0)
+            put(cb, base)
+            put(cb, 0)
+            put(cb, base)
+            put(cb, packets.put(gp.CB_COLOR0_SLICE__TILE_MAX, slice))
+            contextOne(cb, at + (gp.CB_COLOR0_DCC_BASE - gp.CB_COLOR0_BASE), base)
+        } else {
+            contextOne(cb, at + (gp.CB_COLOR0_INFO - gp.CB_COLOR0_BASE), packets.put(gp.CB_COLOR0_INFO__FORMAT, gp.COLOR_INVALID))
+        }
+        t += 1
+    }
+    const a = d.*.area
+    contextOne(cb, gp.PA_SC_WINDOW_SCISSOR_TL, packets.put(gp.SCISSOR__X, @intCast(u32, a.offset.x)) | packets.put(gp.SCISSOR__Y, @intCast(u32, a.offset.y)))
+    contextOne(cb, gp.PA_SC_WINDOW_SCISSOR_BR, packets.put(gp.SCISSOR__X, @intCast(u32, a.offset.x) + a.extent.width) | packets.put(gp.SCISSOR__Y, @intCast(u32, a.offset.y) + a.extent.height))
+}
+
+// Rendering begun on `count` targets' views in `area`, each cleared whose
+// load operation says so.
+fn begin(cb: *CommandBufferObject, area: vk.Rect2D, count: u32, views: [*]const usize, loads: [*]const vk.AttachmentLoadOp, clears: ?[*]const vk.ClearValue, pass: usize) -> void {
+    const d = &cb.*.draw
+    d.*.rendering = true
+    d.*.area = area
+    d.*.targetCount = if count > 8 { 8 } else { count }
+    d.*.pass = pass
+    var k: usize = 0
+    while k < 8 {
+        d.*.views[k] = if k < @intCast(usize, d.*.targetCount) { views[k] } else { 0 }
+        k += 1
+    }
+    emitTargets(cb)
+    k = 0
+    while k < @intCast(usize, d.*.targetCount) {
+        if views[k] != 0 && loads[k] == vk.AttachmentLoadOp.clear && clears != null {
+            var rect = vk.ClearRect.init()
+            rect.rect = area
+            rect.baseArrayLayer = 0
+            rect.layerCount = 1
+            clearTarget(cb, @intCast(u32, k), &clears.?[k].color, &rect)
+        }
+        k += 1
+    }
+}
+
+pub fn cmdBeginRendering(buffer: vk.CommandBuffer, info: *const vk.RenderingInfo) -> void {
+    const cb = commands.bufferOf(buffer)
+    if !cb.*.graphics || info.*.layerCount != 1 || info.*.viewMask != 0 || info.*.colorAttachmentCount > 8 || info.*.pDepthAttachment != null || info.*.pStencilAttachment != null { return }
+    var views: [8]usize = undefined
+    var loads: [8]vk.AttachmentLoadOp = undefined
+    var clears: [8]vk.ClearValue = undefined
+    var k: usize = 0
+    while k < @intCast(usize, info.*.colorAttachmentCount) {
+        const a = &info.*.pColorAttachments.?[k]
+        views[k] = a.*.imageView
+        loads[k] = a.*.loadOp
+        clears[k] = a.*.clearValue
+        k += 1
+    }
+    begin(cb, info.*.renderArea, info.*.colorAttachmentCount, &views, &loads, &clears, 0)
+}
+
+pub fn cmdEndRendering(buffer: vk.CommandBuffer) -> void {
+    const cb = commands.bufferOf(buffer)
+    cb.*.draw.rendering = false
+}
+
+// A render pass's dependency as a memory barrier (vk_render_pass.c's
+// VkMemoryBarrier2, no image named).
+fn dependency(cb: *CommandBufferObject, sourceStages: u32, targetStages: u32, sourceAccess: u32, targetAccess: u32) -> void {
+    if sourceStages == 0 && targetStages == 0 { return }
+    commands.barrier(cb, sourceStages, targetStages, commands.sourceFlush(sourceAccess, false), commands.targetFlush(targetAccess, false))
+}
+
+pub fn cmdBeginRenderPass(buffer: vk.CommandBuffer, info: *const vk.RenderPassBeginInfo, contents: vk.SubpassContents) -> void {
+    const cb = commands.bufferOf(buffer)
+    if !cb.*.graphics || info.*.renderPass == 0 || info.*.framebuffer == 0 { return }
+    const p = image.passOf(info.*.renderPass)
+    const f = image.framebufferOf(info.*.framebuffer)
+    dependency(cb, p.*.beginSource, p.*.beginTarget, p.*.beginSourceAccess, p.*.beginTargetAccess)
+    var views: [8]usize = undefined
+    var loads: [8]vk.AttachmentLoadOp = undefined
+    var clears: [8]vk.ClearValue = undefined
+    var k: usize = 0
+    while k < @intCast(usize, p.*.colourCount) {
+        const a = p.*.colours[k]
+        views[k] = if a == vk.ATTACHMENT_UNUSED || a >= f.*.count { 0 } else { f.*.views[@intCast(usize, a)] }
+        loads[k] = if a == vk.ATTACHMENT_UNUSED { vk.AttachmentLoadOp.load } else { p.*.loadOps[@intCast(usize, a)] }
+        if a != vk.ATTACHMENT_UNUSED && info.*.pClearValues != null && a < info.*.clearValueCount { clears[k] = info.*.pClearValues.?[@intCast(usize, a)] }
+        k += 1
+    }
+    var given: ?[*]const vk.ClearValue = null
+    if info.*.pClearValues != null { given = &clears }
+    begin(cb, info.*.renderArea, p.*.colourCount, &views, &loads, given, info.*.renderPass)
+}
+
+pub fn cmdEndRenderPass(buffer: vk.CommandBuffer) -> void {
+    const cb = commands.bufferOf(buffer)
+    const pass = cb.*.draw.pass
+    cb.*.draw.rendering = false
+    if pass == 0 { return }
+    const p = image.passOf(pass)
+    dependency(cb, p.*.endSource, p.*.endTarget, p.*.endSourceAccess, p.*.endTargetAccess)
+    cb.*.draw.pass = 0
+}
+
+pub fn cmdBeginRenderPass2(buffer: vk.CommandBuffer, info: *const vk.RenderPassBeginInfo, subpass: *const vk.SubpassBeginInfo) -> void { cmdBeginRenderPass(buffer, info, subpass.*.contents) }
+
+pub fn cmdEndRenderPass2(buffer: vk.CommandBuffer, subpass: *const vk.SubpassEndInfo) -> void { cmdEndRenderPass(buffer) }
+
+// (One subpass: there is none to go to.)
+pub fn cmdNextSubpass2(buffer: vk.CommandBuffer, beginInfo: *const vk.SubpassBeginInfo, endInfo: *const vk.SubpassEndInfo) -> void {}
+
+// ---------------------------------------------------------------------------
+// Bound state
+
+pub fn cmdBindVertexBuffers(buffer: vk.CommandBuffer, first: u32, count: u32, buffers: ?[*]const vk.Buffer, offsets: ?[*]const vk.DeviceSize) -> void {
+    const cb = commands.bufferOf(buffer)
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const b = @intCast(usize, first) + k
+        if b < commands.MOST_VERTEX_BUFFERS {
+            const bound = memory.bufferOf(buffers.?[k])
+            const offset = offsets.?[k]
+            cb.*.draw.vertexAddress[b] = bound.*.address + offset
+            cb.*.draw.vertexBytes[b] = if offset < bound.*.size { bound.*.size - offset } else { 0 }
+        }
+        k += 1
+    }
+}
+
+pub fn cmdBindIndexBuffer(buffer: vk.CommandBuffer, given: vk.Buffer, offset: vk.DeviceSize, kind: vk.IndexType) -> void {
+    const cb = commands.bufferOf(buffer)
+    const bound = memory.bufferOf(given)
+    cb.*.draw.indexAddress = bound.*.address + offset
+    cb.*.draw.indexBytes = if offset < bound.*.size { bound.*.size - offset } else { 0 }
+    cb.*.draw.indexType = if kind == vk.IndexType.uint32 { gp.VGT_INDEX_32 } else { gp.VGT_INDEX_16 }
+}
+
+pub fn cmdSetViewport(buffer: vk.CommandBuffer, first: u32, count: u32, viewports: ?[*]const vk.Viewport) -> void {
+    const cb = commands.bufferOf(buffer)
+    if first != 0 || count == 0 { return }
+    cb.*.draw.viewport = viewports.?[0]
+    cb.*.draw.dirty |= Dirty.VIEWPORT | Dirty.SCISSOR
+}
+
+pub fn cmdSetScissor(buffer: vk.CommandBuffer, first: u32, count: u32, scissors: ?[*]const vk.Rect2D) -> void {
+    const cb = commands.bufferOf(buffer)
+    if first != 0 || count == 0 { return }
+    cb.*.draw.scissor = scissors.?[0]
+    cb.*.draw.dirty |= Dirty.SCISSOR
+}
+
+pub fn cmdSetBlendConstants(buffer: vk.CommandBuffer, constants: *const [4]f32) -> void {
+    const cb = commands.bufferOf(buffer)
+    var k: usize = 0
+    while k < 4 {
+        cb.*.draw.blendConstants[k] = floatWord(constants.*[k])
+        k += 1
+    }
+    cb.*.draw.dirty |= Dirty.BLEND_CONSTANTS
+}
+
+// ---------------------------------------------------------------------------
+// The draw's state
+
+// The viewport's rectangle (radv_scissor_from_viewport).
+fn viewportRect(v: *const vk.Viewport) -> vk.Rect2D {
+    const halfWidth = 0.5 * v.*.width
+    const halfHeight = 0.5 * v.*.height
+    const tx = halfWidth + v.*.x
+    const ty = halfHeight + v.*.y
+    const sx = if halfWidth < 0.0 { -halfWidth } else { halfWidth }
+    const sy = if halfHeight < 0.0 { -halfHeight } else { halfHeight }
+    var r = vk.Rect2D.init()
+    r.offset.x = @intFromFloat(i32, tx - sx)
+    r.offset.y = @intFromFloat(i32, ty - sy)
+    r.extent.width = @intCast(u32, @intFromFloat(i32, @ceil(tx + sx)) - r.offset.x)
+    r.extent.height = @intCast(u32, @intFromFloat(i32, @ceil(ty + sy)) - r.offset.y)
+    return r
+}
+
+fn emitViewport(cb: *CommandBufferObject, v: *const vk.Viewport) -> void {
+    const halfWidth = 0.5 * v.*.width
+    const halfHeight = 0.5 * v.*.height
+    context(cb, gp.PA_CL_VPORT_XSCALE, 6)
+    put(cb, floatWord(halfWidth))
+    put(cb, floatWord(halfWidth + v.*.x))
+    put(cb, floatWord(halfHeight))
+    put(cb, floatWord(halfHeight + v.*.y))
+    put(cb, floatWord(v.*.maxDepth - v.*.minDepth))
+    put(cb, floatWord(v.*.minDepth))
+    context(cb, gp.PA_SC_VPORT_ZMIN_0, 2)
+    put(cb, floatWord(0.0))
+    put(cb, floatWord(1.0))
+    // radv_write_guardband for triangles
+    var sx = if halfWidth < 0.0 { -halfWidth } else { halfWidth }
+    var sy = if halfHeight < 0.0 { -halfHeight } else { halfHeight }
+    if sx < 0.5 { sx = 0.5 }
+    if sy < 0.5 { sy = 0.5 }
+    const tx = halfWidth + v.*.x
+    const ty = halfHeight + v.*.y
+    const bandX = (32767.0 - (if tx < 0.0 { -tx } else { tx })) / sx
+    const bandY = (32767.0 - (if ty < 0.0 { -ty } else { ty })) / sy
+    context(cb, gp.PA_CL_GB_VERT_CLIP_ADJ, 4)
+    put(cb, floatWord(bandY))
+    put(cb, floatWord(1.0))
+    put(cb, floatWord(bandX))
+    put(cb, floatWord(1.0))
+}
+
+fn emitScissor(cb: *CommandBufferObject, s: *const vk.Rect2D, v: *const vk.Viewport) -> void {
+    const r = viewportRect(v)
+    var x0 = s.*.offset.x
+    var y0 = s.*.offset.y
+    var x1 = s.*.offset.x + @intCast(i32, s.*.extent.width)
+    var y1 = s.*.offset.y + @intCast(i32, s.*.extent.height)
+    if r.offset.x > x0 { x0 = r.offset.x }
+    if r.offset.y > y0 { y0 = r.offset.y }
+    if r.offset.x + @intCast(i32, r.extent.width) < x1 { x1 = r.offset.x + @intCast(i32, r.extent.width) }
+    if r.offset.y + @intCast(i32, r.extent.height) < y1 { y1 = r.offset.y + @intCast(i32, r.extent.height) }
+    if x1 < x0 { x1 = x0 }
+    if y1 < y0 { y1 = y0 }
+    context(cb, gp.PA_SC_VPORT_SCISSOR_0_TL, 2)
+    put(cb, packets.put(gp.SCISSOR__X, @intCast(u32, x0)) | packets.put(gp.SCISSOR__Y, @intCast(u32, y0)) | gp.SCISSOR__WINDOW_OFFSET_DISABLE)
+    put(cb, packets.put(gp.SCISSOR__X, @intCast(u32, x1)) | packets.put(gp.SCISSOR__Y, @intCast(u32, y1)))
+}
+
+// The state words before a draw of `bound`, as far as they changed;
+// `viewport`, `scissor` the draw's.
+fn emitState(cb: *CommandBufferObject, bound: *const graphics.GraphicsPipelineObject, viewport: *const vk.Viewport, scissor: *const vk.Rect2D, blendConstants: *const [4]u32, targetMask: u32) -> void {
+    const d = &cb.*.draw
+    if !commands.reserve(cb, graphics.MOST_WORDS + 120) { return }
+    if d.*.emitted != @intFromPtr(bound) {
+        var k: usize = 0
+        while k < bound.*.wordCount {
+            put(cb, bound.*.words[k])
+            k += 1
+        }
+        d.*.emitted = @intFromPtr(bound)
+    }
+    if (d.*.dirty & Dirty.FIXED) != 0 {
+        contextOne(cb, gp.PA_CL_CLIP_CNTL, gp.PA_CL_CLIP_CNTL__DX_CLIP_SPACE_DEF | gp.PA_CL_CLIP_CNTL__DX_LINEAR_ATTR_CLIP_ENA)
+        contextOne(cb, gp.VGT_MULTI_PRIM_IB_RESET_EN, 0)
+        contextOne(cb, gp.DB_DEPTH_CONTROL, 0)
+        contextOne(cb, gp.SPI_BARYC_CNTL, gp.SPI_BARYC_CNTL__FRONT_FACE_ALL_BITS)
+        contextOne(cb, gp.PA_SC_AA_CONFIG, 0)
+        contextOne(cb, gp.PA_SC_MODE_CNTL_0, gp.PA_SC_MODE_CNTL_0__VPORT_SCISSOR_ENABLE)
+        contextOne(cb, gp.DB_SHADER_CONTROL, packets.put(gp.DB_SHADER_CONTROL__Z_ORDER, gp.EARLY_Z_THEN_LATE_Z))
+    }
+    if (d.*.dirty & Dirty.PIPELINE) != 0 {
+        put(cb, packets.header(packets.PKT3_SET_UCONFIG_REG, 1, false))
+        put(cb, @intCast(u32, (gp.VGT_PRIMITIVE_TYPE - packets.UCONFIG_START) / 4) | gp.PRIMITIVE_TYPE_INDEX << gp.SH_REG_INDEX_SHIFT)
+        put(cb, bound.*.topology)
+        contextOne(cb, gp.PA_SU_SC_MODE_CNTL, bound.*.suScModeCntl)
+        contextOne(cb, gp.CB_COLOR_CONTROL, if targetMask != 0 { bound.*.colourControl } else { packets.put(gp.CB_COLOR_CONTROL__ROP3, gp.ROP3_COPY) })
+        contextOne(cb, gp.CB_TARGET_MASK, targetMask)
+        context(cb, gp.CB_BLEND0_CONTROL, 8)
+        var k: usize = 0
+        while k < 8 {
+            put(cb, bound.*.blend[k])
+            k += 1
+        }
+    }
+    if (d.*.dirty & (Dirty.PIPELINE | Dirty.BLEND_CONSTANTS)) != 0 {
+        context(cb, gp.CB_BLEND_RED, 4)
+        var k: usize = 0
+        while k < 4 {
+            put(cb, blendConstants.*[k])
+            k += 1
+        }
+    }
+    if (d.*.dirty & (Dirty.PIPELINE | Dirty.VIEWPORT)) != 0 { emitViewport(cb, viewport) }
+    if (d.*.dirty & (Dirty.PIPELINE | Dirty.VIEWPORT | Dirty.SCISSOR)) != 0 { emitScissor(cb, scissor, viewport) }
+    d.*.dirty = 0
+}
+
+// The shaders' user data words: the vertex buffers' table, the base
+// vertex and instance, set 0, the push block.
+fn emitUserData(cb: *CommandBufferObject, bound: *const graphics.GraphicsPipelineObject, sets: u64, push: [*]const u32, pushBytes: usize, baseVertex: u32, firstInstance: u32) -> bool {
+    const d = &cb.*.draw
+    if !commands.reserve(cb, 2 + 8 + 2 + 4) { return false }
+    // The vertex buffers' descriptors.
+    var tableAddress: u64 = 0
+    const bindings = bound.*.vsFacts.vertexBindings
+    if bindings != 0 {
+        var highest: usize = 0
+        var b: usize = 0
+        while b < commands.MOST_VERTEX_BUFFERS {
+            if (bindings >> @intCast(u5, b)) & 1 != 0 { highest = b }
+            b += 1
+        }
+        const table = commands.upload(cb, 16 * (highest + 1), &tableAddress)
+        if table == 0 { return false }
+        const words: [*]u32 = unsafe { @ptrFromInt([*]u32, table) }
+        b = 0
+        while b <= highest {
+            const address = d.*.vertexAddress[b]
+            words[4 * b] = @intCast(u32, address & 0xFFFFFFFF)
+            words[4 * b + 1] = packets.put(packets.SQ_BUF_RSRC_WORD1__BASE_ADDRESS_HI, @intCast(u32, (address >> 32) & 0xFFFF)) | packets.put(packets.SQ_BUF_RSRC_WORD1__STRIDE, bound.*.strides[b])
+            words[4 * b + 2] = @intCast(u32, if d.*.vertexBytes[b] > 0xFFFFFFFF { 0xFFFFFFFF } else { d.*.vertexBytes[b] })
+            words[4 * b + 3] = packets.vertexWord3()
+            b += 1
+        }
+    }
+    var pushAddress: u64 = 0
+    const block = commands.upload(cb, if pushBytes == 0 { 16 } else { pushBytes }, &pushAddress)
+    if block == 0 { return false }
+    if pushBytes > 0 { device.copyBytes(block, @intFromPtr(push), pushBytes) }
+    commands.setRegisters(cb, gp.SPI_SHADER_USER_DATA_VS_0 + 8, 8)
+    put(cb, @intCast(u32, tableAddress & 0xFFFFFFFF))
+    put(cb, @intCast(u32, tableAddress >> 32))
+    put(cb, baseVertex)
+    put(cb, firstInstance)
+    put(cb, @intCast(u32, sets & 0xFFFFFFFF))
+    put(cb, @intCast(u32, sets >> 32))
+    put(cb, @intCast(u32, pushAddress & 0xFFFFFFFF))
+    put(cb, @intCast(u32, pushAddress >> 32))
+    commands.setRegisters(cb, gp.SPI_SHADER_USER_DATA_PS_0 + 8, 4)
+    put(cb, @intCast(u32, sets & 0xFFFFFFFF))
+    put(cb, @intCast(u32, sets >> 32))
+    put(cb, @intCast(u32, pushAddress & 0xFFFFFFFF))
+    put(cb, @intCast(u32, pushAddress >> 32))
+    return true
+}
+
+// The draw packets: `indexed` with `count` indices from `firstIndex`,
+// else `count` vertices.
+fn emitDraw(cb: *CommandBufferObject, indexed: bool, count: u32, firstIndex: u32, instances: u32) -> void {
+    const d = &cb.*.draw
+    if !commands.reserve(cb, 2 + 2 + 6) { return }
+    put(cb, packets.header(gp.PKT3_NUM_INSTANCES, 0, false))
+    put(cb, instances)
+    if indexed {
+        if d.*.streamIndexType != d.*.indexType {
+            put(cb, packets.header(gp.PKT3_INDEX_TYPE, 0, false))
+            put(cb, d.*.indexType)
+            d.*.streamIndexType = d.*.indexType
+        }
+        const size: u64 = if d.*.indexType == gp.VGT_INDEX_32 { 4 } else { 2 }
+        const skipped = size * @intCast(u64, firstIndex)
+        const address = d.*.indexAddress + skipped
+        const most = if skipped < d.*.indexBytes { (d.*.indexBytes - skipped) / size } else { 0 }
+        put(cb, packets.header(gp.PKT3_DRAW_INDEX_2, 4, false))
+        put(cb, @intCast(u32, if most > 0xFFFFFFFF { 0xFFFFFFFF } else { most }))
+        put(cb, @intCast(u32, address & 0xFFFFFFFF))
+        put(cb, @intCast(u32, address >> 32))
+        put(cb, count)
+        put(cb, gp.DI_SRC_SEL_DMA)
+    } else {
+        put(cb, packets.header(gp.PKT3_DRAW_INDEX_AUTO, 1, false))
+        put(cb, count)
+        put(cb, gp.DI_SRC_SEL_AUTO_INDEX)
+        d.*.streamIndexType = 0xFFFFFFFF
+    }
+}
+
+fn drawOf(cb: *CommandBufferObject, indexed: bool, count: u32, instances: u32, first: u32, base: u32, firstInstance: u32) -> void {
+    const d = &cb.*.draw
+    if !cb.*.graphics || d.*.pipeline == 0 || !d.*.rendering || count == 0 || instances == 0 { return }
+    const bound = graphics.graphicsOf(d.*.pipeline)
+    if bound.*.dynamicViewport == false && (d.*.dirty & Dirty.PIPELINE) != 0 { d.*.viewport = bound.*.viewport }
+    if bound.*.dynamicScissor == false && (d.*.dirty & Dirty.PIPELINE) != 0 { d.*.scissor = bound.*.scissor }
+    if bound.*.dynamicBlend == false && (d.*.dirty & Dirty.PIPELINE) != 0 {
+        var k: usize = 0
+        while k < 4 {
+            d.*.blendConstants[k] = bound.*.blendConstants[k]
+            k += 1
+        }
+    }
+    emitState(cb, bound, &d.*.viewport, &d.*.scissor, &d.*.blendConstants, bound.*.targetMask)
+    commands.emitFlush(cb)
+    const layout = pipeline.pipelineLayoutOf(bound.*.layout)
+    if !emitUserData(cb, bound, d.*.sets[0], &cb.*.push, @intCast(usize, layout.*.pushBytes), base, firstInstance) { return }
+    emitDraw(cb, indexed, count, first, instances)
+}
+
+pub fn cmdDraw(buffer: vk.CommandBuffer, vertexCount: u32, instanceCount: u32, firstVertex: u32, firstInstance: u32) -> void {
+    drawOf(commands.bufferOf(buffer), false, vertexCount, instanceCount, 0, firstVertex, firstInstance)
+}
+
+pub fn cmdDrawIndexed(buffer: vk.CommandBuffer, indexCount: u32, instanceCount: u32, firstIndex: u32, vertexOffset: i32, firstInstance: u32) -> void {
+    drawOf(commands.bufferOf(buffer), true, indexCount, instanceCount, firstIndex, @bitCast(u32, vertexOffset), firstInstance)
+}
+
+// ---------------------------------------------------------------------------
+// The clear
+
+var clearWords: [clear.MOST_WORDS]u32 = undefined // (per run)
+
+fn moduleOf(owner: *DeviceObject, words: []const u32, into: *vk.ShaderModule) -> bool {
+    var info = vk.ShaderModuleCreateInfo.init()
+    info.codeSize = words.length * 4
+    info.pCode = words.pointer
+    return pipeline.createShaderModule(@intFromPtr(owner), &info, null, into) == vk.Result.success
+}
+
+// The clear pipeline of target `target`, made when first asked: 0 when it
+// cannot be made.
+fn clearPipeline(owner: *DeviceObject, target: u32) -> usize {
+    if owner.*.clearPipelines[@intCast(usize, target)] != 0 { return owner.*.clearPipelines[@intCast(usize, target)] }
+    const handle = @intFromPtr(owner)
+    if owner.*.clearLayout == 0 {
+        var range = vk.PushConstantRange.init()
+        range.stageFlags = vk.SHADER_STAGE_FRAGMENT_BIT
+        range.offset = 0
+        range.size = 16
+        var info = vk.PipelineLayoutCreateInfo.init()
+        info.pushConstantRangeCount = 1
+        info.pPushConstantRanges = unsafe { @ptrCast([*]const vk.PushConstantRange, &range) }
+        if pipeline.createPipelineLayout(handle, &info, null, &owner.*.clearLayout) != vk.Result.success { return 0 }
+    }
+    var vertexModule: vk.ShaderModule = 0
+    var fragmentModule: vk.ShaderModule = 0
+    const vertexCount = clear.vertex(clearWords[0..])
+    if vertexCount == 0 || !moduleOf(owner, clearWords[0..vertexCount], &vertexModule) { return 0 }
+    const fragmentCount = clear.fragment(target, clearWords[0..])
+    if fragmentCount == 0 || !moduleOf(owner, clearWords[0..fragmentCount], &fragmentModule) {
+        pipeline.destroyShaderModule(handle, vertexModule, null)
+        return 0
+    }
+    var stages: [2]vk.PipelineShaderStageCreateInfo = undefined
+    stages[0] = vk.PipelineShaderStageCreateInfo.init()
+    stages[0].stage = vk.SHADER_STAGE_VERTEX_BIT
+    stages[0].module = vertexModule
+    stages[0].pName = "main".pointer
+    stages[1] = vk.PipelineShaderStageCreateInfo.init()
+    stages[1].stage = vk.SHADER_STAGE_FRAGMENT_BIT
+    stages[1].module = fragmentModule
+    stages[1].pName = "main".pointer
+    var binding = vk.VertexInputBindingDescription.init()
+    binding.binding = 0
+    binding.stride = 8
+    binding.inputRate = vk.VertexInputRate.vertex
+    var attribute = vk.VertexInputAttributeDescription.init()
+    attribute.location = 0
+    attribute.binding = 0
+    attribute.format = vk.Format.r32g32Sfloat
+    attribute.offset = 0
+    var input = vk.PipelineVertexInputStateCreateInfo.init()
+    input.vertexBindingDescriptionCount = 1
+    input.pVertexBindingDescriptions = unsafe { @ptrCast([*]const vk.VertexInputBindingDescription, &binding) }
+    input.vertexAttributeDescriptionCount = 1
+    input.pVertexAttributeDescriptions = unsafe { @ptrCast([*]const vk.VertexInputAttributeDescription, &attribute) }
+    var assembly = vk.PipelineInputAssemblyStateCreateInfo.init()
+    assembly.topology = vk.PrimitiveTopology.triangleStrip
+    var viewportState = vk.PipelineViewportStateCreateInfo.init()
+    viewportState.viewportCount = 1
+    viewportState.scissorCount = 1
+    var raster = vk.PipelineRasterizationStateCreateInfo.init()
+    raster.polygonMode = vk.PolygonMode.fill
+    raster.cullMode = vk.CULL_MODE_NONE
+    raster.frontFace = vk.FrontFace.counterClockwise
+    raster.lineWidth = 1.0
+    var samples = vk.PipelineMultisampleStateCreateInfo.init()
+    samples.rasterizationSamples = vk.SAMPLE_COUNT_1_BIT
+    var blends: [8]vk.PipelineColorBlendAttachmentState = undefined
+    var formats: [8]vk.Format = undefined
+    var k: usize = 0
+    while k < 8 {
+        blends[k] = vk.PipelineColorBlendAttachmentState.init()
+        blends[k].colorWriteMask = if k == @intCast(usize, target) { 0xF } else { 0 }
+        formats[k] = if k == @intCast(usize, target) { vk.Format.r8g8b8a8Unorm } else { vk.Format.undefined_ }
+        k += 1
+    }
+    var blend = vk.PipelineColorBlendStateCreateInfo.init()
+    blend.attachmentCount = target + 1
+    blend.pAttachments = &blends
+    const dynamics = [2]vk.DynamicState{ vk.DynamicState.viewport, vk.DynamicState.scissor }
+    var dynamic = vk.PipelineDynamicStateCreateInfo.init()
+    dynamic.dynamicStateCount = 2
+    dynamic.pDynamicStates = &dynamics
+    var rendering = vk.PipelineRenderingCreateInfo.init()
+    rendering.colorAttachmentCount = target + 1
+    rendering.pColorAttachmentFormats = &formats
+    var info = vk.GraphicsPipelineCreateInfo.init()
+    info.pNext = unsafe { @ptrCast(*const anyopaque, &rendering) }
+    info.stageCount = 2
+    info.pStages = &stages
+    info.pVertexInputState = &input
+    info.pInputAssemblyState = &assembly
+    info.pViewportState = &viewportState
+    info.pRasterizationState = &raster
+    info.pMultisampleState = &samples
+    info.pColorBlendState = &blend
+    info.pDynamicState = &dynamic
+    info.layout = owner.*.clearLayout
+    var made: vk.Pipeline = 0
+    const result = graphics.createGraphicsPipelines(handle, 0, 1, unsafe { @ptrCast([*]const vk.GraphicsPipelineCreateInfo, &info) }, null, unsafe { @ptrCast([*]vk.Pipeline, &made) })
+    pipeline.destroyShaderModule(handle, vertexModule, null)
+    pipeline.destroyShaderModule(handle, fragmentModule, null)
+    if result != vk.Result.success { return 0 }
+    owner.*.clearPipelines[@intCast(usize, target)] = made
+    return made
+}
+
+// The corners of the clear's strip.
+const CORNERS = [8]u32{ 0xBF800000, 0xBF800000, 0x3F800000, 0xBF800000, 0xBF800000, 0x3F800000, 0x3F800000, 0x3F800000 }
+
+// Target `target` cleared to `colour` in `rect` (a drawn rectangle).
+fn clearTarget(cb: *CommandBufferObject, target: u32, colour: *const vk.ClearColorValue, rect: *const vk.ClearRect) -> void {
+    const d = &cb.*.draw
+    if target >= d.*.targetCount || d.*.views[@intCast(usize, target)] == 0 || rect.*.rect.extent.width == 0 || rect.*.rect.extent.height == 0 { return }
+    const made = clearPipeline(ownerOf(cb), target)
+    if made == 0 {
+        cb.*.failed = true
+        return
+    }
+    const bound = graphics.graphicsOf(made)
+    var viewport = vk.Viewport.init()
+    viewport.x = @floatFromInt(f32, rect.*.rect.offset.x)
+    viewport.y = @floatFromInt(f32, rect.*.rect.offset.y)
+    viewport.width = @floatFromInt(f32, rect.*.rect.extent.width)
+    viewport.height = @floatFromInt(f32, rect.*.rect.extent.height)
+    viewport.minDepth = 0.0
+    viewport.maxDepth = 1.0
+    const none = [4]u32{ 0, 0, 0, 0 }
+    d.*.dirty = 0xFFFFFFFF
+    emitState(cb, bound, &viewport, &rect.*.rect, &none, @intCast(u32, 0xF) << @intCast(u5, 4 * target))
+    commands.emitFlush(cb)
+    // the corners' buffer, the colour's block
+    var cornersAddress: u64 = 0
+    const corners = commands.upload(cb, 32, &cornersAddress)
+    if corners == 0 { return }
+    device.copyBytes(corners, @intFromPtr(&CORNERS), 32)
+    const savedAddress = d.*.vertexAddress[0]
+    const savedBytes = d.*.vertexBytes[0]
+    d.*.vertexAddress[0] = cornersAddress
+    d.*.vertexBytes[0] = 32
+    const colourWords: [*]const u32 = unsafe { @ptrCast([*]const u32, colour) }
+    const ok = emitUserData(cb, bound, 0, colourWords, 16, 0, 0)
+    d.*.vertexAddress[0] = savedAddress
+    d.*.vertexBytes[0] = savedBytes
+    if !ok { return }
+    emitDraw(cb, false, 4, 0, 1)
+    // the application's state again before its next draw
+    d.*.dirty = 0xFFFFFFFF
+}
+
+pub fn cmdClearAttachments(buffer: vk.CommandBuffer, count: u32, attachments: ?[*]const vk.ClearAttachment, rectCount: u32, rects: ?[*]const vk.ClearRect) -> void {
+    const cb = commands.bufferOf(buffer)
+    if !cb.*.graphics || !cb.*.draw.rendering { return }
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const a = &attachments.?[k]
+        if a.*.aspectMask == vk.IMAGE_ASPECT_COLOR_BIT {
+            var r: usize = 0
+            while r < @intCast(usize, rectCount) {
+                clearTarget(cb, a.*.colorAttachment, &a.*.clearValue.color, &rects.?[r])
+                r += 1
+            }
+        }
+        k += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The copy of an image into a buffer
+
+pub fn cmdCopyImageToBuffer(buffer: vk.CommandBuffer, sourceImage: vk.Image, layout: vk.ImageLayout, targetBuffer: vk.Buffer, count: u32, regions: ?[*]const vk.BufferImageCopy) -> void {
+    const cb = commands.bufferOf(buffer)
+    const img = image.imageOf(sourceImage)
+    const to = memory.bufferOf(targetBuffer)
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const r = &regions.?[k]
+        const rowLength = if r.*.bufferRowLength == 0 { r.*.imageExtent.width } else { r.*.bufferRowLength }
+        const rowsHeight = if r.*.bufferImageHeight == 0 { r.*.imageExtent.height } else { r.*.bufferImageHeight }
+        _ = rowsHeight
+        var row: u32 = 0
+        while row < r.*.imageExtent.height {
+            const y = @intCast(u64, r.*.imageOffset.y) + @intCast(u64, row)
+            const source = img.*.address + (y * @intCast(u64, img.*.pitch) + @intCast(u64, r.*.imageOffset.x)) * 4
+            const target = to.*.address + r.*.bufferOffset + @intCast(u64, row) * @intCast(u64, rowLength) * 4
+            const bytes = @intCast(u64, r.*.imageExtent.width) * 4
+            if !commands.reserve(cb, 2 + 7 + 7 + 7) { return }
+            const raw = commands.beforeCopy(cb)
+            commands.dmaPacket(cb, 0, source, target, @intCast(u32, bytes) | raw)
+            cb.*.copying = true
+            row += 1
+        }
+        k += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan 1.1's commands of a command buffer
+
+// One device in the group: its mask is 1 (the valid usage), nothing to
+// write.
+pub fn cmdSetDeviceMask(buffer: vk.CommandBuffer, mask: u32) -> void {}
+
+// A base other than 0 needs a pipeline made with VK_PIPELINE_CREATE_
+// DISPATCH_BASE_BIT (the valid usage), which this stage refuses (the host
+// card does not model COMPUTE_START_X): so the base is 0 here.
+pub fn cmdDispatchBase(buffer: vk.CommandBuffer, baseX: u32, baseY: u32, baseZ: u32, x: u32, y: u32, z: u32) -> void {
+    if baseX != 0 || baseY != 0 || baseZ != 0 { return }
+    commands.cmdDispatch(buffer, x, y, z)
+}

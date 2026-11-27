@@ -1,0 +1,230 @@
+// A passive adapter from DisplayPort to HDMI or DVI (a "DP dual mode"
+// adapter, DP++) behind a DisplayPort connector of a Polaris card (DCE
+// 11.2), told apart and asked over the connector's DDC line by the card's
+// I2C engine (gpu_ddc.mlx's Transfer), as Linux 6.6's DRM helper asks it:
+// drivers/gpu/drm/display/drm_dp_dual_mode_helper.c, with its numbers
+// from include/drm/display/drm_dp_dual_mode_helper.h (each held against
+// those files by tools/check_gpu_registers.py).
+//
+// WHEN (gpu_dpwatch.mlx): a monitor on a DisplayPort connector is asked
+// over the AUX channel first; when nothing answers there, this file asks
+// the DDC line. Linux's display core tells the two apart before either by
+// the DDC line's clock pin read as an input (dp_is_sink_present: a native
+// monitor holds it low, an adapter pulls it up); that pin is not switched
+// here (it would be a write of the pins' mask and output enable, with
+// waits for the pad to settle, before every AUX ask): a monitor that
+// answers on the AUX channel is a DisplayPort one, and an adapter does not
+// answer there.
+//
+// WHAT IS READ (drm_dp_dual_mode_detect): the adapter's registers at I2C
+// address 0x40, always from their start, as the helper reads them
+// (drm_dp_dual_mode_read: one byte 0 written, then the register's offset
+// and its size read, the bytes before the offset dropped): the HDMI ID
+// (16 bytes at 00h, up to three reads as Linux's display core reads it);
+// no answer: "not known" (none, or a type 1 DVI adapter, which need not
+// have registers). Then the adapter's ID (10h):
+// 0xA8 with the HDMI ID's text an LSPCON; 0xA0 a type 2 adapter, to HDMI
+// when the HDMI ID is "DP-HDMI ADAPTOR" and 04h, else to DVI; anything
+// else a type 1 adapter (the helper takes 00h and FFh for one and warns
+// for others), to HDMI or DVI by the HDMI ID. The highest TMDS clock
+// (drm_dp_dual_mode_max_tmds_clock): 165 MHz for type 1; for type 2 its
+// register (1Dh) times 2.5 MHz, 165 MHz when it reads 00h or FFh or does
+// not answer.
+// "Not known" with an EDID that answers over the same DDC line is taken
+// as a DVI adapter (ours: the helper leaves that to the driver; the
+// display core's own detection makes one that does not answer at 0x40 a
+// DVI adapter, query_dp_dual_mode_adaptor's DISPLAY_DONGLE_DP_DVI_DONGLE,
+// at 165 MHz). An LSPCON (an active converter) is said and not driven.
+// The connector is then driven as TMDS through its DIG, its kind 13h in
+// the transmitter's blocks, with the adapter's clock as the limit
+// (gpu_mode.mlx's Limit.adapter), HDMI signalling only through one that
+// passes HDMI (decide_signal_from_strap_and_dongle_type: and the card's
+// straps allow it and the monitor's EDID says HDMI).
+//
+// Nothing here waits by itself but by `pause` between the steps of a
+// transfer, as gpu_ddc.mlx's `read` does: for a boot, or for the trap's
+// way back while no EDID is being read on the card (one transfer at a
+// time on the whole I2C engine).
+const scanout = @import("./gpu_display.mlx")
+const ddc = @import("./gpu_ddc.mlx")
+
+// The adapter's I2C address and its registers (drm_dp_dual_mode_helper.c
+// and .h).
+pub const DP_DUAL_MODE_SLAVE_ADDRESS: usize = 0x40
+pub const DP_DUAL_MODE_HDMI_ID: usize = 0x00
+pub const DP_DUAL_MODE_HDMI_ID_LEN: usize = 16
+pub const DP_DUAL_MODE_ADAPTOR_ID: usize = 0x10
+pub const DP_DUAL_MODE_REV_TYPE2: usize = 0x00
+pub const DP_DUAL_MODE_TYPE_TYPE2: usize = 0xA0
+pub const DP_DUAL_MODE_TYPE_HAS_DPCD: usize = 0x08
+pub const DP_DUAL_MODE_MAX_TMDS_CLOCK: usize = 0x1D
+// The HDMI ID of an adapter to HDMI (is_hdmi_adaptor's text and its end
+// mark).
+pub const HDMI_ID = "DP-HDMI ADAPTOR\x04"
+// A type 1 adapter's highest TMDS clock, and the default for a type 2 one
+// (kHz).
+pub const TYPE1_MAX_TMDS_CLOCK: usize = 165000
+// How often the HDMI ID is read before nothing is taken to answer there
+// (link_detection.c's query_dp_dual_mode_adaptor: once, and again while
+// its retry_count of 2 lasts).
+pub const ID_READS: usize = 3
+
+// What is behind the connector (drm_dp_dual_mode_type).
+pub const Dual = enum(u8) { none, unknown, type1_dvi, type1_hdmi, type2_dvi, type2_hdmi, lspcon }
+
+pub const Adapter = struct {
+    dual: Dual
+    // The highest TMDS clock it passes (kHz; 0: none known).
+    clock: usize
+    // What it said: its HDMI ID (read: whether it answered), its ID byte
+    // (read: whether that answered), its clock register (NONE: not read).
+    id: [16]u8
+    idRead: bool
+    adaptorId: usize
+    adaptorRead: bool
+    clockByte: usize
+}
+
+pub const NONE: usize = 0xFFFFFFFF
+
+pub fn nothing() -> Adapter { return Adapter.{ .dual = Dual.none, .clock = 0, .id = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .idRead = false, .adaptorId = 0, .adaptorRead = false, .clockByte = NONE } }
+
+// Whether it is an adapter the connector is driven through as TMDS.
+pub fn passive(a: *const Adapter) -> bool { return a.*.dual == Dual.type1_dvi || a.*.dual == Dual.type1_hdmi || a.*.dual == Dual.type2_dvi || a.*.dual == Dual.type2_hdmi }
+
+// Whether it passes HDMI signalling.
+pub fn passesHdmi(a: *const Adapter) -> bool { return a.*.dual == Dual.type1_hdmi || a.*.dual == Dual.type2_hdmi }
+
+fn isHdmiAdaptor(id: *const [16]u8) -> bool {
+    var k: usize = 0
+    while k < DP_DUAL_MODE_HDMI_ID_LEN {
+        if id.*[k] != HDMI_ID[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+fn isType1Adaptor(id: usize) -> bool { return id == 0 || id == 0xFF }
+
+fn isType2Adaptor(id: usize) -> bool { return id == (DP_DUAL_MODE_TYPE_TYPE2 | DP_DUAL_MODE_REV_TYPE2) }
+
+fn isLspconAdaptor(hdmiId: *const [16]u8, id: usize) -> bool { return isHdmiAdaptor(hdmiId) && id == (DP_DUAL_MODE_TYPE_TYPE2 | DP_DUAL_MODE_TYPE_HAS_DPCD) }
+
+// What the reads are lent: the card, the I2C engine's hands, a pause
+// (microseconds), the connector's DDC line, the card's count of lines and
+// its crystal (gpu_ddc.mlx's `read` takes the same).
+pub const Lent = struct {
+    card: *const scanout.Card
+    hands: *const ddc.Hands
+    pause: fn(usize) -> void
+    wire: *const ddc.Wire
+    lines: usize
+    crystal: usize
+}
+
+// `size` of the adapter's registers from `offset` read into `into`
+// (drm_dp_dual_mode_read: from the start, the first `offset` bytes
+// dropped). Whether the transfer went through.
+fn read(lent: *const Lent, offset: usize, size: usize, into: []u8) -> bool {
+    if lent.*.wire.*.line == ddc.NONE || !lent.*.wire.*.hardware { return false }
+    var t: ddc.Transfer = undefined
+    t.begin(lent.*.wire.*.line, lent.*.lines, lent.*.crystal)
+    t.write(DP_DUAL_MODE_SLAVE_ADDRESS, 0)
+    t.read(DP_DUAL_MODE_SLAVE_ADDRESS, offset + size)
+    const pause = lent.*.pause
+    while true {
+        const next = t.step(lent.*.card, lent.*.hands, true)
+        if next == ddc.Next.done { break }
+        if next == ddc.Next.wait { pause(t.pause) }
+    }
+    if !t.succeeded() || t.got < offset + size { return false }
+    var k: usize = 0
+    while k < size && k < into.length {
+        into[k] = t.received[offset + k]
+        k += 1
+    }
+    return true
+}
+
+// The adapter behind the connector asked (the file's head). The HDMI ID
+// is read up to ID_READS times: Linux's display core, the driver of this
+// card, reads it again twice when it does not answer ("passive HDMI
+// dongles can sometimes fail here without retrying", link_detection.c's
+// query_dp_dual_mode_adaptor), and an adapter taken for none at its
+// first read would be driven as DVI at 165 MHz.
+pub fn detect(lent: *const Lent) -> Adapter {
+    var a = nothing()
+    var reads: usize = 0
+    while !a.idRead && reads < ID_READS {
+        a.idRead = read(lent, DP_DUAL_MODE_HDMI_ID, DP_DUAL_MODE_HDMI_ID_LEN, a.id[0..])
+        reads += 1
+    }
+    if !a.idRead {
+        a.dual = Dual.unknown
+        return a
+    }
+    var one: [1]u8 = undefined
+    a.adaptorRead = read(lent, DP_DUAL_MODE_ADAPTOR_ID, 1, one[0..])
+    if a.adaptorRead {
+        a.adaptorId = @intCast(usize, one[0])
+        if isLspconAdaptor(&a.id, a.adaptorId) {
+            a.dual = Dual.lspcon
+            return a
+        }
+        if isType2Adaptor(a.adaptorId) {
+            a.dual = if isHdmiAdaptor(&a.id) { Dual.type2_hdmi } else { Dual.type2_dvi }
+            // drm_dp_dual_mode_max_tmds_clock.
+            a.clock = TYPE1_MAX_TMDS_CLOCK
+            if read(lent, DP_DUAL_MODE_MAX_TMDS_CLOCK, 1, one[0..]) {
+                a.clockByte = @intCast(usize, one[0])
+                if a.clockByte != 0 && a.clockByte != 0xFF { a.clock = a.clockByte * 5000 / 2 }
+            }
+            return a
+        }
+    }
+    a.dual = if isHdmiAdaptor(&a.id) { Dual.type1_hdmi } else { Dual.type1_dvi }
+    a.clock = TYPE1_MAX_TMDS_CLOCK
+    return a
+}
+
+// "Not known" with an EDID that answered on the same line: a type 1 DVI
+// adapter (the file's head).
+pub fn takenAsDvi(a: *Adapter) -> void {
+    if a.*.dual != Dual.unknown { return }
+    a.*.dual = Dual.type1_dvi
+    a.*.clock = TYPE1_MAX_TMDS_CLOCK
+}
+
+pub fn dualText(dual: Dual) -> []const u8 {
+    return match dual {
+        .none => "none",
+        .unknown => "nothing that answers at its address",
+        .type1_dvi => "a passive adapter to DVI (DP dual mode, type 1)",
+        .type1_hdmi => "a passive adapter to HDMI (DP dual mode, type 1)",
+        .type2_dvi => "a passive adapter to DVI (DP dual mode, type 2)",
+        .type2_hdmi => "a passive adapter to HDMI (DP dual mode, type 2)",
+        .lspcon => "an active converter (LSPCON)"
+    }
+}
+
+// What the adapter said, after "gpu: connector 1 (DisplayPort): ": "a
+// passive adapter to HDMI (DP dual mode, type 2) (its ID 0xa0, 300000 kHz
+// at most): the connector is taken for one that sends TMDS (HDMI or DVI,
+// by what the monitor's EDID says) through its DIG" (whether a monitor is
+// driven there is said when its EDID is read).
+pub fn say(card: *const scanout.Card, a: *const Adapter) -> void {
+    card.say(dualText(a.*.dual))
+    if a.*.dual == Dual.lspcon {
+        card.say(": it is not driven (no path of this driver's leads through one)\n")
+        return
+    }
+    card.say(" (")
+    if a.*.adaptorRead {
+        card.fieldHex("its ID ", a.*.adaptorId)
+        card.say(", ")
+    }
+    card.field("", a.*.clock)
+    card.say(" kHz at most): the connector is taken for one that sends TMDS (")
+    card.say(if passesHdmi(a) { "HDMI or DVI, by what the monitor's EDID says" } else { "DVI" })
+    card.say(") through its DIG\n")
+}

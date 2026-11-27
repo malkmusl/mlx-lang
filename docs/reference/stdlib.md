@@ -1762,7 +1762,7 @@ length, leaving out what does not fit `capacity` (a number's leading
 digits are kept). A number's digits are written straight into the line,
 last first, so none of them takes the compiler's value arena either
 (an array of digits of their own, handed to `append` as a slice, took
-24 bytes of it a number; `tests/485_std_drawing_arena_runtime.mlx`
+24 bytes of it a number; `tests/525_std_drawing_arena_runtime.mlx`
 compares every length at every capacity with that code).
 
 Two argument-passing surfaces coexist: an explicit `Argument` (tagged

@@ -1,0 +1,209 @@
+// The kernel's random numbers (random_fill and the Linux layer's
+// getrandom): a generator on ChaCha20's block function (RFC 8439, 2.3),
+// keyed at boot from the processor's own source of random numbers (RDSEED
+// where it has one, else RDRAND), with the time-stamp counter and the
+// clock mixed in. (The 16 bytes a program is started with are not from
+// here: process.mlx makes them of the time-stamp counter, and nothing
+// of std's takes a secret from them.)
+//
+// A key made of what the processor's source gave is fit for secrets: a
+// TLS key drawn from this generator cannot be worked out by someone who
+// watches the connection. A processor without such a source leaves the
+// time-stamp counter and the clock alone, which someone can search
+// through: the generator still gives numbers that differ from boot to
+// boot, and says that they are not fit for secrets (`fit`; system_info
+// passes it on, and a program that is about to send a secret asks).
+//
+// Every request takes a block of its own to make the key anew before it
+// is answered (the key that made an answer is gone when the answer is
+// given: what was given before cannot be worked out from the generator
+// as it is later), and the time-stamp counter at the request goes into
+// the block's nonce.
+//
+// Nothing here is the kernel's alone (no port, no instruction): the
+// kernel's part is cpu.mlx, which asks the processor. So this builds on
+// the host too (tests/488).
+
+// What the generator is keyed from.
+pub const Seed = struct {
+    // Four words of the processor's source, and whether it gave them
+    // (false: it has none, or it gave nothing that can be told from a
+    // source that is stuck).
+    processor: [4]usize
+    fromProcessor: bool
+    // The time-stamp counter and the clock's seconds at boot.
+    counter: usize
+    clock: usize
+}
+
+const MASK: usize = 0xFFFFFFFF
+
+fn rotate(value: usize, by: usize) -> usize { return ((value << by) | (value >> (32 - by))) & MASK }
+
+fn quarter(x: *[16]usize, a: usize, b: usize, c: usize, d: usize) -> void {
+    x.*[a] = (x.*[a] + x.*[b]) & MASK
+    x.*[d] = rotate(x.*[d] ^ x.*[a], 16)
+    x.*[c] = (x.*[c] + x.*[d]) & MASK
+    x.*[b] = rotate(x.*[b] ^ x.*[c], 12)
+    x.*[a] = (x.*[a] + x.*[b]) & MASK
+    x.*[d] = rotate(x.*[d] ^ x.*[a], 8)
+    x.*[c] = (x.*[c] + x.*[d]) & MASK
+    x.*[b] = rotate(x.*[b] ^ x.*[c], 7)
+}
+
+// ChaCha20's block function: the 64 bytes of the block `counter` under
+// `key` (eight words of 32 bits) and `nonce` (three), into `out`.
+pub fn block(key: *const [8]usize, counter: usize, nonce: *const [3]usize, out: *[64]u8) -> void {
+    var state: [16]usize = undefined
+    // "expand 32-byte k"
+    state[0] = 0x61707865
+    state[1] = 0x3320646e
+    state[2] = 0x79622d32
+    state[3] = 0x6b206574
+    var k: usize = 0
+    while k < 8 {
+        state[4 + k] = key.*[k] & MASK
+        k += 1
+    }
+    state[12] = counter & MASK
+    state[13] = nonce.*[0] & MASK
+    state[14] = nonce.*[1] & MASK
+    state[15] = nonce.*[2] & MASK
+    var x: [16]usize = state
+    var round: usize = 0
+    while round < 10 {
+        quarter(&x, 0, 4, 8, 12)
+        quarter(&x, 1, 5, 9, 13)
+        quarter(&x, 2, 6, 10, 14)
+        quarter(&x, 3, 7, 11, 15)
+        quarter(&x, 0, 5, 10, 15)
+        quarter(&x, 1, 6, 11, 12)
+        quarter(&x, 2, 7, 8, 13)
+        quarter(&x, 3, 4, 9, 14)
+        round += 1
+    }
+    k = 0
+    while k < 16 {
+        const word = (x[k] + state[k]) & MASK
+        out.*[k * 4] = @intCast(u8, word & 255)
+        out.*[k * 4 + 1] = @intCast(u8, (word >> 8) & 255)
+        out.*[k * 4 + 2] = @intCast(u8, (word >> 16) & 255)
+        out.*[k * 4 + 3] = @intCast(u8, (word >> 24) & 255)
+        k += 1
+    }
+}
+
+fn word(bytes: *const [64]u8, at: usize) -> usize {
+    return @intCast(usize, bytes.*[at]) | (@intCast(usize, bytes.*[at + 1]) << 8) | (@intCast(usize, bytes.*[at + 2]) << 16) | (@intCast(usize, bytes.*[at + 3]) << 24)
+}
+
+// Whether four words are what a source of random numbers gives, as far
+// as can be told: not all the same, none of them all zeros or all ones
+// (a source that is stuck gives those: processors have).
+pub fn plausible(words: *const [4]usize) -> bool {
+    var same = true
+    var k: usize = 0
+    while k < 4 {
+        if words.*[k] == 0 || words.*[k] == 0xFFFFFFFFFFFFFFFF { return false }
+        if words.*[k] != words.*[0] { same = false }
+        k += 1
+    }
+    return !same
+}
+
+pub const Generator = struct {
+    key: [8]usize
+    // The requests answered so far: a part of each request's nonce.
+    requests: usize
+    // Whether the key is made of what the processor's source gave: the
+    // numbers are fit for secrets.
+    fit: bool
+
+    // The generator keyed from `seed`.
+    pub fn init(self: *Self, seed: *const Seed) -> void {
+        self.*.fit = seed.*.fromProcessor && plausible(&seed.*.processor)
+        var k: usize = 0
+        while k < 4 {
+            // (Without the processor's words the key is the counter and
+            // the clock spread over its words.)
+            const given = if self.*.fit { seed.*.processor[k] } else { (seed.*.counter +% k *% 0x9E3779B97F4A7C15) ^ (seed.*.clock << (k * 8)) }
+            self.*.key[k * 2] = given & MASK
+            self.*.key[k * 2 + 1] = (given >> 32) & MASK
+            k += 1
+        }
+        self.*.requests = 0
+        // The counter and the clock mixed in, and the key no longer the
+        // words as they came.
+        self.rekey(seed.*.counter, seed.*.clock)
+    }
+
+    // The key made anew from itself, the request's number and what the
+    // caller mixes in; what is left of that block (32 bytes) in `rest`.
+    fn step(self: *Self, first: usize, second: usize, rest: *[64]u8) -> void {
+        const nonce = [3]usize{ first & MASK, ((first >> 32) ^ second) & MASK, self.*.requests & MASK }
+        block(&self.*.key, 0, &nonce, rest)
+        var k: usize = 0
+        while k < 8 {
+            self.*.key[k] = word(rest, k * 4)
+            k += 1
+        }
+        self.*.requests += 1
+    }
+
+    fn rekey(self: *Self, first: usize, second: usize) -> void {
+        var scratch: [64]u8 = undefined
+        self.step(first, second, &scratch)
+        var k: usize = 0
+        while k < 64 {
+            scratch[k] = 0
+            k += 1
+        }
+    }
+
+    // `length` random bytes into `into`. `moment`: the time-stamp
+    // counter now (mixed in; anything else changes nothing for the
+    // worse).
+    pub fn fill(self: *Self, into: [*]u8, length: usize, moment: usize) -> void {
+        var stream: [64]u8 = undefined
+        // The key for this answer; the generator's own key is the next
+        // one already.
+        var key: [8]usize = self.*.key
+        self.step(moment, length, &stream)
+        const nonce = [3]usize{ moment & MASK, (moment >> 32) & MASK, self.*.requests & MASK }
+        var done: usize = 0
+        var counter: usize = 1
+        while done < length {
+            block(&key, counter, &nonce, &stream)
+            var k: usize = 0
+            while k < 64 && done < length {
+                into[done] = stream[k]
+                done += 1
+                k += 1
+            }
+            counter += 1
+        }
+        var k: usize = 0
+        while k < 64 {
+            stream[k] = 0
+            k += 1
+        }
+        k = 0
+        while k < 8 {
+            key[k] = 0
+            k += 1
+        }
+    }
+
+    // A random word.
+    pub fn next(self: *Self, moment: usize) -> usize {
+        var bytes: [8]u8 = undefined
+        self.fill(&bytes, 8, moment)
+        var value: usize = 0
+        var k: usize = 0
+        while k < 8 {
+            value = (value << 8) | @intCast(usize, bytes[k])
+            k += 1
+        }
+        return value
+    }
+}

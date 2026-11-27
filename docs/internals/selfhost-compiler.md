@@ -383,7 +383,7 @@ written, does not reach into one; the lowering's own `expressionType`
 still gives every array's slice the type `[]T`. A slice of a module-level
 constant table is a slice of its image, which is in the program's code
 (`ir/lower.mlx`, `constantImageFor`;
-`tests/483_constant_table_addresses_runtime.mlx`): a generic body that
+`tests/523_constant_table_addresses_runtime.mlx`): a generic body that
 stores through one faults there, as a store into a string literal's bytes
 does, instead of changing the table for every reader.
 

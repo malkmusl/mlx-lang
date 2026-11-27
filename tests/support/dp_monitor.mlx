@@ -1,0 +1,878 @@
+// A monitor on a DisplayPort output of a Radeon that is a table, for the
+// tests of the kernel's DisplayPort link (tests/480_gpu_dp_sequence_
+// runtime.mlx and 481_gpu_dp_link_runtime.mlx). The card is
+// tests/support/tmds_card.mlx's (its registers by number, its list of
+// every write, its tables that write down what they were told, its log);
+// this file puts behind it:
+// - the AUX channel's registers as an engine that does what the card's
+//   does as far as the driver can tell: the software's request for the
+//   registers, the bytes of a request written one by one, the start, the
+//   status with its "done" and its count of reply bytes, the reply read
+//   back a byte a read. It answers only when it is switched on, its pins
+//   are the hardware's and in AUX mode, the software holds its registers
+//   and the hot plug line it watches reads high;
+// - the monitor: its own registers (the DPCD) by address, an EDID behind
+//   the channel's I2C bridge, and lanes that recover the card's clock and
+//   lock or do not, by what the card sends: the transmitter on at the
+//   rate and lanes the monitor was told (what the transmitter's table was
+//   last told), the training pattern in the back end's register, and the
+//   lanes' drive (what the table's drive call was last told) against what
+//   each lane needs;
+// - a frame counter that runs by the DTO's phase, and a stream whose
+//   state follows what was asked for.
+// Every AUX transaction is written down (the request's bytes, the reply)
+// and marked in the card's list of writes at its place (`EVENT` and its
+// number), so that a test holds writes, table runs and transactions in
+// one order. Every write to an AUX register is written down beside.
+//
+// What the monitor and the channel can be made to do wrong is a variable
+// each, below. Nothing of a real card's ROM or a real monitor is in here.
+const scanout = @import("../../projects/brix/kernel/gpu_display.mlx")
+const atom = @import("../../projects/brix/kernel/atom.mlx")
+const card = @import("./tmds_card.mlx")
+const rom = @import("./atom_rom.mlx")
+
+pub const NEVER: usize = 0xFFFFFFFF
+// The mark of a transaction in the card's list of writes.
+pub const EVENT: usize = 0x7F20
+
+// The AUX channels' registers (channel 0's; 0x1C a channel), the pads'
+// two calibration words, the DDC lines' pin words (four a line).
+const AUX: usize = 0x5C00
+const AUX_STEP: usize = 0x1C
+const AUX_BLOCK: usize = 0x0C
+const IMPCAL_P: usize = 0x483B
+const IMPCAL_N: usize = 0x483C
+const PINS: usize = 0x4868
+
+// Where the output is: the back end (the transmitter's number), the hot
+// plug line and the AUX channel the board wires to it (both counted from
+// 0).
+pub var backEnd: usize = 1
+pub var line: usize = 1
+pub var channel: usize = 1
+
+// The monitor's own registers.
+pub const DPCD: usize = 0x2300
+pub var dpcd: [DPCD]u8 = undefined
+// Its EDID (two blocks) behind the I2C bridge, and where the bridge's
+// read stands.
+pub var edid: [256]u8 = undefined
+var segment: usize = 0
+var offset: usize = 0
+
+// The transmitter as its table was last told: on, the rate, the lanes,
+// the lanes' drive.
+pub var txOn = false
+pub var txCode: usize = 0
+pub var txLanes: usize = 0
+pub var txSwing: usize = 0
+pub var txPre: usize = 0
+// Each lane: its clock recovered, equalised and locked.
+pub var clockOf: [4]bool = undefined
+pub var lockOf: [4]bool = undefined
+
+// What the lanes need and how they ask. A lane's clock comes when the
+// card's swing is this at least (4: never); it locks when the
+// pre-emphasis is this at least.
+pub var needSwing: [4]usize = undefined
+pub var needPre: [4]usize = undefined
+// A lane asks for one step more than it is given (else for what it
+// needs at once); it asks for the swing it is given and never recovers.
+pub var stepwise = false
+pub var stubborn = false
+// A lane asks for this swing whatever it is given and whatever it needs
+// (NEVER: by the rules above).
+pub var asksSwing: [4]usize = undefined
+// Clock recovery is lost on this lane when the equalisation's pattern
+// comes (4: on none).
+pub var losesClockIn: usize = 4
+// The equalisation comes in the round of this number at the earliest
+// (counted from 1).
+pub var lockAfter: usize = 1
+// The cable carries this rate at most and this many lanes.
+pub var cableRate: usize = 0x1E
+pub var cableLanes: usize = 4
+// The lanes drop when the training's pattern is taken off; the lanes
+// drop at the status read of this number (counted from 0, every read
+// that covers 202h).
+pub var dropsAtExit = false
+pub var dropsAtRead: usize = NEVER
+pub var statusReads: usize = 0
+// The transmitter's drive call does nothing.
+pub var driveDeaf = false
+// The lanes stay locked but the monitor says they are not aligned, until
+// it is told a training pattern again (tests/510_gpu_dp_switch_runtime.
+// mlx: a link lost that way).
+pub var unaligned = false
+// What the lanes need and do wrong above holds at this rate alone (0:
+// at every rate): a monitor that is hard to train at the new rate and
+// trains at once at the firmware's.
+pub var faultRate: usize = 0
+
+// What the driver's waits came to, each the least there was (NEVER:
+// none yet), in nanoseconds of the card's clock: from the monitor told
+// a pattern or a drive to its status read, in clock recovery and in the
+// equalisation; from the pattern taken off to the read of 200h; from
+// the monitor woken (600h = 1) to the next transaction; between two
+// tries of one request when the first was put off. And the clock at
+// each time the transmitter was turned on, and how often.
+pub var leastClockWait: usize = NEVER
+pub var leastEqualiseWait: usize = NEVER
+pub var holdsWaited: usize = NEVER
+pub var wokeWaited: usize = NEVER
+pub var leastRetryGap: usize = NEVER
+pub var turnedOnAt: [16]usize = undefined
+pub var turnedOn: usize = 0
+// The least time the transmitter was off before it was turned on again.
+pub var leastOff: usize = NEVER
+var turnedOffAt: usize = NEVER
+// How often the channel's status was looked at since the last start.
+pub var statusLooks: usize = 0
+var toldAt: usize = 0
+var exitAt: usize = 0
+var wokeAt: usize = NEVER
+var lastAt: usize = 0
+var lastPutOff = false
+
+// What the channel can be made to do wrong (transactions are counted
+// from 0).
+// No answer to these transactions (the status says "done" and a
+// timeout); the channel never says "done" for them.
+pub var silentFrom: usize = NEVER
+pub var silentUntil: usize = NEVER
+pub var deadFrom: usize = NEVER
+pub var deadUntil: usize = NEVER
+// An answer that is none to this one.
+pub var noiseAt: usize = NEVER
+// The monitor puts off the first so many tries of every access to its
+// registers; gives one byte fewer than asked at the first answer of a
+// read.
+pub var putsOff: usize = 0
+pub var shortFirst = false
+// It refuses a write to this address.
+pub var refuses: usize = NEVER
+// "Done" shows after so many looks at the status.
+pub var lateBy: usize = 0
+// The card's microcontroller holds the channel; the software never gets
+// it; the byte count does not hold.
+pub var microcontroller = false
+pub var neverGranted = false
+pub var countDeaf = false
+// The I2C side: puts off so many transactions; gives so many bytes a
+// read at most; knows no EDID.
+pub var i2cPutsOff: usize = 0
+pub var i2cChunk: usize = 16
+pub var i2cDeaf = false
+// The data word's bits that are no field read as these.
+pub var dataNoise: usize = 0
+
+// The engine's state.
+var holder: usize = 0
+var status: usize = 0
+var lateLeft: usize = 0
+var reading = false
+var tx: [32]u8 = undefined
+var txAt: usize = 0
+var rx: [32]u8 = undefined
+var rxCount: usize = 0
+var rxAt: usize = 0
+var dataWord: usize = 0
+var repeats: usize = 0
+var eqRounds: usize = 0
+var lastPattern: usize = 0
+
+// Every transaction: the first byte (the command and the address's top),
+// the address, the length asked for or sent (NEVER: none in the request),
+// how many bytes the request had, the data sent, and the reply's bytes.
+pub const TRANSACTIONS: usize = 4096
+pub var headOf: [TRANSACTIONS]u8 = undefined
+pub var addressOf: [TRANSACTIONS]usize = undefined
+pub var lengthOf: [TRANSACTIONS]usize = undefined
+pub var sentOf: [TRANSACTIONS]usize = undefined
+pub var dataOf: [TRANSACTIONS * 16]u8 = undefined
+pub var replyOf: [TRANSACTIONS]u8 = undefined
+pub var repliedOf: [TRANSACTIONS]usize = undefined
+pub var transactions: usize = 0
+
+// Every write to an AUX register (the channel's, the calibration's, the
+// pins'), in order; and writes the channel made to anything else.
+pub const AUX_WRITES: usize = 16384
+pub var auxTo: [AUX_WRITES]usize = undefined
+pub var auxWith: [AUX_WRITES]usize = undefined
+pub var auxWritten: usize = 0
+pub var strayWrites: usize = 0
+
+fn base() -> usize { return AUX + AUX_STEP * channel }
+
+fn isAux(number: usize) -> bool {
+    if number == IMPCAL_P || number == IMPCAL_N { return true }
+    if number >= PINS && number < PINS + 24 { return true }
+    return number >= AUX && number < AUX + AUX_STEP * 6
+}
+
+fn dropLock() -> void {
+    var k: usize = 0
+    while k < 4 {
+        clockOf[k] = false
+        lockOf[k] = false
+        k += 1
+    }
+}
+
+// The lanes judged, when the monitor is told a pattern or a drive: by
+// what the card sends (the file's head).
+fn judge() -> void {
+    const told = @intCast(usize, dpcd[0x102]) & 0x0F
+    if told == 0 {
+        exitAt = card.clock
+        if dropsAtExit && (faultRate == 0 || txCode == faultRate) { dropLock() }
+        return
+    }
+    unaligned = false
+    const pattern = if told == 7 { 4 } else { told }
+    const faulty = faultRate == 0 || txCode == faultRate
+    toldAt = card.clock
+    if pattern != lastPattern { eqRounds = 0 }
+    lastPattern = pattern
+    if pattern != 1 { eqRounds += 1 }
+    const sent = (card.raw(scanout.DIG[backEnd] + 0xB0) & 3) + 1
+    const lanes = @intCast(usize, dpcd[0x101]) & 0x1F
+    const awake = @intCast(usize, dpcd[0x600]) == 1
+    const carried = txOn && awake && @intCast(usize, dpcd[0x100]) == txCode && lanes == txLanes && txCode <= cableRate && lanes <= cableLanes && sent == pattern
+    var k: usize = 0
+    while k < 4 {
+        // (The monitor was told the drive the card has.)
+        const said = @intCast(usize, dpcd[0x103 + k])
+        const honest = said & 3 == txSwing && (said >> 3) & 3 == txPre
+        const there = carried && k < lanes && honest
+        if pattern == 1 {
+            clockOf[k] = there && (!faulty || (!stubborn && txSwing >= needSwing[k]))
+            lockOf[k] = false
+        } else {
+            if !there || (faulty && k == losesClockIn) { clockOf[k] = false }
+            lockOf[k] = clockOf[k] && (!faulty || (txPre >= needPre[k] && eqRounds >= lockAfter))
+        }
+        k += 1
+    }
+}
+
+// How often the event status indicators (2002h to 200Fh) were read
+// (tests/514_gpu_dp_adapter_runtime.mlx).
+pub var esiReads: usize = 0
+
+// A byte of the monitor's registers as it reads now. The event status
+// indicators stand for what they mirror (drm_dp.h: 2002h, 2003h for 200h,
+// 201h; 200Ch to 200Fh for 202h to 205h).
+fn registerByte(address: usize) -> u8 {
+    const lanes = @intCast(usize, dpcd[0x101]) & 0x1F
+    if address == 0x2002 || address == 0x2003 { return registerByte(address - 0x1E02) }
+    if address >= 0x200C && address <= 0x200F { return registerByte(address - 0x1E0A) }
+    if address == 0x200 { return 1 }
+    if address == 0x202 || address == 0x203 {
+        const first = (address - 0x202) * 2
+        var byte: usize = 0
+        var k: usize = 0
+        while k < 2 {
+            var half: usize = 0
+            if clockOf[first + k] { half = half | 1 }
+            if lockOf[first + k] { half = half | 6 }
+            byte = byte | (half << @intCast(u6, 4 * k))
+            k += 1
+        }
+        return @intCast(u8, byte)
+    }
+    if address == 0x204 {
+        var all = lanes != 0
+        var k: usize = 0
+        while k < lanes && k < 4 {
+            if !lockOf[k] { all = false }
+            k += 1
+        }
+        return if all && !unaligned { 0x01 } else { 0x00 }
+    }
+    if address == 0x205 { return if lockOf[0] { 0x01 } else { 0x00 } }
+    if address == 0x206 || address == 0x207 {
+        const first = (address - 0x206) * 2
+        var byte: usize = 0
+        var k: usize = 0
+        while k < 2 {
+            const lane = first + k
+            const faulty = faultRate == 0 || txCode == faultRate
+            var swing = txSwing
+            if faulty && !clockOf[lane] && !stubborn {
+                swing = if stepwise { txSwing + 1 } else { needSwing[lane] }
+                if swing > 3 { swing = 3 }
+            }
+            if faulty && asksSwing[lane] != NEVER { swing = asksSwing[lane] }
+            var pre = if needPre[lane] > 3 { 3 } else { needPre[lane] }
+            if !faulty { pre = txPre }
+            byte = byte | ((swing | (pre << 2)) << @intCast(u6, 4 * k))
+            k += 1
+        }
+        return @intCast(u8, byte)
+    }
+    return if address < DPCD { dpcd[address] } else { 0 }
+}
+
+// The monitor's answer to the request in `tx` (`bytes` of them), into
+// `rx`.
+fn answer(bytes: usize) -> void {
+    const command = @intCast(usize, tx[0]) >> 4
+    const address = ((@intCast(usize, tx[0]) & 0xF) << 16) | (@intCast(usize, tx[1]) << 8) | @intCast(usize, tx[2])
+    const length = if bytes >= 4 { @intCast(usize, tx[3]) + 1 } else { 0 }
+    rxCount = 1
+    rx[0] = 0x00
+    if command == 0x9 || command == 0x8 {
+        if repeats < putsOff {
+            rx[0] = 0x20
+            return
+        }
+        if command == 0x9 {
+            var give = length
+            if shortFirst && repeats == putsOff && length > 1 { give = length - 1 }
+            if address <= 0x200C && address + length > 0x200C { esiReads += 1 }
+            if address <= 0x202 && address + length > 0x202 {
+                if statusReads == dropsAtRead { dropLock() }
+                statusReads += 1
+                const waited = card.clock - toldAt
+                const told = @intCast(usize, dpcd[0x102]) & 0x0F
+                if address == 0x202 && told == 1 && waited < leastClockWait { leastClockWait = waited }
+                if address == 0x202 && told > 1 && waited < leastEqualiseWait { leastEqualiseWait = waited }
+                if address == 0x200 { holdsWaited = card.clock - exitAt }
+            }
+            var k: usize = 0
+            while k < give {
+                rx[1 + k] = registerByte(address + k)
+                k += 1
+            }
+            rxCount = 1 + give
+            return
+        }
+        if address == refuses {
+            rx[0] = 0x10
+            return
+        }
+        var k: usize = 0
+        while k < length && address + k < DPCD {
+            dpcd[address + k] = tx[4 + k]
+            k += 1
+        }
+        if address <= 0x600 && address + length > 0x600 && @intCast(usize, dpcd[0x600]) == 2 { dropLock() }
+        if address == 0x600 && @intCast(usize, dpcd[0x600]) == 1 { wokeAt = card.clock }
+        if address <= 0x106 && address + length > 0x102 { judge() }
+        return
+    }
+    // The I2C bridge: a write, a read or a question how far a write has
+    // come, to the EDID's address or its segment's.
+    const kind = command & 3
+    if i2cDeaf || (address != 0x50 && address != 0x30) {
+        rx[0] = 0x40
+        return
+    }
+    if length != 0 && i2cPutsOff != 0 {
+        i2cPutsOff -= 1
+        rx[0] = 0x80
+        return
+    }
+    if kind == 0 && length != 0 {
+        if address == 0x30 { segment = @intCast(usize, tx[4]) } else { offset = @intCast(usize, tx[4]) }
+    }
+    if kind == 1 && length != 0 {
+        const give = if length < i2cChunk { length } else { i2cChunk }
+        var k: usize = 0
+        while k < give {
+            rx[1 + k] = edid[(segment * 256 + offset + k) % 256]
+            k += 1
+        }
+        offset += give
+        rxCount = 1 + give
+    }
+}
+
+// The channel started: the request written down, and answered or not.
+fn start() -> void {
+    const at = base()
+    const bytes = (card.raw(at + 1) >> 16) & 0x1F
+    const control = card.raw(at)
+    const pins = card.raw(PINS + 4 * channel)
+    const t = transactions
+    const length = if bytes >= 4 { @intCast(usize, tx[3]) + 1 } else { NEVER }
+    const address = ((@intCast(usize, tx[0]) & 0xF) << 16) | (@intCast(usize, tx[1]) << 8) | @intCast(usize, tx[2])
+    if t != 0 && t - 1 < TRANSACTIONS && headOf[t - 1] == tx[0] && addressOf[t - 1] == address && lengthOf[t - 1] == length { repeats += 1 } else { repeats = 0 }
+    if t < TRANSACTIONS {
+        headOf[t] = tx[0]
+        addressOf[t] = address
+        lengthOf[t] = length
+        sentOf[t] = bytes
+        var k: usize = 0
+        while k < 16 {
+            dataOf[t * 16 + k] = if 4 + k < bytes { tx[4 + k] } else { 0 }
+            k += 1
+        }
+        replyOf[t] = 0xFF
+        repliedOf[t] = 0
+    }
+    transactions += 1
+    card.note(EVENT, t)
+    if wokeAt != NEVER && address != 0x600 {
+        if card.clock - wokeAt < wokeWaited { wokeWaited = card.clock - wokeAt }
+        wokeAt = NEVER
+    }
+    if repeats != 0 && lastPutOff && card.clock - lastAt < leastRetryGap { leastRetryGap = card.clock - lastAt }
+    lastAt = card.clock
+    lastPutOff = false
+    statusLooks = 0
+    rxCount = 0
+    rxAt = 0
+    lateLeft = 0
+    // Not switched on, pins that are not the hardware's or not in AUX
+    // mode: nothing goes out and nothing comes.
+    if control & 1 == 0 || pins & 0x101 != 0 || pins & 0x10000 == 0 || (t >= deadFrom && t < deadUntil) {
+        status = 0
+        return
+    }
+    const watched = (control >> 20) & 7
+    if card.raw(0x1898 + 8 * watched) & 2 == 0 {
+        status = 0x201
+        return
+    }
+    if t >= silentFrom && t < silentUntil {
+        status = 0x81
+        return
+    }
+    if t == noiseAt {
+        // (A stop that is none, and a byte that looks like "taken"
+        // behind it: only the status says that it is no answer.)
+        rx[0] = 0x00
+        rxCount = 1
+        status = 0x4001 | (1 << 24)
+        return
+    }
+    answer(bytes)
+    lastPutOff = @intCast(usize, rx[0]) == 0x20 || @intCast(usize, rx[0]) == 0x80
+    if t < TRANSACTIONS {
+        replyOf[t] = rx[0]
+        repliedOf[t] = rxCount
+    }
+    status = 1 | (rxCount << 24)
+    lateLeft = lateBy
+}
+
+// The card read: an AUX register by the engine, the frame counter of a
+// controller whose clock is the DTO's, a stream's state; else the card's
+// own.
+pub fn read(number: usize) -> u32 {
+    const at = base()
+    if number == at + 2 {
+        const who = if microcontroller { 2 } else { holder }
+        return @intCast(u32, (card.raw(number) & ~@intCast(usize, 0xC)) | (who << 2))
+    }
+    if number == at + 4 {
+        statusLooks += 1
+        if lateLeft != 0 {
+            lateLeft -= 1
+            return @intCast(u32, status & ~@intCast(usize, 1))
+        }
+        return @intCast(u32, status)
+    }
+    if number == at + 6 {
+        if !reading { return @intCast(u32, dataWord | dataNoise) }
+        const byte = if rxAt < rxCount { @intCast(usize, rx[rxAt]) } else { 0 }
+        rxAt += 1
+        return @intCast(u32, (dataWord & ~@intCast(usize, 0xFF00)) | (byte << 8) | dataNoise)
+    }
+    var value = @intCast(usize, card.read(number))
+    var c: usize = 0
+    while c < 6 {
+        if number == scanout.OFFSETS[c] + 0x1BA6 && card.raw(0x140 + 4 * c) & 0x10 != 0 {
+            const top = scanout.OFFSETS[c]
+            const modulo = card.raw(0x142 + 4 * c)
+            if card.raw(top + 0x1B9C) & 1 == 0 || modulo == 0 { return 7 }
+            if card.freezeRegister != card.NEVER && card.raw(card.freezeRegister) == card.freezeValue { return 7 }
+            const hertz = 600000000 * card.raw(0x141 + 4 * c) / modulo
+            if hertz == 0 { return 7 }
+            const period = (card.raw(top + 0x1B80) + 1) * (card.raw(top + 0x1B87) + 1) * 1000000000 / hertz
+            if period == 0 { return 7 }
+            return @intCast(u32, (card.clock / period) & 0xFFFFFF)
+        }
+        c += 1
+    }
+    var m: usize = 0
+    while m < 7 {
+        if number == scanout.DIG[m] + 0xA4 && number != card.stuckRegister { value = (value & ~@intCast(usize, 0x10000)) | ((value & 1) << 16) }
+        m += 1
+    }
+    return @intCast(u32, value)
+}
+
+// The card as the driver's own hands write the display's registers.
+pub fn write(number: usize, value: u32) -> void { card.write(number, value) }
+
+// The card as the AUX channel writes it (gpu_aux.mlx's Port).
+pub fn auxWrite(number: usize, value: u32) -> void {
+    const word = @intCast(usize, value)
+    const at = base()
+    if auxWritten < AUX_WRITES {
+        auxTo[auxWritten] = number
+        auxWith[auxWritten] = word
+    }
+    auxWritten += 1
+    if !isAux(number) {
+        strayWrites += 1
+        return
+    }
+    if number == at + 1 {
+        var kept = word & ~@intCast(usize, 1)
+        if countDeaf { kept = (kept & ~@intCast(usize, 0x1F0000)) | (card.raw(number) & 0x1F0000) }
+        card.store(number, kept)
+        if word & 1 != 0 && holder == 1 && !microcontroller { start() }
+        return
+    }
+    if number == at + 2 {
+        if word & 0x10000 != 0 && !microcontroller && !neverGranted { holder = 1 }
+        if word & 0x20000 != 0 && holder == 1 { holder = 0 }
+        card.store(number, word & ~@intCast(usize, 0x2000C))
+        return
+    }
+    if number == at + 3 {
+        if word & 2 != 0 { status = status & ~@intCast(usize, 1) }
+        card.store(number, word & ~@intCast(usize, 2))
+        return
+    }
+    if number == at + 6 {
+        dataWord = word & ~dataNoise
+        if word & 1 != 0 {
+            // Reading: from the reply's first byte.
+            reading = true
+            if word & 0x1F0000 == 0 { rxAt = 0 }
+            return
+        }
+        reading = false
+        if word & 0x80000000 != 0 { txAt = 0 }
+        if txAt < 32 { tx[txAt] = @intCast(u8, (word >> 8) & 0xFF) }
+        txAt += 1
+        return
+    }
+    card.store(number, word)
+}
+
+// What the transmitter's table was told, kept for the lanes.
+fn transmitter() -> void {
+    const w0 = card.raw(card.MAIL)
+    const w1 = card.raw(card.MAIL + 1)
+    if w0 & 0xFF != backEnd { return }
+    const action = (w0 >> 8) & 0xFF
+    if action == 1 && !card.transmitterDeaf {
+        if turnedOn < 16 { turnedOnAt[turnedOn] = card.clock }
+        turnedOn += 1
+        if turnedOffAt != NEVER && card.clock - turnedOffAt < leastOff { leastOff = card.clock - turnedOffAt }
+        txOn = true
+        txCode = w1 / 2700
+        txLanes = (w0 >> 24) & 0xFF
+        txSwing = 0
+        txPre = 0
+    }
+    if action == 0 && !card.transmitterStays {
+        turnedOffAt = card.clock
+        txOn = false
+        dropLock()
+    }
+    if action == 11 && !driveDeaf {
+        txSwing = (w0 >> 16) & 3
+        txPre = (w0 >> 19) & 3
+    }
+}
+
+fn tableWrite(number: usize, value: u32) -> bool {
+    const inner = card.hands()
+    const put = inner.write
+    const taken = put(number, value)
+    if taken && number == card.GO && @intCast(usize, value) == 76 { transmitter() }
+    return taken
+}
+
+// The card as a table reaches it.
+pub fn hands() -> atom.Hands {
+    var all = card.hands()
+    all.read = read
+    all.write = tableWrite
+    return all
+}
+
+// Everything forgotten: the card's registers, a monitor that says
+// nothing of itself, lanes that lock at once, a channel that is in
+// order.
+pub fn reset() -> void {
+    card.reset()
+    unaligned = false
+    var k: usize = 0
+    while k < DPCD {
+        dpcd[k] = 0
+        k += 1
+    }
+    k = 0
+    while k < 256 {
+        edid[k] = 0
+        k += 1
+    }
+    k = 0
+    while k < 4 {
+        needSwing[k] = 0
+        needPre[k] = 0
+        asksSwing[k] = NEVER
+        clockOf[k] = false
+        lockOf[k] = false
+        k += 1
+    }
+    backEnd = 1
+    line = 1
+    channel = 1
+    segment = 0
+    offset = 0
+    txOn = false
+    txCode = 0
+    txLanes = 0
+    txSwing = 0
+    txPre = 0
+    stepwise = false
+    stubborn = false
+    losesClockIn = 4
+    lockAfter = 1
+    cableRate = 0x1E
+    cableLanes = 4
+    dropsAtExit = false
+    dropsAtRead = NEVER
+    statusReads = 0
+    esiReads = 0
+    driveDeaf = false
+    faultRate = 0
+    leastClockWait = NEVER
+    leastEqualiseWait = NEVER
+    holdsWaited = NEVER
+    wokeWaited = NEVER
+    leastRetryGap = NEVER
+    turnedOn = 0
+    leastOff = NEVER
+    turnedOffAt = NEVER
+    statusLooks = 0
+    toldAt = 0
+    exitAt = 0
+    wokeAt = NEVER
+    lastAt = 0
+    lastPutOff = false
+    silentFrom = NEVER
+    silentUntil = NEVER
+    deadFrom = NEVER
+    deadUntil = NEVER
+    noiseAt = NEVER
+    putsOff = 0
+    shortFirst = false
+    refuses = NEVER
+    lateBy = 0
+    microcontroller = false
+    neverGranted = false
+    countDeaf = false
+    i2cPutsOff = 0
+    i2cChunk = 16
+    i2cDeaf = false
+    dataNoise = 0
+    holder = 0
+    status = 0
+    lateLeft = 0
+    reading = false
+    txAt = 0
+    rxCount = 0
+    rxAt = 0
+    dataWord = 0
+    repeats = 0
+    eqRounds = 0
+    lastPattern = 0
+    transactions = 0
+    auxWritten = 0
+    strayWrites = 0
+}
+
+// The transactions and the writes counted anew (after a plan was made,
+// before it is carried out).
+pub fn forget() -> void {
+    card.forget()
+    transactions = 0
+    auxWritten = 0
+    strayWrites = 0
+    statusReads = 0
+    repeats = 0
+    leastClockWait = NEVER
+    leastEqualiseWait = NEVER
+    holdsWaited = NEVER
+    wokeWaited = NEVER
+    leastRetryGap = NEVER
+    turnedOn = 0
+    leastOff = NEVER
+    turnedOffAt = NEVER
+    wokeAt = NEVER
+}
+
+// The monitor's capabilities: its registers' revision, its highest rate
+// (as it numbers it) and lanes, with enhanced framing, pattern 3 (when
+// `tps3`), downspread; its EDID a block that begins as one does.
+pub fn monitor(revision: usize, rate: usize, lanes: usize, tps3: bool) -> void {
+    dpcd[0x000] = @intCast(u8, revision)
+    dpcd[0x001] = @intCast(u8, rate)
+    dpcd[0x002] = @intCast(u8, lanes | 0x80 | (if tps3 { 0x40 } else { 0 }))
+    dpcd[0x003] = 0x01
+    dpcd[0x006] = 0x01
+    var k: usize = 0
+    while k < 256 {
+        edid[k] = @intCast(u8, (k * 7 + 3) & 0xFF)
+        k += 1
+    }
+    k = 1
+    while k < 7 {
+        edid[k] = 0xFF
+        k += 1
+    }
+    edid[0] = 0
+    edid[7] = 0
+    edid[126] = 1
+}
+
+// The firmware's state of a card whose picture leaves by DisplayPort:
+// controller `c` runs the picture's own 1280x960 timing (1800 by 1000,
+// 108 MHz by the DTO: a phase in Hz over a modulo of 600 MHz), the
+// 1280x960 picture at the start of the card's memory as its surface,
+// nothing scaled; it leaves by front end `m` on back end `backEnd`, in
+// DisplayPort mode, a link of `lanes` lanes at the rate `code`, trained,
+// its stream on with M over N for that rate, eight bits a colour; the
+// back end watches hot plug line `line`, which reads high; AUX channel
+// `channel` is on, watches that line, its pins in AUX mode; the display
+// engine's clock is 600 MHz; the firmware's scratch words hold some
+// notes. And the monitor holds that link, every lane locked, awake.
+pub fn firmware(c: usize, m: usize, code: usize, lanes: usize) -> void {
+    const at = scanout.OFFSETS[c]
+    const back = scanout.DIG[backEnd]
+    const front = scanout.DIG[m]
+    card.store(0x809, 0xF5FFF400)
+    card.store(at + 0x1B9C, 0x00010001)
+    card.store(at + 0x1B80, 1799)
+    card.store(at + 0x1B87, 999)
+    card.store(at + 0x1B81, (424 << 16) | 1704)
+    card.store(at + 0x1B8D, (39 << 16) | 999)
+    card.store(at + 0x1B82, 112 << 16)
+    card.store(at + 0x1B8E, 3 << 16)
+    card.store(at + 0x1A00, 1)
+    card.store(at + 0x1A01, 2)
+    card.store(at + 0x1A04, 0)
+    card.store(at + 0x1A07, 0xF4)
+    card.store(at + 0x1A06, 1280)
+    card.store(at + 0x1A0D, 1280)
+    card.store(at + 0x1A0E, 960)
+    card.store(at + 0x1A12, 1)
+    card.store(at + 0x1AC3, 960)
+    card.store(at + 0x1B5C, 0)
+    card.store(at + 0x1B5D, (1280 << 16) | 960)
+    card.store(at + 0x1AC1, 0x1006B0)
+    card.store(at + 0x1B53, 0x11)
+    card.store(0x321 + c, 0x12)
+    card.store(at + 0x1B32, 0x00010100)
+    card.marks[c * 4] = 0x00FA0030
+    card.marks[c * 4 + 1] = 0x00FA0040
+    card.store(at + 0x1BB6, 0x100)
+    card.store(at + 0x1B30, 0x0001242B)
+    card.store(at + 0x1BB3, 0x00003101)
+    card.store(back + 0x48, 0x101)
+    card.store(back + 0x47, (line << 28) | (@intCast(usize, 0x100) << @intCast(u6, m)))
+    card.store(front + 0x00, c | 0x400)
+    card.store(back + 0xA3, lanes - 1)
+    card.store(back + 0xA0, 0x10)
+    card.store(back + 0xAB, 0x10002000)
+    card.store(back + 0xB6, 0x0001FF10)
+    card.store(back + 0xB0, 0x00000002)
+    card.store(front + 0xA4, 0x10001)
+    card.store(front + 0xA1, 0x01000000)
+    card.store(front + 0xA8, 0x100)
+    card.store(front + 0xA9, 0x8000)
+    card.store(front + 0xAA, 0x8000 * 108000 / (code * 27000))
+    card.store(0x140 + 4 * c, 0x10)
+    card.store(0x141 + 4 * c, 108000000)
+    card.store(0x142 + 4 * c, 600000000)
+    card.store(0x124, 0x08000018)
+    card.store(0x5CB, 0x20010005)
+    card.store(0x5CF, 0x00000010)
+    card.store(0x1898 + 8 * line, 0x12)
+    card.store(0x189A + 8 * line, 0x10000000)
+    card.store(AUX + AUX_STEP * channel, 1 | (line << 20))
+    card.store(AUX + AUX_STEP * channel + 0x0A, 0x100)
+    card.store(PINS + 4 * channel, 0x10000)
+    dpcd[0x100] = @intCast(u8, code)
+    dpcd[0x101] = @intCast(u8, lanes | 0x80)
+    dpcd[0x107] = 0x10
+    dpcd[0x108] = 0x01
+    dpcd[0x600] = 0x01
+    txOn = true
+    txCode = code
+    txLanes = lanes
+    var k: usize = 0
+    while k < 4 {
+        clockOf[k] = k < lanes
+        lockOf[k] = k < lanes
+        k += 1
+    }
+}
+
+// The encoder object that is transmitter `n` (ObjectID.h: the pairs
+// UNIPHY A and B, C and D, E and F by 0x1E, 0x20 and 0x21, the first and
+// the second of a pair by their number).
+pub fn encoderOf(n: usize) -> usize {
+    const pairs = [_]usize{ 0x1E, 0x20, 0x21 }
+    return 0x2000 | ((1 + n % 2) << 8) | pairs[(n / 2) % 3]
+}
+
+// The bit of DC_GPIO_HPD_A that is hot plug line `h` (counted from 0).
+const HPD_SHIFTS = [_]usize{ 0, 8, 16, 24, 26, 28 }
+
+// A ROM as a Polaris card's is laid out, with nothing of a real one's in
+// it, for a board that wires a DisplayPort connector to transmitter
+// `backEnd`, its hot plug pin to line `line` and its DDC line to AUX
+// channel `channel` (the ROM's table of DDC lines has four entries, the
+// connector's is the third; the others are other lines), and an HDMI
+// connector to another transmitter. `caps`: the encoder's capability
+// record (bit 1: 5.4 Gbit/s, bit 3: 8.1; NEVER: no record). The tables
+// are tmds_card.mlx's programs; the transmitter's ends as `ending` says.
+// Finished.
+pub fn makeRom(builder: *rom.Builder, caps: usize, ending: card.Ending) -> void {
+    const end = [_]u8{0x5B}
+    builder.begin(81, 35)
+    _ = builder.command(0, 0, 0, end[0..])
+    var k: usize = 0
+    while k < card.TABLES[0..].length {
+        const table = card.TABLES[k]
+        var how = if table == 46 { card.Ending.answer } else { card.Ending.plain }
+        if table == 76 { how = ending }
+        _ = builder.command(table, 0, card.TABLE_WORDS[k] * 4, card.program(table, card.TABLE_WORDS[k], how))
+        k += 1
+    }
+    builder.revise(12, 1, 7)
+    builder.revise(76, 1, 6)
+    builder.revise(4, 1, 5)
+    builder.revise(35, 1, 1)
+    builder.revise(49, 1, 3)
+    builder.revise(46, 2, 1)
+    _ = builder.firmware(100000, 6000, 200000, 16000, 600000, 625000, 0)
+    builder.generator(3600000)
+    const other = (backEnd + 3) % 6
+    const connectors = [_]usize{ 0x3113, 0x310C }
+    const encoders = [_]usize{ encoderOf(backEnd), encoderOf(other) }
+    const pinIds = [_]usize{ 7, 9 }
+    const lineIds = [_]usize{ 2, 0xFF }
+    _ = builder.objects(connectors[0..], encoders[0..], pinIds[0..], lineIds[0..])
+    const pinRegisters = [_]usize{ 0x488D, 0x488D }
+    const pinShifts = [_]usize{ HPD_SHIFTS[line % 6], HPD_SHIFTS[(line + 1) % 6] }
+    _ = builder.pins(1, pinIds[0..], pinRegisters[0..], pinShifts[0..])
+    const lineRegisters = [_]usize{ 0x4869 + 4 * ((channel + 1) % 6), 0x4869 + 4 * ((channel + 2) % 6), 0x4869 + 4 * channel, 0x4869 + 4 * ((channel + 3) % 6) }
+    const lineBytes = [_]usize{ 0x90, 0x91, 0x82, 0x93 }
+    _ = builder.ddcLines(1, lineRegisters[0..], lineBytes[0..])
+    _ = builder.scratch(64)
+    if caps != NEVER { builder.capability(0, caps) }
+    builder.finish()
+}

@@ -33,6 +33,11 @@ pub const DATA_ARENA: usize = 0
 pub const DATA_ARENA_END: usize = 8
 pub const DATA_SIZE: usize = 16
 
+// Where the offsets of the zero data start (placeZeroDataApart): far above
+// any data area, so an offset says which part it is in; the image writers
+// put the part after the file's data and resolve its references there.
+pub const ZERO_DATA: usize = 1099511627776
+
 const NO_FIXUP: usize = 0xFFFFFFFFFFFFFFFF
 
 pub const Fixup = struct {
@@ -53,8 +58,8 @@ pub const SymbolEntry = struct {
 // An exported data symbol (lir.DataExport): `size` bytes at `offset` in the
 // data area, holding `value` when the image is loaded.
 // A global or exported word of the data area (lir.Global): where it lies
-// (after the fixed words), its size and initial value, and whether the
-// dynamic image names it.
+// (after the fixed words, or in the zero data apart: placeZeroDataApart),
+// its size and initial value, and whether the dynamic image names it.
 pub const DataEntry = struct {
     namePointer: [*]const u8
     nameLength: usize
@@ -115,6 +120,16 @@ pub const Encoder = struct {
     xmmBits: [8]usize
     xmmNext: usize
     cachedXmmLoadCount: usize
+    // Where the data area's bytes with an initial value end (the fixed
+    // words, then those entries): what the image's file holds.
+    dataEnd: usize
+    // Whether entries whose bytes are all zero go apart, after the file's
+    // data, in memory only (a program's .bss: placeZeroDataApart); their
+    // offsets count from ZERO_DATA. The part's end and the largest
+    // alignment in it.
+    zeroApart: bool
+    zeroEnd: usize
+    zeroAlign: usize
     allocator: allocator_module.Allocator
 }
 
@@ -160,6 +175,10 @@ pub fn init(allocator: allocator_module.Allocator) -> Encoder {
             .xmmBits = [8]usize{ 0, 0, 0, 0, 0, 0, 0, 0 },
             .xmmNext = 0,
             .cachedXmmLoadCount = 0,
+            .dataEnd = DATA_SIZE,
+            .zeroApart = false,
+            .zeroEnd = 0,
+            .zeroAlign = 8,
             .allocator = allocator,
         }
     }
@@ -1491,13 +1510,68 @@ var maxDataAlignment: usize = 8
 pub fn largestDataAlignment() -> usize { return maxDataAlignment }
 pub fn noteDataAlignment(alignment: usize) -> void { if alignment > maxDataAlignment { maxDataAlignment = alignment } }
 
+// With the zero data apart, an entry whose bytes are all zero goes there
+// instead, its offset ZERO_DATA and its place in that part.
 pub fn reserveData(enc: *Encoder, name_ptr: [*]const u8, name_len: usize, size: usize, alignment: usize, value: u64, bytes: [*]const u8, byte_count: usize, exported: bool) -> usize {
+    if enc.*.zeroApart && holdsZero(size, value, bytes, byte_count) {
+        var place = zeroDataSize(enc)
+        if alignment > 1 { place = (place + alignment - 1) / alignment * alignment }
+        if alignment > enc.*.zeroAlign { enc.*.zeroAlign = alignment }
+        enc.*.zeroEnd = place + size
+        const zero_entry = DataEntry.{ .namePointer = name_ptr, .nameLength = name_len, .offset = ZERO_DATA + place, .size = size, .value = value, .bytes = bytes, .byteCount = byte_count, .exported = exported }
+        unsafe { const appended_zero = vector.Vector.appendAt(enc.*.dataExports, @ptrCast([*]const u8, &zero_entry)) }
+        return ZERO_DATA + place
+    }
     var offset = dataSize(enc)
     if alignment > 1 { offset = (offset + alignment - 1) / alignment * alignment }
     if alignment > maxDataAlignment { maxDataAlignment = alignment }
+    enc.*.dataEnd = offset + size
     const entry = DataEntry.{ .namePointer = name_ptr, .nameLength = name_len, .offset = offset, .size = size, .value = value, .bytes = bytes, .byteCount = byte_count, .exported = exported }
     unsafe { const appended = vector.Vector.appendAt(enc.*.dataExports, @ptrCast([*]const u8, &entry)) }
     return offset
+}
+
+// A program's data apart from its zero data: the globals whose initial
+// bytes are all zero (holdsZero) are placed after the file's data, in
+// memory only. For a program's image writer, which resolves their
+// references there (applyLinkFixups); not for an object's data (mlx-cc)
+// or the kernel's, whose loader copies the file's bytes alone.
+pub fn placeZeroDataApart(enc: *Encoder) -> void { enc.*.zeroApart = true }
+
+// Whether an entry's initial bytes are all zero: no bytes given and a
+// zero value (`undefined` of any type, `= 0`, `null`, `false`, 0.0 but
+// not -0.0, a pointer or function the start writes), or every byte given
+// zero (an array or a struct of zeros, a table whose every element is an
+// address the start writes).
+pub fn holdsZero(size: usize, value: u64, bytes: [*]const u8, byte_count: usize) -> bool {
+    if byte_count == 0 { return value == 0 }
+    var index: usize = 0
+    while index < byte_count && index < size {
+        if bytes[index] != 0 { return false }
+        index += 1
+    }
+    return true
+}
+
+// Whether a data offset lies in the zero data (placeZeroDataApart).
+pub fn inZeroData(offset: usize) -> bool { return offset >= ZERO_DATA }
+
+// The zero data's size (a multiple of 8 bytes) and the alignment its
+// start needs.
+pub fn zeroDataSize(enc: *Encoder) -> usize { return (enc.*.zeroEnd + 7) / 8 * 8 }
+pub fn zeroDataAlignment(enc: *Encoder) -> usize { return enc.*.zeroAlign }
+
+// The bytes of the entries whose initial bytes are all zero, apart or
+// not (what a .bss holds or would hold).
+pub fn zeroBytes(enc: *Encoder) -> usize {
+    var total: usize = 0
+    var index: usize = 0
+    while index < dataEntryCount(enc) {
+        const entry = dataEntryAt(enc, index)
+        if holdsZero(entry.size, entry.value, entry.bytes, entry.byteCount) { total += entry.size }
+        index += 1
+    }
+    return total
 }
 
 // An exported word of `size` bytes holding `value` (export const).
@@ -1537,20 +1611,22 @@ pub fn dataExportAt(enc: *Encoder, export_index: usize) -> DataEntry {
 }
 
 // The data area: the fixed words (DATA_SIZE) and the entries after them, a
-// multiple of 8 bytes.
+// multiple of 8 bytes (with the zero data apart, without it: what the
+// file holds).
 pub fn dataSize(enc: *Encoder) -> usize {
-    const count = dataEntryCount(enc)
-    if count == 0 { return DATA_SIZE }
-    const last = dataEntryAt(enc, count - 1)
-    return (last.offset + last.size + 7) / 8 * 8
+    return (enc.*.dataEnd + 7) / 8 * 8
 }
 
 // Writes every entry's initial value into `data`, an image of the data
-// area (zeroed, dataSize bytes).
+// area (zeroed, dataSize bytes); the zero data apart is not in it.
 pub fn fillData(enc: *Encoder, data: [*]u8) -> void {
     var index: usize = 0
     while index < dataEntryCount(enc) {
         const entry = dataEntryAt(enc, index)
+        if inZeroData(entry.offset) {
+            index += 1
+            continue
+        }
         var byte: usize = 0
         if entry.byteCount != 0 {
             while byte < entry.byteCount && byte < entry.size {
@@ -1714,9 +1790,9 @@ pub fn hasLinkFixups(enc: *Encoder) -> bool {
 
 // Resolves GOT and data references once the object writer has placed the
 // GOT (8 bytes per import, in importIndex order, then one per data GOT
-// name) and the data area; both offsets are relative to the start of the
-// code.
-pub fn applyLinkFixups(enc: *Encoder, got_offset: usize, data_offset: usize) -> void {
+// name), the data area and the zero data apart (placeZeroDataApart; any
+// value without it); the offsets are relative to the start of the code.
+pub fn applyLinkFixups(enc: *Encoder, got_offset: usize, data_offset: usize, zero_offset: usize) -> void {
     var index: usize = 0
     while index < enc.*.fixups.*.length {
         unsafe {
@@ -1732,7 +1808,7 @@ pub fn applyLinkFixups(enc: *Encoder, got_offset: usize, data_offset: usize) -> 
                 resolved = true
             }
             if fixup.*.kind == FixupKind.data_rel32 {
-                destination = data_offset + fixup.*.targetHash
+                destination = if inZeroData(fixup.*.targetHash) { zero_offset + (fixup.*.targetHash - ZERO_DATA) } else { data_offset + fixup.*.targetHash }
                 resolved = true
             }
             if resolved {

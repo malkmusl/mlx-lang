@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checked arithmetic on integers narrower than 64 bits (spec operators.xml,
 # Arithmetic; compiler/selfhost/ir/lower.mlx, emitArithmeticPolicy):
-# tests/484_narrow_overflow_runtime.mlx's values in range, wrapping and
+# tests/524_narrow_overflow_runtime.mlx's values in range, wrapping and
 # saturating, and each of its overflowing cases run as a program of its
 # own, which the trap must end (status 132: SIGILL, ud2 on x86_64, UDF on
 # AArch64). On x86_64, then as an AArch64 program in
@@ -17,7 +17,7 @@ compiler=${1:-${MLX_COMPILER:-mlx-out/bin/compiler/mlx4}}
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 failures=0
-test=484_narrow_overflow_runtime
+test=524_narrow_overflow_runtime
 
 # run LABEL PROGRAM...: the values (13), then case 1, 2, ... until the
 # program says there is none (2), each ended by the trap (132).

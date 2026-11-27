@@ -144,7 +144,7 @@ brixOS's console drew its font so and filled the kernel's arena in 173
 characters). Its rows may hold strings, functions (and optional ones) and
 slices of other constant tables with bounds known at compile time, in
 nested structs and arrays: the image holds their addresses
-(`tests/483_constant_table_addresses_runtime.mlx`, a table of 48 icons
+(`tests/523_constant_table_addresses_runtime.mlx`, a table of 48 icons
 with a name and a function each, rows naming slices of other tables and
 another module's; before, reading `ICONS[i].name` copied the whole table
 into the arena, and `ROWS[0..]` put the rows and every table they name

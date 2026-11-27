@@ -1,0 +1,1029 @@
+// The host card's draws: what the graphics ring's DRAW_INDEX_AUTO and
+// DRAW_INDEX_2 do (the study's 4.4 and 8.2 (c)), from the registers the
+// streams set (card_run.mlx keeps them, CLEAR_STATE's among them) to the
+// colour targets' words. It is a MODEL of the fixed part of the card
+// between and after the two shaders, ours, small, and wrong in the last
+// bit unless the card shows otherwise (the study's 8.2 (c) and 11.9):
+//
+//   1 the vertices: the draw's indices (0 to count - 1, or the index
+//     buffer's 16- or 32-bit words through L2, an index past the
+//     buffer's end 0: radv_cs_emit_draw_indexed_packet "Hardware uses this
+//     information to return 0 for out-of-bounds reads"), for every
+//     instance; each one a lane of a vertex wave (64 a wave) run in the
+//     interpreter with v0 the index, v1 the instance (VGPR_COMP_CNT 1:
+//     "InstanceID / StepRate0", VGT_INSTANCE_STEP_RATE_0 1), the user data
+//     words of SPI_SHADER_USER_DATA_VS_n; its exports: the position (pos0,
+//     4 components, done) and SPI_VS_OUT_CONFIG's parameters;
+//   2 the triangles of the topology (VGT_PRIMITIVE_TYPE: a list, or a
+//     strip whose triangle i is the vertices i, i + 1 + i % 2, i + 2 - i % 2,
+//     the first one provoking); a triangle that would need clipping (a
+//     vertex with w <= 0, z outside 0 to w (DX_CLIP_SPACE_DEF), or x, y
+//     outside the guard band PA_CL_GB_*_CLIP_ADJ) is refused: the clipper
+//     is not modelled at this stage;
+//   3 the viewport transform (PA_CL_VPORT_*: x * scale + offset after the
+//     division by w, PA_CL_VTE_CNTL as RADV writes it), the position
+//     snapped to 1/256 of a pixel rounding to even (PA_SU_VTX_CNTL), the
+//     facing by the sign of the area (PA_SU_SC_MODE_CNTL's FACE: 0, a
+//     triangle whose area is positive in Vulkan's formula is the front)
+//     and the culling it asks (CULL_FRONT, CULL_BACK), a triangle of no
+//     area dropped;
+//   4 the pixels: a pixel's centre (PIX_CENTER: x + 0.5, y + 0.5) inside
+//     the triangle by the three edge functions on the snapped positions,
+//     exactly; on an edge it is the triangle's when the edge is a top or a
+//     left one (the model's tie rule for the clear state's PA_SC_EDGERULE
+//     0xAA99AAAA, which it requires; what its bits mean is in none of the
+//     sources: so two triangles that share an edge cover each centre on it
+//     once), within the scissors (window, generic, screen, the
+//     viewport's when VPORT_SCISSOR_ENABLE), one sample (no MSAA);
+//   5 the barycentrics with perspective at the centre (I, J of the second
+//     and third vertex: each vertex's edge function over the area, over
+//     its w, normalised), as floats into v0, v1 of a pixel wave of the
+//     triangle's pixels (64 a wave); the interpolation's three words of
+//     each input (SPI_PS_INPUT_CNTL_n's OFFSET: the vertex parameter it
+//     reads): P0 the first vertex's, P10 and P20 the second's and third's
+//     less it, a FLAT_SHADE input's the three vertices' own (P0 the
+//     provoking one's);
+//   6 the colour targets: the pixel wave's exports (mrt n, SPI_SHADER_
+//     COL_FORMAT's SPI_SHADER_32_ABGR) into the linear target n
+//     (CB_COLORn_*: BASE, PITCH and SLICE's tiles of 8 and 64 pixels, the
+//     row whole 64 bytes,
+//     COLOR_8_8_8_8 UNORM, COMP_SWAP STD or ALT (RADV's
+//     radv_translate_colorswap: XYZW, ZYXW), TILE_MODE_INDEX an entry of
+//     the card's tile mode table that is ARRAY_LINEAR_ALIGNED), clamped to
+//     0 to 1 (BLEND_CLAMP) and rounded to the nearest of 255 steps, ties to
+//     even; blended when CB_BLENDn_CONTROL enables it (the factors and
+//     functions of gfx8.json's BlendOp and CombFunc that the stage offers,
+//     the constant of CB_BLEND_RED .. ALPHA, in double precision); the
+//     components of CB_TARGET_MASK alone. The words go into the colour
+//     block's cache (card_cache.mlx): memory's once a CB flush or the
+//     kernel's fence wrote them back.
+//
+// IT REFUSES, with the register and its value, every register it reads
+// that no stream set (CLEAR_STATE sets the context registers its table
+// has) and every value it does not model: depth, stencil, MSAA, more
+// stages than VS and PS, primitive restart, points and lines, another
+// interpolation, a compressed or tiled target, a blend it does not have.
+const std = @import("std")
+const packets = @import("./packets.mlx")
+const gp = @import("./graphics_packets.mlx")
+const cache = @import("./card_cache.mlx")
+const wave = @import("./wave.mlx")
+const decode = @import("./decode.mlx")
+const encode = @import("./encode.mlx")
+const isa = @import("./isa.mlx")
+
+// What the host card gives a draw: its registers and its failures (card_
+// run.mlx's).
+pub const Host = struct {
+    // A register's value; false (and the failure recorded) when no stream
+    // set it.
+    read: fn(usize, *u32) -> bool
+    // A register's value the model does not take (its offset, the value).
+    refuse: fn(u64, u64) -> bool
+    // Something of the draw the model does not take (what: Unknown's
+    // number, a detail).
+    unknown: fn(u64, u64) -> bool
+    // A shader stopped in the interpreter (its address, the stop, its word,
+    // what it said).
+    stopped: fn(u64, wave.Stop, usize, u64) -> bool
+    // The caches refused (card_cache's failure).
+    memory: fn() -> bool
+}
+
+// What of a draw the model does not take (Host.unknown's first number).
+pub const Unknown = struct {
+    // A vertex needs the clipper (detail: the vertex's number).
+    pub const CLIP: u64 = 1
+    // The vertex shader's exports are not what SPI_VS_OUT_CONFIG and
+    // SPI_SHADER_POS_FORMAT say (detail: the target).
+    pub const VERTEX_EXPORTS: u64 = 2
+    // The pixel shader's exports are not what SPI_SHADER_COL_FORMAT says.
+    pub const PIXEL_EXPORTS: u64 = 3
+    // A pixel outside its target (detail: the offset in pixels).
+    pub const OUTSIDE: u64 = 4
+    // An input reads a parameter the vertex shader does not export.
+    pub const PARAMETER: u64 = 5
+    // More of something than the model keeps (vertices, a shader's words).
+    pub const TOO_MANY: u64 = 6
+    // A target's tile mode is not linear in the card's table.
+    pub const TILING: u64 = 7
+    // A shader not mapped to execute.
+    pub const SHADER: u64 = 8
+}
+
+// What the card's record and table give the model.
+pub const Card = struct {
+    // The tile mode table as the kernel programmed it (GB_TILE_MODE0 ..
+    // 31).
+    tileModes: [32]u32
+    rcpError: i32
+}
+
+// The draw's state as read from the registers.
+const MOST_VERTICES: usize = 4096
+const MOST_PARAMETERS: usize = 16
+const MOST_CODE: usize = 16384
+
+var vsCode: [MOST_CODE]u32 = undefined // (per run)
+var psCode: [MOST_CODE]u32 = undefined // (per run)
+var vsWords: usize = 0 // (per run)
+var psWords: usize = 0 // (per run)
+
+// Each vertex's position and parameters (vertex * 4 + component).
+var positions: [MOST_VERTICES * 4]u32 = undefined // (per run)
+var parameters: [MOST_VERTICES * MOST_PARAMETERS * 4]u32 = undefined // (per run)
+var vertexCount: usize = 0 // (per run)
+
+var host: Host = undefined // (per run)
+var card: Card = undefined // (per run)
+var memory: wave.Memory = undefined // (per run)
+var result: wave.Result = undefined // (per run)
+
+// The draws run in a submit.
+pub var draws: usize = 0 // (per run)
+// The pixels written by the last draw (a test's look).
+pub var pixelsWritten: usize = 0 // (per run)
+
+fn port() -> wave.Port {
+    return wave.Port.{ .scalarRead = cache.scalarRead, .vectorRead = cache.vectorRead, .vectorWrite = cache.vectorWrite }
+}
+
+fn read(offset: usize, value: *u32) -> bool {
+    const function = host.read
+    return function(offset, value)
+}
+
+fn refuse(offset: usize, value: u32) -> bool {
+    const function = host.refuse
+    return function(@intCast(u64, offset), @intCast(u64, value))
+}
+
+fn unknown(what: u64, detail: u64) -> bool {
+    const function = host.unknown
+    return function(what, detail)
+}
+
+fn memoryFailed() -> bool {
+    const function = host.memory
+    return function()
+}
+
+fn stopped(address: u64, stop: wave.Stop, pc: usize, detail: u64) -> bool {
+    const function = host.stopped
+    return function(address, stop, pc, detail)
+}
+
+// A register that must hold `wanted`.
+fn expect(offset: usize, wanted: u32) -> bool {
+    var value: u32 = 0
+    if !read(offset, &value) { return false }
+    if value != wanted { return refuse(offset, value) }
+    return true
+}
+
+// A register whose bits outside `allowed` must be 0: its value.
+fn within(offset: usize, allowed: u32, value: *u32) -> bool {
+    if !read(offset, value) { return false }
+    if (value.* & ~allowed) != 0 { return refuse(offset, value.*) }
+    return true
+}
+
+fn field(word: u32, mask: u32) -> u32 { return packets.get(word, mask) }
+
+fn floatOf(word: u32) -> f64 { return @floatCast(f64, @bitCast(f32, word)) }
+
+// ---------------------------------------------------------------------------
+// The shaders
+
+// A shader's words from `address` through the instruction cache to its
+// end (the first s_endpgm no branch jumps beyond), into `into`; its
+// length, or 0.
+fn fetchShader(address: u64, into: []u32) -> usize {
+    var fetched: usize = 0
+    var at: usize = 0
+    var furthest: usize = 0
+    while true {
+        while fetched < at + 3 && fetched < into.length {
+            var word: u32 = 0
+            const where = address + 4 * @intCast(u64, fetched)
+            if !cache.mapped(where, cache.EXECUTE) { break }
+            if !cache.fetch(where, &word) {
+                _ = memoryFailed()
+                return 0
+            }
+            into[fetched] = word
+            fetched += 1
+        }
+        if at >= fetched {
+            _ = unknown(Unknown.SHADER, address + 4 * @intCast(u64, at))
+            return 0
+        }
+        var inst: encode.Inst = undefined
+        const length = decode.decode(into[0..fetched], at, &inst)
+        if length == 0 {
+            _ = unknown(Unknown.SHADER, address + 4 * @intCast(u64, at))
+            return 0
+        }
+        if inst.op.format == isa.Format.sopp {
+            if inst.op.number == isa.S_ENDPGM.number && at >= furthest { return at + length }
+            const name = decode.name(inst.op)
+            if startsWith(name, "s_branch") || startsWith(name, "s_cbranch") {
+                const distance = @intCast(i64, @bitCast(i16, @intCast(u16, inst.imm & 0xFFFF)))
+                const target = @intCast(i64, at + length) + distance
+                if target > 0 && @intCast(usize, target) > furthest { furthest = @intCast(usize, target) }
+            }
+        }
+        at += length
+    }
+    return 0
+}
+
+fn startsWith(text: []const u8, prefix: []const u8) -> bool {
+    if text.length < prefix.length { return false }
+    var k: usize = 0
+    while k < prefix.length {
+        if text[k] != prefix[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// A stage's program: its address (PGM_LO, PGM_HI's MEM_BASE), RSRC1 and
+// RSRC2 as the model takes them (the counts, FLOAT_MODE 0xC0, DX10_CLAMP;
+// USER_SGPR alone), RSRC3's compute units (some enabled), its user data
+// words; the launch and its code.
+fn stage(lo: usize, hi: usize, rsrc1At: usize, rsrc2At: usize, rsrc3At: usize, userAt: usize, vertex: bool, launch: *wave.Launch, into: []u32, words: *usize) -> bool {
+    var low: u32 = 0
+    var high: u32 = 0
+    var rsrc1: u32 = 0
+    var rsrc2: u32 = 0
+    var rsrc3: u32 = 0
+    if !read(lo, &low) || !within(hi, gp.SPI_SHADER_PGM_HI__MEM_BASE, &high) { return false }
+    const known1 = gp.SPI_SHADER_PGM_RSRC1__VGPRS | gp.SPI_SHADER_PGM_RSRC1__SGPRS | gp.SPI_SHADER_PGM_RSRC1__FLOAT_MODE | gp.SPI_SHADER_PGM_RSRC1__DX10_CLAMP | (if vertex { gp.SPI_SHADER_PGM_RSRC1_VS__VGPR_COMP_CNT } else { 0 })
+    if !within(rsrc1At, known1, &rsrc1) { return false }
+    if field(rsrc1, gp.SPI_SHADER_PGM_RSRC1__FLOAT_MODE) != packets.FP_16_64_DENORMS || (rsrc1 & gp.SPI_SHADER_PGM_RSRC1__DX10_CLAMP) == 0 { return refuse(rsrc1At, rsrc1) }
+    if vertex && field(rsrc1, gp.SPI_SHADER_PGM_RSRC1_VS__VGPR_COMP_CNT) > 1 { return refuse(rsrc1At, rsrc1) }
+    if !within(rsrc2At, gp.SPI_SHADER_PGM_RSRC2__USER_SGPR, &rsrc2) { return false }
+    if !read(rsrc3At, &rsrc3) { return false }
+    if field(rsrc3, gp.SPI_SHADER_PGM_RSRC3__CU_EN) == 0 { return refuse(rsrc3At, rsrc3) }
+    const address = @intCast(u64, low) << 8 | @intCast(u64, high) << 40
+    launch.*.vgprs = (field(rsrc1, gp.SPI_SHADER_PGM_RSRC1__VGPRS) + 1) * 4
+    launch.*.sgprs = (field(rsrc1, gp.SPI_SHADER_PGM_RSRC1__SGPRS) + 1) * 8 - packets.VCC_SGPRS
+    launch.*.userCount = field(rsrc2, gp.SPI_SHADER_PGM_RSRC2__USER_SGPR)
+    var u: u32 = 2
+    while u < launch.*.userCount {
+        if !read(userAt + 4 * @intCast(usize, u), &launch.*.user[@intCast(usize, u)]) { return false }
+        u += 1
+    }
+    launch.*.groupIdX = false
+    launch.*.groupIdY = false
+    launch.*.groupIdZ = false
+    launch.*.localIdComponents = 0
+    launch.*.groupSizeX = 1
+    launch.*.groupSizeY = 1
+    launch.*.groupSizeZ = 1
+    launch.*.rcpError = card.rcpError
+    launch.*.maxSteps = 50000000
+    words.* = fetchShader(address, into)
+    return words.* != 0
+}
+
+// ---------------------------------------------------------------------------
+// The vertices
+
+var vsLaunch: wave.Launch = undefined // (per run)
+var psLaunch: wave.Launch = undefined // (per run)
+var vsComponents: u32 = 0 // (per run)
+var vsAddress: u64 = 0 // (per run)
+var psAddress: u64 = 0 // (per run)
+var parameterCount: u32 = 0 // (per run)
+var initial: [2 * wave.LANES]u32 = undefined // (per run)
+var exportedParameters: u32 = 0 // (per run)
+
+// Runs the vertex shader for `count` vertices whose indices and instances
+// are in `indices` and `instances`, from vertex `first` on.
+fn shadeVertices(indices: []const u32, instance: u32, first: usize) -> bool {
+    var at: usize = 0
+    while at < indices.length {
+        var exec: u64 = 0
+        var lane: usize = 0
+        while lane < wave.LANES && at + lane < indices.length {
+            initial[lane] = indices[at + lane]
+            initial[wave.LANES + lane] = instance
+            exec |= @intCast(u64, 1) << lane
+            lane += 1
+        }
+        const none: [1]u32 = [1]u32{ 0 }
+        if !wave.startGraphics(&vsLaunch, none[0..0], initial[0..], vsComponents + 1, exec, null) { return unknown(Unknown.TOO_MANY, 0) }
+        result.steps = 0
+        result.stop = wave.Stop.done
+        wave.run(&vsLaunch, &memory, &result)
+        if result.stop != wave.Stop.done {
+            if cache.failure != cache.Failure.none { return memoryFailed() }
+            return stopped(vsAddress, result.stop, result.pc, result.detail)
+        }
+        // The exports: pos0 (4 components, done), then the parameters.
+        var position = false
+        var seen: u32 = 0
+        var e: usize = 0
+        while e < wave.exportedCount {
+            const x = &wave.exported[e]
+            if x.*.exec != exec { return unknown(Unknown.VERTEX_EXPORTS, @intCast(u64, x.*.target)) }
+            if x.*.target == 12 {
+                if x.*.mask != 0xF || (x.*.flags & encode.DONE) == 0 || position { return unknown(Unknown.VERTEX_EXPORTS, 12) }
+                position = true
+                var l: usize = 0
+                while l < lane {
+                    var c: usize = 0
+                    while c < 4 {
+                        positions[(first + at + l) * 4 + c] = x.*.values[c * wave.LANES + l]
+                        c += 1
+                    }
+                    l += 1
+                }
+            } else if x.*.target >= 32 && x.*.target < 32 + @intCast(u32, MOST_PARAMETERS) {
+                const p = @intCast(usize, x.*.target - 32)
+                if (seen >> @intCast(u5, p)) & 1 != 0 || @intCast(u32, p) >= parameterCount { return unknown(Unknown.VERTEX_EXPORTS, @intCast(u64, x.*.target)) }
+                seen |= @intCast(u32, 1) << @intCast(u5, p)
+                var l: usize = 0
+                while l < lane {
+                    var c: usize = 0
+                    while c < 4 {
+                        parameters[((first + at + l) * MOST_PARAMETERS + p) * 4 + c] = if ((x.*.mask >> @intCast(u5, c)) & 1) != 0 { x.*.values[c * wave.LANES + l] } else { 0 }
+                        c += 1
+                    }
+                    l += 1
+                }
+            } else {
+                return unknown(Unknown.VERTEX_EXPORTS, @intCast(u64, x.*.target))
+            }
+            e += 1
+        }
+        // (RADV counts one parameter at least, VS_EXPORT_COUNT 0, also for
+        // a shader that exports none: a parameter not exported is read by
+        // no input, which the draw checks after the vertices.)
+        if !position || (at > 0 && seen != exportedParameters) { return unknown(Unknown.VERTEX_EXPORTS, @intCast(u64, seen)) }
+        exportedParameters = seen
+        at += lane
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The fixed part's state
+
+const Rect = struct {
+    x0: i64
+    y0: i64
+    x1: i64
+    y1: i64
+}
+
+var scissor: Rect = undefined // (per run)
+var xScale: f64 = 0.0 // (per run)
+var xOffset: f64 = 0.0 // (per run)
+var yScale: f64 = 0.0 // (per run)
+var yOffset: f64 = 0.0 // (per run)
+var horizontalBand: f64 = 0.0 // (per run)
+var verticalBand: f64 = 0.0 // (per run)
+var cullFront = false // (per run)
+var cullBack = false // (per run)
+var frontClockwise = false // (per run)
+var interpolated: u32 = 0 // (per run)
+var inputParameter: [32]u32 = undefined // (per run)
+var inputFlat: [32]bool = undefined // (per run)
+
+// The colour targets.
+const Target = struct {
+    enabled: bool
+    base: u64
+    pitch: u64
+    slice: u64
+    swap: u32
+    mask: u32
+    blend: u32
+}
+
+var targets: [8]Target = undefined // (per run)
+var blendConstant: [4]f64 = undefined // (per run)
+
+fn intersect(r: *Rect, tl: u32, br: u32, xMask: u32, yMask: u32) -> void {
+    const x0 = @intCast(i64, field(tl, xMask))
+    const y0 = @intCast(i64, field(tl, yMask))
+    const x1 = @intCast(i64, field(br, xMask))
+    const y1 = @intCast(i64, field(br, yMask))
+    if x0 > r.*.x0 { r.*.x0 = x0 }
+    if y0 > r.*.y0 { r.*.y0 = y0 }
+    if x1 < r.*.x1 { r.*.x1 = x1 }
+    if y1 < r.*.y1 { r.*.y1 = y1 }
+}
+
+// The registers of the fixed part, each read and held to what the model
+// takes.
+fn fixedState() -> bool {
+    // One VS and one PS, nothing between (VGT_SHADER_STAGES_EN 0: the
+    // VS stage real, no LS, HS, ES, GS), no GS mode, no primitive id, no
+    // primitive restart, one sample.
+    if !expect(gp.VGT_SHADER_STAGES_EN, 0) || !expect(gp.VGT_GS_MODE, 0) || !expect(gp.VGT_PRIMITIVEID_EN, 0) || !expect(gp.VGT_MULTI_PRIM_IB_RESET_EN, 0) { return false }
+    if !expect(gp.VGT_MAX_VTX_INDX, 0xFFFFFFFF) || !expect(gp.VGT_MIN_VTX_INDX, 0) || !expect(gp.VGT_INDX_OFFSET, 0) || !expect(gp.VGT_INSTANCE_STEP_RATE_0, 1) { return false }
+    var aa: u32 = 0
+    if !read(gp.PA_SC_AA_CONFIG, &aa) { return false }
+    if field(aa, gp.PA_SC_AA_CONFIG__MSAA_NUM_SAMPLES) != 0 { return refuse(gp.PA_SC_AA_CONFIG, aa) }
+    var mode0: u32 = 0
+    if !within(gp.PA_SC_MODE_CNTL_0, gp.PA_SC_MODE_CNTL_0__VPORT_SCISSOR_ENABLE, &mode0) { return false }
+    // No depth and no stencil: neither tested nor written, no target.
+    var depth: u32 = 0
+    if !read(gp.DB_DEPTH_CONTROL, &depth) { return false }
+    if (depth & (gp.DB_DEPTH_CONTROL__STENCIL_ENABLE | gp.DB_DEPTH_CONTROL__Z_ENABLE | gp.DB_DEPTH_CONTROL__Z_WRITE_ENABLE | gp.DB_DEPTH_CONTROL__DEPTH_BOUNDS_ENABLE)) != 0 { return refuse(gp.DB_DEPTH_CONTROL, depth) }
+    var zInfo: u32 = 0
+    var sInfo: u32 = 0
+    var shaderControl: u32 = 0
+    if !read(gp.DB_Z_INFO, &zInfo) || !read(gp.DB_STENCIL_INFO, &sInfo) || !read(gp.DB_SHADER_CONTROL, &shaderControl) { return false }
+    if field(zInfo, gp.DB_Z_INFO__FORMAT) != 0 { return refuse(gp.DB_Z_INFO, zInfo) }
+    if field(sInfo, gp.DB_STENCIL_INFO__FORMAT) != 0 { return refuse(gp.DB_STENCIL_INFO, sInfo) }
+    if (shaderControl & (gp.DB_SHADER_CONTROL__Z_EXPORT_ENABLE | gp.DB_SHADER_CONTROL__KILL_ENABLE)) != 0 { return refuse(gp.DB_SHADER_CONTROL, shaderControl) }
+    // The clipper: Vulkan's clip space (z from 0 to w), no user planes or
+    // distances, the clipper on (the model refuses what it would clip).
+    var clip: u32 = 0
+    if !read(gp.PA_CL_CLIP_CNTL, &clip) { return false }
+    const clipKnown = gp.PA_CL_CLIP_CNTL__DX_CLIP_SPACE_DEF | gp.PA_CL_CLIP_CNTL__DX_LINEAR_ATTR_CLIP_ENA | gp.PA_CL_CLIP_CNTL__ZCLIP_NEAR_DISABLE | gp.PA_CL_CLIP_CNTL__ZCLIP_FAR_DISABLE
+    if (clip & ~clipKnown) != 0 || (clip & gp.PA_CL_CLIP_CNTL__DX_CLIP_SPACE_DEF) == 0 { return refuse(gp.PA_CL_CLIP_CNTL, clip) }
+    if !expect(gp.PA_CL_VS_OUT_CNTL, 0) { return false }
+    if !expect(gp.PA_CL_VTE_CNTL, gp.PA_CL_VTE_CNTL__VTX_W0_FMT | gp.PA_CL_VTE_CNTL__ALL_SCALES_OFFSETS) { return false }
+    if !expect(gp.PA_SU_VTX_CNTL, gp.PA_SU_VTX_CNTL__PIX_CENTER | packets.put(gp.PA_SU_VTX_CNTL__ROUND_MODE, gp.X_ROUND_TO_EVEN) | packets.put(gp.PA_SU_VTX_CNTL__QUANT_MODE, gp.X_16_8_FIXED_POINT_1_256TH)) { return false }
+    if !expect(gp.PA_SC_EDGERULE, gp.EDGE_RULE) || !expect(gp.PA_SC_CLIPRECT_RULE, 0xFFFF) || !expect(gp.PA_SC_WINDOW_OFFSET, 0) { return false }
+    if !expect(gp.PA_SC_RASTER_CONFIG, gp.RASTER_CONFIG_POLARIS10) || !expect(gp.PA_SC_RASTER_CONFIG_1, gp.RASTER_CONFIG_1_POLARIS10) { return false }
+    // Culling and facing: no polygon mode, no offset, the first vertex
+    // provoking.
+    var su: u32 = 0
+    if !within(gp.PA_SU_SC_MODE_CNTL, gp.PA_SU_SC_MODE_CNTL__CULL_FRONT | gp.PA_SU_SC_MODE_CNTL__CULL_BACK | gp.PA_SU_SC_MODE_CNTL__FACE, &su) { return false }
+    cullFront = (su & gp.PA_SU_SC_MODE_CNTL__CULL_FRONT) != 0
+    cullBack = (su & gp.PA_SU_SC_MODE_CNTL__CULL_BACK) != 0
+    frontClockwise = (su & gp.PA_SU_SC_MODE_CNTL__FACE) != 0
+    // The viewport.
+    var words: [6]u32 = undefined
+    var k: usize = 0
+    while k < 6 {
+        if !read(gp.PA_CL_VPORT_XSCALE + 4 * k, &words[k]) { return false }
+        k += 1
+    }
+    xScale = floatOf(words[0])
+    xOffset = floatOf(words[1])
+    yScale = floatOf(words[2])
+    yOffset = floatOf(words[3])
+    var zmin: u32 = 0
+    var zmax: u32 = 0
+    if !read(gp.PA_SC_VPORT_ZMIN_0, &zmin) || !read(gp.PA_SC_VPORT_ZMAX_0, &zmax) { return false }
+    // The guard band: a vertex beyond it would be clipped.
+    var band: [4]u32 = undefined
+    k = 0
+    while k < 4 {
+        if !read(gp.PA_CL_GB_VERT_CLIP_ADJ + 4 * k, &band[k]) { return false }
+        k += 1
+    }
+    verticalBand = floatOf(band[0])
+    horizontalBand = floatOf(band[2])
+    // The scissors.
+    scissor = Rect.{ .x0 = 0, .y0 = 0, .x1 = 16384, .y1 = 16384 }
+    var tl: u32 = 0
+    var br: u32 = 0
+    // (the window scissor as radv_cmd_buffer_begin_rendering writes it,
+    // without WINDOW_OFFSET_DISABLE: the window's offset is 0 here)
+    if !read(gp.PA_SC_WINDOW_SCISSOR_TL, &tl) || !read(gp.PA_SC_WINDOW_SCISSOR_BR, &br) { return false }
+    intersect(&scissor, tl, br, gp.SCISSOR__X, gp.SCISSOR__Y)
+    if !read(gp.PA_SC_GENERIC_SCISSOR_TL, &tl) || !read(gp.PA_SC_GENERIC_SCISSOR_BR, &br) { return false }
+    if (tl & gp.SCISSOR__WINDOW_OFFSET_DISABLE) == 0 { return refuse(gp.PA_SC_GENERIC_SCISSOR_TL, tl) }
+    intersect(&scissor, tl, br, gp.SCISSOR__X, gp.SCISSOR__Y)
+    if !read(gp.PA_SC_SCREEN_SCISSOR_TL, &tl) || !read(gp.PA_SC_SCREEN_SCISSOR_BR, &br) { return false }
+    intersect(&scissor, tl, br, gp.SCREEN_SCISSOR__X, gp.SCREEN_SCISSOR__Y)
+    if (mode0 & gp.PA_SC_MODE_CNTL_0__VPORT_SCISSOR_ENABLE) != 0 {
+        if !read(gp.PA_SC_VPORT_SCISSOR_0_TL, &tl) || !read(gp.PA_SC_VPORT_SCISSOR_0_BR, &br) { return false }
+        if (tl & gp.SCISSOR__WINDOW_OFFSET_DISABLE) == 0 { return refuse(gp.PA_SC_VPORT_SCISSOR_0_TL, tl) }
+        intersect(&scissor, tl, br, gp.SCISSOR__X, gp.SCISSOR__Y)
+    }
+    return true
+}
+
+// The interpolation's registers: PERSP_CENTER alone, at the centre, the
+// inputs' parameters.
+fn interpolationState() -> bool {
+    if !expect(gp.SPI_PS_INPUT_ENA, gp.SPI_PS_INPUT_ENA__PERSP_CENTER_ENA) || !expect(gp.SPI_PS_INPUT_ADDR, gp.SPI_PS_INPUT_ENA__PERSP_CENTER_ENA) { return false }
+    var baryc: u32 = 0
+    if !read(gp.SPI_BARYC_CNTL, &baryc) { return false }
+    if (baryc & 0x1) != 0 { return refuse(gp.SPI_BARYC_CNTL, baryc) }
+    var interp: u32 = 0
+    if !read(gp.SPI_INTERP_CONTROL_0, &interp) { return false }
+    var control: u32 = 0
+    if !within(gp.SPI_PS_IN_CONTROL, gp.SPI_PS_IN_CONTROL__NUM_INTERP, &control) { return false }
+    interpolated = field(control, gp.SPI_PS_IN_CONTROL__NUM_INTERP)
+    if interpolated > 32 { return refuse(gp.SPI_PS_IN_CONTROL, control) }
+    var n: u32 = 0
+    while n < interpolated {
+        const at = gp.SPI_PS_INPUT_CNTL_0 + 4 * @intCast(usize, n)
+        var cntl: u32 = 0
+        if !within(at, gp.SPI_PS_INPUT_CNTL__OFFSET | gp.SPI_PS_INPUT_CNTL__FLAT_SHADE, &cntl) { return false }
+        const offset = field(cntl, gp.SPI_PS_INPUT_CNTL__OFFSET)
+        inputParameter[n] = offset
+        inputFlat[n] = (cntl & gp.SPI_PS_INPUT_CNTL__FLAT_SHADE) != 0
+        if inputFlat[n] && (interp & gp.SPI_INTERP_CONTROL_0__FLAT_SHADE_ENA) == 0 { return refuse(gp.SPI_INTERP_CONTROL_0, interp) }
+        if offset >= parameterCount { return unknown(Unknown.PARAMETER, @intCast(u64, n)) }
+        n += 1
+    }
+    return true
+}
+
+// The blend factors the model takes.
+fn blendFactorKnown(factor: u32) -> bool {
+    return factor <= gp.BLEND_ONE_MINUS_DST_COLOR || factor == gp.BLEND_CONSTANT_COLOR || factor == gp.BLEND_ONE_MINUS_CONSTANT_COLOR || factor == gp.BLEND_CONSTANT_ALPHA || factor == gp.BLEND_ONE_MINUS_CONSTANT_ALPHA
+}
+
+// The colour block's registers: CB_COLOR_CONTROL normal with the copy
+// raster operation, the export formats, each target.
+fn colourState(colourFormats: *u32) -> bool {
+    if !expect(gp.CB_COLOR_CONTROL, packets.put(gp.CB_COLOR_CONTROL__MODE, gp.CB_NORMAL) | packets.put(gp.CB_COLOR_CONTROL__ROP3, gp.ROP3_COPY)) { return false }
+    var targetMask: u32 = 0
+    var shaderMask: u32 = 0
+    if !read(gp.CB_TARGET_MASK, &targetMask) || !read(gp.CB_SHADER_MASK, &shaderMask) || !read(gp.SPI_SHADER_COL_FORMAT, colourFormats) { return false }
+    if !expect(gp.SPI_SHADER_Z_FORMAT, gp.SPI_SHADER_ZERO) { return false }
+    var k: usize = 0
+    while k < 4 {
+        var word: u32 = 0
+        if !read(gp.CB_BLEND_RED + 4 * k, &word) { return false }
+        blendConstant[k] = floatOf(word)
+        k += 1
+    }
+    var t: usize = 0
+    while t < 8 {
+        targets[t].enabled = false
+        const format = (colourFormats.* >> @intCast(u5, 4 * t)) & 0xF
+        const at = gp.CB_COLOR0_BASE + gp.CB_COLOR_STRIDE * t
+        var info: u32 = 0
+        if !read(at + (gp.CB_COLOR0_INFO - gp.CB_COLOR0_BASE), &info) { return false }
+        const targetBits = (targetMask >> @intCast(u5, 4 * t)) & 0xF
+        if field(info, gp.CB_COLOR0_INFO__FORMAT) == gp.COLOR_INVALID || targetBits == 0 {
+            if format != gp.SPI_SHADER_ZERO && format != gp.SPI_SHADER_32_ABGR { return refuse(gp.SPI_SHADER_COL_FORMAT, colourFormats.*) }
+            t += 1
+            continue
+        }
+        if format != gp.SPI_SHADER_32_ABGR || ((shaderMask >> @intCast(u5, 4 * t)) & 0xF) == 0 { return refuse(gp.SPI_SHADER_COL_FORMAT, colourFormats.*) }
+        // A linear COLOR_8_8_8_8 UNORM target as RADV's radv_initialise_
+        // color_surface makes one: no compression, no fast clear, no DCC,
+        // one sample, one layer.
+        const infoKnown = gp.CB_COLOR0_INFO__FORMAT | gp.CB_COLOR0_INFO__NUMBER_TYPE | gp.CB_COLOR0_INFO__COMP_SWAP | gp.CB_COLOR0_INFO__BLEND_CLAMP | gp.CB_COLOR0_INFO__SIMPLE_FLOAT
+        if (info & ~infoKnown) != 0 || field(info, gp.CB_COLOR0_INFO__FORMAT) != gp.COLOR_8_8_8_8 || field(info, gp.CB_COLOR0_INFO__NUMBER_TYPE) != gp.NUMBER_UNORM || field(info, gp.CB_COLOR0_INFO__COMP_SWAP) > gp.SWAP_ALT || (info & gp.CB_COLOR0_INFO__BLEND_CLAMP) == 0 || (info & gp.CB_COLOR0_INFO__SIMPLE_FLOAT) == 0 { return refuse(at + (gp.CB_COLOR0_INFO - gp.CB_COLOR0_BASE), info) }
+        var base: u32 = 0
+        var pitch: u32 = 0
+        var slice: u32 = 0
+        var view: u32 = 0
+        var attrib: u32 = 0
+        if !read(at, &base) || !read(at + (gp.CB_COLOR0_PITCH - gp.CB_COLOR0_BASE), &pitch) || !read(at + (gp.CB_COLOR0_SLICE - gp.CB_COLOR0_BASE), &slice) { return false }
+        if !expect(at + (gp.CB_COLOR0_VIEW - gp.CB_COLOR0_BASE), 0) { return false }
+        _ = view
+        if !within(at + (gp.CB_COLOR0_ATTRIB - gp.CB_COLOR0_BASE), gp.CB_COLOR0_ATTRIB__TILE_MODE_INDEX | gp.CB_COLOR0_ATTRIB__FMASK_TILE_MODE_INDEX, &attrib) { return false }
+        const index = field(attrib, gp.CB_COLOR0_ATTRIB__TILE_MODE_INDEX)
+        if field(card.tileModes[@intCast(usize, index)], gp.GB_TILE_MODE__ARRAY_MODE) != gp.ARRAY_LINEAR_ALIGNED { return unknown(Unknown.TILING, @intCast(u64, index)) }
+        targets[t].enabled = true
+        targets[t].base = @intCast(u64, base) << 8
+        targets[t].pitch = (@intCast(u64, field(pitch, gp.CB_COLOR0_PITCH__TILE_MAX)) + 1) * 8
+        // a linear aligned row of whole 64 bytes (addrlib's linear pitch
+        // alignment, max(8, 64 / bytes a pixel) pixels: image.mlx)
+        if (targets[t].pitch * 4) % 64 != 0 { return refuse(at + (gp.CB_COLOR0_PITCH - gp.CB_COLOR0_BASE), pitch) }
+        targets[t].slice = (@intCast(u64, field(slice, gp.CB_COLOR0_SLICE__TILE_MAX)) + 1) * 64
+        targets[t].swap = field(info, gp.CB_COLOR0_INFO__COMP_SWAP)
+        targets[t].mask = targetBits
+        var blend: u32 = 0
+        if !read(gp.CB_BLEND0_CONTROL + 4 * t, &blend) { return false }
+        if (blend & gp.CB_BLEND0_CONTROL__ENABLE) != 0 {
+            const parts = [4]u32{ field(blend, gp.CB_BLEND0_CONTROL__COLOR_SRCBLEND), field(blend, gp.CB_BLEND0_CONTROL__COLOR_DESTBLEND), field(blend, gp.CB_BLEND0_CONTROL__ALPHA_SRCBLEND), field(blend, gp.CB_BLEND0_CONTROL__ALPHA_DESTBLEND) }
+            var p: usize = 0
+            while p < 4 {
+                if !blendFactorKnown(parts[p]) { return refuse(gp.CB_BLEND0_CONTROL + 4 * t, blend) }
+                p += 1
+            }
+            if field(blend, gp.CB_BLEND0_CONTROL__COLOR_COMB_FCN) > gp.COMB_DST_MINUS_SRC || field(blend, gp.CB_BLEND0_CONTROL__ALPHA_COMB_FCN) > gp.COMB_DST_MINUS_SRC || (blend & gp.CB_BLEND0_CONTROL__DISABLE_ROP3) != 0 { return refuse(gp.CB_BLEND0_CONTROL + 4 * t, blend) }
+        } else if blend != 0 {
+            return refuse(gp.CB_BLEND0_CONTROL + 4 * t, blend)
+        }
+        targets[t].blend = blend
+        t += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// A triangle
+
+// Rounds to the nearest integer, ties to even.
+fn roundEven(x: f64) -> i64 {
+    const down = @floor(x)
+    const fraction = x - down
+    var n = @intFromFloat(i64, down)
+    if fraction > 0.5 { n += 1 }
+    if fraction == 0.5 && (n & 1) != 0 { n += 1 }
+    return n
+}
+
+// A vertex's window position in 1/256 of a pixel, its 1/w; false when it
+// would need the clipper.
+fn windowOf(vertex: usize, x: *i64, y: *i64, inverseW: *f64) -> bool {
+    const cx = floatOf(positions[vertex * 4])
+    const cy = floatOf(positions[vertex * 4 + 1])
+    const cz = floatOf(positions[vertex * 4 + 2])
+    const cw = floatOf(positions[vertex * 4 + 3])
+    if !(cw > 0.0) || !(cz >= 0.0) || !(cz <= cw) { return unknown(Unknown.CLIP, @intCast(u64, vertex)) }
+    const xd = cx / cw
+    const yd = cy / cw
+    if !(xd >= -horizontalBand) || !(xd <= horizontalBand) || !(yd >= -verticalBand) || !(yd <= verticalBand) { return unknown(Unknown.CLIP, @intCast(u64, vertex)) }
+    const xw = xd * xScale + xOffset
+    const yw = yd * yScale + yOffset
+    if !(xw > -32768.0) || !(xw < 32768.0) || !(yw > -32768.0) || !(yw < 32768.0) { return unknown(Unknown.CLIP, @intCast(u64, vertex)) }
+    x.* = roundEven(xw * 256.0)
+    y.* = roundEven(yw * 256.0)
+    inverseW.* = 1.0 / cw
+    return true
+}
+
+// The edge function of a -> b at p (twice the signed area of a, b, p).
+fn edge(ax: i64, ay: i64, bx: i64, by: i64, px: i64, py: i64) -> i64 { return (bx - ax) * (py - ay) - (by - ay) * (px - ax) }
+
+// Whether an edge a -> b of a triangle whose inside is where the edge
+// functions are positive is a top or a left edge (y grows downwards): a
+// left edge goes up (dy < 0), a top one is level going right.
+fn topLeft(ax: i64, ay: i64, bx: i64, by: i64) -> bool {
+    const dy = by - ay
+    const dx = bx - ax
+    return dy < 0 || (dy == 0 && dx > 0)
+}
+
+var params: [32 * 4 * 3]u32 = undefined // (per run)
+var pixelX: [wave.LANES]i64 = undefined // (per run)
+var pixelY: [wave.LANES]i64 = undefined // (per run)
+var waveIJ: [2 * wave.LANES]u32 = undefined // (per run)
+var primitives: u32 = 0 // (per run)
+
+fn floatBits(x: f64) -> u32 { return @bitCast(u32, @floatCast(f32, x)) }
+
+fn f32Of(word: u32) -> f32 { return @bitCast(f32, word) }
+
+// The interpolation's words of the triangle a, b, c (a provoking).
+fn primitiveWords(a: usize, b: usize, c: usize) -> void {
+    var n: usize = 0
+    while n < @intCast(usize, interpolated) {
+        const p = @intCast(usize, inputParameter[n])
+        var ch: usize = 0
+        while ch < 4 {
+            const va = parameters[(a * MOST_PARAMETERS + p) * 4 + ch]
+            const vb = parameters[(b * MOST_PARAMETERS + p) * 4 + ch]
+            const vc = parameters[(c * MOST_PARAMETERS + p) * 4 + ch]
+            const at = (n * 4 + ch) * 3
+            if inputFlat[n] {
+                params[at] = va
+                params[at + 1] = vb
+                params[at + 2] = vc
+            } else {
+                params[at] = va
+                params[at + 1] = @bitCast(u32, f32Of(vb) - f32Of(va))
+                params[at + 2] = @bitCast(u32, f32Of(vc) - f32Of(va))
+            }
+            ch += 1
+        }
+        n += 1
+    }
+}
+
+// Shades the pixels gathered (`count` of them) and writes their colours.
+fn shadePixels(count: usize) -> bool {
+    if count == 0 { return true }
+    var exec: u64 = 0
+    var l: usize = 0
+    while l < count {
+        exec |= @intCast(u64, 1) << l
+        l += 1
+    }
+    primitives += 1
+    const mask = 0x10000 | (primitives & 0xFFFF)
+    const extra = [1]u32{ mask }
+    const primitive = wave.Primitive.{ .mask = mask, .params = &params, .attributes = interpolated }
+    if !wave.startGraphics(&psLaunch, extra[0..1], waveIJ[0..], 2, exec, &primitive) { return unknown(Unknown.TOO_MANY, 1) }
+    result.steps = 0
+    result.stop = wave.Stop.done
+    wave.run(&psLaunch, &memory, &result)
+    if result.stop != wave.Stop.done {
+        if cache.failure != cache.Failure.none { return memoryFailed() }
+        return stopped(psAddress, result.stop, result.pc, result.detail)
+    }
+    // The exports: one for each target written, the last with done and
+    // the valid mask.
+    var e: usize = 0
+    var written: u32 = 0
+    while e < wave.exportedCount {
+        const x = &wave.exported[e]
+        const last = e + 1 == wave.exportedCount
+        const wanted = if last { encode.DONE | encode.VALID_MASK } else { 0 }
+        if x.*.flags != wanted || x.*.exec != exec { return unknown(Unknown.PIXEL_EXPORTS, @intCast(u64, x.*.target)) }
+        if x.*.target == 9 {
+            // the null export: nothing written
+            if !last || x.*.mask != 0 { return unknown(Unknown.PIXEL_EXPORTS, 9) }
+        } else {
+            if x.*.target >= 8 || x.*.mask != 0xF || (written >> @intCast(u5, x.*.target)) & 1 != 0 { return unknown(Unknown.PIXEL_EXPORTS, @intCast(u64, x.*.target)) }
+            written |= @intCast(u32, 1) << @intCast(u5, x.*.target)
+            const t = @intCast(usize, x.*.target)
+            if targets[t].enabled {
+                l = 0
+                while l < count {
+                    const colour = [4]u32{ x.*.values[l], x.*.values[wave.LANES + l], x.*.values[2 * wave.LANES + l], x.*.values[3 * wave.LANES + l] }
+                    if !writePixel(t, pixelX[l], pixelY[l], colour) { return false }
+                    l += 1
+                }
+            }
+        }
+        e += 1
+    }
+    if wave.exportedCount == 0 { return unknown(Unknown.PIXEL_EXPORTS, 0) }
+    var t: usize = 0
+    while t < 8 {
+        if targets[t].enabled && (written >> @intCast(u5, t)) & 1 == 0 { return unknown(Unknown.PIXEL_EXPORTS, @intCast(u64, t)) }
+        t += 1
+    }
+    return true
+}
+
+// One triangle of the vertices a, b, c (a provoking).
+fn triangle(a: usize, b: usize, c: usize) -> bool {
+    var x: [3]i64 = undefined
+    var y: [3]i64 = undefined
+    var q: [3]f64 = undefined
+    const vertices = [3]usize{ a, b, c }
+    var k: usize = 0
+    while k < 3 {
+        if !windowOf(vertices[k], &x[k], &y[k], &q[k]) { return false }
+        k += 1
+    }
+    // twice the signed area by the shoelace sum: Vulkan's area a is minus
+    // half of it (y grows downwards); a positive a is counter-clockwise
+    const twice = edge(x[0], y[0], x[1], y[1], x[2], y[2])
+    if twice == 0 { return true }
+    const counterClockwise = twice < 0
+    const front = if frontClockwise { !counterClockwise } else { counterClockwise }
+    if (front && cullFront) || (!front && cullBack) { return true }
+    // the edges oriented so that the inside is positive
+    var ox: [3]i64 = x
+    var oy: [3]i64 = y
+    if twice < 0 {
+        ox[1] = x[2]
+        oy[1] = y[2]
+        ox[2] = x[1]
+        oy[2] = y[1]
+    }
+    primitiveWords(a, b, c)
+    // the pixels whose centres the bounding box holds, within the scissors
+    var x0 = (min3(x[0], x[1], x[2]) - 128) >> 8
+    var x1 = (max3(x[0], x[1], x[2]) + 128 + 255) >> 8
+    var y0 = (min3(y[0], y[1], y[2]) - 128) >> 8
+    var y1 = (max3(y[0], y[1], y[2]) + 128 + 255) >> 8
+    if x0 < scissor.x0 { x0 = scissor.x0 }
+    if y0 < scissor.y0 { y0 = scissor.y0 }
+    if x1 > scissor.x1 { x1 = scissor.x1 }
+    if y1 > scissor.y1 { y1 = scissor.y1 }
+    var gathered: usize = 0
+    var py = y0
+    while py < y1 {
+        var px = x0
+        while px < x1 {
+            const sx = px * 256 + 128
+            const sy = py * 256 + 128
+            var inside = true
+            k = 0
+            while k < 3 && inside {
+                const n = (k + 1) % 3
+                const e = edge(ox[k], oy[k], ox[n], oy[n], sx, sy)
+                if e < 0 || (e == 0 && !topLeft(ox[k], oy[k], ox[n], oy[n])) { inside = false }
+                k += 1
+            }
+            if inside {
+                // the barycentrics of b and c with perspective
+                const l0 = @floatFromInt(f64, edge(x[1], y[1], x[2], y[2], sx, sy))
+                const l1 = @floatFromInt(f64, edge(x[2], y[2], x[0], y[0], sx, sy))
+                const l2 = @floatFromInt(f64, edge(x[0], y[0], x[1], y[1], sx, sy))
+                const area = @floatFromInt(f64, twice)
+                const p0 = l0 / area * q[0]
+                const p1 = l1 / area * q[1]
+                const p2 = l2 / area * q[2]
+                const sum = p0 + p1 + p2
+                waveIJ[gathered] = floatBits(p1 / sum)
+                waveIJ[wave.LANES + gathered] = floatBits(p2 / sum)
+                pixelX[gathered] = px
+                pixelY[gathered] = py
+                gathered += 1
+                if gathered == wave.LANES {
+                    if !shadePixels(gathered) { return false }
+                    gathered = 0
+                }
+            }
+            px += 1
+        }
+        py += 1
+    }
+    return shadePixels(gathered)
+}
+
+fn min3(a: i64, b: i64, c: i64) -> i64 {
+    var m = a
+    if b < m { m = b }
+    if c < m { m = c }
+    return m
+}
+
+fn max3(a: i64, b: i64, c: i64) -> i64 {
+    var m = a
+    if b > m { m = b }
+    if c > m { m = c }
+    return m
+}
+
+// ---------------------------------------------------------------------------
+// The colour block
+
+fn clamp01(x: f64) -> f64 {
+    if !(x > 0.0) { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+// A float of [0, 1] as 8 bits: the nearest of 255 steps, ties to even.
+fn unorm8(x: f64) -> u32 { return @intCast(u32, roundEven(clamp01(x) * 255.0)) }
+
+fn factorOf(factor: u32, component: usize, source: [4]f64, target: [4]f64) -> f64 {
+    if factor == gp.BLEND_ZERO { return 0.0 }
+    if factor == gp.BLEND_ONE { return 1.0 }
+    if factor == gp.BLEND_SRC_COLOR { return source[component] }
+    if factor == gp.BLEND_ONE_MINUS_SRC_COLOR { return 1.0 - source[component] }
+    if factor == gp.BLEND_SRC_ALPHA { return source[3] }
+    if factor == gp.BLEND_ONE_MINUS_SRC_ALPHA { return 1.0 - source[3] }
+    if factor == gp.BLEND_DST_ALPHA { return target[3] }
+    if factor == gp.BLEND_ONE_MINUS_DST_ALPHA { return 1.0 - target[3] }
+    if factor == gp.BLEND_DST_COLOR { return target[component] }
+    if factor == gp.BLEND_ONE_MINUS_DST_COLOR { return 1.0 - target[component] }
+    if factor == gp.BLEND_CONSTANT_COLOR { return blendConstant[component] }
+    if factor == gp.BLEND_ONE_MINUS_CONSTANT_COLOR { return 1.0 - blendConstant[component] }
+    if factor == gp.BLEND_CONSTANT_ALPHA { return blendConstant[3] }
+    return 1.0 - blendConstant[3]
+}
+
+fn combine(function: u32, s: f64, d: f64) -> f64 {
+    if function == gp.COMB_DST_PLUS_SRC { return s + d }
+    if function == gp.COMB_SRC_MINUS_DST { return s - d }
+    if function == gp.COMB_DST_MINUS_SRC { return d - s }
+    if function == gp.COMB_MIN_DST_SRC { return if s < d { s } else { d } }
+    return if s > d { s } else { d }
+}
+
+// The component of the colour that byte `channel` of the pixel holds
+// (COMP_SWAP of four channels: STD r g b a, ALT b g r a).
+fn componentOfChannel(swap: u32, channel: usize) -> usize {
+    if swap == gp.SWAP_ALT && channel == 0 { return 2 }
+    if swap == gp.SWAP_ALT && channel == 2 { return 0 }
+    return channel
+}
+
+fn writePixel(t: usize, px: i64, py: i64, colour: [4]u32) -> bool {
+    const target = &targets[t]
+    const offset = @intCast(u64, py) * target.*.pitch + @intCast(u64, px)
+    if px < 0 || py < 0 || @intCast(u64, px) >= target.*.pitch || offset >= target.*.slice { return unknown(Unknown.OUTSIDE, offset) }
+    const address = target.*.base + 4 * offset
+    var old: u32 = 0
+    if !cache.colourRead(address, &old) { return memoryFailed() }
+    var source: [4]f64 = undefined
+    var before: [4]f64 = undefined
+    var channel: usize = 0
+    while channel < 4 {
+        const c = componentOfChannel(target.*.swap, channel)
+        source[c] = clamp01(@floatCast(f64, f32Of(colour[c])))
+        before[c] = @floatFromInt(f64, (old >> @intCast(u5, 8 * channel)) & 0xFF) / 255.0
+        channel += 1
+    }
+    var out: [4]f64 = source
+    const blend = target.*.blend
+    if (blend & gp.CB_BLEND0_CONTROL__ENABLE) != 0 {
+        const separate = (blend & gp.CB_BLEND0_CONTROL__SEPARATE_ALPHA_BLEND) != 0
+        var c: usize = 0
+        while c < 4 {
+            var sourceFactor = field(blend, gp.CB_BLEND0_CONTROL__COLOR_SRCBLEND)
+            var targetFactor = field(blend, gp.CB_BLEND0_CONTROL__COLOR_DESTBLEND)
+            var function = field(blend, gp.CB_BLEND0_CONTROL__COLOR_COMB_FCN)
+            if c == 3 && separate {
+                sourceFactor = field(blend, gp.CB_BLEND0_CONTROL__ALPHA_SRCBLEND)
+                targetFactor = field(blend, gp.CB_BLEND0_CONTROL__ALPHA_DESTBLEND)
+                function = field(blend, gp.CB_BLEND0_CONTROL__ALPHA_COMB_FCN)
+            }
+            const s = source[c] * factorOf(sourceFactor, c, source, before)
+            const d = before[c] * factorOf(targetFactor, c, source, before)
+            out[c] = combine(function, s, d)
+            c += 1
+        }
+    }
+    var word: u32 = 0
+    channel = 0
+    while channel < 4 {
+        const c = componentOfChannel(target.*.swap, channel)
+        const bits = if ((target.*.mask >> @intCast(u5, c)) & 1) != 0 { unorm8(out[c]) } else { (old >> @intCast(u5, 8 * channel)) & 0xFF }
+        word |= bits << @intCast(u5, 8 * channel)
+        channel += 1
+    }
+    if !cache.colourWrite(address, word) { return memoryFailed() }
+    pixelsWritten += 1
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The draw
+
+var indexList: [MOST_VERTICES]u32 = undefined // (per run)
+
+// A draw of `count` vertices (DRAW_INDEX_AUTO) or indices (DRAW_INDEX_2:
+// at `indexAddress`, `maxIndices` of them there, of INDEX_TYPE
+// `indexType`), `instances` times: true, or false with the failure the
+// host's functions recorded.
+pub fn draw(given: Host, facts: Card, indexed: bool, count: u32, indexAddress: u64, maxIndices: u32, indexType: u32, instances: u32) -> bool {
+    host = given
+    card = facts
+    pixelsWritten = 0
+    draws += 1
+    cache.dispatch = 0x10000 + @intCast(u32, draws)
+    var primitiveType: u32 = 0
+    if !read(gp.VGT_PRIMITIVE_TYPE, &primitiveType) { return false }
+    if primitiveType != gp.DI_PT_TRILIST && primitiveType != gp.DI_PT_TRISTRIP { return refuse(gp.VGT_PRIMITIVE_TYPE, primitiveType) }
+    var outConfig: u32 = 0
+    if !within(gp.SPI_VS_OUT_CONFIG, gp.SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT, &outConfig) { return false }
+    parameterCount = field(outConfig, gp.SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT) + 1
+    if parameterCount > @intCast(u32, MOST_PARAMETERS) { return refuse(gp.SPI_VS_OUT_CONFIG, outConfig) }
+    if !expect(gp.SPI_SHADER_POS_FORMAT, gp.SPI_SHADER_4COMP) { return false }
+    if !fixedState() || !interpolationState() { return false }
+    var colourFormats: u32 = 0
+    if !colourState(&colourFormats) { return false }
+    // The two programs.
+    if !stage(gp.SPI_SHADER_PGM_LO_VS, gp.SPI_SHADER_PGM_HI_VS, gp.SPI_SHADER_PGM_RSRC1_VS, gp.SPI_SHADER_PGM_RSRC2_VS, gp.SPI_SHADER_PGM_RSRC3_VS, gp.SPI_SHADER_USER_DATA_VS_0, true, &vsLaunch, vsCode[0..], &vsWords) { return false }
+    var rsrc1: u32 = 0
+    _ = read(gp.SPI_SHADER_PGM_RSRC1_VS, &rsrc1)
+    vsComponents = field(rsrc1, gp.SPI_SHADER_PGM_RSRC1_VS__VGPR_COMP_CNT)
+    var lo: u32 = 0
+    var hi: u32 = 0
+    _ = read(gp.SPI_SHADER_PGM_LO_VS, &lo)
+    _ = read(gp.SPI_SHADER_PGM_HI_VS, &hi)
+    vsAddress = @intCast(u64, lo) << 8 | @intCast(u64, hi) << 40
+    if !stage(gp.SPI_SHADER_PGM_LO_PS, gp.SPI_SHADER_PGM_HI_PS, gp.SPI_SHADER_PGM_RSRC1_PS, gp.SPI_SHADER_PGM_RSRC2_PS, gp.SPI_SHADER_PGM_RSRC3_PS, gp.SPI_SHADER_USER_DATA_PS_0, false, &psLaunch, psCode[0..], &psWords) { return false }
+    _ = read(gp.SPI_SHADER_PGM_LO_PS, &lo)
+    _ = read(gp.SPI_SHADER_PGM_HI_PS, &hi)
+    psAddress = @intCast(u64, lo) << 8 | @intCast(u64, hi) << 40
+    if count == 0 || instances == 0 { return true }
+    if @intCast(usize, count) > MOST_VERTICES { return unknown(Unknown.TOO_MANY, @intCast(u64, count)) }
+    // The indices.
+    var k: u32 = 0
+    while k < count {
+        if !indexed {
+            indexList[k] = k
+        } else if k >= maxIndices {
+            indexList[k] = 0
+        } else {
+            const size: u64 = if indexType == gp.VGT_INDEX_32 { 4 } else { 2 }
+            const address = indexAddress + size * @intCast(u64, k)
+            var word: u32 = 0
+            if !cache.levelRead(address & ~@intCast(u64, 3), &word) { return memoryFailed() }
+            indexList[k] = if size == 4 { word } else { (word >> @intCast(u5, 8 * @intCast(u32, address & 3))) & 0xFFFF }
+        }
+        k += 1
+    }
+    wave.portMemory(&memory, port())
+    var instance: u32 = 0
+    while instance < instances {
+        // the vertex shader for each vertex, in the code's own load
+        result.steps = 0
+        if !wave.load(vsCode[0..vsWords], &result) { return stopped(vsAddress, result.stop, result.pc, result.detail) }
+        exportedParameters = 0
+        if !shadeVertices(indexList[0..@intCast(usize, count)], instance, 0) { return false }
+        var n: usize = 0
+        while n < @intCast(usize, interpolated) {
+            if (exportedParameters >> @intCast(u5, inputParameter[n])) & 1 == 0 { return unknown(Unknown.PARAMETER, @intCast(u64, n)) }
+            n += 1
+        }
+        if !wave.load(psCode[0..psWords], &result) { return stopped(psAddress, result.stop, result.pc, result.detail) }
+        // the triangles
+        var t: usize = 0
+        const vertices = @intCast(usize, count)
+        if primitiveType == gp.DI_PT_TRILIST {
+            while t + 3 <= vertices {
+                if !triangle(t, t + 1, t + 2) { return false }
+                t += 3
+            }
+        } else {
+            while t + 3 <= vertices {
+                // Vulkan's strip: i, i + (1 + i % 2), i + (2 - i % 2)
+                const odd = t % 2
+                if !triangle(t, t + 1 + odd, t + 2 - odd) { return false }
+                t += 1
+            }
+        }
+        instance += 1
+    }
+    return true
+}

@@ -1,0 +1,1504 @@
+// The shader compiler of our Vulkan driver for the RX 580
+// (projects/brix/vulkan/shader.mlx, built for the host): each of std.gpu's
+// nine compute kernels (std/src/gpu/shaders.mlx and the modules beside
+// it) built as SPIR-V by std.spirv.builder, compiled to the card's words,
+// and run in the interpreter of those words (wave.mlx) on real inputs,
+// every work group and every lane as the card starts them; what it writes
+// is held pixel for pixel against what the processor computes for the same
+// inputs:
+//   text      std.truetype.drawRun (the CPU side of the compositor's and
+//             the canvas's text), a run of DejaVu Sans over a gradient,
+//             clipped at the target's edges and with a translucent colour
+//   nv12      std.gpu.video.convertNv12 (the processor's conversion of a
+//             video frame), BT.601 limited range, odd sizes
+//   paint     std.ui.canvas on the CPU (clear, fillRoundedRect,
+//             strokeRoundedRect: the same commands the canvas gives the
+//             GPU), corners of every radius, boxes off every edge
+//   blit      the compositor's CPU renderer (projects/desktop/compositor/
+//             scene.mlx: blendPixel, shapeCoverage, and its coverPixel and
+//             clip and ring coverage written out as there): opaque and
+//             translucent windows, cut by rounded corners and as frames,
+//             partly off the output
+// and, for the kernels the processor renderer draws in another way (the
+// compositor's CPU blur passes its sums in 16-bit lanes, it draws no
+// wobble and scales previews to the nearest pixel; the pattern exists only
+// on the GPU), against the same kernel's arithmetic written out plainly
+// here from its builder (std/src/gpu/shaders.mlx, warp_shader.mlx):
+//   pattern, blurPass (across and down, the edges repeated), blurMask
+//   (subtracting rectangles), warp (a bent window: the Bezier surface,
+//   three fixed-point rounds, the bilinear sample), shrink (blended and
+//   replacing).
+// Then divisions at the edges, by the compiler's lowering of SPIR-V's
+// UDiv, SDiv, UMod and SRem into Mesa's reciprocal sequence: dividends and
+// divisors 0, 1, 2, 3, 255, 256, primes near 2^16 and 2^31, 2^31 - 1, 2^31,
+// 2^32 - 1 and a few thousand at random, signed and unsigned, against the
+// processor's division; and the same with the reciprocal moved by one and
+// two units in the last place (the card's v_rcp_f32 is not the host's:
+// the study's 11.14): downward the sequence holds every pair, upward one
+// unit breaks it (2 / 3 gives 3; 1 / 1 overflows the conversion), so the
+// card's reciprocal must not round up. A division by zero
+// stops the interpreter (the reciprocal of 0 is not known for the card).
+// Then what a loop's header makes, read after the loop: a word (each lane
+// keeps the value of the round it left in, and the variable too) and a
+// boolean (refused: its lane mask is made whole in every round, so the
+// lanes that left earlier would read the others' bits). Then each of the
+// ten comparisons on a lane's values and on the wave's, at the signed and
+// unsigned edges and on equal pairs, and an if on a lane's value whose two
+// sides give values of the whole wave.
+// Then the wait states: a buffer instruction reading a scalar register a
+// vector instruction wrote (its scalar offset, its descriptor's range) is
+// refused by the interpreter without the s_nop the compiler's pass puts
+// in, and runs with it.
+// With an argument, each failing check is printed.
+// Exits 13.
+const std = @import("std")
+const shaders = @import("std.gpu.shaders")
+const builder = @import("std.spirv.builder")
+const compute = @import("std.spirv.compute")
+const spv = @import("std.spirv.core")
+const tt = @import("std.truetype")
+const canvas = @import("std.ui.canvas")
+const gvideo = @import("std.gpu.video")
+const scene = @import("../projects/desktop/compositor/scene.mlx")
+const shader = @import("../projects/brix/vulkan/shader.mlx")
+const code_module = @import("../projects/brix/vulkan/shader_code.mlx")
+const ir = @import("../projects/brix/vulkan/shader_ir.mlx")
+const wave = @import("../projects/brix/vulkan/wave.mlx")
+const encode = @import("../projects/brix/vulkan/encode.mlx")
+const isa = @import("../projects/brix/vulkan/isa.mlx")
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+
+fn sayNumber(value: u64) -> void {
+    var digits: [20]u8 = undefined
+    var at: usize = 20
+    var rest = value
+    while true {
+        at -= 1
+        digits[at] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    say(digits[at..20])
+}
+
+fn sayHex(value: u32) -> void {
+    var digits: [8]u8 = undefined
+    var k: usize = 0
+    while k < 8 {
+        const d = @intCast(u8, (value >> @intCast(u32, 28 - 4 * k)) & 15)
+        digits[k] = if d < 10 { 48 + d } else { 87 + d }
+        k += 1
+    }
+    say("0x")
+    say(digits[0..8])
+}
+
+pub var failed: u8 = 0
+pub var show = false
+
+fn check(number: u8, holds: bool) -> void {
+    if holds { return }
+    if failed == 0 { failed = number }
+    if show {
+        say("check ")
+        sayNumber(@intCast(u64, number))
+        say(" fails\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chance
+
+var seed: u64 = 0x9E3779B97F4A7C15
+
+fn random() -> u32 {
+    seed ^= seed << 13
+    seed ^= seed >> 7
+    seed ^= seed << 17
+    return @intCast(u32, seed >> 32)
+}
+
+fn below(limit: u32) -> u32 { return random() % limit }
+
+// ---------------------------------------------------------------------------
+// The card on the host: a descriptor set, a push block and four buffers.
+
+pub const WORDS: usize = 16384
+const SET_BASE: u64 = 0x10000
+const PUSH_BASE: u64 = 0x20000
+
+var setWords: [16]u32 = undefined
+var pushBlock: [32]u32 = undefined
+pub var buffers: [4][WORDS]u32 = undefined
+var program: [65536]u32 = undefined
+var facts: shader.Facts = undefined
+var memory: wave.Memory = undefined
+var lastResult: wave.Result = undefined
+var rcpError: i32 = 0
+
+fn bufferBase(b: usize) -> u64 { return 0x100000 * (@intCast(u64, b) + 1) }
+
+// Compiles kernel `which` of std.gpu.shaders.
+fn compileKernel(which: u8) -> bool {
+    const allocator = std.page_allocator.init()
+    var spirv: [*]u32 = undefined
+    const count = shaders.build(allocator, which, &spirv)
+    if count == 0 { return false }
+    var words: []const u32 = undefined
+    unsafe { words = spirv[0..count] }
+    return compileWords(words)
+}
+
+// Another way to run the kernels than the interpreter (tests/509: our
+// driver over the host card, through std.gpu): when `runnerSet`, the
+// kernels' tests compile and dispatch through `runner`, on the same
+// buffers, and hold the same words.
+pub const Runner = struct {
+    compile: fn([]const u32) -> bool
+    dispatch: fn([]const u32, usize, u32, u32) -> bool
+}
+
+pub var runner: Runner = undefined
+pub var runnerSet = false
+
+fn compileWords(words: []const u32) -> bool {
+    if runnerSet {
+        const through = runner.compile
+        return through(words)
+    }
+    const allocator = std.page_allocator.init()
+    var failure: shader.Failure = undefined
+    if !shader.compile(words, allocator, program[0..], &facts, &failure) {
+        if show {
+            say("compile: ")
+            say(shader.failureText(failure.kind))
+            say(" opcode ")
+            sayNumber(@intCast(u64, failure.opcode))
+            say("\n")
+        }
+        return false
+    }
+    return true
+}
+
+// Runs the compiled kernel over groups x groups with the push words given
+// and `bufferCount` buffers (each WORDS words: a descriptor of that range).
+fn dispatch(push: []const u32, bufferCount: usize, groupsX: u32, groupsY: u32) -> bool {
+    if runnerSet {
+        const through = runner.dispatch
+        return through(push, bufferCount, groupsX, groupsY)
+    }
+    wave.emptyMemory(&memory)
+    var b: usize = 0
+    while b < 4 {
+        setWords[b * 4] = @intCast(u32, bufferBase(b) & 0xFFFFFFFF)
+        setWords[b * 4 + 1] = @intCast(u32, bufferBase(b) >> 32)
+        setWords[b * 4 + 2] = if b < bufferCount { @intCast(u32, WORDS * 4) } else { 0 }
+        setWords[b * 4 + 3] = 0
+        b += 1
+    }
+    var k: usize = 0
+    while k < 32 {
+        pushBlock[k] = if k < push.length { push[k] } else { 0 }
+        k += 1
+    }
+    _ = wave.addRegion(&memory, SET_BASE, setWords[0..], false)
+    _ = wave.addRegion(&memory, PUSH_BASE, pushBlock[0..], false)
+    b = 0
+    while b < bufferCount {
+        _ = wave.addRegion(&memory, bufferBase(b), buffers[b][0..], true)
+        b += 1
+    }
+    var launch: wave.Launch = undefined
+    launch.vgprs = facts.vgprs
+    launch.sgprs = facts.sgprs
+    launch.userCount = facts.userSgprs
+    launch.user[2] = @intCast(u32, SET_BASE & 0xFFFFFFFF)
+    launch.user[3] = @intCast(u32, SET_BASE >> 32)
+    launch.user[4] = @intCast(u32, PUSH_BASE & 0xFFFFFFFF)
+    launch.user[5] = @intCast(u32, PUSH_BASE >> 32)
+    launch.groupIdX = facts.groupIdX
+    launch.groupIdY = facts.groupIdY
+    launch.groupIdZ = facts.groupIdZ
+    launch.localIdComponents = facts.localIdComponents
+    launch.groupSizeX = facts.groupSizeX
+    launch.groupSizeY = facts.groupSizeY
+    launch.groupSizeZ = facts.groupSizeZ
+    launch.rcpError = rcpError
+    launch.maxSteps = 50000000
+    wave.dispatch(program[0..facts.words], &launch, groupsX, groupsY, 1, &memory, &lastResult)
+    if lastResult.stop != wave.Stop.done && show {
+        say("run stopped: ")
+        sayNumber(@intCast(u64, @intFromEnum(lastResult.stop)))
+        say(" at word ")
+        sayNumber(@intCast(u64, lastResult.pc))
+        say(" detail ")
+        sayNumber(lastResult.detail)
+        say("\n")
+    }
+    return lastResult.stop == wave.Stop.done
+}
+
+fn groups(size: u32) -> u32 { return (size + 7) / 8 }
+
+// The words of buffer `b` from `offset` on, against `expected`.
+fn sameWords(b: usize, offset: usize, expected: []const u32) -> bool {
+    var k: usize = 0
+    var wrong: u64 = 0
+    while k < expected.length {
+        if buffers[b][offset + k] != expected[k] { wrong += 1 }
+        k += 1
+    }
+    if wrong != 0 && show {
+        sayNumber(wrong)
+        say(" words differ\n")
+    }
+    k = 0
+    while k < expected.length {
+        if buffers[b][offset + k] != expected[k] {
+            if show {
+                say("  word ")
+                sayNumber(@intCast(u64, k))
+                say(": ")
+                sayHex(buffers[b][offset + k])
+                say(", the processor's ")
+                sayHex(expected[k])
+                say("\n")
+            }
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+var expected: [WORDS]u32 = undefined
+
+fn fillRandom(b: usize, count: usize) -> void {
+    var k: usize = 0
+    while k < count {
+        buffers[b][k] = random()
+        k += 1
+    }
+}
+
+// A random premultiplied colour: channels at most its alpha.
+fn premultiplied() -> u32 {
+    const alpha = below(256)
+    var word = alpha << 24
+    var shift: u32 = 0
+    while shift < 24 {
+        word |= below(alpha + 1) << shift
+        shift += 8
+    }
+    return word
+}
+
+// ---------------------------------------------------------------------------
+// pattern, as its builder writes it
+
+fn patternPixel(x: u32, y: u32, time: u32, pointerX: u32, pointerY: u32, flags: u32) -> u32 {
+    const red = (x +% time) & 255
+    const green = (y +% (time >> 1)) & 255
+    const blue = ((x ^ y) +% (time << 1)) & 255
+    const color = 0xFF000000 | red << 16 | green << 8 | blue
+    const dx = @bitCast(i32, x) -% @bitCast(i32, pointerX)
+    const dy = @bitCast(i32, y) -% @bitCast(i32, pointerY)
+    const distance = dx *% dx +% dy *% dy
+    const onRing = distance < 1600 && distance >= 900
+    const near = onRing && (flags & shaders.FLAG_POINTER) != 0
+    const ring = if (flags & shaders.FLAG_PRESSED) != 0 { @intCast(u32, 4294967295) } else { @intCast(u32, 4294955072) }
+    const shaded = if near { ring } else { color }
+    const swapped = (shaded & 4278255360) | ((shaded & 255) << 16) | ((shaded >> 16) & 255)
+    return if (flags & shaders.FLAG_SWAP_RED_BLUE) != 0 { swapped } else { shaded }
+}
+
+pub fn testPattern() -> void {
+    check(1, compileKernel(shaders.PATTERN))
+    const width: u32 = 37
+    const height: u32 = 29
+    var round: u32 = 0
+    while round < 4 {
+        const time = random() & 0xFFFF
+        const px = below(width)
+        const py = below(height)
+        const flags = round & 7 | (if round == 0 { shaders.FLAG_POINTER } else { 0 })
+        var k: usize = 0
+        while k < WORDS {
+            buffers[0][k] = 0x5A5A5A5A
+            k += 1
+        }
+        const push = [6]u32{ width, height, time, px, py, flags }
+        check(2, dispatch(push[0..], 1, groups(width), groups(height)))
+        var y: u32 = 0
+        while y < height {
+            var x: u32 = 0
+            while x < width {
+                expected[@intCast(usize, y * width + x)] = patternPixel(x, y, time, px, py, flags)
+                x += 1
+            }
+            y += 1
+        }
+        check(3, sameWords(0, 0, expected[0..@intCast(usize, width * height)]))
+        // nothing beyond the picture written
+        check(4, buffers[0][@intCast(usize, width * height)] == 0x5A5A5A5A)
+        round += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// nv12 against std.gpu.video.convertNv12
+
+var nv12Bytes: [8192]u8 = undefined
+var nv12Out: [16384]u8 = undefined
+
+pub fn testNv12() -> void {
+    check(10, compileKernel(shaders.NV12))
+    const width: u32 = 21
+    const height: u32 = 13
+    const lumaStride: u32 = 24
+    const chromaStride: u32 = 24
+    const lumaBytes = lumaStride * height
+    const chromaOffset = lumaBytes
+    var conversion: gvideo.Conversion = undefined
+    gvideo.conversionFor(&conversion, gvideo.MATRIX_BT601, false)
+    var k: usize = 0
+    while k < 8192 {
+        nv12Bytes[k] = @intCast(u8, below(256))
+        k += 1
+    }
+    // the bytes as words, four a word, the first lowest
+    k = 0
+    while k < 2048 {
+        buffers[0][k] = @intCast(u32, nv12Bytes[k * 4]) | @intCast(u32, nv12Bytes[k * 4 + 1]) << 8 | @intCast(u32, nv12Bytes[k * 4 + 2]) << 16 | @intCast(u32, nv12Bytes[k * 4 + 3]) << 24
+        k += 1
+    }
+    var push: [14]u32 = undefined
+    push[0] = width
+    push[1] = height
+    push[2] = 0
+    push[3] = lumaStride
+    push[4] = chromaOffset
+    push[5] = chromaStride
+    push[6] = 3
+    push[7] = width + 2
+    push[8] = @bitCast(u32, conversion.yBias)
+    push[9] = @bitCast(u32, conversion.yScale)
+    push[10] = @bitCast(u32, conversion.rCrCoefficient)
+    push[11] = @bitCast(u32, conversion.gCbCoefficient)
+    push[12] = @bitCast(u32, conversion.gCrCoefficient)
+    push[13] = @bitCast(u32, conversion.bCbCoefficient)
+    check(11, dispatch(push[0..], 2, groups(width), groups(height)))
+    gvideo.convertNv12(&conversion, &nv12Bytes[0], @intCast(usize, lumaStride), &nv12Bytes[@intCast(usize, chromaOffset)], @intCast(usize, chromaStride), @intCast(usize, width), @intCast(usize, height), &nv12Out[0], @intCast(usize, width) * 4)
+    var y: usize = 0
+    var same = true
+    while y < @intCast(usize, height) {
+        var x: usize = 0
+        while x < @intCast(usize, width) {
+            const at = (y * @intCast(usize, width) + x) * 4
+            const word = @intCast(u32, nv12Out[at]) | @intCast(u32, nv12Out[at + 1]) << 8 | @intCast(u32, nv12Out[at + 2]) << 16 | @intCast(u32, nv12Out[at + 3]) << 24
+            if buffers[1][3 + y * @intCast(usize, width + 2) + x] != word { same = false }
+            x += 1
+        }
+        y += 1
+    }
+    check(12, same)
+}
+
+// ---------------------------------------------------------------------------
+// text against std.truetype.drawRun
+
+var font: tt.Font = undefined
+var atlas: tt.Atlas = undefined
+var run: tt.Run = undefined
+
+fn background(pixels: []u32, width: u32, height: u32) -> void {
+    var index: u32 = 0
+    while index < width * height {
+        const x = index % width
+        const y = index / width
+        pixels[@intCast(usize, index)] = 4278190080 | ((x & 255) << 16) | (((y * 5) & 255) << 8) | 96
+        index += 1
+    }
+}
+
+pub fn testText() -> void {
+    const allocator = std.page_allocator.init()
+    check(20, compileKernel(shaders.TEXT))
+    if tt.loadFile(&font, "tests/support/fonts/DejaVuSans-subset.ttf".pointer, allocator) != tt.Status.ok {
+        check(21, false)
+        return
+    }
+    check(22, tt.initAtlas(&atlas, &font, 18, 256, 128, allocator) && tt.initRun(&run, 64, allocator))
+    const width: u32 = 96
+    const height: u32 = 40
+    var round: u32 = 0
+    while round < 3 {
+        const text = if round == 0 { "Kepler draws" } else if round == 1 { "on the card" } else { "fifteen" }
+        tt.layout(&atlas, text, &run)
+        const x: i32 = if round == 2 { 70 } else { 3 + @intCast(i32, round) }
+        const y: i32 = if round == 1 { 36 } else { 24 }
+        const color: u32 = if round == 1 { 0x80204060 } else { 0xFFFFE0C0 }
+        // atlas bytes into words (binding 0), the quads (binding 1)
+        var k: usize = 0
+        while k < @intCast(usize, atlas.width * atlas.height / 4) {
+            buffers[0][k] = @intCast(u32, atlas.pixels[k * 4]) | @intCast(u32, atlas.pixels[k * 4 + 1]) << 8 | @intCast(u32, atlas.pixels[k * 4 + 2]) << 16 | @intCast(u32, atlas.pixels[k * 4 + 3]) << 24
+            k += 1
+        }
+        k = 0
+        while k < run.count {
+            const quad = run.quads[k]
+            buffers[1][k * 4] = quad.atlasX | (quad.atlasY << 16)
+            buffers[1][k * 4 + 1] = quad.width | (quad.height << 16)
+            buffers[1][k * 4 + 2] = @bitCast(u32, quad.x)
+            buffers[1][k * 4 + 3] = @bitCast(u32, quad.y)
+            k += 1
+        }
+        background(buffers[2][0..], width, height)
+        background(expected[0..], width, height)
+        // the run's box clipped to the target, relative to the origin
+        var left = x + run.left
+        var top = y + run.top
+        var right = x + run.right
+        var bottom = y + run.bottom
+        if left < 0 { left = 0 }
+        if top < 0 { top = 0 }
+        if right > @intCast(i32, width) { right = @intCast(i32, width) }
+        if bottom > @intCast(i32, height) { bottom = @intCast(i32, height) }
+        const boxWidth = @intCast(u32, right - left)
+        const boxHeight = @intCast(u32, bottom - top)
+        const push = [15]u32{ width, height, 0, @bitCast(u32, x), @bitCast(u32, y), @bitCast(u32, left - x), @bitCast(u32, top - y), boxWidth, boxHeight, @intCast(u32, run.count), atlas.width, color, 0, 0, width }
+        check(23, dispatch(push[0..], 3, groups(boxWidth), groups(boxHeight)))
+        var pixels: [*]u32 = undefined
+        unsafe { pixels = @ptrCast([*]u32, &expected[0]) }
+        tt.drawRun(&atlas, &run, pixels, @intCast(usize, width), @intCast(usize, height), @intCast(usize, width), x, y, color, 0)
+        check(24, sameWords(2, 0, expected[0..@intCast(usize, width * height)]))
+        round += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// paint against std.ui.canvas on the CPU
+
+pub fn testPaint() -> void {
+    check(30, compileKernel(shaders.PAINT))
+    const width: u32 = 45
+    const height: u32 = 34
+    var round: u32 = 0
+    while round < 6 {
+        var c = canvas.Canvas.{ .pixels = undefined, .width = @intCast(usize, width), .height = @intCast(usize, height), .stride = @intCast(usize, width + 3), .swapRedBlue = false, .device = 0, .opacity = 255 }
+        unsafe { c.pixels = @ptrCast([*]u32, &expected[0]) }
+        var commands: usize = 0
+        const clearColor = 0xFF000000 | random() & 0xFFFFFF
+        canvas.clear(&c, clearColor)
+        buffers[1][0] = shaders.PAINT_CLEAR
+        var w: usize = 1
+        while w < 16 {
+            buffers[1][w] = 0
+            w += 1
+        }
+        buffers[1][3] = width
+        buffers[1][4] = height
+        buffers[1][7] = clearColor
+        commands = 1
+        while commands < 12 {
+            const kind = if below(2) == 0 { shaders.PAINT_FILL } else { shaders.PAINT_STROKE }
+            const x = @intCast(i32, below(width + 20)) - 10
+            const y = @intCast(i32, below(height + 20)) - 10
+            const boxWidth = @intCast(i32, below(30)) + 1
+            const boxHeight = @intCast(i32, below(24)) + 1
+            const radius = @intCast(i32, below(14))
+            const thickness = @intCast(i32, below(6)) + 1
+            const color = premultiplied()
+            const base = commands * 16
+            w = 0
+            while w < 16 {
+                buffers[1][base + w] = 0
+                w += 1
+            }
+            buffers[1][base] = kind
+            buffers[1][base + 1] = @bitCast(u32, x)
+            buffers[1][base + 2] = @bitCast(u32, y)
+            buffers[1][base + 3] = @bitCast(u32, boxWidth)
+            buffers[1][base + 4] = @bitCast(u32, boxHeight)
+            buffers[1][base + 5] = @bitCast(u32, radius)
+            buffers[1][base + 6] = @bitCast(u32, thickness)
+            buffers[1][base + 7] = color
+            if kind == shaders.PAINT_FILL {
+                canvas.fillRoundedRect(&c, x, y, boxWidth, boxHeight, radius, color)
+            } else {
+                canvas.strokeRoundedRect(&c, x, y, boxWidth, boxHeight, radius, thickness, color)
+            }
+            commands += 1
+        }
+        fillRandom(0, WORDS)
+        const push = [8]u32{ width, height, 0, width + 3, 0, @intCast(u32, commands), 0, 0 }
+        check(31, dispatch(push[0..], 3, groups(width), groups(height)))
+        var same = true
+        var y: usize = 0
+        while y < @intCast(usize, height) {
+            var x: usize = 0
+            while x < @intCast(usize, width) {
+                if buffers[0][y * @intCast(usize, width + 3) + x] != expected[y * @intCast(usize, width + 3) + x] { same = false }
+                x += 1
+            }
+            y += 1
+        }
+        check(32, same)
+        round += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// blit against the compositor's CPU renderer
+
+// scene.mlx's coverPixel (private there), as written there.
+fn coverPixel(destination: u32, source: u32, alpha: u32, coverage: u32) -> u32 {
+    const scaled = (alpha * coverage + 127) / 255
+    if scaled == 0 { return destination }
+    const red = (((source >> 16) & 255) * coverage + 127) / 255
+    const green = (((source >> 8) & 255) * coverage + 127) / 255
+    const blue = ((source & 255) * coverage + 127) / 255
+    const color = (red << 16) | (green << 8) | blue
+    if scaled == 255 { return 4278190080 | color }
+    return scene.blendPixel(destination, color, scaled)
+}
+
+fn inShape(shape: *const scene.Shape, x: i32, y: i32) -> bool {
+    return x >= shape.*.x && y >= shape.*.y && x < shape.*.x + shape.*.width && y < shape.*.y + shape.*.height
+}
+
+pub fn testBlit() -> void {
+    check(40, compileKernel(shaders.BLIT))
+    const sourceWidth: u32 = 23
+    const sourceHeight: u32 = 17
+    const width: u32 = 40
+    const height: u32 = 31
+    var round: u32 = 0
+    while round < 8 {
+        const opaque = round % 4 == 1
+        const clip = round % 4 == 2
+        const ring = round % 4 == 3
+        var k: usize = 0
+        while k < @intCast(usize, sourceWidth * sourceHeight) {
+            buffers[0][k] = if opaque { 0xFF000000 | random() & 0xFFFFFF } else { premultiplied() }
+            k += 1
+        }
+        k = 0
+        while k < @intCast(usize, width * height) {
+            const pixel = 0xFF000000 | random() & 0xFFFFFF
+            buffers[1][k] = pixel
+            expected[k] = pixel
+            k += 1
+        }
+        const tx = @intCast(i32, below(width)) - 8
+        const ty = @intCast(i32, below(height)) - 6
+        const a = scene.Shape.{ .x = tx + @intCast(i32, below(4)), .y = ty + @intCast(i32, below(4)), .width = 16, .height = 12, .top = @intCast(i32, below(7)), .bottom = @intCast(i32, below(7)) }
+        const b = scene.Shape.{ .x = a.x + 2, .y = a.y + 2, .width = 12, .height = 8, .top = @intCast(i32, below(4)), .bottom = @intCast(i32, below(4)) }
+        var flags: u32 = 0
+        if opaque { flags |= shaders.FLAG_OPAQUE }
+        if clip { flags |= shaders.FLAG_CLIP_CORNERS }
+        if ring { flags |= shaders.FLAG_RING }
+        const push = [23]u32{ sourceWidth, sourceHeight, sourceWidth, 0, width, height, @bitCast(u32, tx), @bitCast(u32, ty), flags, 0, width, @bitCast(u32, a.x), @bitCast(u32, a.y), @bitCast(u32, a.width), @bitCast(u32, a.height), @bitCast(u32, a.top), @bitCast(u32, a.bottom), @bitCast(u32, b.x), @bitCast(u32, b.y), @bitCast(u32, b.width), @bitCast(u32, b.height), @bitCast(u32, b.top), @bitCast(u32, b.bottom) }
+        check(41, dispatch(push[0..], 2, groups(sourceWidth), groups(sourceHeight)))
+        // the CPU renderer: each source pixel over the output where it
+        // lands, at the coverage of the window's corners or of its frame
+        var sy: i32 = 0
+        while sy < @intCast(i32, sourceHeight) {
+            var sx: i32 = 0
+            while sx < @intCast(i32, sourceWidth) {
+                const ox = tx + sx
+                const oy = ty + sy
+                if ox >= 0 && oy >= 0 && ox < @intCast(i32, width) && oy < @intCast(i32, height) {
+                    const at = @intCast(usize, oy) * @intCast(usize, width) + @intCast(usize, ox)
+                    var pixel = buffers[0][@intCast(usize, sy) * @intCast(usize, sourceWidth) + @intCast(usize, sx)]
+                    var coverage: u32 = 255
+                    if clip && inShape(&a, ox, oy) { coverage = scene.shapeCoverage(&a, ox, oy) }
+                    if ring {
+                        const outer = scene.shapeCoverage(&a, ox, oy)
+                        const inner = scene.shapeCoverage(&b, ox, oy)
+                        coverage = if outer > inner { outer - inner } else { 0 }
+                    }
+                    const alpha = if opaque { @intCast(u32, 255) } else { pixel >> 24 }
+                    if coverage == 255 {
+                        if alpha == 255 {
+                            expected[at] = pixel | 0xFF000000
+                        } else if alpha != 0 {
+                            expected[at] = scene.blendPixel(expected[at], pixel, alpha)
+                        }
+                    } else if coverage != 0 {
+                        expected[at] = coverPixel(expected[at], pixel, alpha, coverage)
+                    }
+                }
+                sx += 1
+            }
+            sy += 1
+        }
+        check(42, sameWords(1, 0, expected[0..@intCast(usize, width * height)]))
+        round += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// blurPass and blurMask, as their builders write them
+
+fn clampCount(value: i32, limit: u32) -> i32 {
+    const last = @intCast(i32, limit) - 1
+    const low = if value < 0 { 0 } else { value }
+    return if low > last { last } else { low }
+}
+
+pub fn testBlur() -> void {
+    const width: u32 = 27
+    const height: u32 = 19
+    const stride: u32 = 31
+    var vertical: u32 = 0
+    while vertical < 2 {
+        check(50, compileKernel(shaders.BLUR_PASS))
+        fillRandom(0, WORDS)
+        fillRandom(1, WORDS)
+        const push = [7]u32{ width, height, 5, stride, 7, stride + 2, vertical }
+        check(51, dispatch(push[0..], 2, groups(width), groups(height)))
+        var same = true
+        var y: i32 = 0
+        while y < @intCast(i32, height) {
+            var x: i32 = 0
+            while x < @intCast(i32, width) {
+                var sums = [4]u32{ 0, 0, 0, 0 }
+                var offset: i32 = 0 - shaders.BLUR_RADIUS
+                while offset <= shaders.BLUR_RADIUS {
+                    const column = if vertical != 0 { x } else { clampCount(x + offset, width) }
+                    const row = if vertical != 0 { clampCount(y + offset, height) } else { y }
+                    const pixel = buffers[0][5 + @intCast(usize, row) * @intCast(usize, stride) + @intCast(usize, column)]
+                    var c: u32 = 0
+                    while c < 4 {
+                        sums[c] += (pixel >> (24 - c * 8)) & 255
+                        c += 1
+                    }
+                    offset += 1
+                }
+                const window = @intCast(u32, shaders.BLUR_RADIUS * 2 + 1)
+                const result = (sums[0] / window) << 24 | (sums[1] / window) << 16 | (sums[2] / window) << 8 | (sums[3] / window)
+                if buffers[1][7 + @intCast(usize, y) * @intCast(usize, stride + 2) + @intCast(usize, x)] != result { same = false }
+                x += 1
+            }
+            y += 1
+        }
+        check(52, same)
+        vertical += 1
+    }
+    // blurMask: the region's rectangles, the last one over a pixel decides
+    check(53, compileKernel(shaders.BLUR_MASK))
+    fillRandom(0, WORDS)
+    fillRandom(1, WORDS)
+    var k: usize = 0
+    while k < @intCast(usize, WORDS) {
+        expected[k] = buffers[1][k]
+        k += 1
+    }
+    const opCount: u32 = 7
+    var o: u32 = 0
+    while o < 40 {
+        buffers[2][@intCast(usize, 3 + o * 5)] = if o == 0 { 0 } else { below(2) }
+        buffers[2][@intCast(usize, 3 + o * 5 + 1)] = @bitCast(u32, @intCast(i32, below(30)) - 6)
+        buffers[2][@intCast(usize, 3 + o * 5 + 2)] = @bitCast(u32, @intCast(i32, below(24)) - 6)
+        buffers[2][@intCast(usize, 3 + o * 5 + 3)] = below(20)
+        buffers[2][@intCast(usize, 3 + o * 5 + 4)] = below(16)
+        o += 1
+    }
+    const areaX: u32 = 4
+    const areaY: u32 = 2
+    const originX: i32 = 3
+    const originY: i32 = -2
+    const push = [12]u32{ width, height, 1, stride, 2, 40, areaX, areaY, @bitCast(u32, originX), @bitCast(u32, originY), 3, opCount }
+    check(54, dispatch(push[0..], 3, groups(width), groups(height)))
+    var y: u32 = 0
+    while y < height {
+        var x: u32 = 0
+        while x < width {
+            const rx = @intCast(i32, areaX + x) - originX
+            const ry = @intCast(i32, areaY + y) - originY
+            var covered = false
+            o = 0
+            while o < opCount {
+                const base = @intCast(usize, 3 + o * 5)
+                const left = @bitCast(i32, buffers[2][base + 1])
+                const top = @bitCast(i32, buffers[2][base + 2])
+                if rx >= left && rx < left + @bitCast(i32, buffers[2][base + 3]) && ry >= top && ry < top + @bitCast(i32, buffers[2][base + 4]) {
+                    covered = buffers[2][base] == 0
+                }
+                o += 1
+            }
+            if covered { expected[2 + @intCast(usize, (areaY + y) * 40 + areaX + x)] = buffers[0][1 + @intCast(usize, y * stride + x)] }
+            x += 1
+        }
+        y += 1
+    }
+    check(55, sameWords(1, 0, expected[0..WORDS]))
+}
+
+// ---------------------------------------------------------------------------
+// warp and shrink, as warp_shader.mlx writes them
+
+fn bernstein(t: i32, weights: *[4]i32) -> void {
+    const s = 1024 -% t
+    const ss = s *% s
+    const tt2 = t *% t
+    weights.*[0] = (ss *% s) >> 20
+    weights.*[1] = ((3 *% t) *% ss) >> 20
+    weights.*[2] = ((3 *% tt2) *% s) >> 20
+    weights.*[3] = (tt2 *% t) >> 20
+}
+
+fn clampInt(value: i32, low: i32, high: i32) -> i32 {
+    const raised = if value < low { low } else { value }
+    return if raised > high { high } else { raised }
+}
+
+fn warpOffset(x: i32, y: i32, width: i32, height: i32, offsets: *const [16]i32) -> i32 {
+    const u = clampInt((x *% 1024) / width, 0, 1024)
+    const v = clampInt((y *% 1024) / height, 0, 1024)
+    var across: [4]i32 = undefined
+    var down: [4]i32 = undefined
+    bernstein(u, &across)
+    bernstein(v, &down)
+    var total: i32 = 0
+    var row: usize = 0
+    while row < 4 {
+        var sum: i32 = 0
+        var column: usize = 0
+        while column < 4 {
+            sum = sum +% across[column] *% offsets.*[row * 4 + column]
+            column += 1
+        }
+        total = total +% down[row] *% (sum >> 10)
+        row += 1
+    }
+    return total >> 10
+}
+
+fn texel(x: i32, y: i32, width: i32, height: i32, stride: i32) -> u32 {
+    if x >= 0 && x < width && y >= 0 && y < height { return buffers[0][@intCast(usize, y *% stride +% x)] }
+    return 0
+}
+
+fn blendOver(target: u32, sampled: *const [4]u32) -> u32 {
+    const inverse = 255 -% sampled.*[0]
+    var result: u32 = 0
+    var k: u32 = 0
+    while k < 4 {
+        const shift = 24 - k * 8
+        const kept = ((target >> shift) & 255) *% inverse +% 127
+        var sum = sampled.*[k] +% kept / 255
+        if sum > 255 { sum = 255 }
+        result |= sum << shift
+        k += 1
+    }
+    return result
+}
+
+pub fn testWarp() -> void {
+    check(60, compileKernel(shaders.WARP))
+    const width: u32 = 36
+    const height: u32 = 30
+    const restWidth: i32 = 20
+    const restHeight: i32 = 16
+    var round: u32 = 0
+    while round < 3 {
+        var k: usize = 0
+        while k < @intCast(usize, restWidth * restHeight) {
+            buffers[0][k] = premultiplied()
+            k += 1
+        }
+        k = 0
+        while k < @intCast(usize, width * height) {
+            buffers[1][k] = 0xFF000000 | random() & 0xFFFFFF
+            expected[k] = buffers[1][k]
+            k += 1
+        }
+        var offsetsX: [16]i32 = undefined
+        var offsetsY: [16]i32 = undefined
+        k = 0
+        while k < 16 {
+            offsetsX[k] = @intCast(i32, below(97)) - 48
+            offsetsY[k] = @intCast(i32, below(97)) - 48
+            buffers[2][5 + k] = @bitCast(u32, offsetsX[k])
+            buffers[2][5 + 16 + k] = @bitCast(u32, offsetsY[k])
+            k += 1
+        }
+        const boxX: i32 = @intCast(i32, below(10)) - 4
+        const boxY: i32 = @intCast(i32, below(10)) - 4
+        const boxWidth: u32 = 28
+        const boxHeight: u32 = 22
+        const restX: i32 = boxX + 3
+        const restY: i32 = boxY + 2
+        const push = [14]u32{ width, height, 0, width, @bitCast(u32, boxX), @bitCast(u32, boxY), boxWidth, boxHeight, @bitCast(u32, restX), @bitCast(u32, restY), @bitCast(u32, restWidth), @bitCast(u32, restHeight), @bitCast(u32, restWidth), 5 }
+        check(61, dispatch(push[0..], 3, groups(boxWidth), groups(boxHeight)))
+        var y: u32 = 0
+        while y < boxHeight {
+            var x: u32 = 0
+            while x < boxWidth {
+                const px = boxX + @intCast(i32, x)
+                const py = boxY + @intCast(i32, y)
+                if px >= 0 && py >= 0 && px < @intCast(i32, width) && py < @intCast(i32, height) {
+                    const px16 = px *% 16 +% 8 -% restX *% 16
+                    const py16 = py *% 16 +% 8 -% restY *% 16
+                    var sx = px16
+                    var sy = py16
+                    var r: u32 = 0
+                    while r < 3 {
+                        const ox = warpOffset(sx, sy, restWidth * 16, restHeight * 16, &offsetsX)
+                        const oy = warpOffset(sx, sy, restWidth * 16, restHeight * 16, &offsetsY)
+                        sx = px16 -% ox
+                        sy = py16 -% oy
+                        r += 1
+                    }
+                    const cx = sx -% 8
+                    const cy = sy -% 8
+                    const ix = cx >> 4
+                    const iy = cy >> 4
+                    const fx = @bitCast(u32, cx & 15)
+                    const fy = @bitCast(u32, cy & 15)
+                    const c00 = texel(ix, iy, restWidth, restHeight, restWidth)
+                    const c10 = texel(ix + 1, iy, restWidth, restHeight, restWidth)
+                    const c01 = texel(ix, iy + 1, restWidth, restHeight, restWidth)
+                    const c11 = texel(ix + 1, iy + 1, restWidth, restHeight, restWidth)
+                    const gx = 16 - fx
+                    const gy = 16 - fy
+                    var sampled: [4]u32 = undefined
+                    var c: u32 = 0
+                    while c < 4 {
+                        const shift = 24 - c * 8
+                        const sum = ((c00 >> shift) & 255) * gx * gy + ((c10 >> shift) & 255) * fx * gy + ((c01 >> shift) & 255) * gx * fy + ((c11 >> shift) & 255) * fx * fy
+                        sampled[c] = (sum + 128) >> 8
+                        c += 1
+                    }
+                    const at = @intCast(usize, py) * @intCast(usize, width) + @intCast(usize, px)
+                    expected[at] = blendOver(expected[at], &sampled)
+                }
+                x += 1
+            }
+            y += 1
+        }
+        check(62, sameWords(1, 0, expected[0..@intCast(usize, width * height)]))
+        round += 1
+    }
+}
+
+pub fn testShrink() -> void {
+    check(70, compileKernel(shaders.SHRINK))
+    const width: u32 = 30
+    const height: u32 = 26
+    var round: u32 = 0
+    while round < 4 {
+        const sourceWidth = 20 + below(40)
+        const sourceHeight = 10 + below(30)
+        const sourceStride = sourceWidth + 3
+        var k: usize = 0
+        while k < @intCast(usize, sourceStride * sourceHeight + 9) {
+            buffers[0][k] = premultiplied()
+            k += 1
+        }
+        k = 0
+        while k < @intCast(usize, width * height) {
+            buffers[1][k] = 0xFF000000 | random() & 0xFFFFFF
+            expected[k] = buffers[1][k]
+            k += 1
+        }
+        const boxX = @intCast(i32, below(12)) - 4
+        const boxY = @intCast(i32, below(12)) - 4
+        const boxWidth = 5 + below(20)
+        const boxHeight = 4 + below(18)
+        const opacity = if round == 0 { @intCast(u32, 255) } else { below(256) }
+        const replace: u32 = if round == 3 { 1 } else { 0 }
+        const push = [14]u32{ width, height, 0, width, @bitCast(u32, boxX), @bitCast(u32, boxY), boxWidth, boxHeight, sourceWidth, sourceHeight, sourceStride, opacity, 9, replace }
+        check(71, dispatch(push[0..], 2, groups(boxWidth), groups(boxHeight)))
+        var y: u32 = 0
+        while y < boxHeight {
+            var x: u32 = 0
+            while x < boxWidth {
+                const px = boxX + @intCast(i32, x)
+                const py = boxY + @intCast(i32, y)
+                if px >= 0 && py >= 0 && px < @intCast(i32, width) && py < @intCast(i32, height) {
+                    var sums = [4]u32{ 0, 0, 0, 0 }
+                    var row: u32 = 0
+                    while row < 4 {
+                        const sy = ((y * 8 + 2 * row + 1) * sourceHeight) / (boxHeight * 8)
+                        var column: u32 = 0
+                        while column < 4 {
+                            const sx = ((x * 8 + 2 * column + 1) * sourceWidth) / (boxWidth * 8)
+                            const pixel = buffers[0][@intCast(usize, 9 + sy * sourceStride + sx)]
+                            var c: u32 = 0
+                            while c < 4 {
+                                sums[c] += (pixel >> (24 - c * 8)) & 255
+                                c += 1
+                            }
+                            column += 1
+                        }
+                        row += 1
+                    }
+                    var sampled: [4]u32 = undefined
+                    var c: u32 = 0
+                    while c < 4 {
+                        sampled[c] = (((sums[c] + 8) >> 4) * opacity + 127) / 255
+                        c += 1
+                    }
+                    const at = @intCast(usize, py) * @intCast(usize, width) + @intCast(usize, px)
+                    if replace != 0 {
+                        expected[at] = sampled[0] << 24 | sampled[1] << 16 | sampled[2] << 8 | sampled[3]
+                    } else {
+                        expected[at] = blendOver(expected[at], &sampled)
+                    }
+                }
+                x += 1
+            }
+            y += 1
+        }
+        check(72, sameWords(1, 0, expected[0..@intCast(usize, width * height)]))
+        round += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Divisions at the edges
+
+// A kernel of our own: buffer 0 holds pairs, buffer 1 gets for each n / d,
+// n % d (unsigned), n / d, n % d (signed, SPIR-V's SDiv and SRem), n % 8
+// and n / 16 (by constant powers of two), and push words 1 / 2 and 1 % 2
+// (signed: two uniform values, their absolute values two scalar operands).
+fn buildDivider(b: *builder.Builder) -> void {
+    var common: compute.Kernel = undefined
+    compute.declare(b, &common, 3, 2, false)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    _ = builder.label(b)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const count = compute.pushWord(b, &common, 0)
+    const inside = builder.binary(b, spv.Op.uLessThan, common.boolean, x, count)
+    const merge = compute.openIf(b, inside)
+    const two = compute.constant(b, &common, 2)
+    const four = compute.constant(b, &common, 4)
+    const base = builder.binary(b, spv.Op.iMul, common.uint, x, two)
+    const n = compute.load(b, &common, common.buffers[0], base)
+    const d = compute.load(b, &common, common.buffers[0], builder.binary(b, spv.Op.iAdd, common.uint, base, compute.constant(b, &common, 1)))
+    const sn = builder.unary(b, spv.Op.bitcast, common.int, n)
+    const sd = builder.unary(b, spv.Op.bitcast, common.int, d)
+    const out = builder.binary(b, spv.Op.iMul, common.uint, x, compute.constant(b, &common, 8))
+    const p1 = builder.unary(b, spv.Op.bitcast, common.int, compute.pushWord(b, &common, 1))
+    const p2 = builder.unary(b, spv.Op.bitcast, common.int, compute.pushWord(b, &common, 2))
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, out, four)), builder.binary(b, spv.Op.uMod, common.uint, n, compute.constant(b, &common, 8)))
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, out, compute.constant(b, &common, 5))), builder.binary(b, spv.Op.uDiv, common.uint, n, compute.constant(b, &common, 16)))
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, out, compute.constant(b, &common, 6))), builder.unary(b, spv.Op.bitcast, common.uint, builder.binary(b, spv.Op.sDiv, common.int, p1, p2)))
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, out, compute.constant(b, &common, 7))), builder.unary(b, spv.Op.bitcast, common.uint, builder.binary(b, spv.Op.sRem, common.int, p1, p2)))
+    builder.store(b, compute.element(b, &common, common.buffers[1], out), builder.binary(b, spv.Op.uDiv, common.uint, n, d))
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, out, compute.constant(b, &common, 1))), builder.binary(b, spv.Op.uMod, common.uint, n, d))
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, out, two)), builder.unary(b, spv.Op.bitcast, common.uint, builder.binary(b, spv.Op.sDiv, common.int, sn, sd)))
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, out, compute.constant(b, &common, 3))), builder.unary(b, spv.Op.bitcast, common.uint, builder.binary(b, spv.Op.sRem, common.int, sn, sd)))
+    compute.closeIf(b, merge)
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    compute.finish(b, &common, main, 64, 1)
+}
+
+var spirvWords: [8192]u32 = undefined
+
+pub fn compileDivider() -> bool {
+    const allocator = std.page_allocator.init()
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    buildDivider(&b)
+    const count = builder.wordCount(&b)
+    if count > 8192 { return false }
+    unsafe { builder.writeWords(&b, @ptrCast([*]u32, &spirvWords[0])) }
+    builder.deinit(&b)
+    return compileWords(spirvWords[0..count])
+}
+
+pub const EDGES = [_]u32{ 0, 1, 2, 3, 7, 255, 256, 65521, 65536, 65537, 1000003, 2147483629, 2147483647, 2147483648, 2147483649, 4294967291, 4294967294, 4294967295 }
+
+fn signedQuotient(n: i32, d: i32) -> i32 {
+    // the processor's; INT_MIN / -1 is the one quotient that does not fit
+    if n == -2147483648 && d == -1 { return n }
+    return n / d
+}
+
+fn signedRemainder(n: i32, d: i32) -> i32 {
+    if d == -1 { return 0 }
+    return n % d
+}
+
+// Fills the pairs, runs the divider, holds every answer; false at the
+// first wrong one (said with `show`).
+var pushA: i32 = -1000000007
+var pushB: i32 = 77
+
+pub fn divisions(count: usize) -> bool {
+    const push = [3]u32{ @intCast(u32, count), @bitCast(u32, pushA), @bitCast(u32, pushB) }
+    if !dispatch(push[0..], 2, @intCast(u32, (count + 63) / 64), 1) { return false }
+    var k: usize = 0
+    while k < count {
+        const n = buffers[0][k * 2]
+        const d = buffers[0][k * 2 + 1]
+        const sn = @bitCast(i32, n)
+        const sd = @bitCast(i32, d)
+        const want = [8]u32{ n / d, n % d, @bitCast(u32, signedQuotient(sn, sd)), @bitCast(u32, signedRemainder(sn, sd)), n % 8, n / 16, @bitCast(u32, signedQuotient(pushA, pushB)), @bitCast(u32, signedRemainder(pushA, pushB)) }
+        var j: usize = 0
+        while j < 8 {
+            if buffers[1][k * 8 + j] != want[j] {
+                if show {
+                    say("  ")
+                    sayHex(n)
+                    say(" by ")
+                    sayHex(d)
+                    say(": answer ")
+                    sayNumber(@intCast(u64, j))
+                    say(" is ")
+                    sayHex(buffers[1][k * 8 + j])
+                    say(", wanted ")
+                    sayHex(want[j])
+                    say("\n")
+                }
+                return false
+            }
+            j += 1
+        }
+        k += 1
+    }
+    return true
+}
+
+fn testDivision() -> void {
+    check(80, compileDivider())
+    // every pair of the edges (no divisor 0)
+    var count: usize = 0
+    var a: usize = 0
+    while a < EDGES.length {
+        var b: usize = 1
+        while b < EDGES.length {
+            buffers[0][count * 2] = EDGES[a]
+            buffers[0][count * 2 + 1] = EDGES[b]
+            count += 1
+            b += 1
+        }
+        a += 1
+    }
+    // and at chance: dividends of every size, divisors small and large
+    while count < 1500 {
+        buffers[0][count * 2] = random() >> @intCast(u32, below(32))
+        var d = random() >> @intCast(u32, below(32))
+        if d == 0 { d = 1 }
+        buffers[0][count * 2 + 1] = d
+        count += 1
+    }
+    rcpError = 0
+    check(81, divisions(count))
+    // the card's reciprocal is not the host's: one and two units below,
+    // the quotients stay
+    rcpError = -1
+    check(82, divisions(count))
+    rcpError = -2
+    check(83, divisions(count))
+    // above: not so. The sequence's first estimate must not exceed 2^32 /
+    // d (its correction step works on 2^32 - estimate * d); the scale
+    // 4294966784.0 = 2^32 - 512 leaves about one unit in the last place
+    // of room, and the host's reciprocal, correctly rounded, may already
+    // stand half a unit above. One unit more breaks 2 / 3 (it gives 3);
+    // with a divisor of 1 the estimate reaches 2^32 itself, which
+    // v_cvt_u32_f32 must take, and what the card gives for that is not in
+    // the sources (the interpreter stops there). So the card's v_rcp_f32
+    // must not round up by a unit: the study's 11.14 asks the card.
+    buffers[0][0] = 2
+    buffers[0][1] = 3
+    rcpError = 1
+    check(84, !divisions(1) && buffers[1][0] == 3)
+    rcpError = 2
+    check(85, !divisions(1))
+    buffers[0][0] = 77
+    buffers[0][1] = 1
+    rcpError = 1
+    const push = [3]u32{ 1, 1, 1 }
+    check(87, !dispatch(push[0..], 2, 1, 1) && lastResult.stop == wave.Stop.unknown && lastResult.detail == 0x4F800000)
+    rcpError = 0
+    // a divisor of 0 stops the run: the card's reciprocal of 0 is not known
+    buffers[0][0] = 5
+    buffers[0][1] = 0
+    check(86, !dispatch(push[0..], 2, 1, 1) && lastResult.stop == wave.Stop.unknown)
+}
+
+// ---------------------------------------------------------------------------
+// What a loop's header makes, read after the loop
+
+// i = 0; while i < n (n from buffer 0, so the lanes leave at different
+// rounds) { i += 1 }; the header also makes t = i * 3 + n and, with
+// `boolean`, d = i == k (k a push word). After the loop: out[x] = t + (i
+// << 16), or with `boolean` d ? 1 : 0.
+fn buildHeaderValue(b: *builder.Builder, boolean: bool) -> void {
+    var common: compute.Kernel = undefined
+    compute.declare(b, &common, 1, 2, false)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    _ = builder.label(b)
+    const pointer = builder.typePointer(b, spv.StorageClass.function, common.uint)
+    const variable = builder.localVariable(b, pointer)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const n = compute.load(b, &common, common.buffers[0], x)
+    const k = compute.pushWord(b, &common, 0)
+    builder.store(b, variable, common.zero)
+    const header = builder.newId(b)
+    const body = builder.newId(b)
+    const next = builder.newId(b)
+    const merge = builder.newId(b)
+    builder.branch(b, header)
+    _ = builder.labelWith(b, header)
+    const i = builder.load(b, common.uint, variable)
+    const t = builder.binary(b, spv.Op.iAdd, common.uint, builder.binary(b, spv.Op.iMul, common.uint, i, compute.constant(b, &common, 3)), n)
+    const d = builder.binary(b, spv.Op.iEqual, common.boolean, i, k)
+    const going = builder.binary(b, spv.Op.uLessThan, common.boolean, i, n)
+    builder.loopMerge(b, merge, next)
+    builder.branchConditional(b, going, body, merge)
+    _ = builder.labelWith(b, body)
+    builder.store(b, variable, builder.binary(b, spv.Op.iAdd, common.uint, builder.load(b, common.uint, variable), compute.constant(b, &common, 1)))
+    builder.branch(b, next)
+    _ = builder.labelWith(b, next)
+    builder.branch(b, header)
+    _ = builder.labelWith(b, merge)
+    // the word, and the variable after the loop in the high half
+    var result = builder.binary(b, spv.Op.iAdd, common.uint, t, builder.binary(b, spv.Op.shiftLeftLogical, common.uint, builder.load(b, common.uint, variable), compute.constant(b, &common, 16)))
+    if boolean { result = compute.select(b, common.uint, d, compute.constant(b, &common, 1), common.zero) }
+    builder.store(b, compute.element(b, &common, common.buffers[1], x), result)
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    compute.finish(b, &common, main, 64, 1)
+}
+
+fn compileHeaderValue(boolean: bool, failure: *shader.Failure) -> bool {
+    const allocator = std.page_allocator.init()
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    buildHeaderValue(&b, boolean)
+    const count = builder.wordCount(&b)
+    if count > 8192 { return false }
+    unsafe { builder.writeWords(&b, @ptrCast([*]u32, &spirvWords[0])) }
+    builder.deinit(&b)
+    return shader.compile(spirvWords[0..count], allocator, program[0..], &facts, failure)
+}
+
+fn testHeaderValues() -> void {
+    // a word: each lane keeps the value of the round it left in
+    var failure: shader.Failure = undefined
+    check(100, compileHeaderValue(false, &failure))
+    var x: usize = 0
+    while x < 128 {
+        buffers[0][x] = below(9)
+        x += 1
+    }
+    const push = [1]u32{ 3 }
+    check(101, dispatch(push[0..], 2, 2, 1))
+    x = 0
+    while x < 128 {
+        expected[x] = buffers[0][x] * 3 + buffers[0][x] + (buffers[0][x] << 16)
+        x += 1
+    }
+    check(102, sameWords(1, 0, expected[0..128]))
+    // a boolean: its lane mask is made whole in every round, so the lanes
+    // that left earlier would read the last round's bits: refused
+    check(103, !compileHeaderValue(true, &failure) && failure.kind == ir.Failure.loopBoolean)
+}
+
+// ---------------------------------------------------------------------------
+// Each comparison, and an if on a lane's value whose two sides give
+// values that are the wave's own
+
+const COMPARES = [10]spv.Op{ spv.Op.iEqual, spv.Op.iNotEqual, spv.Op.uLessThan, spv.Op.uLessThanEqual, spv.Op.uGreaterThan, spv.Op.uGreaterThanEqual, spv.Op.sLessThan, spv.Op.sLessThanEqual, spv.Op.sGreaterThan, spv.Op.sGreaterThanEqual }
+
+fn hostCompare(which: usize, a: u32, b: u32) -> bool {
+    const sa = @bitCast(i32, a)
+    const sb = @bitCast(i32, b)
+    if which == 0 { return a == b }
+    if which == 1 { return a != b }
+    if which == 2 { return a < b }
+    if which == 3 { return a <= b }
+    if which == 4 { return a > b }
+    if which == 5 { return a >= b }
+    if which == 6 { return sa < sb }
+    if which == 7 { return sa <= sb }
+    if which == 8 { return sa > sb }
+    return sa >= sb
+}
+
+// out[x * 24 + c]: comparison c of the lane's a and b (buffer 0, 2x and
+// 2x + 1); out[x * 24 + 10 + c]: of the push words p and q (uniform);
+// out[x * 24 + 20], [21]: v = a & 1 ? 7 : q and w = p, a & 2 ? 11 : w,
+// each set in an if on the lane's a with values of the whole wave.
+fn buildCompares(b: *builder.Builder) -> void {
+    var common: compute.Kernel = undefined
+    compute.declare(b, &common, 2, 2, false)
+    const main = builder.function(b, common.voidType, spv.FUNCTION_CONTROL_NONE, common.functionType)
+    _ = builder.label(b)
+    const pointer = builder.typePointer(b, spv.StorageClass.function, common.uint)
+    const vv = builder.localVariable(b, pointer)
+    const wv = builder.localVariable(b, pointer)
+    const id = builder.load(b, common.uvec3, common.globalId)
+    const x = builder.compositeExtract(b, common.uint, id, 0)
+    const two = compute.constant(b, &common, 2)
+    const one = compute.constant(b, &common, 1)
+    const a = compute.load(b, &common, common.buffers[0], builder.binary(b, spv.Op.iMul, common.uint, x, two))
+    const c = compute.load(b, &common, common.buffers[0], builder.binary(b, spv.Op.iAdd, common.uint, builder.binary(b, spv.Op.iMul, common.uint, x, two), one))
+    const p = compute.pushWord(b, &common, 0)
+    const q = compute.pushWord(b, &common, 1)
+    const base = builder.binary(b, spv.Op.iMul, common.uint, x, compute.constant(b, &common, 24))
+    var k: u32 = 0
+    while k < 10 {
+        const varying = builder.binary(b, COMPARES[k], common.boolean, a, c)
+        builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, base, compute.constant(b, &common, k))), compute.select(b, common.uint, varying, one, common.zero))
+        const uniform = builder.binary(b, COMPARES[k], common.boolean, p, q)
+        builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, base, compute.constant(b, &common, 10 + k))), compute.select(b, common.uint, uniform, one, common.zero))
+        k += 1
+    }
+    // v: both sides the wave's own values
+    const odd = builder.binary(b, spv.Op.iNotEqual, common.boolean, builder.binary(b, spv.Op.bitwiseAnd, common.uint, a, one), common.zero)
+    const then = builder.newId(b)
+    const other = builder.newId(b)
+    const merge = builder.newId(b)
+    builder.selectionMerge(b, merge)
+    builder.branchConditional(b, odd, then, other)
+    _ = builder.labelWith(b, then)
+    builder.store(b, vv, compute.constant(b, &common, 7))
+    builder.branch(b, merge)
+    _ = builder.labelWith(b, other)
+    builder.store(b, vv, q)
+    builder.branch(b, merge)
+    _ = builder.labelWith(b, merge)
+    // w: the wave's value before, another one on one side
+    builder.store(b, wv, p)
+    const second = builder.binary(b, spv.Op.iNotEqual, common.boolean, builder.binary(b, spv.Op.bitwiseAnd, common.uint, a, two), common.zero)
+    const after = compute.openIf(b, second)
+    builder.store(b, wv, compute.constant(b, &common, 11))
+    compute.closeIf(b, after)
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, base, compute.constant(b, &common, 20))), builder.load(b, common.uint, vv))
+    builder.store(b, compute.element(b, &common, common.buffers[1], builder.binary(b, spv.Op.iAdd, common.uint, base, compute.constant(b, &common, 21))), builder.load(b, common.uint, wv))
+    builder.returnVoid(b)
+    builder.functionEnd(b)
+    compute.finish(b, &common, main, 64, 1)
+}
+
+const COMPARE_EDGES = [_]u32{ 0, 1, 2, 0x7FFFFFFE, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFFFFFFFE, 0xFFFFFFFF }
+
+fn testCompares() -> void {
+    const allocator = std.page_allocator.init()
+    var b: builder.Builder = undefined
+    builder.init(&b, allocator, spv.version(1, 3))
+    buildCompares(&b)
+    const count = builder.wordCount(&b)
+    var compiled = false
+    if count <= 8192 {
+        unsafe { builder.writeWords(&b, @ptrCast([*]u32, &spirvWords[0])) }
+        compiled = compileWords(spirvWords[0..count])
+    }
+    builder.deinit(&b)
+    check(104, compiled)
+    // every pair of the edges, the rest at chance; equal pairs among them
+    var round: u32 = 0
+    while round < 4 {
+        const lanes: usize = 256
+        var x: usize = 0
+        while x < lanes {
+            var a = random()
+            var c = random()
+            const pair = x + @intCast(usize, round) * lanes
+            if pair < COMPARE_EDGES.length * COMPARE_EDGES.length {
+                a = COMPARE_EDGES[pair / COMPARE_EDGES.length]
+                c = COMPARE_EDGES[pair % COMPARE_EDGES.length]
+            } else if below(4) == 0 {
+                c = a
+            }
+            buffers[0][2 * x] = a
+            buffers[0][2 * x + 1] = c
+            x += 1
+        }
+        const p = COMPARE_EDGES[@intCast(usize, round) * 2]
+        const q = COMPARE_EDGES[@intCast(usize, round) * 2 + 1]
+        const push = [2]u32{ p, q }
+        check(105, dispatch(push[0..], 2, @intCast(u32, lanes / 64), 1))
+        x = 0
+        while x < lanes {
+            const a = buffers[0][2 * x]
+            var k: usize = 0
+            while k < 10 {
+                expected[x * 24 + k] = if hostCompare(k, a, buffers[0][2 * x + 1]) { 1 } else { 0 }
+                expected[x * 24 + 10 + k] = if hostCompare(k, p, q) { 1 } else { 0 }
+                k += 1
+            }
+            expected[x * 24 + 20] = if (a & 1) != 0 { 7 } else { q }
+            expected[x * 24 + 21] = if (a & 2) != 0 { 11 } else { p }
+            expected[x * 24 + 22] = buffers[1][x * 24 + 22]
+            expected[x * 24 + 23] = buffers[1][x * 24 + 23]
+            x += 1
+        }
+        check(106, sameWords(1, 0, expected[0..lanes * 24]))
+        round += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The wait states
+
+var hazardLines: [16]code_module.Line = undefined
+var paddedLines: [32]code_module.Line = undefined
+var hazardWords: [64]u32 = undefined
+
+fn line(inst: encode.Inst) -> code_module.Line { return code_module.Line.{ .kind = code_module.LineKind.inst, .inst = inst, .label = 0 } }
+
+// v_readfirstlane_b32 puts a vector register into the scalar offset of a
+// buffer store right after: five wait states are owed between.
+fn testHazards() -> void {
+    var count: usize = 0
+    var i = encode.blank(isa.S_LOAD_DWORDX4)
+    i.dst = 12
+    i.src0 = 2
+    i.flags = encode.IMM
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.S_WAITCNT)
+    i.imm = encode.waitWord(encode.WAIT_VM_MASK, encode.WAIT_EXP_MASK, 0)
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.V_LSHLREV_B32)
+    i.dst = encode.VGPR + 3
+    i.src0 = encode.constant(2)
+    i.src1 = encode.VGPR + 0
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.V_READFIRSTLANE_B32)
+    i.dst = 16
+    i.src0 = encode.VGPR + 3
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.BUFFER_STORE_DWORD)
+    i.dst = encode.VGPR + 0
+    i.src0 = encode.VGPR + 3
+    i.src1 = 12
+    i.src2 = 16
+    i.flags = encode.OFFEN
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.S_WAITCNT)
+    i.imm = 0
+    hazardLines[count] = line(i)
+    count += 1
+    hazardLines[count] = line(encode.blank(isa.S_ENDPGM))
+    count += 1
+    facts.vgprs = 4
+    facts.sgprs = 20
+    facts.userSgprs = 6
+    facts.groupIdX = true
+    facts.groupIdY = true
+    facts.groupIdZ = true
+    facts.localIdComponents = 2
+    facts.groupSizeX = 64
+    facts.groupSizeY = 1
+    facts.groupSizeZ = 1
+    // as it stands: refused, the first rule
+    var words = code_module.assemble(hazardLines[0..count], hazardWords[0..])
+    facts.words = words
+    check(90, words > 0)
+    var k: usize = 0
+    while k < words {
+        program[k] = hazardWords[k]
+        k += 1
+    }
+    const push = [1]u32{ 0 }
+    check(91, !dispatch(push[0..], 1, 1, 1) && lastResult.stop == wave.Stop.hazard && lastResult.detail == 1)
+    // padded: an s_nop 4 before the store, and it runs
+    const padded = code_module.padHazards(hazardLines[0..count], paddedLines[0..])
+    check(92, padded == count + 1 && paddedLines[4].inst.op.number == isa.S_NOP.number && paddedLines[4].inst.imm == 4)
+    words = code_module.assemble(paddedLines[0..padded], hazardWords[0..])
+    facts.words = words
+    k = 0
+    while k < words {
+        program[k] = hazardWords[k]
+        k += 1
+    }
+    check(93, dispatch(push[0..], 1, 1, 1))
+    // the same for the descriptor: its range word s14 from a vector
+    // register by v_readfirstlane, then the store reads s[12:15]
+    count = 0
+    i = encode.blank(isa.S_LOAD_DWORDX4)
+    i.dst = 12
+    i.src0 = 2
+    i.flags = encode.IMM
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.V_MOV_B32)
+    i.dst = encode.VGPR + 2
+    i.src0 = encode.LITERAL
+    i.literal = 256
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.V_LSHLREV_B32)
+    i.dst = encode.VGPR + 3
+    i.src0 = encode.constant(2)
+    i.src1 = encode.VGPR + 0
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.S_WAITCNT)
+    i.imm = encode.waitWord(encode.WAIT_VM_MASK, encode.WAIT_EXP_MASK, 0)
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.V_READFIRSTLANE_B32)
+    i.dst = 14
+    i.src0 = encode.VGPR + 2
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.BUFFER_STORE_DWORD)
+    i.dst = encode.VGPR + 0
+    i.src0 = encode.VGPR + 3
+    i.src1 = 12
+    i.src2 = encode.constant(0)
+    i.flags = encode.OFFEN
+    hazardLines[count] = line(i)
+    count += 1
+    i = encode.blank(isa.S_WAITCNT)
+    i.imm = 0
+    hazardLines[count] = line(i)
+    count += 1
+    hazardLines[count] = line(encode.blank(isa.S_ENDPGM))
+    count += 1
+    words = code_module.assemble(hazardLines[0..count], hazardWords[0..])
+    facts.words = words
+    k = 0
+    while k < words {
+        program[k] = hazardWords[k]
+        k += 1
+    }
+    check(94, !dispatch(push[0..], 1, 1, 1) && lastResult.stop == wave.Stop.hazard && lastResult.detail == 1)
+    const padded2 = code_module.padHazards(hazardLines[0..count], paddedLines[0..])
+    check(95, padded2 == count + 1 && paddedLines[5].inst.op.number == isa.S_NOP.number && paddedLines[5].inst.imm == 4)
+    words = code_module.assemble(paddedLines[0..padded2], hazardWords[0..])
+    facts.words = words
+    k = 0
+    while k < words {
+        program[k] = hazardWords[k]
+        k += 1
+    }
+    check(96, dispatch(push[0..], 1, 1, 1) && buffers[0][63] == 63)
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    show = arguments.length > 1
+    testPattern()
+    testNv12()
+    testText()
+    testPaint()
+    testBlit()
+    testBlur()
+    testWarp()
+    testShrink()
+    testDivision()
+    testHeaderValues()
+    testCompares()
+    testHazards()
+    if failed != 0 { return failed }
+    return 13
+}

@@ -1,0 +1,280 @@
+// How the desktop's programs ask the compositor for another mode of the
+// display, on brixOS: the settings program's Display page asks, the
+// compositor asks the kernel (std.displaymodes), follows the change and
+// puts the question whether to keep it on the screen (mode_question.mlx).
+//
+// The compositor listens on a listener node next to its Wayland socket,
+// $XDG_RUNTIME_DIR/<socket>.modes (named in the .display file it writes:
+// `ask = PATH`, display.mlx), and speaks MLXIPC's native wire on each
+// channel it accepts (std.ipc on a direct channel: no bus between them):
+//
+//     org.mlx.Display.Ask (u width, u height, u millihertz) -> ()
+//
+// millihertz 0 is any rate of that size. The reply comes once the
+// display runs the mode (it waits to be kept: the question is on the
+// screen), or it is an error whose text says in plain words why not:
+//
+//     org.mlx.Display.Refused   the kernel would not set it (its reason)
+//     org.mlx.Display.Busy      a mode waits to be kept or taken back
+//     org.mlx.Display.NotFound  the display has no such mode
+//     org.mlx.Display.Failed    the change failed on the way
+//     org.mlx.Display.NotAllowed  this desktop may not change the mode
+//
+// Only a program of the compositor's own user (or root) is heard: the
+// kernel says who holds the channel's other end (channel_peer). At most
+// MOST_ASKERS at once; more are let go at once.
+//
+// Other systems keep what they had: the settings program writes the mode
+// into compositor.conf and it is taken at the compositor's next start.
+const std = @import("std")
+const builtin = @import("builtin")
+const ipc = @import("std.ipc")
+const dbus = @import("std.dbus")
+const displaymodes = @import("std.displaymodes")
+const state = @import("./state.mlx")
+
+const brix = std.os.brix
+const Compositor = state.Compositor
+
+pub const INTERFACE: []const u8 = "org.mlx.Display"
+pub const PATH: []const u8 = "/org/mlx/Display"
+pub const ASK: []const u8 = "Ask"
+// The listener's name: the Wayland socket's with this after it.
+pub const SUFFIX: []const u8 = ".modes"
+pub const MOST_ASKERS: usize = 2
+
+pub const REFUSED: []const u8 = "org.mlx.Display.Refused"
+pub const BUSY: []const u8 = "org.mlx.Display.Busy"
+pub const NOT_FOUND: []const u8 = "org.mlx.Display.NotFound"
+pub const FAILED: []const u8 = "org.mlx.Display.Failed"
+pub const NOT_ALLOWED: []const u8 = "org.mlx.Display.NotAllowed"
+pub const UNKNOWN: []const u8 = "org.mlx.Display.Unknown"
+
+pub const Asking = struct {
+    // The listener (-1: none), the askers' connections (ipc.Client
+    // records; 0: none), the listener's path (NUL-terminated) and the
+    // user the compositor runs as.
+    listener: isize
+    clients: [2]usize
+    path: [272]u8
+    pathLength: usize
+    user: u32
+}
+
+// An Ask that came: from which asker, the call (to answer), the mode.
+pub const Request = struct {
+    which: usize
+    message: ipc.Message
+    width: usize
+    height: usize
+    millihertz: usize
+}
+
+fn clientAt(address: usize) -> *ipc.Client {
+    unsafe { return @ptrFromInt(*ipc.Client, address) }
+}
+
+// The listener's path for this compositor into `asking` (false without
+// XDG_RUNTIME_DIR).
+fn pathFor(asking: *Asking, compositor: *Compositor) -> bool {
+    const runtime = state.environmentValue(compositor.*.environment, "XDG_RUNTIME_DIR")
+    if @intFromPtr(runtime) == 0 || runtime[0] == 0 { return false }
+    const path: [*]u8 = &asking.*.path
+    var length: usize = 0
+    while runtime[length] != 0 && length < 180 {
+        path[length] = runtime[length]
+        length += 1
+    }
+    path[length] = 47
+    length += 1
+    var index: usize = 0
+    while index < compositor.*.socketNameLength && index < 64 {
+        path[length] = compositor.*.socketName[index]
+        length += 1
+        index += 1
+    }
+    length = std.text.append(path, length, length + SUFFIX.length, SUFFIX)
+    path[length] = 0
+    asking.*.pathLength = length
+    return true
+}
+
+// Listens for askers; false when it cannot (the desktop then offers no
+// change at once: the file says no `ask`).
+pub fn begin(asking: *Asking, compositor: *Compositor) -> bool {
+    asking.*.listener = -1
+    asking.*.clients[0] = 0
+    asking.*.clients[1] = 0
+    asking.*.pathLength = 0
+    asking.*.user = ownUser()
+    if !pathFor(asking, compositor) { return false }
+    const path: [*]const u8 = &asking.*.path
+    // (One left by a compositor before that ended without removing it.)
+    _ = std.fs.delete(path)
+    const listener = dbus.listen(path[0..asking.*.pathLength])
+    if listener < 0 {
+        asking.*.pathLength = 0
+        return false
+    }
+    asking.*.listener = listener
+    return true
+}
+
+// The user this program runs as (brixOS: process_self; elsewhere, where
+// only the host tests listen, getuid).
+fn ownUser() -> u32 {
+    if comptime builtin.os == builtin.Os.brixos {
+        var record: brix.ProcessRecord = undefined
+        var nothing: [1]u8 = undefined
+        return if brix.processSelf(&record, nothing[0..0]) >= 0 { record.user } else { 0 }
+    }
+    return @intCast(u32, std.linux.syscall0(std.linux.SYS_getuid) & 0xFFFFFFFF)
+}
+
+// Where askers reach the compositor (empty: they do not).
+pub fn pathOf(asking: *const Asking) -> []const u8 {
+    const path: [*]const u8 = &asking.*.path
+    return path[0..asking.*.pathLength]
+}
+
+fn drop(asking: *Asking, compositor: *Compositor, which: usize) -> void {
+    const address = asking.*.clients[which]
+    if address == 0 { return }
+    ipc.disconnect(clientAt(address), compositor.*.allocator)
+    state.release(compositor, unsafe { @ptrFromInt([*]u8, address) }, @sizeOf(ipc.Client))
+    asking.*.clients[which] = 0
+}
+
+pub fn end(asking: *Asking, compositor: *Compositor) -> void {
+    drop(asking, compositor, 0)
+    drop(asking, compositor, 1)
+    if asking.*.listener >= 0 {
+        ipc.closeDescriptor(asking.*.listener)
+        asking.*.listener = -1
+        const path: [*]const u8 = &asking.*.path
+        _ = std.fs.delete(path)
+    }
+}
+
+// The descriptors to wait on (the listener, the askers) into `list` from
+// `count`; the count after them.
+pub fn descriptors(asking: *const Asking, list: [*]isize, count: usize, capacity: usize) -> usize {
+    var at = count
+    if asking.*.listener >= 0 && at < capacity {
+        list[at] = asking.*.listener
+        at += 1
+    }
+    var which: usize = 0
+    while which < MOST_ASKERS {
+        if asking.*.clients[which] != 0 && at < capacity {
+            list[at] = ipc.descriptorOfClient(clientAt(asking.*.clients[which]))
+            at += 1
+        }
+        which += 1
+    }
+    return at
+}
+
+// New askers taken (of the compositor's user, or root; MOST_ASKERS at
+// most).
+fn acceptAll(asking: *Asking, compositor: *Compositor) -> void {
+    if asking.*.listener < 0 { return }
+    var tries: usize = 0
+    while tries < 4 {
+        tries += 1
+        const descriptor = dbus.accept(asking.*.listener)
+        if descriptor < 0 { return }
+        var pid: u32 = 0
+        var uid: u32 = 0
+        var gid: u32 = 0
+        const known = dbus.peerOf(descriptor, &pid, &uid, &gid)
+        var slot: usize = MOST_ASKERS
+        if asking.*.clients[0] == 0 { slot = 0 } else if asking.*.clients[1] == 0 { slot = 1 }
+        if !known || (uid != asking.*.user && uid != 0) || slot == MOST_ASKERS {
+            if compositor.*.verbose { state.say(if slot == MOST_ASKERS { "display: an asker more than the compositor hears at once, let go\n" } else { "display: an asker of another user, let go\n" }) }
+            ipc.closeDescriptor(descriptor)
+            continue
+        }
+        const memory = state.allocate(compositor, @sizeOf(ipc.Client))
+        const client = clientAt(@intFromPtr(memory))
+        if !ipc.attach(client, compositor.*.allocator, descriptor) {
+            state.release(compositor, memory, @sizeOf(ipc.Client))
+            ipc.closeDescriptor(descriptor)
+            continue
+        }
+        asking.*.clients[slot] = @intFromPtr(memory)
+    }
+}
+
+// The next Ask an asker sent, into `request`; false when none waits.
+// Calls that are no Ask are answered here; an asker that went is let go.
+pub fn take(asking: *Asking, compositor: *Compositor, request: *Request) -> bool {
+    acceptAll(asking, compositor)
+    var which: usize = 0
+    while which < MOST_ASKERS {
+        const address = asking.*.clients[which]
+        if address == 0 {
+            which += 1
+            continue
+        }
+        const client = clientAt(address)
+        var message: ipc.Message = undefined
+        while ipc.next(client, &message, 0) {
+            if message.kind != ipc.CALL { continue }
+            if !std.text.same(message.interface, INTERFACE) || !std.text.same(message.member, ASK) || !std.text.same(message.signature, "uuu") {
+                _ = ipc.replyError(client, &message, UNKNOWN, "no such call: org.mlx.Display.Ask (uuu) is the one there is")
+                continue
+            }
+            var reading = ipc.reader(ipc.bodyOf(client, &message), message.bodyLength)
+            const width = ipc.readU32(&reading)
+            const height = ipc.readU32(&reading)
+            const millihertz = ipc.readU32(&reading)
+            request.*.which = which
+            request.*.message = message
+            request.*.width = @intCast(usize, width)
+            request.*.height = @intCast(usize, height)
+            request.*.millihertz = @intCast(usize, millihertz)
+            return true
+        }
+        if client.*.closed { drop(asking, compositor, which) }
+        which += 1
+    }
+    return false
+}
+
+// The kernel's answer to the request (0, or a negative brix.Status, with
+// the display's state after it) told to its asker.
+pub fn answer(asking: *Asking, request: *const Request, status: isize, after: *const displaymodes.State) -> void {
+    const address = asking.*.clients[request.*.which]
+    if address == 0 { return }
+    const client = clientAt(address)
+    if status == 0 {
+        var nothing: [1]u8 = undefined
+        var none: [1]isize = [1]isize{ 0 }
+        _ = ipc.reply(client, &request.*.message, "", &nothing, 0, &none, 0)
+        return
+    }
+    _ = ipc.replyError(client, &request.*.message, errorName(status), refusal(status, after.*.last, after.*.lastWhy))
+}
+
+// The error's name for a status of display_mode.
+pub fn errorName(status: isize) -> []const u8 {
+    if status == -brix.Status.unsupported { return REFUSED }
+    if status == -brix.Status.busy { return BUSY }
+    if status == -brix.Status.not_found { return NOT_FOUND }
+    if status == -brix.Status.no_right { return NOT_ALLOWED }
+    return FAILED
+}
+
+// Why a mode was not set, in plain words, from display_mode's status and
+// what the display's record says of the last request (its end and its
+// reason, std.displaymodes Last and Why).
+pub fn refusal(status: isize, last: usize, why: u32) -> []const u8 {
+    if status == -brix.Status.unsupported { return displaymodes.whyText(why) }
+    if status == -brix.Status.busy { return "another mode waits to be kept or taken back" }
+    if status == -brix.Status.not_found { return "the display has no such mode" }
+    if status == -brix.Status.no_right { return "this desktop may not change the display's mode (the login did not give it the display)" }
+    if last == displaymodes.Last.FAILED_BACK { return "the change failed, and the mode before runs again" }
+    if last == displaymodes.Last.FAILED_LOST { return "the change failed, and what the display shows is not known" }
+    return "the display's mode could not be changed"
+}

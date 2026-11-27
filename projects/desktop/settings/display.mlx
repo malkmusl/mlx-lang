@@ -1,7 +1,7 @@
-// The Display page: the monitor the compositor drives, the mode it starts
-// in and night light. What the monitor is comes from the compositor, which
-// writes $XDG_RUNTIME_DIR/<WAYLAND_DISPLAY>.display when it has set it up
-// (projects/desktop/compositor/display.mlx):
+// The Display page: the monitor the compositor drives, its mode and night
+// light. What the monitor is comes from the compositor, which writes
+// $XDG_RUNTIME_DIR/<WAYLAND_DISPLAY>.display when it has set it up and
+// whenever the display changes (projects/desktop/compositor/display.mlx):
 //
 //     backend = drm                  (drm: the monitor itself; nested: a
 //                                     window in another session)
@@ -12,22 +12,50 @@
 //     gamma = 256                    (the CRTC's gamma table's size, for
 //                                     night light; 0: it has none)
 //
-// What to change goes into compositor.conf with the other settings (main
-// loads and saves these keys):
+// On brixOS the compositor says more (drm.brixos.mlx's describe): who
+// sets the display's modes, where to ask it for one, and each mode with
+// its rate in millihertz, whether it is the monitor's own, the one that
+// runs, the one the next boots set, or, when it cannot be set, why:
+//
+//     driver = Radeon, HDMI or DVI
+//     ask = /temporary/users/1000/wayland-mlx.modes
+//     available = 1920x1080@60 60000 own
+//     unavailable = 3840x2160@30 30000: more than this output carries
+//     pending = 12                   (seconds left to keep a mode)
+//
+// There a mode chosen is set at once: the page asks the compositor
+// (org.mlx.Display.Ask on the channel at `ask`, MLXIPC's native wire:
+// projects/desktop/compositor/mode_change.mlx), the compositor asks the
+// kernel and shows, on the new picture, whether to keep it. Kept, the
+// kernel sets it at the next boots too; not kept within fifteen seconds,
+// the mode before comes back by itself.
+//
+// Elsewhere what to change goes into compositor.conf with the other
+// settings (main loads and saves these keys), and the compositor takes
+// the mode at its next start:
 //
 //     display-mode = auto            (or WxH@HZ: taken at the next start)
 //     night-light = off
 //     night-light-temperature = 4000 (Kelvin, 1500 to 6500)
 const std = @import("std")
+const ipc = @import("std.ipc")
+const dbus = @import("std.dbus")
 const apps_module = @import("../shared/apps.mlx")
 const page_module = @import("./page.mlx")
 
 const Page = page_module.Page
 
-pub const MAX_MODES: usize = 32
+pub const MAX_MODES: usize = 96
 pub const COOLEST: u32 = 6500
 pub const WARMEST: u32 = 1500
 pub const DEFAULT_TEMPERATURE: u32 = 4000
+// The longest reason kept for a mode that cannot be set, and for an
+// answer of the compositor.
+pub const REASON_MOST: usize = 120
+// How long the page waits for the compositor's answer (milliseconds): a
+// change on a Radeon takes about a second, its way back as long again,
+// and the card's own bounds are some twenty seconds.
+pub const ASK_WAIT: isize = 45000
 
 // The widgets' items (page_module.idOf): above everything main.mlx uses.
 const ITEM_MODE: usize = 1500
@@ -42,6 +70,16 @@ pub const Mode = struct {
     width: u32
     height: u32
     hertz: u32
+    // Its rate exactly (0: not said), the monitor's own, the one that
+    // runs, the one the next boots set (brixOS); whether it can be set,
+    // and why not when it cannot (`reason`).
+    millihertz: u32
+    own: bool
+    runs: bool
+    kept: bool
+    can: bool
+    reason: [120]u8
+    reasonLength: usize
 }
 
 pub const Display = struct {
@@ -65,9 +103,26 @@ pub const Display = struct {
     height: u32
     hertz: u32
     millihertz: u32
-    modes: [32]Mode
+    modes: [96]Mode
     modeCount: usize
     gamma: bool
+    // brixOS: who sets the modes, where to ask the compositor for one
+    // (empty: nowhere, the mode is taken at the next start), the seconds
+    // left to keep a mode asked for (0: none waits).
+    driver: [40]u8
+    driverLength: usize
+    ask: [272]u8
+    askLength: usize
+    pending: u32
+    // What the last request came to, in plain words (empty: none yet),
+    // and whether it was set.
+    answer: [160]u8
+    answerLength: usize
+    answerSet: bool
+    // The line said last of what the page shows (said again only when it
+    // is another: for whoever reads the program's errors).
+    told: [256]u8
+    toldLength: usize
     // The compositor's file (NUL-terminated).
     statePath: [256]u8
     statePathLength: usize
@@ -116,6 +171,53 @@ pub fn parseMode(text: []const u8, mode: *Mode) -> bool {
     return true
 }
 
+fn word(text: []const u8, from: usize, end: *usize) -> []const u8 {
+    var start = from
+    while start < text.length && text[start] == 32 { start += 1 }
+    var stop = start
+    while stop < text.length && text[stop] != 32 && text[stop] != 58 { stop += 1 }
+    end.* = stop
+    return text[start..stop]
+}
+
+// A mode line's value (an `available` or `unavailable` line): "WxH@HZ",
+// then on brixOS its rate in millihertz, the words own, runs and kept,
+// and after a colon why it cannot be set. `can`: the line's key was
+// `available`. False when it is not one.
+pub fn parseModeLine(text: []const u8, can: bool, mode: *Mode) -> bool {
+    var end: usize = 0
+    const first = word(text, 0, &end)
+    if !parseMode(first, mode) { return false }
+    mode.*.millihertz = 0
+    mode.*.own = false
+    mode.*.runs = false
+    mode.*.kept = false
+    mode.*.can = can
+    mode.*.reasonLength = 0
+    var at = end
+    while at < text.length {
+        if text[at] == 58 {
+            const reason = std.text.trimmed(text[at + 1..text.length])
+            const bytes: [*]u8 = &mode.*.reason
+            mode.*.reasonLength = std.text.append(bytes, 0, REASON_MOST, reason)
+            return true
+        }
+        const next = word(text, at, &end)
+        if next.length == 0 {
+            at = end + 1
+            continue
+        }
+        var used: usize = 0
+        const value = number(next, &used)
+        if used == next.length { mode.*.millihertz = value }
+        if std.text.same(next, "own") { mode.*.own = true }
+        if std.text.same(next, "runs") { mode.*.runs = true }
+        if std.text.same(next, "kept") { mode.*.kept = true }
+        at = end
+    }
+    return true
+}
+
 fn writeNumber(out: [*]u8, at: usize, value: u32) -> usize { return std.text.appendUnsigned(out, at, at + 10, @intCast(usize, value)) }
 
 // "WxH@HZ" (the form compositor.conf and the compositor's file use).
@@ -132,6 +234,12 @@ pub fn init(display: *Display, environment: [*][*]const u8) -> void {
     display.*.changed = false
     display.*.known = false
     display.*.modeCount = 0
+    display.*.askLength = 0
+    display.*.driverLength = 0
+    display.*.pending = 0
+    display.*.answerLength = 0
+    display.*.answerSet = false
+    display.*.toldLength = 0
     defaults(display)
     // $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY.display (WAYLAND_DISPLAY may be a
     // path of its own).
@@ -214,24 +322,23 @@ pub fn save(display: *Display, text: [*]u8, at: usize) -> usize {
     return length + 1
 }
 
-// Reads what the compositor said; false when it said nothing (yet).
-pub fn refresh(display: *Display, allocator: std.allocator.Allocator) -> bool {
-    const path: [*]const u8 = &display.*.statePath
+// What the compositor said in `text` (its file's contents) taken in;
+// false when it said nothing of its backend.
+pub fn take(display: *Display, text: []const u8) -> bool {
     display.*.known = false
-    const loaded = std.fs.readFileAlloc(path, allocator)
-    if loaded == null { return false }
-    const contents = loaded.?
-    const text = contents.items
     display.*.modeCount = 0
     display.*.gamma = false
     display.*.backendLength = 0
     display.*.outputLength = 0
     display.*.millihertz = 0
+    display.*.askLength = 0
+    display.*.driverLength = 0
+    display.*.pending = 0
     var bytes: [*]u8 = undefined
     var at: usize = 0
-    while at < contents.length {
+    while at < text.length {
         var end = at
-        while end < contents.length && text[end] != 10 { end += 1 }
+        while end < text.length && text[end] != 10 { end += 1 }
         const line = text[at..end]
         var equals: usize = 0
         while equals < line.length && line[equals] != 61 { equals += 1 }
@@ -257,22 +364,88 @@ pub fn refresh(display: *Display, allocator: std.allocator.Allocator) -> bool {
                 var used: usize = 0
                 display.*.millihertz = number(value, &used)
             }
-            if std.text.same(key, "available") && display.*.modeCount < MAX_MODES && parseMode(value, &mode) {
-                const slot = modeAt(display, display.*.modeCount)
-                slot.*.width = mode.width
-                slot.*.height = mode.height
-                slot.*.hertz = mode.hertz
+            const available = std.text.same(key, "available")
+            if (available || std.text.same(key, "unavailable")) && display.*.modeCount < MAX_MODES && parseModeLine(value, available, &mode) {
+                modeAt(display, display.*.modeCount).* = mode
                 display.*.modeCount += 1
             }
             if std.text.same(key, "gamma") {
                 var used: usize = 0
                 display.*.gamma = number(value, &used) > 0
             }
+            if std.text.same(key, "driver") {
+                bytes = &display.*.driver
+                display.*.driverLength = std.text.append(bytes, 0, 40, value)
+            }
+            if std.text.same(key, "ask") {
+                bytes = &display.*.ask
+                display.*.askLength = std.text.append(bytes, 0, 270, value)
+            }
+            if std.text.same(key, "pending") {
+                var used: usize = 0
+                display.*.pending = number(value, &used)
+            }
         }
         at = end + 1
     }
-    std.fs.ArrayList.deinit(contents)
     return display.*.known
+}
+
+// Reads what the compositor said; false when it said nothing (yet).
+pub fn refresh(display: *Display, allocator: std.allocator.Allocator) -> bool {
+    const path: [*]const u8 = &display.*.statePath
+    display.*.known = false
+    const loaded = std.fs.readFileAlloc(path, allocator)
+    if loaded == null { return false }
+    const contents = loaded.?
+    const known = take(display, contents.items[0..contents.length])
+    std.fs.ArrayList.deinit(contents)
+    if known { tell(display) }
+    return known
+}
+
+// What the page shows, in a line on the program's errors when it is
+// another than the one said before ("control: display: 1024x768 at 60.00
+// Hz runs (QEMU's adapter); 6 modes to choose, 1 not available; set at
+// once"), into `out` (at least 256 bytes); its length.
+pub fn summary(display: *Display, out: [*]u8) -> usize {
+    var length = std.text.append(out, 0, 256, "control: display: ")
+    length = writeNumber(out, length, display.*.width)
+    length = std.text.append(out, length, 256, "x")
+    length = writeNumber(out, length, display.*.height)
+    length = std.text.append(out, length, 256, " at ")
+    length += rateLabel(after(out, length), display.*.millihertz, display.*.hertz, kernelModes(display))
+    length = std.text.append(out, length, 256, " runs")
+    if display.*.driverLength > 0 {
+        length = std.text.append(out, length, 256, " (")
+        length = std.text.append(out, length, 200, driverOf(display))
+        length = std.text.append(out, length, 256, ")")
+    }
+    var can: usize = 0
+    var index: usize = 0
+    while index < display.*.modeCount {
+        if modeAt(display, index).*.can { can += 1 }
+        index += 1
+    }
+    length = std.text.append(out, length, 256, "; ")
+    length = std.text.appendUnsigned(out, length, length + 10, can)
+    length = std.text.append(out, length, 256, " modes to choose, ")
+    length = std.text.appendUnsigned(out, length, length + 10, display.*.modeCount - can)
+    length = std.text.append(out, length, 256, " not available; ")
+    length = std.text.append(out, length, 256, if changesAtOnce(display) { "set at once" } else if kernelModes(display) { "not changed from here" } else { "taken at the next start" })
+    if display.*.pending > 0 { length = std.text.append(out, length, 256, "; waits to be kept") }
+    return length
+}
+
+fn tell(display: *Display) -> void {
+    var text: [256]u8 = undefined
+    const bytes: [*]u8 = &text
+    const length = summary(display, bytes)
+    const told: [*]u8 = &display.*.told
+    if std.text.same(bytes[0..length], told[0..display.*.toldLength]) { return }
+    display.*.toldLength = std.text.append(told, 0, 256, bytes[0..length])
+    _ = std.io.eprint(bytes[0..length])
+    _ = std.io.eprint("\n")
 }
 
 fn backendOf(display: *Display) -> []const u8 {
@@ -284,6 +457,48 @@ fn outputOf(display: *Display) -> []const u8 {
     const bytes: [*]const u8 = &display.*.output
     return bytes[0..display.*.outputLength]
 }
+
+fn driverOf(display: *Display) -> []const u8 {
+    const bytes: [*]const u8 = &display.*.driver
+    return bytes[0..display.*.driverLength]
+}
+
+fn askOf(display: *Display) -> []const u8 {
+    const bytes: [*]const u8 = &display.*.ask
+    return bytes[0..display.*.askLength]
+}
+
+pub fn answerOf(display: *Display) -> []const u8 {
+    const bytes: [*]const u8 = &display.*.answer
+    return bytes[0..display.*.answerLength]
+}
+
+fn reasonOf(mode: *Mode) -> []const u8 {
+    const bytes: [*]const u8 = &mode.*.reason
+    return bytes[0..mode.*.reasonLength]
+}
+
+// Whether the mode that runs is the one the next boots set (kept).
+pub fn runsKept(display: *Display) -> bool {
+    var index: usize = 0
+    while index < display.*.modeCount {
+        const mode = modeAt(display, index)
+        if mode.*.runs && mode.*.kept { return true }
+        index += 1
+    }
+    return false
+}
+
+// Whether a mode chosen on the page is set at once (the compositor takes
+// requests: brixOS), not at the next start.
+pub fn changesAtOnce(display: *const Display) -> bool { return display.*.askLength > 0 }
+
+// Whether the display's modes are the kernel's, set while the system runs
+// or not at all (brixOS: the file names who sets them), not the
+// compositor's at its next start. A display there that no driver changes
+// (the firmware's picture), or a compositor that takes no requests, offers
+// nothing to choose: compositor.conf's mode would be taken by nobody.
+pub fn kernelModes(display: *const Display) -> bool { return display.*.driverLength > 0 || display.*.askLength > 0 }
 
 // "1920 × 1080" and, with `hertz`, ", 60 Hz" into `out`; its length.
 fn modeLabel(out: [*]u8, width: u32, height: u32, hertz: u32) -> usize {
@@ -299,12 +514,14 @@ fn modeLabel(out: [*]u8, width: u32, height: u32, hertz: u32) -> usize {
 }
 
 // The refresh rate with two decimals (59.94 Hz), from millihertz.
-fn rateLabel(out: [*]u8, millihertz: u32, hertz: u32) -> usize {
+fn rateLabel(out: [*]u8, millihertz: u32, hertz: u32, cut: bool) -> usize {
     if millihertz == 0 {
         const length = writeNumber(out, 0, hertz)
         return length + std.text.append(after(out, length), 0, 3, " Hz")
     }
-    const hundredths = (millihertz + 5) / 10
+    // (`cut`: at the hundredths, as brixOS's kernel and its `display` tool
+    // say it; elsewhere rounded, as the page always said it.)
+    const hundredths = if cut { millihertz / 10 } else { (millihertz + 5) / 10 }
     var length = writeNumber(out, 0, hundredths / 100)
     const rest = hundredths % 100
     if rest != 0 {
@@ -319,6 +536,21 @@ fn rateLabel(out: [*]u8, millihertz: u32, hertz: u32) -> usize {
     return length + std.text.append(after(out, length), 0, 3, " Hz")
 }
 
+// A mode's row on the brixOS page: "1920 × 1080, 59.94 Hz (the monitor's
+// own)" into `out` (at least 120 bytes); its length.
+pub fn rowLabel(mode: *const Mode, german: bool, out: [*]u8) -> usize {
+    var length = writeNumber(out, 0, mode.*.width)
+    length += std.text.append(after(out, length), 0, 8, " × ")
+    length = writeNumber(out, length, mode.*.height)
+    // (A rate nobody knows, the firmware's picture's, is not said.)
+    if mode.*.millihertz != 0 || mode.*.hertz != 0 {
+        length += std.text.append(after(out, length), 0, 2, ", ")
+        length += rateLabel(after(out, length), mode.*.millihertz, mode.*.hertz, true)
+    }
+    if mode.*.own { length += std.text.append(after(out, length), 0, 40, if german { " (eigener Modus des Monitors)" } else { " (the monitor's own)" }) }
+    return length
+}
+
 fn chooseMode(display: *Display, width: u32, height: u32, hertz: u32) -> void {
     display.*.wantWidth = width
     display.*.wantHeight = height
@@ -326,45 +558,102 @@ fn chooseMode(display: *Display, width: u32, height: u32, hertz: u32) -> void {
     display.*.changed = true
 }
 
+fn keepAnswer(display: *Display, set: bool, text: []const u8) -> void {
+    const bytes: [*]u8 = &display.*.answer
+    display.*.answerLength = std.text.append(bytes, 0, 160, text)
+    display.*.answerSet = set
+}
+
+// Asks the compositor for `mode` at once (brixOS): it sets it and puts
+// the question whether to keep it on the screen. What came of it is the
+// page's answer (answerOf); true when the display runs it now. The
+// compositor's file is read again after it.
+pub fn ask(display: *Display, mode: *const Mode, german: bool, allocator: std.allocator.Allocator) -> bool {
+    if display.*.askLength == 0 { return false }
+    const descriptor = dbus.connect(askOf(display))
+    if descriptor < 0 {
+        keepAnswer(display, false, if german { "Der Compositor nimmt gerade keine Anfrage an." } else { "The compositor takes no request now." })
+        return false
+    }
+    const memory = allocator.alloc(@sizeOf(ipc.Client), 16)
+    if memory == null {
+        ipc.closeDescriptor(descriptor)
+        return false
+    }
+    const client: *ipc.Client = unsafe { @ptrCast(*ipc.Client, memory.?) }
+    var set = false
+    if ipc.attach(client, allocator, descriptor) {
+        var body: [12]u8 = undefined
+        const bytes: [*]u8 = &body
+        var writing: ipc.Writer = undefined
+        ipc.begin(&writing, bytes, 12)
+        ipc.putU32(&writing, mode.*.width)
+        ipc.putU32(&writing, mode.*.height)
+        ipc.putU32(&writing, mode.*.millihertz)
+        const serial = ipc.call(client, "org.mlx.Display", "/org/mlx/Display", "org.mlx.Display", "Ask", "uuu", bytes, writing.length)
+        var reply: ipc.Message = undefined
+        if serial == 0 || !ipc.waitReply(client, serial, &reply, ASK_WAIT) {
+            keepAnswer(display, false, if german { "Der Compositor hat nicht geantwortet." } else { "The compositor did not answer." })
+        } else if reply.kind == ipc.ERROR {
+            var reading = ipc.reader(ipc.bodyOf(client, &reply), reply.bodyLength)
+            const why = ipc.readString(&reading)
+            var text: [160]u8 = undefined
+            const out: [*]u8 = &text
+            var length = std.text.append(out, 0, 160, if german { "Nicht gesetzt: " } else { "Not set: " })
+            length = std.text.append(out, length, 158, if reading.failed { "the compositor did not say why" } else { why })
+            length = std.text.append(out, length, 160, ".")
+            keepAnswer(display, false, out[0..length])
+        } else {
+            set = true
+            keepAnswer(display, true, if german { "Gesetzt: auf dem Bildschirm behalten oder zurück." } else { "Set: keep it or go back on the screen." })
+        }
+        // (Said for whoever reads the program's errors.)
+        var said: [256]u8 = undefined
+        const line: [*]u8 = &said
+        var length = std.text.append(line, 0, 256, "control: display: asked for ")
+        length = writeNumber(line, length, mode.*.width)
+        length = std.text.append(line, length, 256, "x")
+        length = writeNumber(line, length, mode.*.height)
+        length = std.text.append(line, length, 256, ": ")
+        length = std.text.append(line, length, 254, answerOf(display))
+        line[length] = 10
+        _ = std.io.eprint(line[0..length + 1])
+        ipc.disconnect(client, allocator)
+    } else {
+        ipc.closeDescriptor(descriptor)
+    }
+    allocator.free(memory.?, @sizeOf(ipc.Client), 16)
+    _ = refresh(display, allocator)
+    return set
+}
+
 // The page; the y after it.
 pub fn draw(display: *Display, page: *const Page, top: i32) -> i32 {
-    var text: [160]u8 = undefined
+    var text: [200]u8 = undefined
     const bytes: [*]u8 = &text
     var y = page_module.section(page, top, page_module.say(page, "Monitor", "Monitor"))
     const drm = std.text.same(backendOf(display), "drm")
     if !display.*.known {
         y = page_module.note(page, y, page_module.say(page, "The compositor has not said which monitor it drives (an Mlx compositor writes it at start).", "Der Compositor hat nicht mitgeteilt, welchen Monitor er ansteuert (ein Mlx-Compositor schreibt das beim Start)."))
     } else {
-        if display.*.outputLength > 0 { y = page_module.infoRow(page, y, page_module.say(page, "Connector", "Anschluss"), outputOf(display)) }
+        if display.*.driverLength > 0 {
+            y = page_module.infoRow(page, y, page_module.say(page, "Display", "Anzeige"), driverOf(display))
+        } else if display.*.outputLength > 0 {
+            y = page_module.infoRow(page, y, page_module.say(page, "Connector", "Anschluss"), outputOf(display))
+        }
         var length = modeLabel(bytes, display.*.width, display.*.height, 0)
         y = page_module.infoRow(page, y, page_module.say(page, "Resolution", "Auflösung"), bytes[0..length])
-        length = rateLabel(bytes, display.*.millihertz, display.*.hertz)
+        length = rateLabel(bytes, display.*.millihertz, display.*.hertz, kernelModes(display))
         y = page_module.infoRow(page, y, page_module.say(page, "Refresh rate", "Bildwiederholrate"), bytes[0..length])
-        y = page_module.infoRow(page, y, page_module.say(page, "Shown", "Anzeige"), if drm { page_module.say(page, "On the monitor itself (DRM)", "Direkt auf dem Monitor (DRM)") } else { page_module.say(page, "In a window of another session", "In einem Fenster einer anderen Sitzung") })
+        y = page_module.infoRow(page, y, page_module.say(page, "Shown", "Anzeige"), if drm { page_module.say(page, "On the monitor itself", "Direkt auf dem Monitor") } else { page_module.say(page, "In a window of another session", "In einem Fenster einer anderen Sitzung") })
     }
 
     y = page_module.section(page, y, page_module.say(page, "Resolution and refresh rate", "Auflösung und Bildwiederholrate"))
-    if page_module.choiceRow(page, y, ITEM_MODE, page_module.say(page, "Automatic (native resolution, fastest refresh)", "Automatisch (native Auflösung, schnellste Rate)"), display.*.wantWidth == 0) { chooseMode(display, 0, 0, 0) }
-    y += page_module.px(page, page_module.CHOICE_ROW)
-    var listed = false
-    var index: usize = 0
-    while index < display.*.modeCount {
-        const mode = modeAt(display, index)
-        const chosen = display.*.wantWidth == mode.*.width && display.*.wantHeight == mode.*.height && display.*.wantHertz == mode.*.hertz
-        if chosen { listed = true }
-        const length = modeLabel(bytes, mode.*.width, mode.*.height, mode.*.hertz)
-        if page_module.choiceRow(page, y, ITEM_MODE + 1 + index, bytes[0..length], chosen) { chooseMode(display, mode.*.width, mode.*.height, mode.*.hertz) }
-        y += page_module.px(page, page_module.CHOICE_ROW)
-        index += 1
+    if kernelModes(display) {
+        y = drawAtOnce(display, page, y)
+    } else {
+        y = drawNextStart(display, page, y, drm)
     }
-    // A mode compositor.conf asks for that this monitor does not list.
-    if display.*.wantWidth != 0 && !listed {
-        const length = modeLabel(bytes, display.*.wantWidth, display.*.wantHeight, display.*.wantHertz)
-        _ = page_module.choiceRow(page, y, ITEM_MODE + 1 + MAX_MODES, bytes[0..length], true)
-        y += page_module.px(page, page_module.CHOICE_ROW)
-        y = page_module.note(page, y, page_module.say(page, "The monitor has no such mode: the compositor takes the automatic one.", "Der Monitor kennt diesen Modus nicht: der Compositor nimmt den automatischen."))
-    }
-    y = page_module.note(page, y, if drm || !display.*.known { page_module.say(page, "Takes effect when the compositor starts next.", "Gilt ab dem nächsten Start des Compositors.") } else { page_module.say(page, "In a window the window's size counts; this is for the monitor itself.", "Im Fenster zählt dessen Größe; dies gilt für den Monitor selbst.") })
 
     y = page_module.section(page, y, page_module.say(page, "Night light", "Nachtlicht"))
     if page_module.switchRow(page, y, ITEM_NIGHT, page_module.say(page, "Night light", "Nachtlicht"), page_module.say(page, "Warmer colours, easier on the eyes at night", "Wärmere Farben, angenehmer für die Augen am Abend"), display.*.nightLight) {
@@ -387,4 +676,92 @@ pub fn draw(display: *Display, page: *const Page, top: i32) -> i32 {
         length += std.text.append(after(bytes, length), 0, 120, page_module.say(page, "; this output has no gamma table (night light needs the monitor itself, DRM)", "; diese Ausgabe hat keine Gammatabelle (Nachtlicht braucht den Monitor selbst, DRM)"))
     }
     return page_module.note(page, y, bytes[0..length])
+}
+
+// The modes as the kernel offers them (brixOS): each one the display can
+// run, the one that runs chosen; a click asks the compositor for it now
+// (when it takes requests). Those it cannot run follow, each with the
+// reason.
+fn drawAtOnce(display: *Display, page: *const Page, top: i32) -> i32 {
+    var text: [200]u8 = undefined
+    const bytes: [*]u8 = &text
+    var y = top
+    var index: usize = 0
+    var unavailable: usize = 0
+    var chosen: usize = MAX_MODES
+    while index < display.*.modeCount {
+        const mode = modeAt(display, index)
+        if !mode.*.can {
+            unavailable += 1
+            index += 1
+            continue
+        }
+        const length = rowLabel(mode, page.*.german, bytes)
+        if page_module.choiceRow(page, y, ITEM_MODE + 1 + index, bytes[0..length], mode.*.runs) && !mode.*.runs && changesAtOnce(display) { chosen = index }
+        y += page_module.px(page, page_module.CHOICE_ROW)
+        index += 1
+    }
+    if chosen < MAX_MODES {
+        // Asked for once the rows are laid out (asking reads the
+        // compositor's file again: the next frame shows what came of it).
+        const mode = modeAt(display, chosen).*
+        _ = ask(display, &mode, page.*.german, std.heap.allocator())
+    }
+    if display.*.answerLength > 0 { y = page_module.note(page, y, answerOf(display)) }
+    if !changesAtOnce(display) {
+        // (No driver changes this display, or the compositor takes no
+        // requests: nothing is written that nobody would take.)
+        y = page_module.note(page, y, page_module.say(page, "This display's mode is not changed from here.", "Der Modus dieser Anzeige wird hier nicht geändert."))
+    } else if display.*.pending > 0 {
+        var length = std.text.append(bytes, 0, 120, page_module.say(page, "Keep it or go back on the screen: it goes back by itself in ", "Auf dem Bildschirm behalten oder zurück: es geht von selbst zurück in "))
+        length = writeNumber(bytes, length, display.*.pending)
+        length = std.text.append(bytes, length, 200, " s.")
+        y = page_module.note(page, y, bytes[0..length])
+    } else {
+        y = page_module.note(page, y, page_module.say(page, "Takes effect at once; it is kept only when you say so on the screen.", "Gilt sofort; behalten wird es nur, wenn Sie es auf dem Bildschirm bestätigen."))
+        // The mode that runs is the one kept: where it is kept.
+        if runsKept(display) { y = page_module.note(page, y, page_module.say(page, "Kept: the next boots set it when brixOS runs from a disk; from its image alone, until it restarts.", "Behalten: die nächsten Starts setzen ihn, wenn brixOS von einer Platte läuft; nur vom Image, bis zum Neustart.")) }
+    }
+    if unavailable == 0 { return y }
+    y = page_module.section(page, y, page_module.say(page, "Not available", "Nicht verfügbar"))
+    index = 0
+    while index < display.*.modeCount {
+        const mode = modeAt(display, index)
+        index += 1
+        if mode.*.can { continue }
+        var length = rowLabel(mode, page.*.german, bytes)
+        length = std.text.append(bytes, length, 124, ": ")
+        length = std.text.append(bytes, length, 200, reasonOf(mode))
+        y = page_module.note(page, y, bytes[0..length])
+    }
+    return y
+}
+
+// The modes as other systems offer them: the one to start in, written to
+// compositor.conf and taken at the compositor's next start.
+fn drawNextStart(display: *Display, page: *const Page, top: i32, drm: bool) -> i32 {
+    var text: [160]u8 = undefined
+    const bytes: [*]u8 = &text
+    var y = top
+    if page_module.choiceRow(page, y, ITEM_MODE, page_module.say(page, "Automatic (native resolution, fastest refresh)", "Automatisch (native Auflösung, schnellste Rate)"), display.*.wantWidth == 0) { chooseMode(display, 0, 0, 0) }
+    y += page_module.px(page, page_module.CHOICE_ROW)
+    var listed = false
+    var index: usize = 0
+    while index < display.*.modeCount {
+        const mode = modeAt(display, index)
+        const chosen = display.*.wantWidth == mode.*.width && display.*.wantHeight == mode.*.height && display.*.wantHertz == mode.*.hertz
+        if chosen { listed = true }
+        const length = modeLabel(bytes, mode.*.width, mode.*.height, mode.*.hertz)
+        if page_module.choiceRow(page, y, ITEM_MODE + 1 + index, bytes[0..length], chosen) { chooseMode(display, mode.*.width, mode.*.height, mode.*.hertz) }
+        y += page_module.px(page, page_module.CHOICE_ROW)
+        index += 1
+    }
+    // A mode compositor.conf asks for that this monitor does not list.
+    if display.*.wantWidth != 0 && !listed {
+        const length = modeLabel(bytes, display.*.wantWidth, display.*.wantHeight, display.*.wantHertz)
+        _ = page_module.choiceRow(page, y, ITEM_MODE + 1 + MAX_MODES, bytes[0..length], true)
+        y += page_module.px(page, page_module.CHOICE_ROW)
+        y = page_module.note(page, y, page_module.say(page, "The monitor has no such mode: the compositor takes the automatic one.", "Der Monitor kennt diesen Modus nicht: der Compositor nimmt den automatischen."))
+    }
+    return page_module.note(page, y, if drm || !display.*.known { page_module.say(page, "Takes effect when the compositor starts next.", "Gilt ab dem nächsten Start des Compositors.") } else { page_module.say(page, "In a window the window's size counts; this is for the monitor itself.", "Im Fenster zählt dessen Größe; dies gilt für den Monitor selbst.") })
 }

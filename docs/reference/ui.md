@@ -140,7 +140,7 @@ look an app takes every frame, calls with the desktop's colours) hands
 on the scheme it reads without a scheme variable. drawText and
 drawCells took 4128 bytes of the arena a call, `drawImageRect` 6 KiB, a
 widget 16 bytes, a terminal's frame 20 KiB and a KiB a row drawn,
-`theme.at` 48 bytes (`tests/485_std_drawing_arena_runtime.mlx` measures
+`theme.at` 48 bytes (`tests/525_std_drawing_arena_runtime.mlx` measures
 each with `std.turns` and compares what is drawn, and the colours, with
 the code it replaced).
 

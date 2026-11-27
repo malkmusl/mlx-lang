@@ -1,0 +1,396 @@
+// A Radeon's TMDS output (HDMI or DVI signalling) given another mode
+// while the system runs: the mode set that runs at boot for the monitor's
+// own mode, made for the timing a program asked for.
+//
+// Nothing of the mode set itself is here. The plan is gpu_mode.mlx's,
+// made from the card's state as it is at that moment for a monitor and
+// its timing (`mode.makeFor`: here the "monitor" handed over is the mode
+// asked for: its size and its timing, with what the real monitor's EDID
+// says of HDMI); it is carried out by gpu_set.mlx (`attemptWith`), with
+// its checks and its way back. What is added for a running system:
+// - THE CARD IS READ ANEW before the plan (gpu_display.mlx's `report`):
+//   the plan's way back leads to what the card runs now, which is no
+//   longer what the firmware left.
+// - EVERYTHING ELSE STANDS STILL while the card is changed: `hold` before
+//   the first write, `release` after the last, on every path (the kernel
+//   lends them: smp.mlx stops the other processors where they are and
+//   lets them go on). At boot nothing else runs; now programs do, and
+//   one that draws, or a processor that comes into the kernel for the
+//   card, must not meet it half set.
+// - WHERE THE NEW PICTURE GOES. gpu_display.mlx's `planFor` puts a new
+//   picture behind the one shown, which at boot is right once; a system
+//   that changes its mode again and again would walk through the card's
+//   memory to its end. So the picture is put at the start of the
+//   aperture whenever the picture shown lies wholly beyond it, else
+//   behind the one shown: two places in turn. That is done with what
+//   `makeFor` takes: it is handed a copy of the read-out and of the
+//   kernel's picture in which the surface shown ends at the aperture's
+//   start (`placed`); nothing else of the plan looks at those words (the
+//   way back's surface words are read from the card by gpu_set.mlx
+//   before the first write).
+// - A MODE IS JUDGED by making its plan and looking at why it is not
+//   complete (`judge`): nothing is written for that, and no table is run.
+// - THE MODE BEFORE is put back the same way (`back`): by its own timing
+//   when it was one of the monitor's, else by the timing the plan read
+//   from the controller's words before the change, at the clock that was
+//   measured (the firmware's mode has no other).
+//
+// A DISPLAYPORT OUTPUT'S MODE is changed the same way (`judgeOn`,
+// `changeOn`): the plan is the DisplayPort one gpu_mode.mlx makes with
+// what the output's monitor said over its AUX channel (`makeWith`: the
+// link kept when it has room and the display clock carries the new rows,
+// else taken down and trained for them), carried out with that channel
+// lent (gpu_set.mlx's `attemptLink`), every other processor held still as
+// for a TMDS change. Its way back is the plan's own: the link's rate and
+// lanes of before, the timing the controller's words had.
+//
+// What gpu_mode.mlx does not offer, so that it is not there: another
+// rate of the size that runs (`makeFor` takes a size that is the
+// controller's as "already": `Why.SAME_SIZE`); an output of another kind,
+// or a DisplayPort one whose monitor did not answer (`Why.OUTPUT`).
+//
+// The lines gpu_set.mlx says speak of "the monitor's own mode" and "the
+// firmware's state", which is what they are at boot. Here they mean the
+// mode asked for and the mode that runs now; a line before the plan says
+// so in the log.
+//
+// Built for the host too, against a card that is a table
+// (tests/490_gpu_mode_change_runtime.mlx).
+const scanout = @import("./gpu_display.mlx")
+const mode = @import("./gpu_mode.mlx")
+const modeset = @import("./gpu_set.mlx")
+const edid = @import("./edid.mlx")
+const dm = @import("./display_modes.mlx")
+const aux = @import("./gpu_aux.mlx")
+const dplink = @import("./gpu_link.mlx")
+
+// What the kernel lends for a change: the card as the read-out reaches it
+// (its registers read, the clock, the log), as a change writes it, its
+// ROM's tables (none: the ROM is not open) and what the plan needs of the
+// ROM; everything else held still and let go again (`hold`: how many
+// processors did not say that they stand still, 0 on a machine that is
+// well); and a switch for what is said: for the log alone (true), or for
+// the screen too.
+pub const Lent = struct {
+    card: scanout.Card
+    hands: modeset.Hands
+    tables: ?*const modeset.Tables
+    rom: mode.Rom
+    hold: fn() -> usize
+    release: fn() -> void
+    aside: fn(bool) -> void
+}
+
+// What the driver knows of the card's display between changes: the
+// read-out last made, the kernel's picture in the aperture, what the
+// monitor's EDID says of HDMI, room for a plan (the last one made) and
+// for one that only judges, what became of the last change, and the mode
+// before it: its timing as the controller's words had it.
+pub const Seen = struct {
+    readout: scanout.Readout
+    memory: scanout.Memory
+    offer: edid.Offer
+    plan: mode.Plan
+    trial: mode.Plan
+    result: modeset.Result
+    was: edid.Timing
+    wasThere: bool
+    // How long the other processors stood still for the last change
+    // (nanoseconds), and how many did not say they did.
+    stood: usize
+    deaf: usize
+    // How often everything else was held and let go (the two are the
+    // same after every change).
+    holds: usize
+    releases: usize
+    // The read-out is the card as it is now: nothing was written since
+    // it was made (gpu_together.mlx: a move then plans from it without
+    // reading the card again).
+    fresh: bool
+}
+
+fn less(a: usize, b: usize) -> usize { return if a > b { a - b } else { 0 } }
+
+// The controller that is on (the first; CONTROLLERS when none is).
+fn running(readout: *const scanout.Readout) -> usize {
+    var index: usize = 0
+    while index < scanout.CONTROLLERS && !readout.*.controllers[index].on { index += 1 }
+    return index
+}
+
+// Whether the card's picture leaves by a TMDS output: one controller is
+// on, its encoder found and sending DVI or HDMI signalling.
+pub fn tmds(seen: *const Seen) -> bool {
+    if !seen.*.readout.plausible || seen.*.readout.on != 1 { return false }
+    const c = &seen.*.readout.controllers[running(&seen.*.readout)]
+    return c.*.encoder.found && (c.*.encoder.mode == scanout.MODE_DVI || c.*.encoder.mode == scanout.MODE_HDMI)
+}
+
+// Whether it leaves by a DisplayPort output with one stream.
+pub fn dp(seen: *const Seen) -> bool {
+    if !seen.*.readout.plausible || seen.*.readout.on != 1 { return false }
+    const c = &seen.*.readout.controllers[running(&seen.*.readout)]
+    return c.*.encoder.found && c.*.encoder.mode == scanout.MODE_DISPLAYPORT
+}
+
+// The kind of the display's driver by the output the picture leaves by
+// (display_modes.mlx's Kind).
+pub fn kindOf(seen: *const Seen) -> usize {
+    if tmds(seen) { return dm.Kind.RADEON_TMDS }
+    if dp(seen) { return dm.Kind.RADEON_DP }
+    return dm.Kind.RADEON_OTHER
+}
+
+// The rate the display runs at as the read-out counted it (frames in a
+// thousand seconds; 0: not counted).
+pub fn rate(seen: *const Seen) -> usize {
+    if seen.*.readout.on != 1 { return 0 }
+    return seen.*.readout.controllers[running(&seen.*.readout)].rate.millihertz
+}
+
+// The card read anew: what its display controller runs now (the lines
+// of the read-out are said through the card's log).
+pub fn look(lent: *const Lent, seen: *Seen) -> void {
+    scanout.report(&lent.*.card, &seen.*.memory, &seen.*.readout)
+    seen.*.fresh = true
+}
+
+// The read-out and the kernel's picture as `makeFor` is handed them for a
+// picture of `width` by `height`: as they are when the new picture has to
+// go behind the one shown; with the surface shown ending at the
+// aperture's start when the new one fits in front of it (the file's
+// head).
+fn placed(seen: *const Seen, width: usize, height: usize, readout: *scanout.Readout, memory: *scanout.Memory) -> void {
+    readout.* = seen.*.readout
+    memory.* = seen.*.memory
+    const index = running(&seen.*.readout)
+    if index == scanout.CONTROLLERS || memory.*.pictureWidth == 0 { return }
+    const c = &readout.*.controllers[index]
+    const pitch = (width + scanout.ROW - 1) / scanout.ROW * scanout.ROW
+    const bytes = pitch * 4 * height
+    const surface = less(c.*.address, readout.*.base)
+    // (Both the surface the controller shows and the picture the kernel
+    // draws on lie beyond the new one's end.)
+    if bytes <= surface && bytes <= memory.*.pictureOffset {
+        c.*.address = readout.*.base
+        c.*.yEnd = 0
+        memory.*.pictureOffset = 0
+        memory.*.pictureBytes = 0
+    }
+}
+
+// The "monitor" a plan is made for: the mode asked for as its own, of the
+// timing `t`; and what the real monitor's EDID says of HDMI, without its
+// other timings (the plan takes the timing asked for or none).
+pub fn asMonitor(t: *const edid.Timing) -> edid.Monitor {
+    return edid.Monitor.{ .state = edid.State.found, .width = t.*.width, .height = t.*.height, .timing = t.*, .timings = 1, .ofOwnSize = 1, .extension = edid.Extension.none }
+}
+
+// The plan for the timing `t`, from the card as it was last read, into
+// `plan`.
+// `heard`: what a DisplayPort output's monitor said (null: none).
+fn planFor(lent: *const Lent, seen: *const Seen, t: *const edid.Timing, heard: ?*const dplink.Heard, plan: *mode.Plan) -> void {
+    var readout: scanout.Readout = undefined
+    var memory: scanout.Memory = undefined
+    placed(seen, t.*.width, t.*.height, &readout, &memory)
+    const monitor = asMonitor(t)
+    var offer = seen.*.offer
+    offer.count = 0
+    mode.makeWith(&lent.*.card, &readout, &memory, &monitor, &offer, &lent.*.rom, mode.Wish.own, heard, plan)
+}
+
+// Whether the mode can be set, by its plan (`mode.why`, and for a clock
+// beyond the link's the link's most): nothing is written and no table is
+// run. For a mode with a timing (display_modes.mlx asks about no other).
+pub fn judge(lent: *const Lent, seen: *Seen, asked: *dm.Mode) -> void { judgeOn(lent, seen, asked, null) }
+
+// The same, with what the monitor of a DisplayPort output said over its
+// AUX channel (`heard`; null: none, and such an output's modes are judged
+// as an output this driver changes none of).
+pub fn judgeOn(lent: *const Lent, seen: *Seen, asked: *dm.Mode, heard: ?*const dplink.Heard) -> void {
+    if !asked.*.timed {
+        asked.*.why = dm.Why.NO_TIMING
+        return
+    }
+    const onDp = dp(seen) && heard != null && heard.?.*.state == dplink.Asked.heard
+    if !tmds(seen) && !onDp {
+        asked.*.why = dm.Why.OUTPUT
+        return
+    }
+    const plan = &seen.*.trial
+    planFor(lent, seen, &asked.*.timing, if onDp { heard } else { null }, plan)
+    if plan.*.complete { return }
+    const missing = plan.*.missing
+    if missing == mode.Missing.already {
+        // The size that runs: the mode that runs itself (nothing to
+        // set, and nothing against it), or another rate of it.
+        const now = rate(seen)
+        const by = less(now, asked.*.millihertz) + less(asked.*.millihertz, now)
+        if now != 0 && by * 100 > now { asked.*.why = dm.Why.SAME_SIZE }
+    } else if missing == mode.Missing.no_timing_fits {
+        asked.*.why = if asked.*.timing.clock < mode.TMDS_MIN_PIXEL_CLOCK { dm.Why.TOO_SLOW } else { dm.Why.TOO_FAST }
+        asked.*.limit = plan.*.detail[1]
+    } else if missing == mode.Missing.no_setting {
+        // (No rate and lanes both ends of the DisplayPort link have carry
+        // it: what they carry at most, at the plan's bits a pixel.)
+        asked.*.why = dm.Why.TOO_FAST
+        asked.*.limit = dplink.symbolClock(plan.*.detail[0]) * 8 * plan.*.detail[1] / (if plan.*.link.bits != 0 { plan.*.link.bits } else { 24 })
+    } else if missing == mode.Missing.too_large {
+        asked.*.why = dm.Why.SIZE
+    } else if missing == mode.Missing.no_room {
+        asked.*.why = dm.Why.MEMORY
+    } else if plan.*.situation == mode.Situation.displayport && !onDp {
+        asked.*.why = dm.Why.OUTPUT
+    } else {
+        asked.*.why = dm.Why.CARD
+    }
+}
+
+fn sayTiming(lent: *const Lent, t: *const edid.Timing) -> void {
+    edid.sayTiming(lent.*.card.write, t)
+}
+
+// The timing `t` set: the card read anew, the plan made and said, every
+// other processor held, the plan carried out, the processors let go. When
+// it ends done the display runs `t`, its picture `offset` bytes into the
+// aperture, `width` by `height`, `pitch` pixels from row to row
+// (`seen.plan` has them: its offset, width, height and pitch), and the
+// card is read once more so that what is judged next is judged by what
+// runs now.
+pub fn change(lent: *const Lent, seen: *Seen, t: *const edid.Timing) -> dm.Set { return changeOn(lent, seen, t, null, null) }
+
+// The same on a DisplayPort output, with what its monitor said over its
+// AUX channel (`heard`) and that channel lent (`channel`); both null: as
+// `change`.
+pub fn changeOn(lent: *const Lent, seen: *Seen, t: *const edid.Timing, heard: ?*const dplink.Heard, channel: ?*aux.Channel) -> dm.Set {
+    const card = &lent.*.card
+    const aside = lent.*.aside
+    card.say("gpu: the display's mode is changed while the system runs: asked for is ")
+    sayTiming(lent, t)
+    card.say("\n")
+    card.say("gpu: in the lines that follow, \"the monitor's own mode\" is the mode asked for and \"the firmware's state\" is the mode that runs now\n")
+    // The read-out's own lines: for the log alone.
+    aside(true)
+    look(lent, seen)
+    aside(false)
+    const plan = &seen.*.plan
+    const onDp = dp(seen) && heard != null && heard.?.*.state == dplink.Asked.heard && channel != null
+    planFor(lent, seen, t, if onDp { heard } else { null }, plan)
+    // (What the plan comes to is said; its steps one by one are not, as
+    // they are at boot: the kernel's log keeps its first part, and a
+    // system that changes its mode often would fill it with lists. What
+    // is carried out is said step by step as it happens.)
+    mode.say(card, plan)
+    if !plan.*.complete {
+        card.say("gpu: the mode asked for is not set, the mode that runs stays: ")
+        mode.sayReason(card, plan)
+        card.say("\n")
+        return dm.Set.refused
+    }
+    const ours = plan.*.situation == mode.Situation.tmds || (onDp && plan.*.situation == mode.Situation.displayport)
+    if !ours || lent.*.tables == null {
+        card.say("gpu: the mode asked for is not set, the mode that runs stays: the display's driver changes the mode of an HDMI or DVI output by the card's own tables, and of a DisplayPort output whose monitor answered, and this is no such change\n")
+        return dm.Set.refused
+    }
+    // What the way back of a later request needs: the mode that runs
+    // now, as the plan read it from the controller's words.
+    const was = plan.*.tmds.was
+    // Everything else stands still from here to the last write.
+    const done = heldWith(lent, seen, plan, &seen.*.result, "the change", if onDp { channel } else { null }, null)
+    if !done {
+        const outcome = seen.*.result.outcome
+        if outcome == modeset.Outcome.untouched { return dm.Set.refused }
+        if outcome == modeset.Outcome.back {
+            card.say("gpu: the change failed and the mode that ran before it runs again\n")
+            return dm.Set.back
+        }
+        card.say("gpu: the change failed, and the mode that ran before it is not known to be back\n")
+        return dm.Set.lost
+    }
+    seen.*.was = was
+    seen.*.wasThere = true
+    // The kernel's picture is the new one from here on.
+    seen.*.memory.pictureOffset = plan.*.offset
+    seen.*.memory.pictureBytes = plan.*.bytes
+    seen.*.memory.pictureWidth = plan.*.width
+    seen.*.memory.pictureHeight = plan.*.height
+    seen.*.memory.picturePitch = plan.*.pitch
+    aside(true)
+    look(lent, seen)
+    aside(false)
+    return dm.Set.done
+}
+
+// A plan carried out with every other processor held still meanwhile:
+// `hold` before the first write, `release` after the last, on every path,
+// and how long they stood still said. The one way the card's display is
+// written while the system runs: a program's change (`change`, "the
+// change") and the switch's move (gpu_switch.mlx's `carry`, "the move")
+// both go through it. A plan that writes nothing (not complete, not a
+// TMDS output's, no tables lent) holds nobody: gpu_set.mlx says why it is
+// not carried out. Whatever is tried, the read-out is not the card's any
+// more afterwards (`fresh`).
+pub fn held(lent: *const Lent, seen: *Seen, plan: *const mode.Plan, result: *modeset.Result, what: []const u8) -> bool { return heldWith(lent, seen, plan, result, what, null, null) }
+
+// The same for a plan with DisplayPort ends, lent their monitors' AUX
+// channels (gpu_set.mlx's `attemptMove`): `channel` the one on the plan's
+// DisplayPort end (the output a move brings the picture to, or the one
+// output of a plan on it), `oldChannel` the one on the output a move
+// leaves.
+pub fn heldWith(lent: *const Lent, seen: *Seen, plan: *const mode.Plan, result: *modeset.Result, what: []const u8, channel: ?*aux.Channel, oldChannel: ?*aux.Channel) -> bool {
+    const card = &lent.*.card
+    seen.*.fresh = false
+    // (What writes the card: a TMDS output's plan, a DisplayPort output's
+    // (kept or trained), a move's.)
+    const writes = plan.*.situation == mode.Situation.tmds || plan.*.situation == mode.Situation.displayport || plan.*.move.on
+    if !plan.*.complete || plan.*.count > mode.STEPS || !writes || lent.*.tables == null { return modeset.attemptMove(card, &lent.*.hands, lent.*.tables, channel, oldChannel, plan, true, result) }
+    const hold = lent.*.hold
+    const release = lent.*.release
+    const began = card.time()
+    seen.*.holds += 1
+    seen.*.deaf = hold()
+    const done = modeset.attemptMove(card, &lent.*.hands, lent.*.tables, channel, oldChannel, plan, true, result)
+    release()
+    seen.*.releases += 1
+    seen.*.stood = less(card.time(), began)
+    card.say("gpu: every other processor stood still for ")
+    card.say(what)
+    card.field(", ", seen.*.stood / 1000000)
+    card.say(" ms")
+    if seen.*.deaf != 0 {
+        card.field(" (", seen.*.deaf)
+        card.say(if seen.*.deaf == 1 { " did not say within a fifth of a second that it stood still)" } else { " did not say within a fifth of a second that they stood still)" })
+    }
+    card.say("\n")
+    return done
+}
+
+// The mode before the last change put back: by `before`'s own timing when
+// it has one (a mode of the monitor's), else by the timing the
+// controller's words had before the change.
+pub fn back(lent: *const Lent, seen: *Seen, before: *const dm.Mode) -> dm.Set { return backOn(lent, seen, before, null, null) }
+
+// The same on a DisplayPort output (`changeOn`).
+pub fn backOn(lent: *const Lent, seen: *Seen, before: *const dm.Mode, heard: ?*const dplink.Heard, channel: ?*aux.Channel) -> dm.Set {
+    if before.*.timed && !before.*.timing.interlaced { return changeOn(lent, seen, &before.*.timing, heard, channel) }
+    if !seen.*.wasThere {
+        lent.*.card.say("gpu: the mode before is not put back: its timing is not known\n")
+        return dm.Set.refused
+    }
+    const was = seen.*.was
+    return changeOn(lent, seen, &was, heard, channel)
+}
+
+// Nothing known yet (before the first read-out).
+pub fn begin(seen: *Seen) -> void {
+    seen.*.offer = edid.nothing()
+    seen.*.wasThere = false
+    seen.*.stood = 0
+    seen.*.deaf = 0
+    seen.*.holds = 0
+    seen.*.releases = 0
+    seen.*.fresh = false
+    seen.*.readout.on = 0
+    seen.*.readout.plausible = false
+    seen.*.memory = scanout.Memory.{ .aperture = 0, .pictureOffset = 0, .pictureBytes = 0, .pictureWidth = 0, .pictureHeight = 0, .picturePitch = 0 }
+}

@@ -1,0 +1,2375 @@
+// The shader compiler's intermediate form, and the reading of a SPIR-V
+// shader into it: the first two parts of the compiler the study designs
+// (its 5.4: reading and typing, the intermediate form, variables to
+// values, lowering what the card lacks), for the compute stage and, from
+// the driver's stage (c), the vertex and fragment stages (the study's
+// 5.3).
+//
+// THE FORM (the study's decision 8.3.2): values in SSA, every value one
+// node; the control flow kept as SPIR-V structures it, a tree of lists:
+// a list holds nodes, ifs and loops in order; an if has a then-list and an
+// else-list, a loop a header list (run every time round, ending in its
+// condition), a body list and a continue list. Where control flow joins,
+// the values that differ are BLOCK PARAMETERS: an if's parameter takes
+// its then-value or its else-value, a loop's its value from before the
+// loop or from the end of the continue list (no phis). A value is a word
+// (32 bits: an integer, or a float's bits) or a boolean; a boolean is a
+// LANE MASK on the card, one bit a lane. A vector or a matrix is split
+// into its components as it is read (a matrix column after column), so
+// that every node is one word. Every value is marked uniform (one value
+// for the wave: a scalar register) or varying (one a lane: a vector
+// register) by `markUniform`.
+//
+// READING takes what std.spirv.module validated (its structure) and
+// refuses, naming the opcode, everything outside this stage: what is
+// taken is one entry point of GLCompute, Vertex or Fragment (with
+// OriginUpperLeft) with one function; 32-bit integers, 32-bit floats and
+// booleans, their vectors of 2 to 4 and float matrices of 2 to 4 columns;
+// function variables of these (made into values here: the card has no
+// stack); push constant blocks and, in set 0, uniform blocks (any binding:
+// members at their Offset, matrices at their MatrixStride, column- or
+// row-major, arrays at their ArrayStride, every index a constant) and in a
+// compute shader storage buffers of words; the built-ins
+// GlobalInvocationId, LocalInvocationId and WorkgroupId (compute),
+// VertexIndex and InstanceIndex (vertex) and Position (a vertex output, on
+// its own or in gl_PerVertex); a vertex shader's inputs by Location (the
+// pipeline's vertex input description, `vertexInputs`, says where each is
+// fetched from) and outputs by Location; a fragment shader's inputs by
+// Location, interpolated with perspective at the pixel's centre or Flat,
+// and its outputs by Location (the colour targets); the integer and
+// float arithmetic, comparisons and logic of SPIR-V and the conversions
+// between them, the vector and matrix operations (OpVectorTimesScalar,
+// OpMatrixTimesScalar, OpMatrixTimesVector, OpVectorTimesMatrix,
+// OpMatrixTimesMatrix, OpDot, OpTranspose), the composite ones
+// (construct, extract, insert, shuffle) and of GLSL.std.450 FAbs, SAbs,
+// Floor, Fract, the min, max and clamp of floats, unsigned and signed
+// words, FMix and Step; selections (OpSelectionMerge) and loops
+// (OpLoopMerge) whose condition is at their top and which end only there
+// (a boolean their header makes is not read after them). Not at this
+// stage: discard (OpKill), textures, the square root and the other
+// functions whose result the card rounds its own way, FragCoord and the
+// other fragment built-ins, centroid, sample and noperspective inputs.
+// Division and remainder are
+// lowered as they are read (`divide`): by a constant power of two into a
+// shift or a mask, else by the sequence Mesa's nir_lower_idiv.c gives for
+// 32 bits (emit_udiv, "ported from LLVM's AMDGPUTargetLowering::
+// LowerUDIVREM", and emit_idiv for the signed ones), with the reciprocal
+// of the card's float unit. A float division is a times the reciprocal of
+// b (RADV's lower_fdiv), a negation a multiplication by -1.0 (ACO's
+// fneg).
+//
+// A SHADER'S OUTPUTS are slots like a function's variables, and what they
+// hold when the function returns is exported (`exports`): a vertex
+// shader's position (target pos0) and its outputs by location in
+// increasing order as parameters 0, 1, ...; a fragment shader's outputs
+// to the colour targets of their locations (mrt n).
+
+const spv = @import("std.spirv.core")
+const module = @import("std.spirv.module")
+
+pub const NONE: u32 = 0xFFFFFFFF
+pub const MAX_NODES: usize = 32768
+pub const MAX_ITEMS: usize = 32768
+pub const MAX_PARAMS: usize = 8192
+pub const MAX_IDS: usize = 65536
+pub const MAX_SLOTS: usize = 128
+pub const MAX_BINDINGS: u32 = 8
+pub const MAX_COMPONENTS: usize = 65536
+pub const MAX_LOCATIONS: u32 = 16
+
+pub const Stage = enum(u8) {
+    compute,
+    vertex,
+    fragment,
+}
+
+pub const Kind = enum(u8) {
+    constant,
+    param,
+    localId,
+    groupId,
+    push,
+    load,
+    store,
+    add,
+    sub,
+    mul,
+    shl,
+    shr,
+    sar,
+    band,
+    bor,
+    bxor,
+    bnot,
+    smax,
+    mulhi,
+    eq,
+    ne,
+    ult,
+    ule,
+    ugt,
+    uge,
+    slt,
+    sle,
+    sgt,
+    sge,
+    land,
+    lor,
+    lnot,
+    leq,
+    lne,
+    select,
+    u2f,
+    f2u,
+    rcp,
+    fmul,
+    // The float operations of the graphics stages, and the integer min
+    // and max (vector instructions alone on GFX8).
+    fadd,
+    fsub,
+    fmin,
+    fmax,
+    ffloor,
+    ffract,
+    fabs,
+    i2f,
+    f2i,
+    // A float comparison: imm the VOPC condition (CMP_LT ..).
+    fcmp,
+    smin,
+    umin,
+    umax,
+    // A vertex shader's input: imm location << 2 | component.
+    attribute,
+    // VertexIndex (imm 0) or InstanceIndex (imm 1).
+    vertexIndex,
+    // A fragment shader's input: imm location << 2 | component, 0x10000
+    // when it is flat.
+    interp,
+}
+
+pub const Sort = enum(u8) {
+    word,
+    boolean,
+    none,
+}
+
+pub const Node = struct {
+    kind: Kind
+    sort: Sort
+    a: u32
+    b: u32
+    c: u32
+    imm: u32
+    uniform: bool
+    // Another value this one is (a load of a variable, a bitcast, a loop
+    // parameter that never changes): `find` follows it.
+    alias: u32
+}
+
+pub const ItemKind = enum(u8) {
+    node,
+    branch,
+    loop,
+}
+
+// An entry of a list. node: `node`. branch: `cond`, then-list `first`,
+// else-list `second`. loop: header-list `first` (ending in `cond`: go on
+// while it holds), body-list `second`, continue-list `third`. Both: the
+// parameters `params` .. `params + paramCount`.
+pub const Item = struct {
+    kind: ItemKind
+    node: u32
+    cond: u32
+    first: u32
+    second: u32
+    third: u32
+    params: u32
+    paramCount: u32
+    next: u32
+}
+
+// A block parameter: `value` (a node of kind param) takes `from0` (the
+// then-value; a loop: from before it) or `from1` (the else-value; a loop:
+// from the end of the continue list).
+pub const Param = struct {
+    value: u32
+    from0: u32
+    from1: u32
+}
+
+pub const Failure = enum(u8) {
+    none,
+    invalid,
+    notCompute,
+    tooLarge,
+    unsupported,
+    structure,
+    undefinedValue,
+    registers,
+    programTooLarge,
+    // A boolean made in a loop's header and read after the loop: a lane
+    // mask is written whole every time round, so the lanes that left the
+    // loop earlier would read what the last round made for the others.
+    loopBoolean,
+    // A vertex input the pipeline does not describe, or of another number
+    // type than its format's.
+    interface,
+}
+
+// What the shader is, besides its code.
+pub const Shape = struct {
+    stage: Stage
+    originUpperLeft: bool
+    localSizeX: u32
+    localSizeY: u32
+    localSizeZ: u32
+    // The highest push constant word read, plus one.
+    pushWords: u32
+    // Bit b: binding b of set 0 is used.
+    bindings: u32
+    usesLocalY: bool
+    usesLocalZ: bool
+    usesGroup: [3]bool
+    // A vertex shader: the input locations read (bit L), each one's
+    // components and number format (NUMBER_FLOAT, _UINT, _SINT); whether
+    // it reads VertexIndex, InstanceIndex.
+    attributes: u32
+    attributeComponents: [16]u32
+    attributeSort: [16]u32
+    usesVertexIndex: bool
+    usesInstanceIndex: bool
+    // A fragment shader: the input locations read, each one's components
+    // read (bit c), and those that are flat.
+    inputs: u32
+    inputMask: [16]u32
+    inputFlat: u32
+}
+
+// An export at the shader's end: its target (EXP_POS0, EXP_PARAM0 + n,
+// EXP_MRT0 + n) and four values (NONE: 0).
+pub const Export = struct {
+    target: u32
+    values: [4]u32
+}
+
+// The export targets (Linux v6.6, include/asic_reg/gca/gfx_8_0_enum.h:
+// SQ_EXP_MRT0, SQ_EXP_MRTZ, SQ_EXP_NULL, SQ_EXP_POS0, SQ_EXP_PARAM0;
+// Mesa's files have them in a generated header only, the study's 10.4).
+pub const EXP_MRT0: u32 = 0x0
+pub const EXP_MRTZ: u32 = 0x8
+pub const EXP_NULL: u32 = 0x9
+pub const EXP_POS0: u32 = 0xC
+pub const EXP_PARAM0: u32 = 0x20
+
+pub const MOST_EXPORTS: usize = 24
+
+pub var exports: [24]Export = undefined
+pub var exportCount: u32 = 0
+// A vertex shader's parameter number of each output location (NONE: not
+// exported).
+pub var parameterOf: [16]u32 = undefined
+
+pub var nodes: [MAX_NODES]Node = undefined
+pub var nodeCount: u32 = 0
+pub var items: [MAX_ITEMS]Item = undefined
+pub var itemCount: u32 = 0
+pub var params: [MAX_PARAMS]Param = undefined
+pub var paramCount: u32 = 0
+pub var root: u32 = NONE
+pub var shape: Shape = undefined
+
+// Why reading stopped: the failure, the SPIR-V opcode and the word where.
+pub var failure: Failure = Failure.none
+pub var failureOpcode: u32 = 0
+pub var failureOffset: usize = 0
+
+fn fail(kind: Failure, opcode: u32, offset: usize) -> bool {
+    if failure == Failure.none {
+        failure = if loopBooleanRead { Failure.loopBoolean } else { kind }
+        failureOpcode = opcode
+        failureOffset = offset
+    }
+    return false
+}
+
+pub fn find(value: u32) -> u32 {
+    var v = value
+    while v != NONE && nodes[v].alias != NONE { v = nodes[v].alias }
+    return v
+}
+
+pub fn node(kind: Kind, sort: Sort, a: u32, b: u32, c: u32, imm: u32) -> u32 {
+    if nodeCount >= @intCast(u32, MAX_NODES) {
+        _ = fail(Failure.tooLarge, 0, 0)
+        return NONE
+    }
+    nodes[nodeCount] = Node.{ .kind = kind, .sort = sort, .a = a, .b = b, .c = c, .imm = imm, .uniform = false, .alias = NONE }
+    closedHeader[nodeCount] = false
+    nodeCount += 1
+    return nodeCount - 1
+}
+
+// Constants are made once each and stand outside the lists.
+const MOST_CONSTANTS: u32 = 1024
+var constantSeen: [1024]u32 = undefined
+var constantNodes: [1024]u32 = undefined
+var constantKept: u32 = 0
+
+pub fn constant(sort: Sort, value: u32) -> u32 {
+    var k: u32 = 0
+    while k < constantKept {
+        const n = constantNodes[k]
+        if constantSeen[k] == value && nodes[n].sort == sort { return n }
+        k += 1
+    }
+    const n = node(Kind.constant, sort, NONE, NONE, NONE, value)
+    if constantKept < MOST_CONSTANTS {
+        constantSeen[constantKept] = value
+        constantNodes[constantKept] = n
+        constantKept += 1
+    }
+    return n
+}
+
+// A list being built: its first and last items.
+pub const List = struct {
+    head: u32
+    tail: u32
+}
+
+pub fn emptyList() -> List { return List.{ .head = NONE, .tail = NONE } }
+
+pub fn append(list: *List, item: Item) -> u32 {
+    if itemCount >= @intCast(u32, MAX_ITEMS) {
+        _ = fail(Failure.tooLarge, 0, 0)
+        return NONE
+    }
+    items[itemCount] = item
+    items[itemCount].next = NONE
+    if list.*.tail == NONE {
+        list.*.head = itemCount
+    } else {
+        items[list.*.tail].next = itemCount
+    }
+    list.*.tail = itemCount
+    itemCount += 1
+    return itemCount - 1
+}
+
+fn blankItem(kind: ItemKind) -> Item {
+    return Item.{ .kind = kind, .node = NONE, .cond = NONE, .first = NONE, .second = NONE, .third = NONE, .params = 0, .paramCount = 0, .next = NONE }
+}
+
+// A node in the list: its value.
+pub fn emit(list: *List, kind: Kind, sort: Sort, a: u32, b: u32, c: u32, imm: u32) -> u32 {
+    const n = node(kind, sort, a, b, c, imm)
+    if n == NONE { return NONE }
+    var item = blankItem(ItemKind.node)
+    item.node = n
+    _ = append(list, item)
+    return n
+}
+
+fn word2(list: *List, kind: Kind, a: u32, b: u32) -> u32 { return emit(list, kind, Sort.word, a, b, NONE, 0) }
+fn bool2(list: *List, kind: Kind, a: u32, b: u32) -> u32 { return emit(list, kind, Sort.boolean, a, b, NONE, 0) }
+
+// ---------------------------------------------------------------------------
+// Division (nir_lower_idiv.c)
+
+fn isPowerOfTwo(value: u32) -> bool { return value != 0 && (value & (value - 1)) == 0 }
+
+fn log2(value: u32) -> u32 {
+    var k: u32 = 0
+    while (@intCast(u32, 1) << k) != value { k += 1 }
+    return k
+}
+
+// emit_udiv: the quotient, or with `modulo` the remainder, of n / d.
+fn udivide(list: *List, n: u32, d: u32, modulo: bool) -> u32 {
+    const dn = find(d)
+    if nodes[dn].kind == Kind.constant && isPowerOfTwo(nodes[dn].imm) {
+        if modulo { return word2(list, Kind.band, n, constant(Sort.word, nodes[dn].imm - 1)) }
+        return word2(list, Kind.shr, n, constant(Sort.word, log2(nodes[dn].imm)))
+    }
+    const scale: f32 = 4294966784.0
+    // rcp = f2u32(frcp(u2f32(d)) * 4294966784.0)
+    const real = emit(list, Kind.u2f, Sort.word, d, NONE, NONE, 0)
+    const inverse = emit(list, Kind.rcp, Sort.word, real, NONE, NONE, 0)
+    const scaled = word2(list, Kind.fmul, inverse, constant(Sort.word, @bitCast(u32, scale)))
+    const first = emit(list, Kind.f2u, Sort.word, scaled, NONE, NONE, 0)
+    // rcp = rcp + umul_high(rcp, rcp * (0 - d))
+    const negative = word2(list, Kind.sub, constant(Sort.word, 0), d)
+    const product = word2(list, Kind.mul, first, negative)
+    const correction = word2(list, Kind.mulhi, first, product)
+    const reciprocal = word2(list, Kind.add, first, correction)
+    // q = umul_high(n, rcp); r = n - q * d
+    const quotient = word2(list, Kind.mulhi, n, reciprocal)
+    const remainder = word2(list, Kind.sub, n, word2(list, Kind.mul, quotient, d))
+    // first refinement
+    const ge = bool2(list, Kind.uge, remainder, d)
+    const one = constant(Sort.word, 1)
+    var q1 = quotient
+    if !modulo { q1 = emit(list, Kind.select, Sort.word, ge, word2(list, Kind.add, quotient, one), quotient, 0) }
+    const r1 = emit(list, Kind.select, Sort.word, ge, word2(list, Kind.sub, remainder, d), remainder, 0)
+    // second refinement
+    const ge2 = bool2(list, Kind.uge, r1, d)
+    if modulo { return emit(list, Kind.select, Sort.word, ge2, word2(list, Kind.sub, r1, d), r1, 0) }
+    return emit(list, Kind.select, Sort.word, ge2, word2(list, Kind.add, q1, one), q1, 0)
+}
+
+// iabs as ACO selects it: v_max_i32(src, 0 - src).
+fn absolute(list: *List, value: u32) -> u32 {
+    return word2(list, Kind.smax, value, word2(list, Kind.sub, constant(Sort.word, 0), value))
+}
+
+// emit_idiv for idiv and irem (SPIR-V's SDiv and SRem: the remainder's
+// sign is the dividend's).
+fn sdivide(list: *List, n: u32, d: u32, remainder: bool) -> u32 {
+    const lhs = absolute(list, n)
+    const rhs = absolute(list, d)
+    const zero = constant(Sort.word, 0)
+    if !remainder {
+        const sign = bool2(list, Kind.slt, word2(list, Kind.bxor, n, d), zero)
+        const result = udivide(list, lhs, rhs, false)
+        return emit(list, Kind.select, Sort.word, sign, word2(list, Kind.sub, zero, result), result, 0)
+    }
+    const sign = bool2(list, Kind.slt, n, zero)
+    const result = udivide(list, lhs, rhs, true)
+    return emit(list, Kind.select, Sort.word, sign, word2(list, Kind.sub, zero, result), result, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Reading SPIR-V
+
+// What an id is.
+const IdKind = enum(u8) {
+    nothing,
+    typeVoid,
+    typeBool,
+    typeInt,
+    typeFloat,
+    typeVector,
+    typeMatrix,
+    typePointer,
+    typeStruct,
+    typeArray,
+    typeFunction,
+    value,
+    composite,
+    variable,
+    pointer,
+    builtin,
+    label,
+    function,
+    other,
+}
+
+// For each id: its kind and five words (a type's parts; a value's node, or
+// a composite's first component and count and type; a variable's storage
+// class, type and slot or location; a pointer's target, its base, its
+// index node or binding, its type and a matrix's stride; a label's word
+// offset).
+var idKind: [MAX_IDS]IdKind = undefined
+var idA: [MAX_IDS]u32 = undefined
+var idB: [MAX_IDS]u32 = undefined
+var idC: [MAX_IDS]u32 = undefined
+var idD: [MAX_IDS]u32 = undefined
+var idE: [MAX_IDS]u32 = undefined
+var decoBinding: [MAX_IDS]u32 = undefined
+var decoSet: [MAX_IDS]u32 = undefined
+var decoBuiltin: [MAX_IDS]u32 = undefined
+var decoLocation: [MAX_IDS]u32 = undefined
+var decoArrayStride: [MAX_IDS]u32 = undefined
+var decoFlat: [MAX_IDS]bool = undefined
+var bound: u32 = 0
+var spirv: []const u32 = undefined
+
+// The components of composite values (vectors and matrices, a matrix
+// column after column), as nodes.
+var pool: [MAX_COMPONENTS]u32 = undefined
+var poolCount: u32 = 0
+
+// The member types of structures (idC of a structure type: its first).
+var memberTypes: [4096]u32 = undefined
+var memberTypeCount: u32 = 0
+
+// Member decorations: (struct id, member) -> byte offset, matrix stride,
+// row-major, built-in.
+const MOST_MEMBERS: usize = 512
+var memberStruct: [512]u32 = undefined
+var memberIndex: [512]u32 = undefined
+var memberOffset: [512]u32 = undefined
+var memberStride: [512]u32 = undefined
+var memberRowMajor: [512]bool = undefined
+var memberBuiltin: [512]u32 = undefined
+var memberCount: u32 = 0
+
+// The function's variables' current values, one slot a component; the
+// outputs of a vertex or fragment shader live in slots too.
+var env: [MAX_SLOTS]u32 = undefined
+var slotCount: u32 = 0
+
+// The output slots: the position's four, each location's.
+var positionSlot: u32 = NONE
+var outputSlot: [16]u32 = undefined
+var outputComponents: [16]u32 = undefined
+
+// The import of GLSL.std.450 (0: none).
+var glslSet: u32 = 0
+
+// Pointer targets (idA of a pointer id).
+const TARGET_SLOT: u32 = 1
+const TARGET_PUSH: u32 = 2
+const TARGET_BUFFER: u32 = 3
+const TARGET_BUILTIN: u32 = 4
+const TARGET_UNIFORM: u32 = 5
+const TARGET_INPUT: u32 = 6
+const TARGET_REFUSED: u32 = 7
+
+const STORAGE_FUNCTION: u32 = 7
+const STORAGE_INPUT: u32 = 1
+const STORAGE_OUTPUT: u32 = 3
+const STORAGE_PUSH: u32 = 9
+const STORAGE_BUFFER: u32 = 12
+const STORAGE_UNIFORM: u32 = 2
+
+fn op(value: spv.Op) -> u32 { return @intCast(u32, @intFromEnum(value)) }
+fn deco(value: spv.Decoration) -> u32 { return @intCast(u32, @intFromEnum(value)) }
+fn builtinNumber(value: spv.BuiltIn) -> u32 { return @intCast(u32, @intFromEnum(value)) }
+
+fn opcodeAt(at: usize) -> u32 { return spirv[at] & 0xFFFF }
+fn countAt(at: usize) -> usize { return @intCast(usize, spirv[at] >> 16) }
+
+fn idOk(id: u32) -> bool { return id != 0 && id < bound }
+
+// The booleans made in the header of a loop that has ended: reading one
+// is refused (Failure.loopBoolean), and `loopBooleanRead` says so to `fail`.
+var closedHeader: [MAX_NODES]bool = undefined
+var loopBooleanRead = false
+
+fn checked(node: u32) -> u32 {
+    const value = find(node)
+    if value != NONE && closedHeader[value] {
+        loopBooleanRead = true
+        return NONE
+    }
+    return value
+}
+
+// A scalar value's node.
+fn valueOf(id: u32) -> u32 {
+    if !idOk(id) || idKind[id] != IdKind.value { return NONE }
+    return checked(idA[id])
+}
+
+// How many components a value has (0: no value).
+fn countOf(id: u32) -> u32 {
+    if !idOk(id) { return 0 }
+    if idKind[id] == IdKind.value { return 1 }
+    if idKind[id] == IdKind.composite { return idB[id] }
+    return 0
+}
+
+// A value's component k.
+fn componentOf(id: u32, k: u32) -> u32 {
+    if !idOk(id) { return NONE }
+    if idKind[id] == IdKind.value { return if k == 0 { checked(idA[id]) } else { NONE } }
+    if idKind[id] == IdKind.composite && k < idB[id] { return checked(pool[idA[id] + k]) }
+    return NONE
+}
+
+fn scalarSortOf(typeId: u32) -> Sort {
+    if !idOk(typeId) { return Sort.none }
+    if idKind[typeId] == IdKind.typeBool { return Sort.boolean }
+    if idKind[typeId] == IdKind.typeInt && idA[typeId] == 32 { return Sort.word }
+    if idKind[typeId] == IdKind.typeFloat && idA[typeId] == 32 { return Sort.word }
+    return Sort.none
+}
+
+// A scalar type's sort (Sort.none for any other type).
+fn typeOf(typeId: u32) -> Sort { return scalarSortOf(typeId) }
+
+// The scalar type of a scalar, vector or matrix type.
+fn baseOf(typeId: u32) -> u32 {
+    if !idOk(typeId) { return 0 }
+    if idKind[typeId] == IdKind.typeVector { return idA[typeId] }
+    if idKind[typeId] == IdKind.typeMatrix { return baseOf(idA[typeId]) }
+    return typeId
+}
+
+fn isFloat(typeId: u32) -> bool {
+    const b = baseOf(typeId)
+    return idOk(b) && idKind[b] == IdKind.typeFloat
+}
+
+fn isSigned(typeId: u32) -> bool {
+    const b = baseOf(typeId)
+    return idOk(b) && idKind[b] == IdKind.typeInt && idB[b] != 0
+}
+
+// The components of a value of `typeId`: 1 for a scalar, n for a vector,
+// columns x rows for a matrix; 0 for a type that is no value of words.
+fn componentsOf(typeId: u32) -> u32 {
+    if !idOk(typeId) { return 0 }
+    const k = idKind[typeId]
+    if k == IdKind.typeBool || k == IdKind.typeInt || k == IdKind.typeFloat { return if scalarSortOf(typeId) == Sort.none { 0 } else { 1 } }
+    if k == IdKind.typeVector {
+        if scalarSortOf(idA[typeId]) == Sort.none || idB[typeId] < 2 || idB[typeId] > 4 { return 0 }
+        return idB[typeId]
+    }
+    if k == IdKind.typeMatrix {
+        const column = componentsOf(idA[typeId])
+        if column == 0 || idKind[idA[typeId]] != IdKind.typeVector || idB[typeId] < 2 || idB[typeId] > 4 { return 0 }
+        return column * idB[typeId]
+    }
+    return 0
+}
+
+fn rowsOf(typeId: u32) -> u32 {
+    if idOk(typeId) && idKind[typeId] == IdKind.typeMatrix { return componentsOf(idA[typeId]) }
+    return 1
+}
+
+fn setValue(id: u32, value: u32) -> void {
+    idKind[id] = IdKind.value
+    idA[id] = value
+}
+
+// `id` is the value of `count` components `parts` of type `typeId`.
+fn setComponents(id: u32, parts: []const u32, count: u32, typeId: u32) -> bool {
+    if count == 1 {
+        setValue(id, parts[0])
+        valueType[id] = typeId
+        return true
+    }
+    if poolCount + count > @intCast(u32, MAX_COMPONENTS) { return fail(Failure.tooLarge, 0, 0) }
+    var k: u32 = 0
+    while k < count {
+        pool[poolCount + k] = parts[@intCast(usize, k)]
+        k += 1
+    }
+    idKind[id] = IdKind.composite
+    idA[id] = poolCount
+    idB[id] = count
+    idC[id] = typeId
+    poolCount += count
+    return true
+}
+
+fn memberAt(structId: u32, member: u32) -> u32 {
+    var k: u32 = 0
+    while k < memberCount {
+        if memberStruct[k] == structId && memberIndex[k] == member { return k }
+        k += 1
+    }
+    return NONE
+}
+
+fn memberTypeOf(structId: u32, member: u32) -> u32 {
+    if !idOk(structId) || idKind[structId] != IdKind.typeStruct || member >= idA[structId] { return 0 }
+    return memberTypes[idC[structId] + member]
+}
+
+fn memberSlot(structId: u32, member: u32) -> u32 {
+    var k: u32 = 0
+    while k < memberCount {
+        if memberStruct[k] == structId && memberIndex[k] == member { return k }
+        k += 1
+    }
+    if memberCount >= @intCast(u32, MOST_MEMBERS) { return NONE }
+    memberStruct[memberCount] = structId
+    memberIndex[memberCount] = member
+    memberOffset[memberCount] = NONE
+    memberStride[memberCount] = 0
+    memberRowMajor[memberCount] = false
+    memberBuiltin[memberCount] = NONE
+    memberCount += 1
+    return memberCount - 1
+}
+
+fn pushOffset(structId: u32, member: u32) -> u32 {
+    const m = memberAt(structId, member)
+    if m == NONE { return NONE }
+    return memberOffset[m]
+}
+
+// Slots for `count` components, NONE when there is no room.
+fn takeSlots(count: u32) -> u32 {
+    if slotCount + count > @intCast(u32, MAX_SLOTS) { return NONE }
+    const first = slotCount
+    var k: u32 = 0
+    while k < count {
+        env[first + k] = NONE
+        k += 1
+    }
+    slotCount += count
+    return first
+}
+
+fn stageOf(model: u32) -> u32 {
+    if model == @intCast(u32, @intFromEnum(spv.ExecutionModel.glCompute)) { return 0 }
+    if model == @intCast(u32, @intFromEnum(spv.ExecutionModel.vertex)) { return 1 }
+    if model == @intCast(u32, @intFromEnum(spv.ExecutionModel.fragment)) { return 2 }
+    return NONE
+}
+
+// A variable of the module (its storage class and type).
+fn moduleVariable(w: []const u32, at: usize) -> bool {
+    const opcode = w[0] & 0xFFFF
+    if !idOk(w[1]) || idKind[w[1]] != IdKind.typePointer { return fail(Failure.invalid, opcode, at) }
+    const storage = w[3]
+    const id = w[2]
+    const pointee = idB[w[1]]
+    idKind[id] = IdKind.variable
+    idA[id] = storage
+    idB[id] = pointee
+    idC[id] = NONE
+    if storage == STORAGE_BUFFER {
+        if shape.stage != Stage.compute || decoSet[id] != 0 || decoBinding[id] >= MAX_BINDINGS { return fail(Failure.unsupported, opcode, at) }
+        return true
+    }
+    if storage == STORAGE_UNIFORM {
+        // A uniform block of set 0 (its words loaded through the binding's
+        // descriptor as a storage buffer's are).
+        if decoSet[id] != 0 || decoBinding[id] >= MAX_BINDINGS || !idOk(pointee) || idKind[pointee] != IdKind.typeStruct { return fail(Failure.unsupported, opcode, at) }
+        return true
+    }
+    if storage == STORAGE_PUSH { return true }
+    if storage == STORAGE_INPUT {
+        const b = decoBuiltin[id]
+        if shape.stage == Stage.compute {
+            if b != builtinNumber(spv.BuiltIn.globalInvocationId) && b != builtinNumber(spv.BuiltIn.localInvocationId) && b != builtinNumber(spv.BuiltIn.workgroupId) { return fail(Failure.unsupported, opcode, at) }
+            return true
+        }
+        if b != NONE {
+            if shape.stage == Stage.vertex && (b == builtinNumber(spv.BuiltIn.vertexIndex) || b == builtinNumber(spv.BuiltIn.instanceIndex)) { return true }
+            return fail(Failure.unsupported, opcode, at)
+        }
+        const location = decoLocation[id]
+        const n = componentsOf(pointee)
+        if location >= MAX_LOCATIONS || n == 0 || n > 4 { return fail(Failure.unsupported, opcode, at) }
+        idC[id] = location
+        if shape.stage == Stage.vertex {
+            shape.attributeComponents[location] = n
+            shape.attributeSort[location] = if isFloat(pointee) { NUMBER_FLOAT } else if isSigned(pointee) { NUMBER_SINT } else { NUMBER_UINT }
+        } else {
+            if !isFloat(pointee) && !decoFlat[id] { return fail(Failure.unsupported, opcode, at) }
+            if decoFlat[id] { shape.inputFlat |= @intCast(u32, 1) << location }
+        }
+        return true
+    }
+    if storage == STORAGE_OUTPUT {
+        if shape.stage == Stage.compute { return fail(Failure.unsupported, opcode, at) }
+        if decoBuiltin[id] == builtinNumber(spv.BuiltIn.position) && shape.stage == Stage.vertex {
+            if componentsOf(pointee) != 4 { return fail(Failure.unsupported, opcode, at) }
+            positionSlot = takeSlots(4)
+            idC[id] = positionSlot
+            return positionSlot != NONE || fail(Failure.tooLarge, opcode, at)
+        }
+        if idOk(pointee) && idKind[pointee] == IdKind.typeStruct {
+            // gl_PerVertex: its members are built-ins; the position's get
+            // slots, the others none (a store to one is refused).
+            if shape.stage != Stage.vertex { return fail(Failure.unsupported, opcode, at) }
+            var member: u32 = 0
+            while member < idA[pointee] {
+                const m = memberAt(pointee, member)
+                if m != NONE && memberBuiltin[m] == builtinNumber(spv.BuiltIn.position) {
+                    if componentsOf(memberTypeOf(pointee, member)) != 4 { return fail(Failure.unsupported, opcode, at) }
+                    positionSlot = takeSlots(4)
+                    if positionSlot == NONE { return fail(Failure.tooLarge, opcode, at) }
+                }
+                member += 1
+            }
+            return true
+        }
+        if decoBuiltin[id] != NONE { return fail(Failure.unsupported, opcode, at) }
+        const location = decoLocation[id]
+        const n = componentsOf(pointee)
+        if location >= MAX_LOCATIONS || n == 0 || n > 4 || outputSlot[location] != NONE { return fail(Failure.unsupported, opcode, at) }
+        if shape.stage == Stage.fragment && !isFloat(pointee) { return fail(Failure.unsupported, opcode, at) }
+        outputSlot[location] = takeSlots(n)
+        outputComponents[location] = n
+        idC[id] = outputSlot[location]
+        return outputSlot[location] != NONE || fail(Failure.tooLarge, opcode, at)
+    }
+    return fail(Failure.unsupported, opcode, at)
+}
+
+// The declarations before the function: types, constants, variables,
+// decorations, the execution mode.
+fn declarations() -> bool {
+    var at: usize = 5
+    var entries: u32 = 0
+    var stage: u32 = NONE
+    while at < spirv.length {
+        const opcode = opcodeAt(at)
+        const count = countAt(at)
+        const w = spirv[at..at + count]
+        if opcode == op(spv.Op.function) {
+            if entries != 1 || stage == NONE { return fail(Failure.notCompute, opcode, at) }
+            if shape.stage == Stage.fragment && !shape.originUpperLeft { return fail(Failure.unsupported, op(spv.Op.executionMode), 0) }
+            return true
+        }
+        if opcode == op(spv.Op.entryPoint) {
+            entries += 1
+            stage = stageOf(w[1])
+            if stage == 1 { shape.stage = Stage.vertex }
+            if stage == 2 { shape.stage = Stage.fragment }
+        } else if opcode == op(spv.Op.executionMode) {
+            if w[2] == @intCast(u32, @intFromEnum(spv.ExecutionMode.localSize)) && count >= 6 {
+                shape.localSizeX = w[3]
+                shape.localSizeY = w[4]
+                shape.localSizeZ = w[5]
+            } else if w[2] == @intCast(u32, @intFromEnum(spv.ExecutionMode.originUpperLeft)) {
+                shape.originUpperLeft = true
+            } else if shape.stage != Stage.compute {
+                return fail(Failure.unsupported, opcode, at)
+            }
+        } else if opcode == op(spv.Op.decorate) {
+            const target = w[1]
+            if idOk(target) && count >= 3 {
+                const decoration = w[2]
+                if decoration == deco(spv.Decoration.binding) && count >= 4 { decoBinding[target] = w[3] }
+                if decoration == deco(spv.Decoration.descriptorSet) && count >= 4 { decoSet[target] = w[3] }
+                if decoration == deco(spv.Decoration.builtIn) && count >= 4 { decoBuiltin[target] = w[3] }
+                if decoration == deco(spv.Decoration.location) && count >= 4 { decoLocation[target] = w[3] }
+                if decoration == deco(spv.Decoration.arrayStride) && count >= 4 { decoArrayStride[target] = w[3] }
+                if decoration == deco(spv.Decoration.flat) { decoFlat[target] = true }
+                // The interpolations this stage does not have: refused.
+                if decoration == deco(spv.Decoration.noPerspective) || decoration == deco(spv.Decoration.centroid) || decoration == deco(spv.Decoration.sample) || decoration == deco(spv.Decoration.component) { return fail(Failure.unsupported, opcode, at) }
+            }
+        } else if opcode == op(spv.Op.memberDecorate) {
+            if count >= 4 {
+                const m = memberSlot(w[1], w[2])
+                if m == NONE { return fail(Failure.tooLarge, opcode, at) }
+                const decoration = w[3]
+                if decoration == deco(spv.Decoration.offset) && count >= 5 { memberOffset[m] = w[4] }
+                if decoration == deco(spv.Decoration.matrixStride) && count >= 5 { memberStride[m] = w[4] }
+                if decoration == deco(spv.Decoration.rowMajor) { memberRowMajor[m] = true }
+                if decoration == deco(spv.Decoration.builtIn) && count >= 5 { memberBuiltin[m] = w[4] }
+            }
+        } else if opcode == op(spv.Op.typeVoid) {
+            idKind[w[1]] = IdKind.typeVoid
+        } else if opcode == op(spv.Op.typeBool) {
+            idKind[w[1]] = IdKind.typeBool
+        } else if opcode == op(spv.Op.typeInt) {
+            idKind[w[1]] = IdKind.typeInt
+            idA[w[1]] = w[2]
+            idB[w[1]] = w[3]
+        } else if opcode == op(spv.Op.typeFloat) {
+            idKind[w[1]] = IdKind.typeFloat
+            idA[w[1]] = w[2]
+        } else if opcode == op(spv.Op.typeVector) {
+            idKind[w[1]] = IdKind.typeVector
+            idA[w[1]] = w[2]
+            idB[w[1]] = w[3]
+        } else if opcode == op(spv.Op.typeMatrix) {
+            idKind[w[1]] = IdKind.typeMatrix
+            idA[w[1]] = w[2]
+            idB[w[1]] = w[3]
+        } else if opcode == op(spv.Op.typePointer) {
+            idKind[w[1]] = IdKind.typePointer
+            idA[w[1]] = w[2]
+            idB[w[1]] = w[3]
+        } else if opcode == op(spv.Op.typeStruct) {
+            idKind[w[1]] = IdKind.typeStruct
+            idA[w[1]] = @intCast(u32, count - 2)
+            if count > 2 { idB[w[1]] = w[2] }
+            if memberTypeCount + @intCast(u32, count - 2) > 4096 { return fail(Failure.tooLarge, opcode, at) }
+            idC[w[1]] = memberTypeCount
+            var k: usize = 2
+            while k < count {
+                memberTypes[memberTypeCount] = w[k]
+                memberTypeCount += 1
+                k += 1
+            }
+        } else if opcode == op(spv.Op.typeRuntimeArray) || opcode == op(spv.Op.typeArray) {
+            idKind[w[1]] = IdKind.typeArray
+            idA[w[1]] = w[2]
+            idB[w[1]] = if opcode == op(spv.Op.typeArray) && count >= 4 { w[3] } else { 0 }
+        } else if opcode == op(spv.Op.typeFunction) {
+            idKind[w[1]] = IdKind.typeFunction
+        } else if opcode == op(spv.Op.constant) {
+            if typeOf(w[1]) != Sort.word || count != 4 { return fail(Failure.unsupported, opcode, at) }
+            setValue(w[2], constant(Sort.word, w[3]))
+            valueType[w[2]] = w[1]
+        } else if opcode == op(spv.Op.constantTrue) || opcode == op(spv.Op.constantFalse) {
+            setValue(w[2], constant(Sort.boolean, if opcode == op(spv.Op.constantTrue) { 1 } else { 0 }))
+        } else if opcode == op(spv.Op.constantComposite) {
+            if !constantComposite(w, at) { return false }
+        } else if opcode == op(spv.Op.constantNull) || opcode == op(spv.Op.undef) {
+            if !zeros(w[1], w[2], opcode, at) { return false }
+        } else if opcode == op(spv.Op.variable) {
+            if !moduleVariable(w, at) { return false }
+        } else if opcode == op(spv.Op.capability) || opcode == op(spv.Op.memoryModel) || opcode == op(spv.Op.name) || opcode == op(spv.Op.memberName) || opcode == op(spv.Op.source) || opcode == op(spv.Op.sourceContinued) || opcode == op(spv.Op.sourceExtension) || opcode == op(spv.Op.extension) || opcode == op(spv.Op.string) || opcode == op(spv.Op.moduleProcessed) || opcode == op(spv.Op.line) || opcode == op(spv.Op.noLine) {
+            // nothing to take
+        } else if opcode == op(spv.Op.extInstImport) {
+            idKind[w[1]] = IdKind.other
+            if isGlsl(w[2..]) { glslSet = w[1] }
+        } else {
+            return fail(Failure.unsupported, opcode, at)
+        }
+        at += count
+    }
+    return fail(Failure.invalid, 0, at)
+}
+
+// Whether the literal string in `words` is "GLSL.std.450".
+fn isGlsl(words: []const u32) -> bool {
+    const name = "GLSL.std.450"
+    var k: usize = 0
+    while k <= name.length {
+        const w = k / 4
+        if w >= words.length { return false }
+        const byte = @intCast(u8, (words[w] >> @intCast(u5, 8 * (k % 4))) & 0xFF)
+        const wanted: u8 = if k < name.length { name[k] } else { 0 }
+        if byte != wanted { return false }
+        k += 1
+    }
+    return true
+}
+
+// A constant vector or matrix: its components' nodes.
+fn constantComposite(w: []const u32, at: usize) -> bool {
+    const opcode = w[0] & 0xFFFF
+    const n = componentsOf(w[1])
+    if n == 0 { return fail(Failure.unsupported, opcode, at) }
+    var parts: [16]u32 = undefined
+    var count: u32 = 0
+    var k: usize = 3
+    while k < w.length {
+        const c = countOf(w[k])
+        if c == 0 { return fail(Failure.unsupported, opcode, at) }
+        var j: u32 = 0
+        while j < c {
+            if count >= n { return fail(Failure.invalid, opcode, at) }
+            parts[count] = componentOf(w[k], j)
+            count += 1
+            j += 1
+        }
+        k += 1
+    }
+    if count != n { return fail(Failure.invalid, opcode, at) }
+    return setComponents(w[2], parts[0..], n, w[1])
+}
+
+// A value of `typeId` whose components are all 0 (OpConstantNull; OpUndef
+// too: any value will do, and 0 is one every lane has).
+fn zeros(typeId: u32, id: u32, opcode: u32, at: usize) -> bool {
+    const n = componentsOf(typeId)
+    if n == 0 { return fail(Failure.unsupported, opcode, at) }
+    var parts: [16]u32 = undefined
+    var k: u32 = 0
+    while k < n {
+        parts[k] = constant(scalarSortOf(baseOf(typeId)), 0)
+        k += 1
+    }
+    return setComponents(id, parts[0..], n, typeId)
+}
+
+// The word offset of every label of the function, and its variables.
+fn labels(start: usize, entry: *u32) -> bool {
+    var at = start
+    entry.* = NONE
+    while at < spirv.length {
+        const opcode = opcodeAt(at)
+        const count = countAt(at)
+        if opcode == op(spv.Op.label) {
+            idKind[spirv[at + 1]] = IdKind.label
+            idA[spirv[at + 1]] = @intCast(u32, at)
+            if entry.* == NONE { entry.* = spirv[at + 1] }
+        } else if opcode == op(spv.Op.functionEnd) {
+            at += count
+            if at < spirv.length { return fail(Failure.unsupported, opcodeAt(at), at) }
+            return entry.* != NONE
+        } else if opcode == op(spv.Op.functionParameter) || opcode == op(spv.Op.phi) {
+            return fail(Failure.unsupported, opcode, at)
+        }
+        at += count
+    }
+    return fail(Failure.invalid, 0, at)
+}
+
+// The terminator of the block at label `label`, and the merge instruction
+// before it if there is one.
+const Block = struct {
+    first: usize
+    end: usize
+    merge: usize
+    terminator: usize
+}
+
+fn blockOf(label: u32, block: *Block) -> bool {
+    if !idOk(label) || idKind[label] != IdKind.label { return fail(Failure.structure, 0, 0) }
+    var at = @intCast(usize, idA[label])
+    at += countAt(at)
+    block.*.first = at
+    block.*.merge = 0
+    while at < spirv.length {
+        const opcode = opcodeAt(at)
+        if opcode == op(spv.Op.selectionMerge) || opcode == op(spv.Op.loopMerge) {
+            block.*.merge = at
+        } else if opcode == op(spv.Op.branch) || opcode == op(spv.Op.branchConditional) || opcode == op(spv.Op.return_) || opcode == op(spv.Op.returnValue) || opcode == op(spv.Op.switch) || opcode == op(spv.Op.kill) || opcode == op(spv.Op.unreachable) {
+            block.*.terminator = at
+            if block.*.merge == 0 { block.*.end = at } else { block.*.end = block.*.merge }
+            return true
+        }
+        at += countAt(at)
+    }
+    return fail(Failure.structure, 0, at)
+}
+
+// The instructions of a block that are not its merge and terminator.
+fn translateBody(block: *const Block, list: *List) -> bool {
+    var at = block.*.first
+    while at < block.*.end {
+        if !translate(at, list) { return false }
+        at += countAt(at)
+    }
+    return true
+}
+
+// A pointer: its target, base, index node or binding, type and a matrix's
+// stride (0 when its matrices are row-major... see `rowMajor`).
+fn setPointer(id: u32, target: u32, base: u32, index: u32, typeId: u32, stride: u32) -> void {
+    idKind[id] = IdKind.pointer
+    idA[id] = target
+    idB[id] = base
+    idC[id] = index
+    idD[id] = typeId
+    idE[id] = stride
+}
+
+fn translate(at: usize, list: *List) -> bool {
+    const opcode = opcodeAt(at)
+    const count = countAt(at)
+    const w = spirv[at..at + count]
+    if opcode == op(spv.Op.variable) {
+        if w[3] != STORAGE_FUNCTION || count > 4 { return fail(Failure.unsupported, opcode, at) }
+        const pointee = idB[w[1]]
+        const n = componentsOf(pointee)
+        if n == 0 || scalarSortOf(baseOf(pointee)) != Sort.word { return fail(Failure.unsupported, opcode, at) }
+        const first = takeSlots(n)
+        if first == NONE { return fail(Failure.unsupported, opcode, at) }
+        setPointer(w[2], TARGET_SLOT, first, NONE, pointee, 0)
+        return true
+    }
+    if opcode == op(spv.Op.accessChain) || opcode == op(spv.Op.inBoundsAccessChain) {
+        return accessChain(w, at, list)
+    }
+    if opcode == op(spv.Op.load) { return load(w, at, list) }
+    if opcode == op(spv.Op.store) { return store(w, at, list) }
+    if opcode == op(spv.Op.compositeExtract) { return compositeExtract(w, at, list) }
+    if opcode == op(spv.Op.compositeConstruct) { return compositeConstruct(w, at) }
+    if opcode == op(spv.Op.compositeInsert) { return compositeInsert(w, at) }
+    if opcode == op(spv.Op.vectorShuffle) { return vectorShuffle(w, at) }
+    if opcode == op(spv.Op.copyObject) || (opcode == op(spv.Op.bitcast) && countOf(w[3]) > 1) {
+        const n = countOf(w[3])
+        if n == 0 || n != componentsOf(w[1]) { return fail(Failure.unsupported, opcode, at) }
+        var parts: [16]u32 = undefined
+        var k: u32 = 0
+        while k < n {
+            parts[k] = componentOf(w[3], k)
+            if parts[k] == NONE { return fail(Failure.undefinedValue, opcode, at) }
+            k += 1
+        }
+        return setComponents(w[2], parts[0..], n, w[1])
+    }
+    if opcode == op(spv.Op.undef) { return zeros(w[1], w[2], opcode, at) }
+    if opcode == op(spv.Op.transpose) || opcode == op(spv.Op.vectorTimesScalar) || opcode == op(spv.Op.matrixTimesScalar) || opcode == op(spv.Op.matrixTimesVector) || opcode == op(spv.Op.vectorTimesMatrix) || opcode == op(spv.Op.matrixTimesMatrix) || opcode == op(spv.Op.dot) {
+        return linear(w, at, list)
+    }
+    if opcode == op(spv.Op.extInst) { return extended(w, at, list) }
+    // Everything else makes its result component by component.
+    const n = componentsOf(w[1])
+    if n == 0 || count < 4 || (idOk(w[1]) && idKind[w[1]] == IdKind.typeMatrix && opcode != op(spv.Op.fNegate) && opcode != op(spv.Op.fAdd) && opcode != op(spv.Op.fSub)) { return fail(Failure.unsupported, opcode, at) }
+    var parts: [16]u32 = undefined
+    var k: u32 = 0
+    while k < n {
+        parts[k] = elementwise(w, at, list, k)
+        if parts[k] == NONE { return false }
+        k += 1
+    }
+    return setComponents(w[2], parts[0..], n, w[1])
+}
+
+// Operand `which` (0: the first) of an elementwise instruction for
+// component k: its own component k, or its only one (a scalar condition
+// of a select over vectors).
+fn operandPart(w: []const u32, which: usize, k: u32) -> u32 {
+    if 3 + which >= w.length { return NONE }
+    const id = w[3 + which]
+    if countOf(id) == 1 { return componentOf(id, 0) }
+    return componentOf(id, k)
+}
+
+// Component k of an elementwise instruction, or NONE (failed).
+fn elementwise(w: []const u32, at: usize, list: *List, k: u32) -> u32 {
+    const opcode = w[0] & 0xFFFF
+    const resultType = baseOf(w[1])
+    const sort = scalarSortOf(resultType)
+    const count = w.length
+    const a = operandPart(w, 0, k)
+    var b = NONE
+    var c = NONE
+    if count >= 5 { b = operandPart(w, 1, k) }
+    if count >= 6 { c = operandPart(w, 2, k) }
+    if a == NONE || (count >= 5 && b == NONE) || (count >= 6 && c == NONE) {
+        _ = fail(Failure.undefinedValue, opcode, at)
+        return NONE
+    }
+    const float = isFloat(w[1])
+    var result = NONE
+    if count == 4 {
+        if opcode == op(spv.Op.not) && sort == Sort.word {
+            result = emit(list, Kind.bnot, Sort.word, a, NONE, NONE, 0)
+        } else if opcode == op(spv.Op.logicalNot) && sort == Sort.boolean {
+            result = emit(list, Kind.lnot, Sort.boolean, a, NONE, NONE, 0)
+        } else if opcode == op(spv.Op.sNegate) && sort == Sort.word {
+            result = word2(list, Kind.sub, constant(Sort.word, 0), a)
+        } else if opcode == op(spv.Op.fNegate) && float {
+            // ACO's fneg: v_mul_f32 by -1.0
+            result = word2(list, Kind.fmul, constant(Sort.word, FLOAT_MINUS_ONE), a)
+        } else if opcode == op(spv.Op.bitcast) && sort == nodes[a].sort {
+            result = a
+        } else if opcode == op(spv.Op.convertSToF) && float {
+            result = emit(list, Kind.i2f, Sort.word, a, NONE, NONE, 0)
+        } else if opcode == op(spv.Op.convertUToF) && float {
+            result = emit(list, Kind.u2f, Sort.word, a, NONE, NONE, 0)
+        } else if opcode == op(spv.Op.convertFToS) && sort == Sort.word {
+            result = emit(list, Kind.f2i, Sort.word, a, NONE, NONE, 0)
+        } else if opcode == op(spv.Op.convertFToU) && sort == Sort.word {
+            result = emit(list, Kind.f2u, Sort.word, a, NONE, NONE, 0)
+        }
+    } else if opcode == op(spv.Op.select) {
+        if c == NONE || nodes[a].sort != Sort.boolean || nodes[b].sort != sort || nodes[c].sort != sort {
+            _ = fail(Failure.unsupported, opcode, at)
+            return NONE
+        }
+        result = emit(list, Kind.select, sort, a, b, c, 0)
+    } else if count == 5 {
+        const operands = nodes[a].sort
+        if operands != nodes[b].sort {
+            _ = fail(Failure.unsupported, opcode, at)
+            return NONE
+        }
+        const operandType = typeOfOperand(w[3])
+        if operands == Sort.word && sort == Sort.word && float {
+            if opcode == op(spv.Op.fAdd) { result = word2(list, Kind.fadd, a, b) }
+            if opcode == op(spv.Op.fSub) { result = word2(list, Kind.fsub, a, b) }
+            if opcode == op(spv.Op.fMul) { result = word2(list, Kind.fmul, a, b) }
+            if opcode == op(spv.Op.fDiv) {
+                // RADV's lower_fdiv: a * frcp(b)
+                result = word2(list, Kind.fmul, a, emit(list, Kind.rcp, Sort.word, b, NONE, NONE, 0))
+            }
+        } else if operands == Sort.word && sort == Sort.word {
+            if opcode == op(spv.Op.uDiv) {
+                result = udivide(list, a, b, false)
+            } else if opcode == op(spv.Op.uMod) {
+                result = udivide(list, a, b, true)
+            } else if opcode == op(spv.Op.sDiv) {
+                result = sdivide(list, a, b, false)
+            } else if opcode == op(spv.Op.sRem) {
+                result = sdivide(list, a, b, true)
+            } else {
+                const kind = wordKind(opcode)
+                if kind != null { result = word2(list, kind.?, a, b) }
+            }
+        } else if operands == Sort.word && sort == Sort.boolean && operandType != NONE && isFloat(operandType) {
+            result = floatCompare(list, opcode, a, b)
+        } else if operands == Sort.word && sort == Sort.boolean {
+            const kind = compareKind(opcode)
+            if kind != null { result = bool2(list, kind.?, a, b) }
+        } else if operands == Sort.boolean && sort == Sort.boolean {
+            const kind = logicKind(opcode)
+            if kind != null { result = bool2(list, kind.?, a, b) }
+        }
+    }
+    if result == NONE { _ = fail(Failure.unsupported, opcode, at) }
+    return result
+}
+
+// The type of a value id as far as the reader keeps it: a composite's own,
+// a scalar's from the instruction that made it (NONE when not known).
+fn typeOfOperand(id: u32) -> u32 {
+    if !idOk(id) { return NONE }
+    if idKind[id] == IdKind.composite { return idC[id] }
+    return valueType[id]
+}
+
+// Each value id's result type (scalars; composites keep theirs in idC).
+var valueType: [MAX_IDS]u32 = undefined
+
+// The VOPC conditions of the float comparisons (the condition's number
+// in the instruction: f lt eq le gt lg ge o u nge nlg ngt nle neq nlt
+// tru, the order of aco_opcodes.py's v_cmp_*_f32), and whether the
+// operands are swapped: vtn_alu.c's mapping onto NIR's flt, fge, feq,
+// fneu (FOrdGreaterThan is flt swapped, FOrdLessThanEqual fge swapped, the
+// unordered ones the ordered opposite's negation; FOrdNotEqual is fneu of
+// ordered operands, which is lg).
+pub const CMP_LT: u32 = 1
+pub const CMP_EQ: u32 = 2
+pub const CMP_LG: u32 = 5
+pub const CMP_GE: u32 = 6
+pub const CMP_NGE: u32 = 9
+pub const CMP_NLG: u32 = 10
+pub const CMP_NEQ: u32 = 13
+pub const CMP_NLT: u32 = 14
+
+fn floatCompare(list: *List, opcode: u32, a: u32, b: u32) -> u32 {
+    var condition: u32 = 0
+    var swap = false
+    if opcode == op(spv.Op.fOrdEqual) { condition = CMP_EQ }
+    if opcode == op(spv.Op.fOrdNotEqual) { condition = CMP_LG }
+    if opcode == op(spv.Op.fOrdLessThan) { condition = CMP_LT }
+    if opcode == op(spv.Op.fOrdGreaterThan) {
+        condition = CMP_LT
+        swap = true
+    }
+    if opcode == op(spv.Op.fOrdLessThanEqual) {
+        condition = CMP_GE
+        swap = true
+    }
+    if opcode == op(spv.Op.fOrdGreaterThanEqual) { condition = CMP_GE }
+    if opcode == op(spv.Op.fUnordEqual) { condition = CMP_NLG }
+    if opcode == op(spv.Op.fUnordNotEqual) { condition = CMP_NEQ }
+    if opcode == op(spv.Op.fUnordLessThan) { condition = CMP_NGE }
+    if opcode == op(spv.Op.fUnordGreaterThan) {
+        condition = CMP_NGE
+        swap = true
+    }
+    if opcode == op(spv.Op.fUnordLessThanEqual) {
+        condition = CMP_NLT
+        swap = true
+    }
+    if opcode == op(spv.Op.fUnordGreaterThanEqual) { condition = CMP_NLT }
+    if condition == 0 { return NONE }
+    if swap { return emit(list, Kind.fcmp, Sort.boolean, b, a, NONE, condition) }
+    return emit(list, Kind.fcmp, Sort.boolean, a, b, NONE, condition)
+}
+
+// The node of a SPIR-V operation of two words that gives a word.
+fn wordKind(opcode: u32) -> ?Kind {
+    if opcode == op(spv.Op.iAdd) { return Kind.add }
+    if opcode == op(spv.Op.iSub) { return Kind.sub }
+    if opcode == op(spv.Op.iMul) { return Kind.mul }
+    if opcode == op(spv.Op.shiftLeftLogical) { return Kind.shl }
+    if opcode == op(spv.Op.shiftRightLogical) { return Kind.shr }
+    if opcode == op(spv.Op.shiftRightArithmetic) { return Kind.sar }
+    if opcode == op(spv.Op.bitwiseAnd) { return Kind.band }
+    if opcode == op(spv.Op.bitwiseOr) { return Kind.bor }
+    if opcode == op(spv.Op.bitwiseXor) { return Kind.bxor }
+    return null
+}
+
+// ... of two words that gives a boolean.
+fn compareKind(opcode: u32) -> ?Kind {
+    if opcode == op(spv.Op.iEqual) { return Kind.eq }
+    if opcode == op(spv.Op.iNotEqual) { return Kind.ne }
+    if opcode == op(spv.Op.uLessThan) { return Kind.ult }
+    if opcode == op(spv.Op.uLessThanEqual) { return Kind.ule }
+    if opcode == op(spv.Op.uGreaterThan) { return Kind.ugt }
+    if opcode == op(spv.Op.uGreaterThanEqual) { return Kind.uge }
+    if opcode == op(spv.Op.sLessThan) { return Kind.slt }
+    if opcode == op(spv.Op.sLessThanEqual) { return Kind.sle }
+    if opcode == op(spv.Op.sGreaterThan) { return Kind.sgt }
+    if opcode == op(spv.Op.sGreaterThanEqual) { return Kind.sge }
+    return null
+}
+
+// ... of two booleans.
+fn logicKind(opcode: u32) -> ?Kind {
+    if opcode == op(spv.Op.logicalAnd) { return Kind.land }
+    if opcode == op(spv.Op.logicalOr) { return Kind.lor }
+    if opcode == op(spv.Op.logicalEqual) { return Kind.leq }
+    if opcode == op(spv.Op.logicalNotEqual) { return Kind.lne }
+    return null
+}
+
+// -1.0 and 1.0 as words.
+pub const FLOAT_MINUS_ONE: u32 = 0xBF800000
+pub const FLOAT_ONE: u32 = 0x3F800000
+
+fn fmul(list: *List, a: u32, b: u32) -> u32 { return word2(list, Kind.fmul, a, b) }
+fn fadd(list: *List, a: u32, b: u32) -> u32 { return word2(list, Kind.fadd, a, b) }
+
+// The sum of a[k] * b[k] over k, added in order.
+fn dotOf(list: *List, a: []const u32, b: []const u32, n: u32) -> u32 {
+    var sum = fmul(list, a[0], b[0])
+    var k: u32 = 1
+    while k < n {
+        sum = fadd(list, sum, fmul(list, a[@intCast(usize, k)], b[@intCast(usize, k)]))
+        k += 1
+    }
+    return sum
+}
+
+// The linear algebra of SPIR-V on float vectors and matrices (a matrix's
+// component c * rows + r is column c, row r): multiplications into sums of
+// products added in order (what NIR's lowering of them gives, with
+// v_mul_f32 and v_add_f32 for its fmul and fadd).
+fn linear(w: []const u32, at: usize, list: *List) -> bool {
+    const opcode = w[0] & 0xFFFF
+    if !isFloat(w[1]) || w.length < 4 { return fail(Failure.unsupported, opcode, at) }
+    var left: [16]u32 = undefined
+    var right: [16]u32 = undefined
+    const leftCount = countOf(w[3])
+    const rightCount = if w.length >= 5 { countOf(w[4]) } else { 0 }
+    var k: u32 = 0
+    while k < leftCount {
+        left[k] = componentOf(w[3], k)
+        if left[k] == NONE { return fail(Failure.undefinedValue, opcode, at) }
+        k += 1
+    }
+    k = 0
+    while k < rightCount {
+        right[k] = componentOf(w[4], k)
+        if right[k] == NONE { return fail(Failure.undefinedValue, opcode, at) }
+        k += 1
+    }
+    var parts: [16]u32 = undefined
+    const n = componentsOf(w[1])
+    if n == 0 { return fail(Failure.unsupported, opcode, at) }
+    if opcode == op(spv.Op.dot) {
+        if leftCount != rightCount || leftCount < 2 { return fail(Failure.unsupported, opcode, at) }
+        parts[0] = dotOf(list, left[0..], right[0..], leftCount)
+        return setComponents(w[2], parts[0..], 1, w[1])
+    }
+    if opcode == op(spv.Op.vectorTimesScalar) || opcode == op(spv.Op.matrixTimesScalar) {
+        if rightCount != 1 || leftCount != n { return fail(Failure.unsupported, opcode, at) }
+        k = 0
+        while k < n {
+            parts[k] = fmul(list, left[k], right[0])
+            k += 1
+        }
+        return setComponents(w[2], parts[0..], n, w[1])
+    }
+    if opcode == op(spv.Op.transpose) {
+        const from = typeOfOperand(w[3])
+        const rows = rowsOf(from)
+        const columns = leftCount / rows
+        k = 0
+        while k < n {
+            // result column c (of `columns` rows), row r: the operand's
+            // column r, row c
+            const c = k / columns
+            const r = k % columns
+            parts[k] = left[r * rows + c]
+            k += 1
+        }
+        return setComponents(w[2], parts[0..], n, w[1])
+    }
+    if opcode == op(spv.Op.matrixTimesVector) {
+        // M (C columns of R rows) times v (C): R components
+        const rows = n
+        const columns = rightCount
+        if columns * rows != leftCount { return fail(Failure.unsupported, opcode, at) }
+        var r: u32 = 0
+        while r < rows {
+            var sum = fmul(list, left[r], right[0])
+            var c: u32 = 1
+            while c < columns {
+                sum = fadd(list, sum, fmul(list, left[c * rows + r], right[c]))
+                c += 1
+            }
+            parts[r] = sum
+            r += 1
+        }
+        return setComponents(w[2], parts[0..], n, w[1])
+    }
+    if opcode == op(spv.Op.vectorTimesMatrix) {
+        // v (R) times M (C columns of R rows): C components, each the dot
+        // of v and a column
+        const rows = leftCount
+        const columns = n
+        if columns * rows != rightCount { return fail(Failure.unsupported, opcode, at) }
+        var c: u32 = 0
+        while c < columns {
+            parts[c] = dotOf(list, left[0..], right[@intCast(usize, c * rows)..], rows)
+            c += 1
+        }
+        return setComponents(w[2], parts[0..], n, w[1])
+    }
+    // A (K columns of R rows) times B (C columns of K rows): C columns of R
+    // rows, (c, r) the sum over k of A(k, r) * B(c, k).
+    const rows = rowsOf(w[1])
+    const columns = n / rows
+    const inner = leftCount / rows
+    if inner * rows != leftCount || columns * inner != rightCount { return fail(Failure.unsupported, opcode, at) }
+    var c: u32 = 0
+    while c < columns {
+        var r: u32 = 0
+        while r < rows {
+            var sum = fmul(list, left[r], right[c * inner])
+            var j: u32 = 1
+            while j < inner {
+                sum = fadd(list, sum, fmul(list, left[j * rows + r], right[c * inner + j]))
+                j += 1
+            }
+            parts[c * rows + r] = sum
+            r += 1
+        }
+        c += 1
+    }
+    return setComponents(w[2], parts[0..], n, w[1])
+}
+
+// GLSL.std.450's numbers (Mesa's src/compiler/spirv/GLSL.std.450.h).
+pub const GLSL_FABS: u32 = 4
+pub const GLSL_SABS: u32 = 5
+pub const GLSL_FLOOR: u32 = 8
+pub const GLSL_FRACT: u32 = 10
+pub const GLSL_FMIN: u32 = 37
+pub const GLSL_UMIN: u32 = 38
+pub const GLSL_SMIN: u32 = 39
+pub const GLSL_FMAX: u32 = 40
+pub const GLSL_UMAX: u32 = 41
+pub const GLSL_SMAX: u32 = 42
+pub const GLSL_FCLAMP: u32 = 43
+pub const GLSL_UCLAMP: u32 = 44
+pub const GLSL_SCLAMP: u32 = 45
+pub const GLSL_FMIX: u32 = 46
+pub const GLSL_STEP: u32 = 48
+
+// OpExtInst of GLSL.std.450, component by component: what vtn_glsl450.c
+// makes of each (fabs, ffloor, ffract, fmin, fmax, the clamps as min of
+// max, flrp as x + (y - x) * a, step as bcsel(x < edge, 0, 1)).
+fn extended(w: []const u32, at: usize, list: *List) -> bool {
+    const opcode = w[0] & 0xFFFF
+    if glslSet == 0 || w.length < 6 || w[3] != glslSet { return fail(Failure.unsupported, opcode, at) }
+    const which = w[4]
+    const n = componentsOf(w[1])
+    if n == 0 || n > 4 || (idOk(w[1]) && idKind[w[1]] == IdKind.typeMatrix) { return fail(Failure.unsupported, opcode, at) }
+    var parts: [16]u32 = undefined
+    var k: u32 = 0
+    while k < n {
+        var x = NONE
+        var y = NONE
+        var z = NONE
+        if w.length >= 6 { x = if countOf(w[5]) == 1 { componentOf(w[5], 0) } else { componentOf(w[5], k) } }
+        if w.length >= 7 { y = if countOf(w[6]) == 1 { componentOf(w[6], 0) } else { componentOf(w[6], k) } }
+        if w.length >= 8 { z = if countOf(w[7]) == 1 { componentOf(w[7], 0) } else { componentOf(w[7], k) } }
+        if x == NONE || (w.length >= 7 && y == NONE) || (w.length >= 8 && z == NONE) { return fail(Failure.undefinedValue, opcode, at) }
+        var result = NONE
+        const arguments = w.length - 5
+        if arguments == 1 {
+            if which == GLSL_FABS { result = emit(list, Kind.fabs, Sort.word, x, NONE, NONE, 0) }
+            if which == GLSL_SABS { result = absolute(list, x) }
+            if which == GLSL_FLOOR { result = emit(list, Kind.ffloor, Sort.word, x, NONE, NONE, 0) }
+            if which == GLSL_FRACT { result = emit(list, Kind.ffract, Sort.word, x, NONE, NONE, 0) }
+        } else if arguments == 2 {
+            if which == GLSL_FMIN { result = word2(list, Kind.fmin, x, y) }
+            if which == GLSL_FMAX { result = word2(list, Kind.fmax, x, y) }
+            if which == GLSL_UMIN { result = word2(list, Kind.umin, x, y) }
+            if which == GLSL_UMAX { result = word2(list, Kind.umax, x, y) }
+            if which == GLSL_SMIN { result = word2(list, Kind.smin, x, y) }
+            if which == GLSL_SMAX { result = word2(list, Kind.smax, x, y) }
+            if which == GLSL_STEP {
+                // x is the edge, y the value
+                const below = emit(list, Kind.fcmp, Sort.boolean, y, x, NONE, CMP_LT)
+                result = emit(list, Kind.select, Sort.word, below, constant(Sort.word, 0), constant(Sort.word, FLOAT_ONE), 0)
+            }
+        } else if arguments == 3 {
+            if which == GLSL_FCLAMP { result = word2(list, Kind.fmin, word2(list, Kind.fmax, x, y), z) }
+            if which == GLSL_UCLAMP { result = word2(list, Kind.umin, word2(list, Kind.umax, x, y), z) }
+            if which == GLSL_SCLAMP { result = word2(list, Kind.smin, word2(list, Kind.smax, x, y), z) }
+            if which == GLSL_FMIX { result = fadd(list, x, fmul(list, word2(list, Kind.fsub, y, x), z)) }
+        }
+        if result == NONE { return fail(Failure.unsupported, opcode, at) }
+        parts[k] = result
+        k += 1
+    }
+    return setComponents(w[2], parts[0..], n, w[1])
+}
+
+// A composite's component range for the indices `indices` of its type
+// `typeId`: the first component, how many, and the type they make.
+fn indexInto(typeId: u32, indices: []const u32, first: *u32, count: *u32, result: *u32) -> bool {
+    var t = typeId
+    var offset: u32 = 0
+    var k: usize = 0
+    while k < indices.length {
+        const i = indices[k]
+        if !idOk(t) { return false }
+        if idKind[t] == IdKind.typeVector {
+            if i >= idB[t] { return false }
+            offset += i
+            t = idA[t]
+        } else if idKind[t] == IdKind.typeMatrix {
+            if i >= idB[t] { return false }
+            offset += i * componentsOf(idA[t])
+            t = idA[t]
+        } else {
+            return false
+        }
+        k += 1
+    }
+    first.* = offset
+    count.* = componentsOf(t)
+    result.* = t
+    return count.* != 0
+}
+
+fn compositeExtract(w: []const u32, at: usize, list: *List) -> bool {
+    const opcode = w[0] & 0xFFFF
+    const composite = w[3]
+    if w.length < 5 || !idOk(composite) { return fail(Failure.unsupported, opcode, at) }
+    if idKind[composite] == IdKind.builtin {
+        // a compute built-in vector's component
+        if w.length != 5 || w[4] > 2 { return fail(Failure.unsupported, opcode, at) }
+        setValue(w[2], builtin(list, idA[composite], w[4]))
+        return true
+    }
+    var first: u32 = 0
+    var count: u32 = 0
+    var resultType: u32 = 0
+    if !indexInto(typeOfOperand(composite), w[4..], &first, &count, &resultType) { return fail(Failure.unsupported, opcode, at) }
+    var parts: [16]u32 = undefined
+    var k: u32 = 0
+    while k < count {
+        parts[k] = componentOf(composite, first + k)
+        if parts[k] == NONE { return fail(Failure.undefinedValue, opcode, at) }
+        k += 1
+    }
+    if count == 1 { valueType[w[2]] = w[1] }
+    return setComponents(w[2], parts[0..], count, w[1])
+}
+
+fn compositeConstruct(w: []const u32, at: usize) -> bool {
+    const opcode = w[0] & 0xFFFF
+    const n = componentsOf(w[1])
+    if n < 2 { return fail(Failure.unsupported, opcode, at) }
+    var parts: [16]u32 = undefined
+    var count: u32 = 0
+    var k: usize = 3
+    while k < w.length {
+        const c = countOf(w[k])
+        if c == 0 { return fail(Failure.undefinedValue, opcode, at) }
+        var j: u32 = 0
+        while j < c {
+            if count >= n { return fail(Failure.invalid, opcode, at) }
+            parts[count] = componentOf(w[k], j)
+            if parts[count] == NONE { return fail(Failure.undefinedValue, opcode, at) }
+            count += 1
+            j += 1
+        }
+        k += 1
+    }
+    if count != n { return fail(Failure.invalid, opcode, at) }
+    return setComponents(w[2], parts[0..], n, w[1])
+}
+
+fn compositeInsert(w: []const u32, at: usize) -> bool {
+    const opcode = w[0] & 0xFFFF
+    if w.length < 6 { return fail(Failure.unsupported, opcode, at) }
+    const n = componentsOf(w[1])
+    const object = w[3]
+    const composite = w[4]
+    var first: u32 = 0
+    var count: u32 = 0
+    var partType: u32 = 0
+    if n == 0 || countOf(composite) != n || !indexInto(w[1], w[5..], &first, &count, &partType) || countOf(object) != count { return fail(Failure.unsupported, opcode, at) }
+    var parts: [16]u32 = undefined
+    var k: u32 = 0
+    while k < n {
+        parts[k] = if k >= first && k < first + count { componentOf(object, k - first) } else { componentOf(composite, k) }
+        if parts[k] == NONE { return fail(Failure.undefinedValue, opcode, at) }
+        k += 1
+    }
+    return setComponents(w[2], parts[0..], n, w[1])
+}
+
+fn vectorShuffle(w: []const u32, at: usize) -> bool {
+    const opcode = w[0] & 0xFFFF
+    const n = componentsOf(w[1])
+    if w.length < 6 || n == 0 || @intCast(u32, w.length - 5) != n { return fail(Failure.unsupported, opcode, at) }
+    const firstCount = countOf(w[3])
+    const secondCount = countOf(w[4])
+    var parts: [16]u32 = undefined
+    var k: u32 = 0
+    while k < n {
+        const index = w[5 + @intCast(usize, k)]
+        if index == 0xFFFFFFFF {
+            parts[k] = constant(Sort.word, 0)
+        } else if index < firstCount {
+            parts[k] = componentOf(w[3], index)
+        } else if index < firstCount + secondCount {
+            parts[k] = componentOf(w[4], index - firstCount)
+        } else {
+            return fail(Failure.invalid, opcode, at)
+        }
+        if parts[k] == NONE { return fail(Failure.undefinedValue, opcode, at) }
+        k += 1
+    }
+    return setComponents(w[2], parts[0..], n, w[1])
+}
+
+// The vertex shader's inputs as the pipeline describes them (the driver
+// sets them before it compiles a vertex shader): for each location, the
+// binding's descriptor, the byte offset in the binding's element, the
+// format's components (1 to 4: 32-bit each) and number format, and
+// whether the binding advances per instance.
+pub const VertexInput = struct {
+    used: bool
+    binding: u32
+    offset: u32
+    components: u32
+    number: u32
+    perInstance: bool
+}
+
+// The number formats of a vertex input (gfx8.json's BUF_NUM_FORMAT).
+pub const NUMBER_UINT: u32 = 4
+pub const NUMBER_SINT: u32 = 5
+pub const NUMBER_FLOAT: u32 = 7
+
+pub var vertexInputs: [16]VertexInput = undefined
+
+// The driver's description cleared: no input.
+pub fn clearVertexInputs() -> void {
+    var k: usize = 0
+    while k < 16 {
+        vertexInputs[k].used = false
+        k += 1
+    }
+}
+
+// A load of the variable or pointer `pointer` of `typeId`: its components.
+fn load(w: []const u32, at: usize, list: *List) -> bool {
+    const opcode = w[0] & 0xFFFF
+    const pointer = w[3]
+    if !idOk(pointer) { return fail(Failure.invalid, opcode, at) }
+    if idKind[pointer] == IdKind.variable && idA[pointer] == STORAGE_INPUT && shape.stage == Stage.compute {
+        // a built-in vector: its components are read by
+        // OpCompositeExtract
+        idKind[w[2]] = IdKind.builtin
+        idA[w[2]] = decoBuiltin[pointer]
+        return true
+    }
+    var target = NONE
+    var base: u32 = 0
+    var index = NONE
+    var typeId = w[1]
+    var stride: u32 = 0
+    if idKind[pointer] == IdKind.variable {
+        if !variablePointer(pointer, &target, &base, &index, &stride) { return fail(Failure.unsupported, opcode, at) }
+    } else if idKind[pointer] == IdKind.pointer {
+        target = idA[pointer]
+        base = idB[pointer]
+        index = idC[pointer]
+        stride = idE[pointer]
+    } else {
+        return fail(Failure.unsupported, opcode, at)
+    }
+    const n = componentsOf(typeId)
+    if n == 0 { return fail(Failure.unsupported, opcode, at) }
+    var parts: [16]u32 = undefined
+    var k: u32 = 0
+    if target == TARGET_SLOT {
+        while k < n {
+            parts[k] = env[base + k]
+            if parts[k] == NONE { return fail(Failure.undefinedValue, opcode, at) }
+            k += 1
+        }
+    } else if target == TARGET_PUSH || target == TARGET_UNIFORM {
+        while k < n {
+            const offset = memberWord(typeId, base, stride, k)
+            if offset == NONE { return fail(Failure.unsupported, opcode, at) }
+            if target == TARGET_PUSH {
+                if offset / 4 + 1 > shape.pushWords { shape.pushWords = offset / 4 + 1 }
+                parts[k] = emit(list, Kind.push, Sort.word, NONE, NONE, NONE, offset / 4)
+            } else {
+                shape.bindings |= @intCast(u32, 1) << index
+                parts[k] = emit(list, Kind.load, Sort.word, constant(Sort.word, offset / 4), NONE, NONE, index)
+            }
+            k += 1
+        }
+    } else if target == TARGET_BUFFER {
+        if n != 1 { return fail(Failure.unsupported, opcode, at) }
+        parts[0] = emit(list, Kind.load, Sort.word, idC[pointer], NONE, NONE, idB[pointer])
+    } else if target == TARGET_BUILTIN {
+        if n != 1 { return fail(Failure.unsupported, opcode, at) }
+        parts[0] = builtin(list, idB[pointer], idC[pointer])
+    } else if target == TARGET_INPUT {
+        // base: location << 2 | first component
+        while k < n {
+            const location = base >> 2
+            const component = (base & 3) + k
+            if component > 3 { return fail(Failure.unsupported, opcode, at) }
+            if shape.stage == Stage.vertex {
+                shape.attributes |= @intCast(u32, 1) << location
+                parts[k] = emit(list, Kind.attribute, Sort.word, NONE, NONE, NONE, location << 2 | component)
+            } else {
+                shape.inputs |= @intCast(u32, 1) << location
+                shape.inputMask[location] |= @intCast(u32, 1) << component
+                const flat: u32 = if (shape.inputFlat >> location) & 1 != 0 { 0x10000 } else { 0 }
+                parts[k] = emit(list, Kind.interp, Sort.word, NONE, NONE, NONE, location << 2 | component | flat)
+            }
+            k += 1
+        }
+    } else if target == TARGET_VERTEX_ID {
+        if n != 1 { return fail(Failure.unsupported, opcode, at) }
+        if base == 0 { shape.usesVertexIndex = true } else { shape.usesInstanceIndex = true }
+        parts[0] = emit(list, Kind.vertexIndex, Sort.word, NONE, NONE, NONE, base)
+    } else {
+        return fail(Failure.unsupported, opcode, at)
+    }
+    if n == 1 { valueType[w[2]] = typeId }
+    return setComponents(w[2], parts[0..], n, typeId)
+}
+
+const TARGET_VERTEX_ID: u32 = 8
+
+// The pointer a variable itself is.
+fn variablePointer(variable: u32, target: *u32, base: *u32, index: *u32, stride: *u32) -> bool {
+    const storage = idA[variable]
+    stride.* = 0
+    index.* = NONE
+    if storage == STORAGE_OUTPUT {
+        if idC[variable] == NONE { return false }
+        target.* = TARGET_SLOT
+        base.* = idC[variable]
+        return true
+    }
+    if storage == STORAGE_INPUT {
+        const b = decoBuiltin[variable]
+        if b == builtinNumber(spv.BuiltIn.vertexIndex) {
+            target.* = TARGET_VERTEX_ID
+            base.* = 0
+            return true
+        }
+        if b == builtinNumber(spv.BuiltIn.instanceIndex) {
+            target.* = TARGET_VERTEX_ID
+            base.* = 1
+            return true
+        }
+        target.* = TARGET_INPUT
+        base.* = idC[variable] << 2
+        return true
+    }
+    return false
+}
+
+// The byte offset of component k of a value of `typeId` at `base` in a
+// block (push constants, a uniform buffer): words in order for scalars
+// and vectors, a matrix's columns `stride` apart (its rows when the
+// stride's low bit says row-major: the stride is kept as stride << 1 |
+// row-major).
+fn memberWord(typeId: u32, base: u32, stride: u32, k: u32) -> u32 {
+    if base == NONE || (base & 3) != 0 { return NONE }
+    if idOk(typeId) && idKind[typeId] == IdKind.typeMatrix {
+        const rows = rowsOf(typeId)
+        const step = stride >> 1
+        if step == 0 { return NONE }
+        const column = k / rows
+        const row = k % rows
+        if (stride & 1) != 0 { return base + row * step + 4 * column }
+        return base + column * step + 4 * row
+    }
+    return base + 4 * k
+}
+
+fn store(w: []const u32, at: usize, list: *List) -> bool {
+    const opcode = w[0] & 0xFFFF
+    const pointer = w[1]
+    const object = w[2]
+    const n = countOf(object)
+    if n == 0 { return fail(Failure.undefinedValue, opcode, at) }
+    var target = NONE
+    var base: u32 = 0
+    var index = NONE
+    var stride: u32 = 0
+    if !idOk(pointer) { return fail(Failure.unsupported, opcode, at) }
+    if idKind[pointer] == IdKind.variable {
+        if !variablePointer(pointer, &target, &base, &index, &stride) { return fail(Failure.unsupported, opcode, at) }
+    } else if idKind[pointer] == IdKind.pointer {
+        target = idA[pointer]
+        base = idB[pointer]
+        index = idC[pointer]
+    } else {
+        return fail(Failure.unsupported, opcode, at)
+    }
+    if target == TARGET_SLOT {
+        var k: u32 = 0
+        while k < n {
+            const value = componentOf(object, k)
+            if value == NONE { return fail(Failure.undefinedValue, opcode, at) }
+            env[base + k] = value
+            k += 1
+        }
+        return true
+    }
+    if target == TARGET_BUFFER {
+        const value = componentOf(object, 0)
+        if n != 1 || value == NONE || nodes[value].sort != Sort.word { return fail(Failure.unsupported, opcode, at) }
+        _ = emit(list, Kind.store, Sort.none, idC[pointer], value, NONE, idB[pointer])
+        return true
+    }
+    return fail(Failure.unsupported, opcode, at)
+}
+
+// A built-in's component k: the invocation's id in its group, the group's
+// id, or the global id (group * size + local: the card gives the two
+// parts, Mesa's radv_shader.c adds them).
+fn builtin(list: *List, which: u32, k: u32) -> u32 {
+    if k == 1 { shape.usesLocalY = true }
+    if k == 2 { shape.usesLocalZ = true }
+    if which == 27 { return emit(list, Kind.localId, Sort.word, NONE, NONE, NONE, k) }
+    shape.usesGroup[k] = true
+    const group = emit(list, Kind.groupId, Sort.word, NONE, NONE, NONE, k)
+    if which == 26 { return group }
+    var size = shape.localSizeX
+    if k == 1 { size = shape.localSizeY }
+    if k == 2 { size = shape.localSizeZ }
+    const local = emit(list, Kind.localId, Sort.word, NONE, NONE, NONE, k)
+    return word2(list, Kind.add, word2(list, Kind.mul, group, constant(Sort.word, size)), local)
+}
+
+// A constant index of an access chain.
+fn constantIndex(id: u32) -> u32 {
+    const value = valueOf(id)
+    if value == NONE || nodes[value].kind != Kind.constant { return NONE }
+    return nodes[value].imm
+}
+
+fn accessChain(w: []const u32, at: usize, list: *List) -> bool {
+    const opcode = w[0] & 0xFFFF
+    const base = w[3]
+    const id = w[2]
+    if !idOk(base) { return fail(Failure.invalid, opcode, at) }
+    _ = list
+    if idKind[base] == IdKind.variable && (idA[base] == STORAGE_PUSH || idA[base] == STORAGE_UNIFORM) {
+        // constant indices into the block: a member, a matrix's column, a
+        // vector's component, an array's element
+        if w.length < 5 { return fail(Failure.unsupported, opcode, at) }
+        var t = idB[base]
+        var offset: u32 = 0
+        var stride: u32 = 0
+        var k: usize = 4
+        while k < w.length {
+            const i = constantIndex(w[k])
+            if i == NONE || !idOk(t) { return fail(Failure.unsupported, opcode, at) }
+            if idKind[t] == IdKind.typeStruct {
+                const m = memberAt(t, i)
+                if m == NONE || memberOffset[m] == NONE || i >= idA[t] { return fail(Failure.unsupported, opcode, at) }
+                offset += memberOffset[m]
+                stride = memberStride[m] << 1 | (if memberRowMajor[m] { @intCast(u32, 1) } else { 0 })
+                t = memberTypeOf(t, i)
+            } else if idKind[t] == IdKind.typeMatrix {
+                if i >= idB[t] || (stride & 1) != 0 || (stride >> 1) == 0 { return fail(Failure.unsupported, opcode, at) }
+                offset += i * (stride >> 1)
+                t = idA[t]
+            } else if idKind[t] == IdKind.typeVector {
+                if i >= idB[t] { return fail(Failure.unsupported, opcode, at) }
+                offset += 4 * i
+                t = idA[t]
+            } else if idKind[t] == IdKind.typeArray {
+                if decoArrayStride[t] == 0 || decoArrayStride[t] == NONE { return fail(Failure.unsupported, opcode, at) }
+                offset += i * decoArrayStride[t]
+                t = idA[t]
+            } else {
+                return fail(Failure.unsupported, opcode, at)
+            }
+            k += 1
+        }
+        if (offset & 3) != 0 { return fail(Failure.unsupported, opcode, at) }
+        const target = if idA[base] == STORAGE_PUSH { TARGET_PUSH } else { TARGET_UNIFORM }
+        setPointer(id, target, offset, decoBinding[base], t, stride)
+        return true
+    }
+    if idKind[base] == IdKind.variable && idA[base] == STORAGE_BUFFER {
+        // member 0 (the array of words), then the word's index
+        if w.length != 6 { return fail(Failure.unsupported, opcode, at) }
+        const member = valueOf(w[4])
+        const index = valueOf(w[5])
+        if member == NONE || nodes[member].kind != Kind.constant || nodes[member].imm != 0 || index == NONE || nodes[index].sort != Sort.word { return fail(Failure.unsupported, opcode, at) }
+        setPointer(id, TARGET_BUFFER, decoBinding[base], index, 0, 0)
+        shape.bindings |= @intCast(u32, 1) << decoBinding[base]
+        return true
+    }
+    if idKind[base] == IdKind.variable && idA[base] == STORAGE_INPUT && shape.stage == Stage.compute {
+        if w.length != 5 { return fail(Failure.unsupported, opcode, at) }
+        const component = valueOf(w[4])
+        if component == NONE || nodes[component].kind != Kind.constant || nodes[component].imm > 2 { return fail(Failure.unsupported, opcode, at) }
+        setPointer(id, TARGET_BUILTIN, decoBuiltin[base], nodes[component].imm, 0, 0)
+        return true
+    }
+    if idKind[base] == IdKind.variable && idA[base] == STORAGE_OUTPUT && idC[base] == NONE {
+        // gl_PerVertex's member: the position (its slots), or one this
+        // stage does not write
+        if w.length < 5 { return fail(Failure.unsupported, opcode, at) }
+        const t = idB[base]
+        const member = constantIndex(w[4])
+        if member == NONE || !idOk(t) || idKind[t] != IdKind.typeStruct { return fail(Failure.unsupported, opcode, at) }
+        const m = memberAt(t, member)
+        if m == NONE || memberBuiltin[m] != builtinNumber(spv.BuiltIn.position) || positionSlot == NONE {
+            setPointer(id, TARGET_REFUSED, 0, NONE, 0, 0)
+            return true
+        }
+        return componentChain(id, TARGET_SLOT, positionSlot, memberTypeOf(t, member), w[5..], opcode, at)
+    }
+    if idKind[base] == IdKind.variable && (idA[base] == STORAGE_OUTPUT || idA[base] == STORAGE_INPUT) {
+        var target = NONE
+        var first: u32 = 0
+        var index = NONE
+        var stride: u32 = 0
+        if !variablePointer(base, &target, &first, &index, &stride) { return fail(Failure.unsupported, opcode, at) }
+        if target == TARGET_INPUT { return componentChain(id, TARGET_INPUT, first, idB[base], w[4..], opcode, at) }
+        return componentChain(id, target, first, idB[base], w[4..], opcode, at)
+    }
+    if idKind[base] == IdKind.pointer && idA[base] == TARGET_SLOT {
+        return componentChain(id, TARGET_SLOT, idB[base], idD[base], w[4..], opcode, at)
+    }
+    return fail(Failure.unsupported, opcode, at)
+}
+
+// A pointer into a value of slots (or an input's components) by constant
+// indices: the component it starts at.
+fn componentChain(id: u32, target: u32, first: u32, typeId: u32, indices: []const u32, opcode: u32, at: usize) -> bool {
+    var constants: [4]u32 = undefined
+    if indices.length > 4 { return fail(Failure.unsupported, opcode, at) }
+    var k: usize = 0
+    while k < indices.length {
+        constants[k] = constantIndex(indices[k])
+        if constants[k] == NONE { return fail(Failure.unsupported, opcode, at) }
+        k += 1
+    }
+    var offset: u32 = 0
+    var count: u32 = 0
+    var result: u32 = typeId
+    if indices.length > 0 && !indexInto(typeId, constants[0..indices.length], &offset, &count, &result) { return fail(Failure.unsupported, opcode, at) }
+    setPointer(id, target, first + offset, NONE, result, 0)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The structured walk
+
+const Reached = enum(u8) {
+    stop,
+    returned,
+    failed,
+}
+
+// Translates blocks from `start` on into `list` until the block `stop` is
+// reached (or the function returns).
+fn walk(start: u32, stop: u32, list: *List) -> Reached {
+    var label = start
+    var steps: u32 = 0
+    while true {
+        if label == stop { return Reached.stop }
+        steps += 1
+        if steps > 100000 {
+            _ = fail(Failure.structure, 0, 0)
+            return Reached.failed
+        }
+        var block: Block = undefined
+        if !blockOf(label, &block) { return Reached.failed }
+        if block.merge != 0 && opcodeAt(block.merge) == op(spv.Op.loopMerge) {
+            if !loop(label, &block, list) { return Reached.failed }
+            label = spirv[block.merge + 1]
+            continue
+        }
+        if !translateBody(&block, list) { return Reached.failed }
+        const t = block.terminator
+        const opcode = opcodeAt(t)
+        if opcode == op(spv.Op.return_) { return Reached.returned }
+        if opcode == op(spv.Op.branch) {
+            if block.merge != 0 {
+                _ = fail(Failure.structure, opcode, t)
+                return Reached.failed
+            }
+            label = spirv[t + 1]
+            continue
+        }
+        if opcode == op(spv.Op.branchConditional) && block.merge != 0 && opcodeAt(block.merge) == op(spv.Op.selectionMerge) {
+            const merge = spirv[block.merge + 1]
+            if !selection(spirv[t + 1], spirv[t + 2], spirv[t + 3], merge, list, t) { return Reached.failed }
+            label = merge
+            continue
+        }
+        _ = fail(Failure.structure, opcode, t)
+        return Reached.failed
+    }
+}
+
+fn copyEnv(into: *[MAX_SLOTS]u32) -> void {
+    var s: usize = 0
+    while s < MAX_SLOTS {
+        into.*[s] = env[s]
+        s += 1
+    }
+}
+
+fn selection(condId: u32, thenLabel: u32, elseLabel: u32, merge: u32, list: *List, at: usize) -> bool {
+    const cond = valueOf(condId)
+    if cond == NONE || nodes[cond].sort != Sort.boolean { return fail(Failure.undefinedValue, op(spv.Op.branchConditional), at) }
+    var saved: [MAX_SLOTS]u32 = undefined
+    copyEnv(&saved)
+    var thenList = emptyList()
+    if walk(thenLabel, merge, &thenList) != Reached.stop { return fail(Failure.structure, op(spv.Op.branchConditional), at) }
+    var thenEnv: [MAX_SLOTS]u32 = undefined
+    copyEnv(&thenEnv)
+    var s: usize = 0
+    while s < MAX_SLOTS {
+        env[s] = saved[s]
+        s += 1
+    }
+    var elseList = emptyList()
+    if walk(elseLabel, merge, &elseList) != Reached.stop { return fail(Failure.structure, op(spv.Op.branchConditional), at) }
+    var item = blankItem(ItemKind.branch)
+    item.cond = cond
+    item.first = thenList.head
+    item.second = elseList.head
+    item.params = paramCount
+    s = 0
+    while s < @intCast(usize, slotCount) {
+        var fromThen = find(thenEnv[s])
+        var fromElse = find(env[s])
+        if fromThen != fromElse {
+            // A side on which the variable was never written gives 0 (it
+            // is undefined there: any value will do, but it must be one
+            // that exists in those lanes).
+            if fromThen == NONE { fromThen = constant(Sort.word, 0) }
+            if fromElse == NONE { fromElse = constant(Sort.word, 0) }
+            if paramCount >= @intCast(u32, MAX_PARAMS) { return fail(Failure.tooLarge, 0, at) }
+            const p = node(Kind.param, Sort.word, NONE, NONE, NONE, 0)
+            if p == NONE { return false }
+            params[paramCount] = Param.{ .value = p, .from0 = fromThen, .from1 = fromElse }
+            paramCount += 1
+            env[s] = p
+        }
+        s += 1
+    }
+    item.paramCount = paramCount - item.params
+    _ = append(list, item)
+    return failure == Failure.none
+}
+
+fn loop(header: u32, block: *const Block, list: *List) -> bool {
+    const merge = spirv[block.*.merge + 1]
+    const continueLabel = spirv[block.*.merge + 2]
+    const at = block.*.merge
+    var item = blankItem(ItemKind.loop)
+    item.params = paramCount
+    // A parameter for every variable; those the loop does not change are
+    // taken out afterwards.
+    var s: usize = 0
+    while s < @intCast(usize, slotCount) {
+        if paramCount >= @intCast(u32, MAX_PARAMS) { return fail(Failure.tooLarge, 0, at) }
+        const p = node(Kind.param, Sort.word, NONE, NONE, NONE, 0)
+        if p == NONE { return false }
+        var init = find(env[s])
+        if init == NONE { init = constant(Sort.word, 0) }
+        params[paramCount] = Param.{ .value = p, .from0 = init, .from1 = NONE }
+        paramCount += 1
+        env[s] = p
+        s += 1
+    }
+    item.paramCount = paramCount - item.params
+    // The header list: the header block's own instructions and the blocks
+    // it goes on to, up to the conditional branch that leaves the loop.
+    var headerList = emptyList()
+    var current = block.*
+    var label = header
+    var condValue = NONE
+    var bodyLabel = NONE
+    var steps: u32 = 0
+    const headerFirst = nodeCount
+    while true {
+        steps += 1
+        if steps > 1000 { return fail(Failure.structure, 0, at) }
+        if !translateBody(&current, &headerList) { return false }
+        const t = current.terminator
+        const opcode = opcodeAt(t)
+        if opcode == op(spv.Op.branchConditional) {
+            if label != header && current.merge != 0 { return fail(Failure.structure, opcode, t) }
+            const c = valueOf(spirv[t + 1])
+            if c == NONE || nodes[c].sort != Sort.boolean { return fail(Failure.undefinedValue, opcode, t) }
+            if spirv[t + 3] == merge {
+                condValue = c
+                bodyLabel = spirv[t + 2]
+            } else if spirv[t + 2] == merge {
+                condValue = emit(&headerList, Kind.lnot, Sort.boolean, c, NONE, NONE, 0)
+                bodyLabel = spirv[t + 3]
+            } else {
+                return fail(Failure.structure, opcode, t)
+            }
+            break
+        }
+        if opcode != op(spv.Op.branch) || (label != header && current.merge != 0) { return fail(Failure.structure, opcode, t) }
+        label = spirv[t + 1]
+        if label == merge || label == continueLabel { return fail(Failure.structure, opcode, t) }
+        if !blockOf(label, &current) { return false }
+    }
+    const headerEnd = nodeCount
+    var afterHeader: [MAX_SLOTS]u32 = undefined
+    copyEnv(&afterHeader)
+    var bodyList = emptyList()
+    if walk(bodyLabel, continueLabel, &bodyList) != Reached.stop { return fail(Failure.structure, op(spv.Op.loopMerge), at) }
+    var continueList = emptyList()
+    if continueLabel != header {
+        if walk(continueLabel, header, &continueList) != Reached.stop { return fail(Failure.structure, op(spv.Op.loopMerge), at) }
+    }
+    // (only the loop's own parameters: those of the ifs inside it come
+    // after them)
+    const end = item.params + item.paramCount
+    var k = item.params
+    s = 0
+    while k < end {
+        params[k].from1 = find(env[s])
+        k += 1
+        s += 1
+    }
+    // A parameter that comes back as itself is its value from before.
+    k = item.params
+    while k < end {
+        if params[k].from1 == params[k].value {
+            nodes[params[k].value].alias = params[k].from0
+        }
+        k += 1
+    }
+    s = 0
+    while s < MAX_SLOTS {
+        env[s] = find(afterHeader[s])
+        s += 1
+    }
+    // The header's booleans are not to be read after the loop (the words
+    // are: a lane that leaves keeps its value in its vector register).
+    var h = headerFirst
+    while h < headerEnd {
+        if nodes[h].sort == Sort.boolean && nodes[h].kind != Kind.constant { closedHeader[h] = true }
+        h += 1
+    }
+    item.cond = condValue
+    item.first = headerList.head
+    item.second = bodyList.head
+    item.third = continueList.head
+    _ = append(list, item)
+    return failure == Failure.none
+}
+
+// ---------------------------------------------------------------------------
+// Uniform and varying
+
+// The values a lane has of its own are varying: the local id, what a
+// buffer gives (every load is taken as varying, uniform address or not:
+// safe, and only slower), a vertex's inputs and index and a pixel's
+// inputs, what is computed from a varying value, a parameter where
+// control flow on a varying condition joins, and what the card computes
+// only in its vector unit (the float operations, umul_high and the
+// integer min and max, which have no scalar instruction on GFX8).
+fn varyingByKind(kind: Kind) -> bool {
+    return kind == Kind.localId || kind == Kind.load || kind == Kind.mulhi || kind == Kind.smax || kind == Kind.u2f || kind == Kind.f2u || kind == Kind.rcp || kind == Kind.fmul || kind == Kind.fadd || kind == Kind.fsub || kind == Kind.fmin || kind == Kind.fmax || kind == Kind.ffloor || kind == Kind.ffract || kind == Kind.fabs || kind == Kind.i2f || kind == Kind.f2i || kind == Kind.fcmp || kind == Kind.smin || kind == Kind.umin || kind == Kind.umax || kind == Kind.attribute || kind == Kind.vertexIndex || kind == Kind.interp
+}
+
+var changed = false
+
+fn uniformOf(value: u32) -> bool {
+    if value == NONE { return true }
+    return nodes[find(value)].uniform
+}
+
+fn setVarying(value: u32) -> void {
+    if nodes[value].uniform {
+        nodes[value].uniform = false
+        changed = true
+    }
+}
+
+fn markList(head: u32, varyingContext: bool) -> void {
+    var at = head
+    while at != NONE {
+        const item = items[at]
+        if item.kind == ItemKind.node {
+            const n = item.node
+            const k = nodes[n].kind
+            if varyingByKind(k) || !uniformOf(nodes[n].a) || !uniformOf(nodes[n].b) || !uniformOf(nodes[n].c) { setVarying(n) }
+        } else if item.kind == ItemKind.branch {
+            const divergent = varyingContext || !uniformOf(item.cond)
+            markList(item.first, divergent)
+            markList(item.second, divergent)
+            var p = item.params
+            while p < item.params + item.paramCount {
+                if !uniformOf(item.cond) || !uniformOf(params[p].from0) || !uniformOf(params[p].from1) { setVarying(params[p].value) }
+                p += 1
+            }
+        } else {
+            markList(item.first, varyingContext)
+            const divergent = varyingContext || !uniformOf(item.cond)
+            var p = item.params
+            while p < item.params + item.paramCount {
+                if !uniformOf(item.cond) || !uniformOf(params[p].from0) || !uniformOf(params[p].from1) { setVarying(params[p].value) }
+                p += 1
+            }
+            markList(item.second, divergent)
+            markList(item.third, divergent)
+        }
+        at = item.next
+    }
+}
+
+// Starts with every value uniform and makes varying what must be, until
+// nothing changes (a loop's condition can depend on its own parameters).
+pub fn markUniform() -> void {
+    var n: u32 = 0
+    while n < nodeCount {
+        nodes[n].uniform = true
+        n += 1
+    }
+    changed = true
+    var rounds: u32 = 0
+    while changed && rounds < 1000 {
+        changed = false
+        markList(root, false)
+        rounds += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The exports
+
+fn exportOf(target: u32, first: u32, count: u32) -> bool {
+    if exportCount >= @intCast(u32, MOST_EXPORTS) { return fail(Failure.tooLarge, 0, 0) }
+    exports[exportCount].target = target
+    var k: u32 = 0
+    while k < 4 {
+        exports[exportCount].values[k] = if k < count { find(env[first + k]) } else { NONE }
+        k += 1
+    }
+    exportCount += 1
+    return true
+}
+
+// What the outputs hold at the end, as the exports: a vertex shader's
+// position first (it must have one), then its outputs by location as
+// parameters 0, 1, ...; a fragment shader's outputs to their colour
+// targets.
+fn makeExports() -> bool {
+    exportCount = 0
+    var location: u32 = 0
+    while location < MAX_LOCATIONS {
+        parameterOf[location] = NONE
+        location += 1
+    }
+    if shape.stage == Stage.vertex {
+        if positionSlot == NONE { return fail(Failure.undefinedValue, 0, 0) }
+        var k: u32 = 0
+        while k < 4 {
+            if env[positionSlot + k] == NONE { return fail(Failure.undefinedValue, 0, 0) }
+            k += 1
+        }
+        if !exportOf(EXP_POS0, positionSlot, 4) { return false }
+        var parameter: u32 = 0
+        location = 0
+        while location < MAX_LOCATIONS {
+            if outputSlot[location] != NONE {
+                parameterOf[location] = parameter
+                if !exportOf(EXP_PARAM0 + parameter, outputSlot[location], outputComponents[location]) { return false }
+                parameter += 1
+            }
+            location += 1
+        }
+        return true
+    }
+    if shape.stage == Stage.fragment {
+        location = 0
+        while location < 8 {
+            if outputSlot[location] != NONE {
+                if !exportOf(EXP_MRT0 + location, outputSlot[location], outputComponents[location]) { return false }
+            }
+            location += 1
+        }
+        location = 8
+        while location < MAX_LOCATIONS {
+            if outputSlot[location] != NONE { return fail(Failure.unsupported, 0, 0) }
+            location += 1
+        }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+
+// Reads a validated module into the form above. False with `failure` set
+// when it is not what this stage takes.
+pub fn read(words: []const u32, allocator: module.Allocator) -> bool {
+    failure = Failure.none
+    failureOpcode = 0
+    failureOffset = 0
+    loopBooleanRead = false
+    nodeCount = 0
+    itemCount = 0
+    paramCount = 0
+    constantKept = 0
+    memberCount = 0
+    memberTypeCount = 0
+    poolCount = 0
+    slotCount = 0
+    positionSlot = NONE
+    glslSet = 0
+    exportCount = 0
+    root = NONE
+    shape = Shape.{ .stage = Stage.compute, .originUpperLeft = false, .localSizeX = 1, .localSizeY = 1, .localSizeZ = 1, .pushWords = 0, .bindings = 0, .usesLocalY = false, .usesLocalZ = false, .usesGroup = [3]bool{ false, false, false }, .attributes = 0, .attributeComponents = undefined, .attributeSort = undefined, .usesVertexIndex = false, .usesInstanceIndex = false, .inputs = 0, .inputMask = undefined, .inputFlat = 0 }
+    var location: usize = 0
+    while location < 16 {
+        shape.attributeComponents[location] = 0
+        shape.attributeSort[location] = 0
+        shape.inputMask[location] = 0
+        outputSlot[location] = NONE
+        outputComponents[location] = 0
+        parameterOf[location] = NONE
+        location += 1
+    }
+    var diagnostic: module.Diagnostic = undefined
+    unsafe {
+        if module.validate(@ptrCast([*]const u32, words.pointer), words.length, allocator, &diagnostic) != module.Error.none {
+            return fail(Failure.invalid, diagnostic.opcode, diagnostic.offset)
+        }
+    }
+    bound = words[3]
+    if bound > @intCast(u32, MAX_IDS) { return fail(Failure.tooLarge, 0, 0) }
+    spirv = words
+    var id: usize = 0
+    while id < @intCast(usize, bound) {
+        idKind[id] = IdKind.nothing
+        idA[id] = 0
+        idB[id] = 0
+        idC[id] = 0
+        idD[id] = 0
+        idE[id] = 0
+        decoBinding[id] = 0
+        decoSet[id] = 0
+        decoBuiltin[id] = NONE
+        decoLocation[id] = NONE
+        decoArrayStride[id] = 0
+        decoFlat[id] = false
+        valueType[id] = NONE
+        id += 1
+    }
+    if !declarations() { return false }
+    // The function: from its OpFunction on.
+    var at: usize = 5
+    while at < spirv.length && opcodeAt(at) != op(spv.Op.function) { at += countAt(at) }
+    var entry: u32 = 0
+    if !labels(at, &entry) { return false }
+    var top = emptyList()
+    if walk(entry, NONE, &top) != Reached.returned { return fail(Failure.structure, 0, 0) }
+    root = top.head
+    if !makeExports() { return false }
+    // The vertex inputs the shader reads must be the pipeline's, of their
+    // number type.
+    if shape.stage == Stage.vertex {
+        location = 0
+        while location < 16 {
+            if (shape.attributes >> @intCast(u5, location)) & 1 != 0 {
+                const input = vertexInputs[location]
+                if !input.used || input.number != shape.attributeSort[location] { return fail(Failure.interface, 0, 0) }
+            }
+            location += 1
+        }
+    }
+    markUniform()
+    return failure == Failure.none
+}

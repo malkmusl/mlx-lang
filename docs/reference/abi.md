@@ -236,14 +236,14 @@ return 0.0 }` compared equal to null. And an inline function's `return
 have), `if c { value } else { maybe }` was typed as its first branch,
 `T`, so the else branch's null read as present, and `null` for a
 generic `?T` after `T` was passed as one word
-(`tests/488_optional_zero_values_runtime.mlx`, for each of `?u8`,
+(`tests/526_optional_zero_values_runtime.mlx`, for each of `?u8`,
 `?i64`, `?bool`, `?f32`, `?f64` 0.0 and -0.0, an optional struct and
 `?[]const u8`: returned, passed, inlined, in locals, `if`s, `match`es,
 fields, array elements and through pointers). A module-level optional
 given a value is written into the data with its tag, a float's bits or a
 struct literal's bytes too (refused before, MLX-E9001); one given `null`
 or `undefined` stays zeroed, absent
-(`tests/489_optional_zero_globals_runtime.mlx`).
+(`tests/527_optional_zero_globals_runtime.mlx`).
 
 A local of several words (a slice, an optional slice, an error union)
 normally lives in one frame slot per word, which the optimizer forwards
@@ -263,7 +263,7 @@ by the pointer; it was the word 8 bytes after the payload, so `at.*` of
 optional struct, union or array is held by its storage's address as the
 struct itself is, and `&local` is that address; it was the slot holding
 the address, so `at.*` read past it and `at.* = null` overwrote the frame
-(`tests/488_optional_zero_values_runtime.mlx`).
+(`tests/526_optional_zero_values_runtime.mlx`).
 
 ## Aggregate (struct/array) argument and return classification
 
@@ -350,7 +350,7 @@ std runs every frame (text, images, widgets, a terminal's frame, an
 app's look) and
 `std.text`'s numbers keep clear of these, with their working memory in
 the records they serve and digits written straight into the caller's
-line (`tests/485_std_drawing_arena_runtime.mlx`). A `const` local's copy is a region of the function's frame
+line (`tests/525_std_drawing_arena_runtime.mlx`). A `const` local's copy is a region of the function's frame
 instead (the same `alloca` with `arg1 == 1`): the frame-size estimate adds
 its bytes, and nothing of it may be handed back by address. A struct,
 union or array result is copied into its caller's storage anyway (below),
@@ -763,7 +763,7 @@ There, as for a table holding a pointer (`&x`), a function of a C library
 until the program runs, and for a member of an aggregate or a constant
 whose initializer is no literal, the constant is lowered as before: its
 initializer, where it is used (`tests/442_constant_table_static_runtime.mlx`,
-`tests/483_constant_table_addresses_runtime.mlx`,
+`tests/523_constant_table_addresses_runtime.mlx`,
 `tests/333_module_slices_runtime.mlx`).
 
 The address of a module-level constant, `&NAME` (a pointer to a

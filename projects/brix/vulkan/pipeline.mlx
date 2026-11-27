@@ -1,0 +1,546 @@
+// The driver's shader modules, descriptor set layouts, pipeline layouts,
+// compute pipelines, descriptor pools and sets (the study's 8.2 (b), 4.3
+// A, 4.5, 5.2, 7.3).
+//
+// A COMPUTE PIPELINE is the shader compiled by our compiler (shader.mlx),
+// its words in the card's memory below 4 GiB at a 256-byte boundary
+// (RADV_SHADER_ALLOC_ALIGNMENT; COMPUTE_PGM_LO takes the address >> 8)
+// and mapped to execute, and the 15 words of 4.3 A the dispatch copies
+// into the stream: COMPUTE_PGM_LO, COMPUTE_PGM_RSRC1 and _RSRC2,
+// COMPUTE_RESOURCE_LIMITS, COMPUTE_NUM_THREAD_X .. _Z. RSRC1's counts are
+// RADV's formula (radv_shader.c radv_postprocess_binary_config: VGPRS
+// (n - 1) / 4, SGPRS (n - 1) / 8, n at least the entry's arguments + 5)
+// over ACO's (aco_live_var_analysis.cpp get_sgpr_alloc: VCC's two added,
+// 16 at a time on GFX8; get_vgpr_alloc: 4 at a time), FLOAT_MODE 0xC0
+// (ACO's default: 16- and 64-bit denormals kept, 32-bit flushed, aco_
+// instruction_selection.cpp), DX10_CLAMP; RSRC2 is what the compiler's
+// facts say of the entry (USER_SGPR, TGID_*_EN, TIDIG_COMP_CNT);
+// RESOURCE_LIMITS is the card's record's (its compute units and shader
+// engines: the study's silent need 4).
+//
+// A DESCRIPTOR SET is a run of 16-byte buffer descriptors in the card's
+// memory (4.5), binding b's at byte 16 * b (the compiler's rule: the
+// shader loads binding b's four words at 16 * b of set 0's address,
+// which the dispatch gives it in user data words 2 and 3: the study's
+// 5.2, the even pairs). A pool is one block of the card's memory its sets
+// are taken from in order and given back all at once (vkResetDescriptor
+// Pool, every frame in std.gpu: so the addresses repeat, and the queue's
+// preamble invalidates the scalar cache at every submit).
+const std = @import("std")
+const vk = @import("std.vulkan")
+const gpucard = @import("std.gpucard")
+const device = @import("./device.mlx")
+const memory = @import("./memory.mlx")
+const packets = @import("./packets.mlx")
+const shader = @import("./shader.mlx")
+const ir = @import("./shader_ir.mlx")
+
+const DeviceObject = device.DeviceObject
+
+pub const ShaderModuleObject = struct {
+    words: usize
+    count: usize
+}
+
+// The most bindings a set takes (the compiler's MAX_BINDINGS is smaller).
+pub const MOST_BINDINGS: usize = 32
+
+pub const SetLayoutObject = struct {
+    // The bindings there are (bit b: binding b) and their types.
+    present: u32
+    types: [32]vk.DescriptorType
+    // Whether every binding is one this stage writes (a storage or uniform
+    // buffer, one descriptor).
+    usable: bool
+    // The set's bytes: 16 for each binding up to the highest.
+    bytes: usize
+}
+
+pub const MOST_SETS: usize = 4
+
+pub const PipelineLayoutObject = struct {
+    setCount: u32
+    sets: [4]usize
+    pushBytes: u32
+}
+
+// The pipeline's register words (4.3 A): 15.
+pub const PIPELINE_WORDS: usize = 15
+
+// The kinds of pipeline (both kinds' first field: vkDestroyPipeline and
+// vkCmdBindPipeline tell them apart; graphics.mlx's are the graphics ones).
+pub const KIND_COMPUTE: u32 = 1
+pub const KIND_GRAPHICS: u32 = 2
+
+pub const PipelineObject = struct {
+    kind: u32
+    code: device.Block
+    facts: shader.Facts
+    words: [15]u32
+    layout: usize
+}
+
+pub const SetObject = struct {
+    pool: usize
+    // The set's card address and the processor's address of it.
+    address: u64
+    bytes: usize
+    layout: usize
+}
+
+pub const PoolObject = struct {
+    block: device.Block
+    used: usize
+    maxSets: u32
+    setCount: u32
+    sets: usize
+}
+
+fn moduleOf(handle: vk.ShaderModule) -> *ShaderModuleObject { return unsafe { @ptrFromInt(*ShaderModuleObject, handle) } }
+
+// A shader module's SPIR-V words.
+pub fn moduleWords(handle: vk.ShaderModule) -> []const u32 {
+    const module = moduleOf(handle)
+    const spirv: [*]const u32 = unsafe { @ptrFromInt([*]const u32, module.*.words) }
+    return spirv[0..module.*.count]
+}
+pub fn setLayoutOf(handle: vk.DescriptorSetLayout) -> *SetLayoutObject { return unsafe { @ptrFromInt(*SetLayoutObject, handle) } }
+pub fn pipelineLayoutOf(handle: vk.PipelineLayout) -> *PipelineLayoutObject { return unsafe { @ptrFromInt(*PipelineLayoutObject, handle) } }
+pub fn pipelineOf(handle: vk.Pipeline) -> *PipelineObject { return unsafe { @ptrFromInt(*PipelineObject, handle) } }
+pub fn setOf(handle: vk.DescriptorSet) -> *SetObject { return unsafe { @ptrFromInt(*SetObject, handle) } }
+fn poolOf(handle: vk.DescriptorPool) -> *PoolObject { return unsafe { @ptrFromInt(*PoolObject, handle) } }
+
+// ---------------------------------------------------------------------------
+// Shader modules
+
+const SPIRV_MAGIC: u32 = 0x07230203
+
+pub fn createShaderModule(handle: vk.Device, info: *const vk.ShaderModuleCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.ShaderModule) -> vk.Result {
+    into.* = 0
+    if info.*.codeSize == 0 || info.*.codeSize % 4 != 0 || info.*.pCode == null || info.*.pCode.?[0] != SPIRV_MAGIC { return vk.Result.errorUnknown }
+    const address = device.allocate(callbacks, @sizeOf(ShaderModuleObject) + info.*.codeSize, vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made: *ShaderModuleObject = unsafe { @ptrFromInt(*ShaderModuleObject, address) }
+    made.*.words = address + @sizeOf(ShaderModuleObject)
+    made.*.count = info.*.codeSize / 4
+    device.copyBytes(made.*.words, @intFromPtr(info.*.pCode.?), info.*.codeSize)
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn destroyShaderModule(handle: vk.Device, module: vk.ShaderModule, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if module == 0 { return }
+    device.release(callbacks, module, @sizeOf(ShaderModuleObject) + moduleOf(module).*.count * 4)
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor set layouts and pipeline layouts
+
+fn bufferType(kind: vk.DescriptorType) -> bool { return kind == vk.DescriptorType.storageBuffer || kind == vk.DescriptorType.uniformBuffer }
+
+pub fn createDescriptorSetLayout(handle: vk.Device, info: *const vk.DescriptorSetLayoutCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.DescriptorSetLayout) -> vk.Result {
+    into.* = 0
+    const address = device.allocate(callbacks, @sizeOf(SetLayoutObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = setLayoutOf(address)
+    made.*.present = 0
+    made.*.usable = info.*.flags == 0
+    var highest: usize = 0
+    var k: usize = 0
+    while k < @intCast(usize, info.*.bindingCount) {
+        const binding = &info.*.pBindings.?[k]
+        const number = @intCast(usize, binding.*.binding)
+        if number >= MOST_BINDINGS {
+            made.*.usable = false
+        } else if binding.*.descriptorCount != 0 {
+            made.*.present |= @intCast(u32, 1) << @intCast(u5, number)
+            made.*.types[number] = binding.*.descriptorType
+            if !bufferType(binding.*.descriptorType) || binding.*.descriptorCount != 1 { made.*.usable = false }
+            if number + 1 > highest { highest = number + 1 }
+        }
+        k += 1
+    }
+    made.*.bytes = packets.DESCRIPTOR_BYTES * highest
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn destroyDescriptorSetLayout(handle: vk.Device, layout: vk.DescriptorSetLayout, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if layout == 0 { return }
+    device.release(callbacks, layout, @sizeOf(SetLayoutObject))
+}
+
+pub fn createPipelineLayout(handle: vk.Device, info: *const vk.PipelineLayoutCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.PipelineLayout) -> vk.Result {
+    into.* = 0
+    const address = device.allocate(callbacks, @sizeOf(PipelineLayoutObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = pipelineLayoutOf(address)
+    made.*.setCount = if info.*.setLayoutCount > @intCast(u32, MOST_SETS) { @intCast(u32, MOST_SETS) } else { info.*.setLayoutCount }
+    var k: usize = 0
+    while k < @intCast(usize, made.*.setCount) {
+        made.*.sets[k] = info.*.pSetLayouts.?[k]
+        k += 1
+    }
+    made.*.pushBytes = 0
+    k = 0
+    while k < @intCast(usize, info.*.pushConstantRangeCount) {
+        const range = &info.*.pPushConstantRanges.?[k]
+        if range.*.offset + range.*.size > made.*.pushBytes { made.*.pushBytes = range.*.offset + range.*.size }
+        k += 1
+    }
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn destroyPipelineLayout(handle: vk.Device, layout: vk.PipelineLayout, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if layout == 0 { return }
+    device.release(callbacks, layout, @sizeOf(PipelineLayoutObject))
+}
+
+// ---------------------------------------------------------------------------
+// Compute pipelines
+
+// Why the last pipeline was not made (what the compiler said; a test's
+// and a log's look).
+pub var lastFailure: shader.Failure = undefined // (per run)
+
+// A test may change the compiled words before they reach the card (the
+// self-test's proof that a wrong compiler output fails vkCreateDevice,
+// and programs the card must refuse): it may write the whole room and
+// change the facts (their `words` too):
+// the address of a fn([]u32, *shader.Facts) -> void, 0 none.
+pub var alterCode: usize = 0 // (per run)
+
+const AlterFunction = fn([]u32, *shader.Facts) -> void
+
+const MOST_CODE: usize = 16384
+
+var compiled: [MOST_CODE]u32 = undefined // (per run)
+
+fn roundUp(value: u32, to: u32) -> u32 { return (value + to - 1) / to * to }
+
+fn largest(a: u32, b: u32) -> u32 { return if a > b { a } else { b } }
+
+// COMPUTE_PGM_RSRC1 and _RSRC2 of a compiled shader.
+pub fn rsrc1Of(facts: *const shader.Facts) -> u32 {
+    const vgprs = roundUp(largest(largest(facts.*.vgprs, facts.*.localIdComponents + 1), 4), 4)
+    var entry = facts.*.userSgprs
+    if facts.*.groupIdX { entry += 1 }
+    if facts.*.groupIdY { entry += 1 }
+    if facts.*.groupIdZ { entry += 1 }
+    const sgprs = largest(roundUp(largest(facts.*.sgprs + 2, 16), 16), entry + 5)
+    return packets.put(packets.COMPUTE_PGM_RSRC1__VGPRS, (vgprs - 1) / 4) | packets.put(packets.COMPUTE_PGM_RSRC1__SGPRS, (sgprs - 1) / 8) | packets.put(packets.COMPUTE_PGM_RSRC1__FLOAT_MODE, packets.FP_16_64_DENORMS) | packets.COMPUTE_PGM_RSRC1__DX10_CLAMP
+}
+
+pub fn rsrc2Of(facts: *const shader.Facts) -> u32 {
+    var word = packets.put(packets.COMPUTE_PGM_RSRC2__USER_SGPR, facts.*.userSgprs) | packets.put(packets.COMPUTE_PGM_RSRC2__TIDIG_COMP_CNT, facts.*.localIdComponents)
+    if facts.*.groupIdX { word |= packets.COMPUTE_PGM_RSRC2__TGID_X_EN }
+    if facts.*.groupIdY { word |= packets.COMPUTE_PGM_RSRC2__TGID_Y_EN }
+    if facts.*.groupIdZ { word |= packets.COMPUTE_PGM_RSRC2__TGID_Z_EN }
+    return word
+}
+
+fn sameName(name: ?[*]const u8, text: []const u8) -> bool {
+    if name == null { return false }
+    var k: usize = 0
+    while k < text.length {
+        if name.?[k] != text[k] { return false }
+        k += 1
+    }
+    return name.?[text.length] == 0
+}
+
+// One pipeline of `info`.
+fn createOne(owner: *DeviceObject, info: *const vk.ComputePipelineCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.Pipeline) -> vk.Result {
+    into.* = 0
+    lastFailure.kind = ir.Failure.none
+    // One stage, compute, entry "main" (the compiler takes one GLCompute
+    // entry), no specialization.
+    // (no flags: VK_PIPELINE_CREATE_DISPATCH_BASE_BIT among them, so a
+    // dispatch's base is 0: render.mlx's vkCmdDispatchBase)
+    if info.*.flags != 0 || info.*.stage.stage != vk.SHADER_STAGE_COMPUTE_BIT || info.*.stage.module == 0 || !sameName(info.*.stage.pName, "main") || info.*.stage.pSpecializationInfo != null { return vk.Result.errorUnknown }
+    const layout = pipelineLayoutOf(info.*.layout)
+    var k: usize = 0
+    while k < @intCast(usize, layout.*.setCount) {
+        if k > 0 || !setLayoutOf(layout.*.sets[k]).*.usable { return vk.Result.errorUnknown }
+        k += 1
+    }
+    const module = moduleOf(info.*.stage.module)
+    const spirv: [*]const u32 = unsafe { @ptrFromInt([*]const u32, module.*.words) }
+    var facts: shader.Facts = undefined
+    if !shader.compile(spirv[0..module.*.count], std.page_allocator.init(), compiled[0..], &facts, &lastFailure) { return vk.Result.errorUnknown }
+    if alterCode != 0 {
+        const alter: AlterFunction = unsafe { @ptrFromInt(AlterFunction, alterCode) }
+        alter(compiled[0..], &facts)
+    }
+    // What the shader reads must be in its layout: its bindings in set 0,
+    // its push words in the push constants' range.
+    if facts.pushWords * 4 > layout.*.pushBytes { return vk.Result.errorUnknown }
+    if facts.bindings != 0 && (layout.*.setCount == 0 || (facts.bindings & ~setLayoutOf(layout.*.sets[0]).*.present) != 0) { return vk.Result.errorUnknown }
+    const address = device.allocate(callbacks, @sizeOf(PipelineObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = pipelineOf(address)
+    made.*.kind = KIND_COMPUTE
+    made.*.facts = facts
+    made.*.layout = info.*.layout
+    if !device.ownBlock(owner, facts.words * 4, gpucard.Access.READ | gpucard.Access.EXECUTE, true, &made.*.code) {
+        device.release(callbacks, address, @sizeOf(PipelineObject))
+        return vk.Result.errorOutOfDeviceMemory
+    }
+    const target: [*]u32 = unsafe { @ptrFromInt([*]u32, made.*.code.bytes) }
+    k = 0
+    while k < facts.words {
+        target[k] = compiled[k]
+        k += 1
+    }
+    // The 15 words of 4.3 A.
+    const waves = (facts.groupSizeX * facts.groupSizeY * facts.groupSizeZ + 63) / 64
+    made.*.words[0] = packets.header(packets.PKT3_SET_SH_REG, 1, false)
+    made.*.words[1] = @intCast(u32, (packets.COMPUTE_PGM_LO - packets.SH_START) / 4)
+    made.*.words[2] = @intCast(u32, made.*.code.address >> 8)
+    made.*.words[3] = packets.header(packets.PKT3_SET_SH_REG, 2, false)
+    made.*.words[4] = @intCast(u32, (packets.COMPUTE_PGM_RSRC1 - packets.SH_START) / 4)
+    made.*.words[5] = rsrc1Of(&facts)
+    made.*.words[6] = rsrc2Of(&facts)
+    made.*.words[7] = packets.header(packets.PKT3_SET_SH_REG, 1, false)
+    made.*.words[8] = @intCast(u32, (packets.COMPUTE_RESOURCE_LIMITS - packets.SH_START) / 4)
+    made.*.words[9] = packets.resourceLimits(waves, owner.*.computeUnits, owner.*.shaderEngines)
+    made.*.words[10] = packets.header(packets.PKT3_SET_SH_REG, 3, false)
+    made.*.words[11] = @intCast(u32, (packets.COMPUTE_NUM_THREAD_X - packets.SH_START) / 4)
+    made.*.words[12] = packets.put(packets.COMPUTE_NUM_THREAD_X__NUM_THREAD_FULL, facts.groupSizeX)
+    made.*.words[13] = packets.put(packets.COMPUTE_NUM_THREAD_X__NUM_THREAD_FULL, facts.groupSizeY)
+    made.*.words[14] = packets.put(packets.COMPUTE_NUM_THREAD_X__NUM_THREAD_FULL, facts.groupSizeZ)
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn createComputePipelines(handle: vk.Device, cache: vk.PipelineCache, count: u32, infos: ?[*]const vk.ComputePipelineCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: ?[*]vk.Pipeline) -> vk.Result {
+    const owner = device.deviceOf(handle)
+    var result = vk.Result.success
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const made = createOne(owner, &infos.?[k], callbacks, &into.?[k])
+        if made != vk.Result.success && result == vk.Result.success { result = made }
+        k += 1
+    }
+    return result
+}
+
+pub fn destroyPipeline(handle: vk.Device, pipeline: vk.Pipeline, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if pipeline == 0 { return }
+    device.dropBlock(device.deviceOf(handle), &pipelineOf(pipeline).*.code)
+    device.release(callbacks, pipeline, @sizeOf(PipelineObject))
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor pools and sets
+
+// A set's start: 64 bytes apart (a choice of ours: a descriptor's four
+// words never straddle two of the model's cache lines).
+const SET_ALIGNMENT: usize = 64
+
+pub fn createDescriptorPool(handle: vk.Device, info: *const vk.DescriptorPoolCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.DescriptorPool) -> vk.Result {
+    const owner = device.deviceOf(handle)
+    into.* = 0
+    var descriptors: usize = 0
+    var k: usize = 0
+    while k < @intCast(usize, info.*.poolSizeCount) {
+        descriptors += @intCast(usize, info.*.pPoolSizes.?[k].descriptorCount)
+        k += 1
+    }
+    const sets = @intCast(usize, info.*.maxSets)
+    const address = device.allocate(callbacks, @sizeOf(PoolObject) + sets * @sizeOf(SetObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = poolOf(address)
+    // Every descriptor, and a set's room to its alignment.
+    const bytes = packets.DESCRIPTOR_BYTES * descriptors + SET_ALIGNMENT * sets + device.PAGE
+    if !device.ownBlock(owner, bytes, gpucard.Access.READ, false, &made.*.block) {
+        device.release(callbacks, address, @sizeOf(PoolObject) + sets * @sizeOf(SetObject))
+        return vk.Result.errorOutOfDeviceMemory
+    }
+    made.*.used = 0
+    made.*.maxSets = info.*.maxSets
+    made.*.setCount = 0
+    made.*.sets = address + @sizeOf(PoolObject)
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn destroyDescriptorPool(handle: vk.Device, pool: vk.DescriptorPool, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if pool == 0 { return }
+    const made = poolOf(pool)
+    device.dropBlock(device.deviceOf(handle), &made.*.block)
+    device.release(callbacks, pool, @sizeOf(PoolObject) + @intCast(usize, made.*.maxSets) * @sizeOf(SetObject))
+}
+
+pub fn resetDescriptorPool(handle: vk.Device, pool: vk.DescriptorPool, flags: vk.DescriptorPoolResetFlags) -> vk.Result {
+    const made = poolOf(pool)
+    made.*.used = 0
+    made.*.setCount = 0
+    return vk.Result.success
+}
+
+pub fn allocateDescriptorSets(handle: vk.Device, info: *const vk.DescriptorSetAllocateInfo, into: ?[*]vk.DescriptorSet) -> vk.Result {
+    const pool = poolOf(info.*.descriptorPool)
+    const usedBefore = pool.*.used
+    const countBefore = pool.*.setCount
+    var k: usize = 0
+    while k < @intCast(usize, info.*.descriptorSetCount) {
+        const layout = setLayoutOf(info.*.pSetLayouts.?[k])
+        const at = (pool.*.used + SET_ALIGNMENT - 1) / SET_ALIGNMENT * SET_ALIGNMENT
+        if pool.*.setCount >= pool.*.maxSets || at + layout.*.bytes > pool.*.block.size {
+            // None of this call's sets is left made (the registry: every
+            // handle null, the pool as it was).
+            pool.*.used = usedBefore
+            pool.*.setCount = countBefore
+            var n: usize = 0
+            while n < @intCast(usize, info.*.descriptorSetCount) {
+                into.?[n] = 0
+                n += 1
+            }
+            return vk.Result.errorOutOfPoolMemory
+        }
+        const sets: [*]SetObject = unsafe { @ptrFromInt([*]SetObject, pool.*.sets) }
+        const set = &sets[@intCast(usize, pool.*.setCount)]
+        set.*.pool = info.*.descriptorPool
+        set.*.address = pool.*.block.address + @intCast(u64, at)
+        set.*.bytes = pool.*.block.bytes + at
+        set.*.layout = info.*.pSetLayouts.?[k]
+        device.zero(set.*.bytes, layout.*.bytes)
+        pool.*.used = at + layout.*.bytes
+        pool.*.setCount += 1
+        into.?[k] = @intFromPtr(set)
+        k += 1
+    }
+    return vk.Result.success
+}
+
+// Binding `binding`'s descriptor of `set`: `buffer`'s range (4.5).
+fn writeBuffer(set: *SetObject, binding: usize, info: *const vk.DescriptorBufferInfo) -> void {
+    const words: [*]u32 = unsafe { @ptrFromInt([*]u32, set.*.bytes + packets.DESCRIPTOR_BYTES * binding) }
+    if info.*.buffer == 0 {
+        words[0] = 0
+        words[1] = 0
+        words[2] = 0
+        words[3] = 0
+        return
+    }
+    const buffer = memory.bufferOf(info.*.buffer)
+    const address = buffer.*.address + info.*.offset
+    var range = info.*.range
+    if range == vk.WHOLE_SIZE { range = buffer.*.size - info.*.offset }
+    words[0] = @intCast(u32, address & 0xFFFFFFFF)
+    words[1] = packets.put(packets.SQ_BUF_RSRC_WORD1__BASE_ADDRESS_HI, @intCast(u32, (address >> 32) & 0xFFFF))
+    words[2] = @intCast(u32, (range + 3) / 4 * 4)
+    words[3] = packets.bufferWord3()
+}
+
+pub fn updateDescriptorSets(handle: vk.Device, writeCount: u32, writes: ?[*]const vk.WriteDescriptorSet, copyCount: u32, copies: ?[*]const vk.CopyDescriptorSet) -> void {
+    var k: usize = 0
+    while k < @intCast(usize, writeCount) {
+        const write = &writes.?[k]
+        const set = setOf(write.*.dstSet)
+        if bufferType(write.*.descriptorType) {
+            // Consecutive bindings take the rest of the count (the
+            // registry's rule; each binding here holds one).
+            var n: usize = 0
+            while n < @intCast(usize, write.*.descriptorCount) {
+                const binding = @intCast(usize, write.*.dstBinding) + @intCast(usize, write.*.dstArrayElement) + n
+                if binding < MOST_BINDINGS { writeBuffer(set, binding, &write.*.pBufferInfo.?[n]) }
+                n += 1
+            }
+        }
+        k += 1
+    }
+    k = 0
+    while k < @intCast(usize, copyCount) {
+        const copy = &copies.?[k]
+        const from = setOf(copy.*.srcSet)
+        const to = setOf(copy.*.dstSet)
+        var n: usize = 0
+        while n < @intCast(usize, copy.*.descriptorCount) {
+            const source = @intCast(usize, copy.*.srcBinding + copy.*.srcArrayElement) + n
+            const target = @intCast(usize, copy.*.dstBinding + copy.*.dstArrayElement) + n
+            device.copyBytes(to.*.bytes + packets.DESCRIPTOR_BYTES * target, from.*.bytes + packets.DESCRIPTOR_BYTES * source, packets.DESCRIPTOR_BYTES)
+            n += 1
+        }
+        k += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan 1.1's descriptor commands (stage (c))
+
+// Whether a set layout of `info` can be made as this stage makes them
+// (vkGetDescriptorSetLayoutSupport): storage and uniform buffers, one
+// descriptor each, below binding 32, no flags.
+pub fn getDescriptorSetLayoutSupport(handle: vk.Device, info: *const vk.DescriptorSetLayoutCreateInfo, into: *vk.DescriptorSetLayoutSupport) -> void {
+    var supported = info.*.flags == 0
+    var k: usize = 0
+    while k < @intCast(usize, info.*.bindingCount) {
+        const binding = &info.*.pBindings.?[k]
+        if binding.*.descriptorCount != 0 && (@intCast(usize, binding.*.binding) >= MOST_BINDINGS || !bufferType(binding.*.descriptorType) || binding.*.descriptorCount != 1) { supported = false }
+        k += 1
+    }
+    into.*.supported = if supported { vk.TRUE } else { vk.FALSE }
+}
+
+// A descriptor update template: its entries (where in the data each
+// binding's VkDescriptorBufferInfo is).
+pub const MOST_ENTRIES: usize = 32
+
+pub const TemplateObject = struct {
+    count: u32
+    bindings: [32]u32
+    counts: [32]u32
+    offsets: [32]usize
+    strides: [32]usize
+    buffers: [32]bool
+}
+
+fn templateOf(handle: vk.DescriptorUpdateTemplate) -> *TemplateObject { return unsafe { @ptrFromInt(*TemplateObject, handle) } }
+
+pub fn createDescriptorUpdateTemplate(handle: vk.Device, info: *const vk.DescriptorUpdateTemplateCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.DescriptorUpdateTemplate) -> vk.Result {
+    into.* = 0
+    if info.*.descriptorUpdateEntryCount > @intCast(u32, MOST_ENTRIES) || info.*.templateType != vk.DescriptorUpdateTemplateType.descriptorSet { return vk.Result.errorUnknown }
+    const address = device.allocate(callbacks, @sizeOf(TemplateObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = templateOf(address)
+    made.*.count = info.*.descriptorUpdateEntryCount
+    var k: usize = 0
+    while k < @intCast(usize, made.*.count) {
+        const e = &info.*.pDescriptorUpdateEntries.?[k]
+        made.*.bindings[k] = e.*.dstBinding + e.*.dstArrayElement
+        made.*.counts[k] = e.*.descriptorCount
+        made.*.offsets[k] = e.*.offset
+        made.*.strides[k] = e.*.stride
+        made.*.buffers[k] = bufferType(e.*.descriptorType)
+        k += 1
+    }
+    into.* = address
+    return vk.Result.success
+}
+
+pub fn destroyDescriptorUpdateTemplate(handle: vk.Device, given: vk.DescriptorUpdateTemplate, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if given == 0 { return }
+    device.release(callbacks, given, @sizeOf(TemplateObject))
+}
+
+pub fn updateDescriptorSetWithTemplate(handle: vk.Device, given: vk.DescriptorSet, template: vk.DescriptorUpdateTemplate, data: ?*const anyopaque) -> void {
+    const set = setOf(given)
+    const made = templateOf(template)
+    const base = @intFromPtr(data.?)
+    var k: usize = 0
+    while k < @intCast(usize, made.*.count) {
+        if made.*.buffers[k] {
+            var n: usize = 0
+            while n < @intCast(usize, made.*.counts[k]) {
+                const binding = @intCast(usize, made.*.bindings[k]) + n
+                const info: *const vk.DescriptorBufferInfo = unsafe { @ptrFromInt(*const vk.DescriptorBufferInfo, base + made.*.offsets[k] + made.*.strides[k] * n) }
+                if binding < MOST_BINDINGS { writeBuffer(set, binding, info) }
+                n += 1
+            }
+        }
+        k += 1
+    }
+}

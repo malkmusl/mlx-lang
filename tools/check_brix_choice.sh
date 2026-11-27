@@ -15,7 +15,7 @@
 #    byte, F;
 # 3. R: the firmware's own mode set again, for that boot; the start after
 #    it is what was remembered before (R changes nothing remembered);
-# 4. A: the monitor only asked (not built: the firmware's picture is
+# 4. A: the monitor only asked (nothing set: the firmware's picture is
 #    kept), for that boot;
 # 5. N: the monitor's own mode again, remembered at the next start; N
 #    once more writes nothing (the machine holds it already);
@@ -25,7 +25,11 @@
 # 7. an image built with a fixed choice (settings/gpu) and no key: the
 #    image's word; a key remembered in the machine comes before it;
 # 8. the same kernel started by a Multiboot loader (no loader of ours):
-#    the default, or the image's word, and no key is named.
+#    the default, or the image's word, and no key is named;
+# 9. a digit (how far the card's engines go, projects/brix/engine_
+#    choice.mlx): it reaches the kernel beside the letters and holds for
+#    its one boot; QEMU has no card of ours, and the kernel says that
+#    nothing of a card's engines is read or written.
 #
 # QEMU has no card this driver sets a mode on: the kernel says the choice
 # there in the log alone ("gpu: no card of ours to set a mode on; this
@@ -230,8 +234,8 @@ echo "ok   R: the firmware's own mode set again for that boot; the start after i
 # ---- 4. A: one boot ----
 boot a
 said "brixOS: display: the monitor only asked (A), for this start only" || fail "the loader does not say what A gave"
-said "this boot: the monitor only asked, which is not built yet: the firmware's picture is kept (A was pressed at this start and holds for this boot only)" || fail "after A the kernel does not say that the asking is not built"
-echo "ok   A: the monitor only asked, which is not built: the kernel says so and keeps the firmware's picture, for that boot"
+said "this boot: the monitor only asked, nothing set: the firmware's picture is kept (A was pressed at this start and holds for this boot only)" || fail "after A the kernel does not say that the monitor is only asked"
+echo "ok   A: the monitor only asked, nothing set: the kernel says so and keeps the firmware's picture, for that boot"
 
 # ---- 5. N, the start after it, and N again ----
 boot n
@@ -244,6 +248,31 @@ boot shift-n
 said "this boot: the monitor's own mode (N was pressed at this start and is remembered; F while the machine starts keeps the firmware's picture)" || fail "N pressed again (with shift) is not taken"
 output | grep -aq '^gpu: the loader looked for a key for [0-9]* ms and took N (the machine held it already: nothing was written)$' || fail "N pressed again is written again, though the machine held it"
 echo "ok   N: the monitor's own mode again, remembered at the next start; N once more (the capital) writes nothing"
+
+# A digit (projects/brix/engine_choice.mlx: how far the card's engines go
+# at this boot), read by the same loader beside the letters: it reaches
+# the kernel, holds for its one boot and leaves the display's choice as it
+# is; QEMU has no card of ours, so nothing of a card's engines is read or
+# written, and the kernel says so.
+none_here="gpu: there is no card of ours here: nothing of a card's engines is read or written"
+digit() {
+    local again
+    for again in 1 2 3; do
+        start "$1"
+        said "$none_here ($1 was pressed at this start" && return 0
+        echo "     (the digit did not reach the loader at this start: once more)"
+    done
+    fail "a digit tapped from the machine's start until the kernel was there did not reach the loader at three starts"
+}
+digit 2
+said "$none_here (2 was pressed at this start and holds for this boot only)" || fail "the kernel does not say the digit 2"
+said "this boot: the monitor's own mode (N was pressed at an earlier start and is remembered; F while the machine starts keeps the firmware's picture)" || fail "a digit changed the display's choice"
+said "brixOS: display: " && fail "the loader says a display's choice for a digit"
+digit 7
+said "$none_here (7 was pressed at this start and holds for this boot only)" || fail "the kernel does not say the digit 7 (the last stage it has)"
+boot
+said "$none_here (no digit was pressed; 1 to 7 held while the machine starts goes further)" || fail "a digit is remembered, or the start without one is not said"
+echo "ok   a digit: it reaches the kernel beside the display's choice and holds for its one boot; without a card of ours nothing of a card's engines is read or written"
 
 # ---- 6. something remembered that is no choice ----
 if [[ -n $have_shell ]]; then
@@ -305,6 +334,7 @@ multiboot() {
 "$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "$work/bin/"
 multiboot
 output | grep -aq "^gpu: no card of ours to set a mode on; this boot: the monitor's own mode (the default)\$" || fail "under Multiboot the kernel does not say the default without a key's name"
+output | grep -aq "^gpu: there is no card of ours here: nothing of a card's engines is read or written (no loader of ours read the keys)\$" || fail "under Multiboot the kernel does not say that no loader read a digit"
 said "the loader looked for a key" && fail "under Multiboot the kernel says that a loader looked for a key"
 printf 'firmware\n' > "$work/gpu"
 "$work/brix-image" "$work/kernel" "$work/brix.img" "flux=$work/flux" "settings/gpu=$work/gpu" "$work/bin/"

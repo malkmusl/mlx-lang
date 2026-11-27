@@ -165,7 +165,7 @@ the fixtures this page's sibling documents).
   a narrow value never carries bits beyond its width into a comparison,
   a widening, a store or a call: `add(2147483647, 201)` of two `i32` used
   to come back as 2147483848, above the `i32` maximum, where only the
-  unsigned types were checked (`tests/484_narrow_overflow_runtime.mlx`,
+  unsigned types were checked (`tests/524_narrow_overflow_runtime.mlx`,
   `tests/run_narrow_overflow.sh`). 64-bit arithmetic is not checked
   yet: `i64`, `u64`, `isize` and `usize` wrap.
 - **Division by zero** follows the same safe-trap/comptime-compile-error
@@ -343,7 +343,7 @@ checks one encoder primitive (`lock xadd`) at the byte level.
 | Manual allocation via `std.mem.Allocator` | Specified and enforced |
 | No GC / no implicit refcounting / no borrow checker | Specified (Mlx uses `@nocopy`/`@noncopy` + move-tracking instead — see `docs/guide/06-ownership.md`) |
 | UB list (use-after-free, double-free, misaligned deref, undefined read, invalid bit pattern, data race, foreign ABI violation) | Specified; some are runtime-checked in safe builds (see `docs/guide/09-unsafe-and-safety.md`), the rest are unchecked by the language |
-| Checked/wrapping/saturating overflow, division by zero | Specified; enforced below 64 bits (`tests/484_narrow_overflow_runtime.mlx`), 64-bit checked arithmetic still wraps (`docs/guide/02-operators.md`) |
+| Checked/wrapping/saturating overflow, division by zero | Specified; enforced below 64 bits (`tests/524_narrow_overflow_runtime.mlx`), 64-bit checked arithmetic still wraps (`docs/guide/02-operators.md`) |
 | Two's-complement signed integers | Specified |
 | `threadlocal` keyword, scope, initializer rule | Specified at the source level; **no executable TLS ABI** — the compiler rejects any use with `MLX-E9001` |
 | `@atomicLoad`/`@atomicStore`/`@atomicRmw`/`@cmpxchgWeak`/`@cmpxchgStrong`/`@fence`, the six memory orders | Specified (names, call shapes, result types, operations, order rules) and implemented on x86_64 and aarch64 (`tests/295_atomics_runtime.mlx`); Stage 0 (mlx0) still rejects them |

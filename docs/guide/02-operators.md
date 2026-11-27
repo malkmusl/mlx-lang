@@ -6,7 +6,7 @@
 `89_checked_overflow_comptime.mlx`, `91_wrapping_saturating_runtime.mlx`,
 `92_saturating_shift_runtime.mlx`, `93_checked_overflow_runtime.mlx`,
 `94_wrapping_shift_count_runtime.mlx`, `113_signed_integer_runtime.mlx`,
-`359_signed_wrapping_runtime.mlx`, `484_narrow_overflow_runtime.mlx`,
+`359_signed_wrapping_runtime.mlx`, `524_narrow_overflow_runtime.mlx`,
 `114_unsigned_comparison_runtime.mlx`, `183_float_exponent_runtime.mlx`,
 `184_signed_right_shift_runtime.mlx`, `203_immediate_alu_gep_runtime.mlx`,
 `207_popcount_runtime.mlx`, `322_float_literal_arithmetic_runtime.mlx`,
@@ -375,7 +375,7 @@ fn main() u8 {
 }
 ```
 
-(`tests/484_narrow_overflow_runtime.mlx`, every type and operator on both
+(`tests/524_narrow_overflow_runtime.mlx`, every type and operator on both
 backends with `tests/run_narrow_overflow.sh`: the overflowing cases end
 the process with SIGILL, the values in range and the wrapping and
 saturating forms of each type exit 13.)
@@ -384,7 +384,7 @@ For explicit wraparound or clamping semantics, use the `%`- and `|`-prefixed
 compound operators: `+%=`/`-%=`/`*%=` wrap, and `+|=`/`-|=`/`*|=` saturate at
 the type's bounds. `<<|` saturates a left shift instead of trapping/wrapping.
 Both keep to the type's width: `i8` `127 +% 1` is -128, `100 +| 100` is
-127 and `-100 -| 100` is -128 (`tests/484_narrow_overflow_runtime.mlx`).
+127 and `-100 -| 100` is -128 (`tests/524_narrow_overflow_runtime.mlx`).
 
 ```mlx
 fn main() u8 {
