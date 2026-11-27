@@ -1,0 +1,384 @@
+// What the driver's parts share (driver.mlx and the parts of stage (b):
+// memory.mlx, pipeline.mlx, commands.mlx, queue.mlx): the card interface
+// the driver uses (card.mlx), the device and queue objects, host memory
+// for the driver's records, and the card's memory the driver makes for
+// itself (a Block: a memory handle, mapped for the processor and at a
+// card address of the device's own choosing).
+//
+// THE CARD'S ADDRESSES are the driver's to choose (the study's 3.5): the
+// context's space runs from 2 MiB (Linux's AMDGPU_VA_RESERVED_SIZE) to
+// 2^40 (the study's 3.3). Shader code goes below 4 GiB, so that
+// COMPUTE_PGM_HI is 0 for every shader (the study's 4.2: address32_hi is
+// the driver's own allocator's constant); everything else above it, so
+// that every 64-bit pointer's high word is used from the first frame.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const icd = @import("std.vulkan.icd")
+const gpucard = @import("std.gpucard")
+const card = @import("./card.mlx")
+
+// ---------------------------------------------------------------------------
+// The card interface
+
+pub var interface: card.Card = undefined // (per run)
+pub var haveCard = false // (per run)
+
+pub fn use(given: card.Card) -> void {
+    interface = given
+    haveCard = true
+}
+
+pub fn cardCount() -> usize {
+    const function = interface.count
+    return function()
+}
+
+pub fn cardDescribe(index: usize, into: *gpucard.Device) -> isize {
+    const function = interface.describe
+    return function(index, into)
+}
+
+pub fn cardOpen(index: usize) -> isize {
+    const function = interface.open
+    return function(index)
+}
+
+pub fn cardClose(context: u32) -> isize {
+    const function = interface.close
+    return function(context)
+}
+
+pub fn cardMemory(context: u32, size: usize, flags: usize) -> isize {
+    const function = interface.memory
+    return function(context, size, flags)
+}
+
+pub fn cardMap(context: u32, memory: u32, size: usize, address: u64, rights: usize) -> isize {
+    const function = interface.map
+    return function(context, memory, 0, size, @intCast(usize, address), rights)
+}
+
+pub fn cardUnmap(context: u32, address: u64, size: usize) -> isize {
+    const function = interface.unmap
+    return function(context, @intCast(usize, address), size)
+}
+
+pub fn cardSubmit(context: u32, streams: usize, count: usize, fence: u32) -> isize {
+    const function = interface.submit
+    return function(context, streams, count, fence)
+}
+
+pub fn cardFence(context: u32) -> isize {
+    const function = interface.fence
+    return function(context)
+}
+
+pub fn cardMapMemory(memory: u32, size: usize) -> isize {
+    const function = interface.mapMemory
+    return function(memory, size)
+}
+
+pub fn cardUnmapMemory(address: usize, size: usize) -> isize {
+    const function = interface.unmapMemory
+    return function(address, size)
+}
+
+pub fn cardRelease(handle: u32) -> isize {
+    const function = interface.release
+    return function(handle)
+}
+
+pub fn cardWait(items: usize, count: usize, timeout: u64) -> isize {
+    const function = interface.wait
+    return function(items, count, timeout)
+}
+
+// The statuses the driver tells apart (std.os.brix.Status).
+pub const PEER_GONE: isize = 11
+pub const TIMED_OUT: isize = 5
+pub const NO_MEMORY: isize = 8
+pub const TOO_MANY: isize = 21
+
+// A wait without an end (std.os.brix.FOREVER).
+pub const FOREVER: u64 = 0xFFFFFFFFFFFFFFFF
+
+// ---------------------------------------------------------------------------
+// Host memory: the application's callbacks when it gives them, else the
+// program's heap (zeroed)
+
+const AllocationFunction = fn(?*anyopaque, usize, usize, vk.SystemAllocationScope) -> usize
+const FreeFunction = fn(?*anyopaque, usize) -> void
+
+pub fn allocate(callbacks: ?*const vk.AllocationCallbacks, size: usize, scope: vk.SystemAllocationScope) -> usize {
+    var address: usize = 0
+    if callbacks != null && callbacks.?.*.pfnAllocation != 0 {
+        var function: AllocationFunction = unsafe { @ptrFromInt(AllocationFunction, callbacks.?.*.pfnAllocation) }
+        address = function(callbacks.?.*.pUserData, size, 16, scope)
+    } else {
+        const memory = std.heap.allocator().alloc(size, 16)
+        if memory != null { address = @intFromPtr(memory.?) }
+    }
+    if address != 0 { zero(address, size) }
+    return address
+}
+
+pub fn release(callbacks: ?*const vk.AllocationCallbacks, address: usize, size: usize) -> void {
+    if address == 0 { return }
+    if callbacks != null && callbacks.?.*.pfnFree != 0 {
+        var function: FreeFunction = unsafe { @ptrFromInt(FreeFunction, callbacks.?.*.pfnFree) }
+        function(callbacks.?.*.pUserData, address)
+        return
+    }
+    std.heap.allocator().free(unsafe { @ptrFromInt([*]u8, address) }, size, 16)
+}
+
+pub fn zero(address: usize, size: usize) -> void {
+    const bytes: [*]u8 = unsafe { @ptrFromInt([*]u8, address) }
+    var k: usize = 0
+    while k < size {
+        bytes[k] = 0
+        k += 1
+    }
+}
+
+pub fn copyBytes(to: usize, from: usize, size: usize) -> void {
+    const target: [*]u8 = unsafe { @ptrFromInt([*]u8, to) }
+    const source: [*]const u8 = unsafe { @ptrFromInt([*]const u8, from) }
+    var k: usize = 0
+    while k < size {
+        target[k] = source[k]
+        k += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The objects
+
+pub const QueueObject = struct {
+    header: icd.DispatchableHeader
+    device: usize
+    family: u32
+    index: u32
+}
+
+// A piece of the card's memory: its handle, its bytes (whole pages), its
+// card address, the processor's address of it (0: not mapped).
+pub const Block = struct {
+    memory: u32
+    size: usize
+    address: u64
+    bytes: usize
+}
+
+pub const PAGE: usize = 4096
+// The space's ends and the line between code and the rest.
+pub const FIRST_ADDRESS: u64 = 0x200000
+pub const LOW_END: u64 = 0x100000000
+pub const ADDRESS_END: u64 = 0x10000000000
+
+// Free ranges of one part of the space, sorted.
+pub const MOST_RANGES: usize = 1024
+
+pub const Space = struct {
+    start: [MOST_RANGES]u64
+    end: [MOST_RANGES]u64
+    count: usize
+}
+
+pub const DeviceObject = struct {
+    header: icd.DispatchableHeader
+    physical: usize
+    // The context on the card (a handle of the kind gpu).
+    context: u32
+    queue: QueueObject
+    // The record's counts a dispatch's COMPUTE_RESOURCE_LIMITS needs.
+    computeUnits: u32
+    shaderEngines: u32
+    // The memory the device offers (the physical device's), what each
+    // heap has given, and the gpu_memory flags of the driver's own blocks.
+    memory: vk.PhysicalDeviceMemoryProperties
+    heapUsed: [16]u64
+    ownFlags: usize
+    // The card's address space, its code part and the rest.
+    low: Space
+    high: Space
+    // The preamble (the study's 4.2), run before every submit's streams.
+    preamble: Block
+    preambleWords: usize
+    // The fence the device gives a submit that has none, and the fence
+    // of the last submit (0: none yet).
+    ownFence: u32
+    lastFence: u32
+    // A stream choked the card: every later call says the device is lost.
+    lost: bool
+    // Stage (c): whether the device has the graphics queue (its family
+    // when the card's record lists a graphics ring), that queue and its
+    // preamble (queue.mlx), the clear's pipelines and their layout
+    // (render.mlx), the device extensions enabled (driver.mlx's
+    // Extension bits).
+    graphics: bool
+    graphicsQueue: QueueObject
+    graphicsPreamble: Block
+    graphicsPreambleWords: usize
+    clearPipelines: [8]u64
+    clearLayout: u64
+    extensions: u32
+    // The compute units of a shader array (the record's: ac_gpu_info.c's
+    // min_good_cu_per_sa), which the vertex shader's late allocation
+    // follows (graphics.mlx).
+    computeUnitsPerArray: u32
+}
+
+pub fn deviceOf(handle: vk.Device) -> *DeviceObject { return unsafe { @ptrFromInt(*DeviceObject, handle) } }
+
+// ---------------------------------------------------------------------------
+// The card's address space
+
+pub fn spaceInit(space: *Space, start: u64, end: u64) -> void {
+    space.*.start[0] = start
+    space.*.end[0] = end
+    space.*.count = 1
+}
+
+// `size` bytes at a multiple of `alignment` (a power of two) from the
+// first free range they fit; 0 when none.
+pub fn spaceTake(space: *Space, size: u64, alignment: u64) -> u64 {
+    var k: usize = 0
+    while k < space.*.count {
+        const at = (space.*.start[k] + alignment - 1) & ~(alignment - 1)
+        if at < space.*.end[k] && space.*.end[k] - at >= size {
+            const before = at - space.*.start[k]
+            const after = space.*.end[k] - (at + size)
+            if before == 0 && after == 0 {
+                var j = k
+                while j + 1 < space.*.count {
+                    space.*.start[j] = space.*.start[j + 1]
+                    space.*.end[j] = space.*.end[j + 1]
+                    j += 1
+                }
+                space.*.count -= 1
+            } else if before == 0 {
+                space.*.start[k] = at + size
+            } else if after == 0 {
+                space.*.end[k] = at
+            } else {
+                if space.*.count == MOST_RANGES { return 0 }
+                var j = space.*.count
+                while j > k + 1 {
+                    space.*.start[j] = space.*.start[j - 1]
+                    space.*.end[j] = space.*.end[j - 1]
+                    j -= 1
+                }
+                space.*.start[k + 1] = at + size
+                space.*.end[k + 1] = space.*.end[k]
+                space.*.end[k] = at
+                space.*.count += 1
+            }
+            return at
+        }
+        k += 1
+    }
+    return 0
+}
+
+// `size` bytes at `at` given back, joined to their neighbours.
+pub fn spaceGive(space: *Space, at: u64, size: u64) -> void {
+    var k: usize = 0
+    while k < space.*.count && space.*.start[k] < at { k += 1 }
+    const joinsBefore = k > 0 && space.*.end[k - 1] == at
+    const joinsAfter = k < space.*.count && space.*.start[k] == at + size
+    if joinsBefore && joinsAfter {
+        space.*.end[k - 1] = space.*.end[k]
+        var j = k
+        while j + 1 < space.*.count {
+            space.*.start[j] = space.*.start[j + 1]
+            space.*.end[j] = space.*.end[j + 1]
+            j += 1
+        }
+        space.*.count -= 1
+    } else if joinsBefore {
+        space.*.end[k - 1] = at + size
+    } else if joinsAfter {
+        space.*.start[k] = at
+    } else if space.*.count < MOST_RANGES {
+        var j = space.*.count
+        while j > k {
+            space.*.start[j] = space.*.start[j - 1]
+            space.*.end[j] = space.*.end[j - 1]
+            j -= 1
+        }
+        space.*.start[k] = at
+        space.*.end[k] = at + size
+        space.*.count += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The card's memory
+
+// `size` bytes of the card's memory (gpu_memory's `flags`) mapped at an
+// address of the device's choosing with `rights` (code below 4 GiB when
+// `code`), and for the processor when `processor`: true with `block`
+// filled, or false (nothing left made).
+pub fn makeBlock(device: *DeviceObject, size: usize, flags: usize, rights: usize, code: bool, processor: bool, block: *Block) -> bool {
+    const pages = (size + PAGE - 1) / PAGE * PAGE
+    block.*.memory = 0
+    block.*.size = pages
+    block.*.address = 0
+    block.*.bytes = 0
+    const made = cardMemory(device.*.context, pages, flags)
+    if made <= 0 { return false }
+    block.*.memory = @intCast(u32, made)
+    // Large blocks at a 2 MiB boundary (Linux's default fragment, the
+    // study's 3.3: radv_amdgpu_winsys_bo_create aligns to it).
+    const alignment: u64 = if pages >= 0x200000 { 0x200000 } else { @intCast(u64, PAGE) }
+    const space = if code { &device.*.low } else { &device.*.high }
+    const at = spaceTake(space, @intCast(u64, pages), alignment)
+    if at == 0 || cardMap(device.*.context, block.*.memory, pages, at, rights) != 0 {
+        if at != 0 { spaceGive(space, at, @intCast(u64, pages)) }
+        _ = cardRelease(block.*.memory)
+        return false
+    }
+    block.*.address = at
+    if processor {
+        const mapped = cardMapMemory(block.*.memory, pages)
+        if mapped <= 0 {
+            dropBlock(device, block)
+            return false
+        }
+        block.*.bytes = @bitCast(usize, mapped)
+    }
+    return true
+}
+
+// The block's processor mapping, made now if it has none: false when the
+// memory cannot be mapped.
+pub fn mapBlock(block: *Block) -> bool {
+    if block.*.bytes != 0 { return true }
+    const mapped = cardMapMemory(block.*.memory, block.*.size)
+    if mapped <= 0 { return false }
+    block.*.bytes = @bitCast(usize, mapped)
+    return true
+}
+
+pub fn dropBlock(device: *DeviceObject, block: *Block) -> void {
+    if block.*.memory == 0 { return }
+    if block.*.bytes != 0 { _ = cardUnmapMemory(block.*.bytes, block.*.size) }
+    if block.*.address != 0 {
+        _ = cardUnmap(device.*.context, block.*.address, block.*.size)
+        const space = if block.*.address < LOW_END { &device.*.low } else { &device.*.high }
+        spaceGive(space, block.*.address, @intCast(u64, block.*.size))
+    }
+    _ = cardRelease(block.*.memory)
+    block.*.memory = 0
+    block.*.bytes = 0
+    block.*.address = 0
+}
+
+// The flags of the driver's own blocks (streams, descriptor sets, push
+// constants, code): the processor writes them, the card reads them; in
+// the system's memory when the card reaches it, else in the part of the
+// card's memory the processor reaches.
+pub fn ownBlock(device: *DeviceObject, size: usize, rights: usize, code: bool, block: *Block) -> bool {
+    return makeBlock(device, size, device.*.ownFlags, rights, code, true, block)
+}

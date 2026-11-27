@@ -1,0 +1,1777 @@
+// Our Vulkan driver's stage (c) over the host card through the loader
+// (projects/brix/vulkan: image.mlx, graphics.mlx, render.mlx, clear.mlx;
+// the host card's graphics ring, card_run.mlx and card_draw.mlx): the
+// first triangle into a buffer.
+//
+// - the device: two queue families on a card whose record lists a
+//   graphics ring (graphics, compute and transfer the second), one on a
+//   card without (nothing of the graphics part offered there: no family,
+//   no extension, no format feature, as on brixOS now); the extensions
+//   VK_KHR_create_renderpass2, VK_KHR_depth_stencil_resolve and
+//   VK_KHR_dynamic_rendering, their commands through the device that
+//   enabled them alone; the format list as the stage has it (R8G8B8A8 and
+//   B8G8R8A8 UNORM linear: rendered to, blended, copied from; no optimal
+//   tiling; the R32 vertex formats), the image format queries;
+// - pixels, each held against tests/support/reference_raster.mlx (the
+//   specification's rules, not the card's model): a triangle with a colour
+//   for each vertex, drawn without indices and with 16- and 32-bit ones; a
+//   quad of two triangles (a list with indices, a strip without) whose
+//   shared edge's pixels are covered once (additive blending: never
+//   twice); culled and not (back faces culled, the front face clockwise);
+//   flat shading (the provoking vertex's colour exactly); a triangle
+//   through a matrix in push constants; the clear of a load operation and
+//   of vkCmdClearAttachments in a rectangle; a render pass and framebuffer
+//   giving the same pixels as dynamic rendering; B8G8R8A8's bytes; the
+//   copy of the image into a buffer;
+// - the cache model's proof: the copy without the barrier that flushes
+//   the colour block is refused by the host card (unflushed), and the
+//   device lost;
+// - Vulkan 1.1's commands: vkGetDeviceQueue2, vkBindBufferMemory2,
+//   vkBindImageMemory2, vkGetBufferMemoryRequirements2 and vkGetImage
+//   MemoryRequirements2 (no dedicated allocation), vkTrimCommandPool,
+//   vkGetDescriptorSetLayoutSupport, the descriptor update templates
+//   (their words those of vkUpdateDescriptorSets), vkCmdDispatchBase (base
+//   0: the words of vkCmdDispatch), vkCmdSetDeviceMask,
+//   vkGetDeviceGroupPeerMemoryFeatures;
+// - every result against the registry's codes (std/registry/vulkan/vk.xml);
+// - (the review's) the pixels of 600 triangles against a second reference
+//   written apart (support/raster_rules.mlx): perspective, viewports moved,
+//   smaller than the target and upside down, scissors, every cull mode
+//   with each front face, edges through pixel centres, degenerate and huge
+//   triangles; a strip culled; blending over a colour; a write mask;
+//   firstVertex, firstIndex and vertexOffset; an indexed draw after one
+//   without indices; a shader of float operations whose operands are not
+//   symmetric (support/spirv/review_shaders.mlx); the render pass's
+//   implicit dependency at its end (Mesa's runtime's); the late allocation
+//   from the record's compute units; the linear layout as addrlib's.
+//
+// No test of the repository draws through the loader yet (std.gpu is
+// compute alone; test 258's swapchain needs stage (d)): this one is the
+// first. Exits 13.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const loader = @import("std.vulkan.loader")
+const builder = @import("std.spirv.builder")
+const spv = @import("std.spirv.core")
+const gpucard = @import("std.gpucard")
+const host = @import("../projects/brix/vulkan/card_host.mlx")
+const run = @import("../projects/brix/vulkan/card_run.mlx")
+const cache = @import("../projects/brix/vulkan/card_cache.mlx")
+const driver = @import("../projects/brix/vulkan/driver.mlx")
+const commands = @import("../projects/brix/vulkan/commands.mlx")
+const compute = @import("../projects/brix/kernel/gpu_compute.mlx")
+const triangle = @import("./support/spirv/triangle.mlx")
+const reference = @import("./support/reference_raster.mlx")
+const rules = @import("./support/raster_rules.mlx")
+const review = @import("./support/spirv/review_shaders.mlx")
+const graphicsModule = @import("../projects/brix/vulkan/graphics.mlx")
+
+fn say(text: []const u8) -> void { _ = std.io.writeAll(std.io.stdout(), text) }
+fn sayNumber(value: u64) -> void { _ = std.io.writeUnsigned(std.io.stdout(), @intCast(usize, value)) }
+
+pub var failed: u8 = 0
+var show = false
+
+fn check(number: u8, holds: bool) -> void {
+    if holds { return }
+    if failed == 0 { failed = number }
+    if show {
+        say("check ")
+        sayNumber(@intCast(u64, number))
+        say(" fails")
+        const r = host.report()
+        if r.*.failure != run.Failure.none {
+            say(" (host card: ")
+            say(run.failureText(r.*.failure))
+            say(", stream ")
+            sayNumber(@intCast(u64, r.*.stream))
+            say(" word ")
+            sayNumber(@intCast(u64, r.*.word))
+            say(" detail ")
+            sayNumber(r.*.detail)
+            say(" / ")
+            sayNumber(r.*.detail2)
+            say(")")
+        }
+        say("\n")
+    }
+}
+
+fn equal(a: []const u8, b: []const u8) -> bool {
+    if a.length != b.length { return false }
+    var k: usize = 0
+    while k < a.length {
+        if a[k] != b[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The registry's codes of a command
+
+var registry: [*]const u8 = undefined
+var registryLength: usize = 0
+
+pub fn readRegistry() -> bool {
+    const loaded = std.fs.readFileAlloc("std/registry/vulkan/vk.xml".pointer, std.heap.allocator())
+    if loaded == null { return false }
+    registry = loaded.?.items
+    registryLength = loaded.?.length
+    return true
+}
+
+fn at(offset: usize, text: []const u8) -> bool {
+    if offset + text.length > registryLength { return false }
+    var k: usize = 0
+    while k < text.length {
+        if registry[offset + k] != text[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+fn tagOf(name: []const u8) -> []const u8 {
+    var k: usize = 0
+    while k + name.length + 13 < registryLength {
+        if at(k, "<name>") && at(k + 6, name) && at(k + 6 + name.length, "</name></proto>") {
+            var start = k
+            while start > 0 && !at(start, "<command") { start -= 1 }
+            var end = start
+            while end < k && registry[end] != 62 { end += 1 }
+            return registry[start..end]
+        }
+        k += 1
+    }
+    return registry[0..0]
+}
+
+fn listed(tag: []const u8, attribute: []const u8, code: []const u8) -> bool {
+    var k: usize = 0
+    while k + attribute.length < tag.length {
+        if equal(tag[k..k + attribute.length], attribute) {
+            var start = k + attribute.length
+            while start < tag.length && tag[start] != 34 {
+                var end = start
+                while end < tag.length && tag[end] != 44 && tag[end] != 34 { end += 1 }
+                if equal(tag[start..end], code) { return true }
+                start = if end < tag.length && tag[end] == 44 { end + 1 } else { end }
+            }
+            return false
+        }
+        k += 1
+    }
+    return false
+}
+
+fn resultName(result: vk.Result) -> []const u8 {
+    if result == vk.Result.success { return "VK_SUCCESS" }
+    if result == vk.Result.incomplete { return "VK_INCOMPLETE" }
+    if result == vk.Result.timeout { return "VK_TIMEOUT" }
+    if result == vk.Result.errorOutOfHostMemory { return "VK_ERROR_OUT_OF_HOST_MEMORY" }
+    if result == vk.Result.errorOutOfDeviceMemory { return "VK_ERROR_OUT_OF_DEVICE_MEMORY" }
+    if result == vk.Result.errorInitializationFailed { return "VK_ERROR_INITIALIZATION_FAILED" }
+    if result == vk.Result.errorDeviceLost { return "VK_ERROR_DEVICE_LOST" }
+    if result == vk.Result.errorExtensionNotPresent { return "VK_ERROR_EXTENSION_NOT_PRESENT" }
+    if result == vk.Result.errorFormatNotSupported { return "VK_ERROR_FORMAT_NOT_SUPPORTED" }
+    if result == vk.Result.errorUnknown { return "VK_ERROR_UNKNOWN" }
+    return "?"
+}
+
+fn gave(number: u8, command: []const u8, result: vk.Result) -> void {
+    const tag = tagOf(command)
+    const name = resultName(result)
+    check(number, tag.length > 0 && (listed(tag, "successcodes=\"", name) || listed(tag, "errorcodes=\"", name)))
+}
+
+// ---------------------------------------------------------------------------
+// The driver over the host card
+
+var global: vk.GlobalCommands = undefined
+pub var instanceCommands: vk.InstanceCommands = undefined
+pub var deviceCommands: vk.DeviceCommands = undefined
+var opened: loader.Driver = undefined
+pub var instance: vk.Instance = 0
+pub var physical: vk.PhysicalDevice = 0
+pub var device: vk.Device = 0
+var memoryProperties: vk.PhysicalDeviceMemoryProperties = undefined
+pub var graphicsQueue: vk.Queue = 0
+
+var block: [3][*]const u8 = undefined
+
+fn noManifests() -> [][*]const u8 {
+    block[0] = unsafe { @ptrFromInt([*]const u8, 0) }
+    return block[0..0]
+}
+
+// The user's RX 580 with a compute ring and, when `graphics`, a graphics
+// ring; the tile mode table the kernel programs (gpu_compute.mlx's).
+// (`arrayUnits`: the compute units of a shader array the card's record
+// says; the RX 580's 9 unless a check asks another card.)
+pub var arrayUnits: u32 = 9
+
+pub fn card(graphics: bool) -> void {
+    host.reset()
+    var facts = host.rx580(1)
+    if graphics { facts.graphicsRings = 1 }
+    facts.computeUnitsPerArray = arrayUnits
+    _ = host.add(&facts)
+    host.setTileModes(compute.TILE_MODES[0..])
+    _ = driver.offer(host.interface())
+    var manifests: loader.Manifests = undefined
+    _ = loader.findDrivers(&manifests, noManifests(), std.heap.allocator())
+    _ = loader.openDriver(&opened, loader.manifestAt(&manifests, 0), std.heap.allocator())
+}
+
+const EXTENSION_NAMES = [3][*]const u8{ "VK_KHR_create_renderpass2".pointer, "VK_KHR_depth_stencil_resolve".pointer, "VK_KHR_dynamic_rendering".pointer }
+
+pub fn makeInstance() -> void {
+    var application = vk.ApplicationInfo.init()
+    application.apiVersion = vk.API_VERSION_1_1
+    var info = vk.InstanceCreateInfo.init()
+    info.pApplicationInfo = &application
+    instance = 0
+    _ = vk.createInstance(opened.global, &info, null, &instance)
+    vk.loadInstanceCommands(&instanceCommands, instance, opened.getInstanceProcAddr)
+    var count: u32 = 1
+    physical = 0
+    _ = vk.enumeratePhysicalDevices(&instanceCommands, instance, &count, unsafe { @ptrCast([*]vk.PhysicalDevice, &physical) })
+    vk.getPhysicalDeviceMemoryProperties(&instanceCommands, physical, &memoryProperties)
+}
+
+pub fn makeDevice(family: u32, extensions: u32) -> vk.Result {
+    var queueInfo = vk.DeviceQueueCreateInfo.init()
+    queueInfo.queueFamilyIndex = family
+    queueInfo.queueCount = 1
+    var priority: u32 = 1065353216
+    queueInfo.pQueuePriorities = unsafe { @ptrCast([*]const f32, &priority) }
+    var deviceInfo = vk.DeviceCreateInfo.init()
+    deviceInfo.queueCreateInfoCount = 1
+    deviceInfo.pQueueCreateInfos = unsafe { @ptrCast([*]const vk.DeviceQueueCreateInfo, &queueInfo) }
+    deviceInfo.enabledExtensionCount = extensions
+    deviceInfo.ppEnabledExtensionNames = &EXTENSION_NAMES
+    device = 0
+    const made = vk.createDevice(&instanceCommands, physical, &deviceInfo, null, &device)
+    if made == vk.Result.success {
+        vk.loadDeviceCommands(&deviceCommands, device, instanceCommands.vkGetDeviceProcAddr)
+        vk.getDeviceQueue(&deviceCommands, device, family, 0, &graphicsQueue)
+    }
+    return made
+}
+
+pub fn dropDevice() -> void {
+    if device != 0 { vk.destroyDevice(&deviceCommands, device, null) }
+    device = 0
+    if instance != 0 { vk.destroyInstance(&instanceCommands, instance, null) }
+    instance = 0
+}
+
+fn typeWith(flags: u32) -> u32 {
+    var k: u32 = 0
+    while k < memoryProperties.memoryTypeCount {
+        if (memoryProperties.memoryTypes[k].propertyFlags & flags) == flags { return k }
+        k += 1
+    }
+    return 0xFFFFFFFF
+}
+
+pub fn hostVisible() -> u32 { return typeWith(vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.MEMORY_PROPERTY_HOST_COHERENT_BIT) }
+
+pub fn makeBuffer(bytes: u64, usage: u32, buffer: *vk.Buffer, memory: *vk.DeviceMemory, mapped: *usize) -> bool {
+    var info = vk.BufferCreateInfo.init()
+    info.size = bytes
+    info.usage = usage
+    if vk.createBuffer(&deviceCommands, device, &info, null, buffer) != vk.Result.success { return false }
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getBufferMemoryRequirements(&deviceCommands, device, buffer.*, &requirements)
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.allocationSize = requirements.size
+    allocation.memoryTypeIndex = hostVisible()
+    if vk.allocateMemory(&deviceCommands, device, &allocation, null, memory) != vk.Result.success { return false }
+    if vk.bindBufferMemory(&deviceCommands, device, buffer.*, memory.*, 0) != vk.Result.success { return false }
+    var address: ?*anyopaque = null
+    if vk.mapMemory(&deviceCommands, device, memory.*, 0, vk.WHOLE_SIZE, 0, &address) != vk.Result.success { return false }
+    mapped.* = @intFromPtr(address.?)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The target and its read-back
+
+pub const SIZE: u32 = 32
+pub const SIDE: usize = 32
+
+pub var image: vk.Image = 0
+pub var imageMemory: vk.DeviceMemory = 0
+pub var view: vk.ImageView = 0
+pub var readBuffer: vk.Buffer = 0
+pub var readMemory: vk.DeviceMemory = 0
+pub var readBytes: usize = 0
+pub var vertexBuffer: vk.Buffer = 0
+pub var vertexMemory: vk.DeviceMemory = 0
+pub var vertexBytes: usize = 0
+pub var indexBuffer: vk.Buffer = 0
+pub var indexMemory: vk.DeviceMemory = 0
+pub var indexBytes: usize = 0
+pub var pool: vk.CommandPool = 0
+pub var commandBuffer: vk.CommandBuffer = 0
+pub var fence: vk.Fence = 0
+pub var layout: vk.PipelineLayout = 0
+
+pub fn makeTarget(format: vk.Format) -> bool {
+    var info = vk.ImageCreateInfo.init()
+    info.imageType = vk.ImageType.type2d
+    info.format = format
+    info.extent.width = SIZE
+    info.extent.height = SIZE
+    info.extent.depth = 1
+    info.mipLevels = 1
+    info.arrayLayers = 1
+    info.samples = vk.SAMPLE_COUNT_1_BIT
+    info.tiling = vk.ImageTiling.linear
+    info.usage = vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT
+    var result = vk.createImage(&deviceCommands, device, &info, null, &image)
+    gave(10, "vkCreateImage", result)
+    if result != vk.Result.success { return false }
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getImageMemoryRequirements(&deviceCommands, device, image, &requirements)
+    check(11, requirements.size == @intCast(u64, SIZE) * @intCast(u64, SIZE) * 4 && requirements.alignment == 256)
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.allocationSize = requirements.size
+    allocation.memoryTypeIndex = typeWith(vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    if vk.allocateMemory(&deviceCommands, device, &allocation, null, &imageMemory) != vk.Result.success { return false }
+    result = vk.bindImageMemory(&deviceCommands, device, image, imageMemory, 0)
+    gave(12, "vkBindImageMemory", result)
+    var subresource = vk.ImageSubresource.init()
+    subresource.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    var placed = vk.SubresourceLayout.init()
+    vk.getImageSubresourceLayout(&deviceCommands, device, image, &subresource, &placed)
+    check(13, placed.rowPitch == @intCast(u64, SIZE) * 4 && placed.offset == 0)
+    var viewInfo = vk.ImageViewCreateInfo.init()
+    viewInfo.image = image
+    viewInfo.viewType = vk.ImageViewType.type2d
+    viewInfo.format = format
+    viewInfo.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    viewInfo.subresourceRange.levelCount = 1
+    viewInfo.subresourceRange.layerCount = 1
+    result = vk.createImageView(&deviceCommands, device, &viewInfo, null, &view)
+    gave(14, "vkCreateImageView", result)
+    return result == vk.Result.success
+}
+
+fn dropTarget() -> void {
+    vk.destroyImageView(&deviceCommands, device, view, null)
+    vk.destroyImage(&deviceCommands, device, image, null)
+    vk.freeMemory(&deviceCommands, device, imageMemory, null)
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines
+
+var spirv: [4096]u32 = undefined
+
+fn moduleOf(kind: triangle.Kind) -> vk.ShaderModule {
+    var b: builder.Builder = undefined
+    builder.init(&b, std.page_allocator.init(), spv.version(1, 3))
+    triangle.build(&b, kind)
+    const count = builder.wordCount(&b)
+    unsafe { builder.writeWords(&b, @ptrCast([*]u32, &spirv)) }
+    builder.deinit(&b)
+    var info = vk.ShaderModuleCreateInfo.init()
+    info.codeSize = count * 4
+    info.pCode = &spirv
+    var module: vk.ShaderModule = 0
+    _ = vk.createShaderModule(&deviceCommands, device, &info, null, &module)
+    return module
+}
+
+fn reckonedModule() -> vk.ShaderModule {
+    var b: builder.Builder = undefined
+    builder.init(&b, std.page_allocator.init(), spv.version(1, 3))
+    review.reckoned(&b)
+    const count = builder.wordCount(&b)
+    unsafe { builder.writeWords(&b, @ptrCast([*]u32, &spirv)) }
+    builder.deinit(&b)
+    var info = vk.ShaderModuleCreateInfo.init()
+    info.codeSize = count * 4
+    info.pCode = &spirv
+    var module: vk.ShaderModule = 0
+    _ = vk.createShaderModule(&deviceCommands, device, &info, null, &module)
+    return module
+}
+
+pub const Options = struct {
+    vertex: triangle.Kind
+    fragment: triangle.Kind
+    strip: bool
+    cull: u32
+    clockwise: bool
+    additive: bool
+    format: vk.Format
+    pass: vk.RenderPass
+    // The colour write mask; the fragment shader of float operations
+    // (support/spirv/review_shaders.mlx) in the place of `fragment`.
+    mask: u32
+    reckoned: bool
+}
+
+pub fn options() -> Options {
+    return Options.{ .vertex = triangle.Kind.vertex, .fragment = triangle.Kind.fragment, .strip = false, .cull = vk.CULL_MODE_NONE, .clockwise = false, .additive = false, .format = vk.Format.r8g8b8a8Unorm, .pass = 0, .mask = 0xF, .reckoned = false }
+}
+
+pub fn makePipeline(o: Options) -> vk.Pipeline {
+    var stages: [2]vk.PipelineShaderStageCreateInfo = undefined
+    stages[0] = vk.PipelineShaderStageCreateInfo.init()
+    stages[0].stage = vk.SHADER_STAGE_VERTEX_BIT
+    stages[0].module = moduleOf(o.vertex)
+    stages[0].pName = "main".pointer
+    stages[1] = vk.PipelineShaderStageCreateInfo.init()
+    stages[1].stage = vk.SHADER_STAGE_FRAGMENT_BIT
+    stages[1].module = if o.reckoned { reckonedModule() } else { moduleOf(o.fragment) }
+    stages[1].pName = "main".pointer
+    var binding = vk.VertexInputBindingDescription.init()
+    binding.binding = 0
+    binding.stride = 20
+    binding.inputRate = vk.VertexInputRate.vertex
+    var attributes: [2]vk.VertexInputAttributeDescription = undefined
+    attributes[0] = vk.VertexInputAttributeDescription.init()
+    attributes[0].location = 0
+    attributes[0].format = vk.Format.r32g32Sfloat
+    attributes[0].offset = 0
+    attributes[1] = vk.VertexInputAttributeDescription.init()
+    attributes[1].location = 1
+    attributes[1].format = vk.Format.r32g32b32Sfloat
+    attributes[1].offset = 8
+    var input = vk.PipelineVertexInputStateCreateInfo.init()
+    input.vertexBindingDescriptionCount = 1
+    input.pVertexBindingDescriptions = unsafe { @ptrCast([*]const vk.VertexInputBindingDescription, &binding) }
+    input.vertexAttributeDescriptionCount = 2
+    input.pVertexAttributeDescriptions = &attributes
+    var assembly = vk.PipelineInputAssemblyStateCreateInfo.init()
+    assembly.topology = if o.strip { vk.PrimitiveTopology.triangleStrip } else { vk.PrimitiveTopology.triangleList }
+    var viewportState = vk.PipelineViewportStateCreateInfo.init()
+    viewportState.viewportCount = 1
+    viewportState.scissorCount = 1
+    var raster = vk.PipelineRasterizationStateCreateInfo.init()
+    raster.polygonMode = vk.PolygonMode.fill
+    raster.cullMode = o.cull
+    raster.frontFace = if o.clockwise { vk.FrontFace.clockwise } else { vk.FrontFace.counterClockwise }
+    raster.lineWidth = 1.0
+    var samples = vk.PipelineMultisampleStateCreateInfo.init()
+    samples.rasterizationSamples = vk.SAMPLE_COUNT_1_BIT
+    var attachment = vk.PipelineColorBlendAttachmentState.init()
+    attachment.colorWriteMask = o.mask
+    if o.additive {
+        attachment.blendEnable = vk.TRUE
+        attachment.srcColorBlendFactor = vk.BlendFactor.one
+        attachment.dstColorBlendFactor = vk.BlendFactor.one
+        attachment.colorBlendOp = vk.BlendOp.add
+        attachment.srcAlphaBlendFactor = vk.BlendFactor.one
+        attachment.dstAlphaBlendFactor = vk.BlendFactor.zero
+        attachment.alphaBlendOp = vk.BlendOp.add
+    }
+    var blend = vk.PipelineColorBlendStateCreateInfo.init()
+    blend.attachmentCount = 1
+    blend.pAttachments = unsafe { @ptrCast([*]const vk.PipelineColorBlendAttachmentState, &attachment) }
+    const dynamics = [2]vk.DynamicState{ vk.DynamicState.viewport, vk.DynamicState.scissor }
+    var dynamic = vk.PipelineDynamicStateCreateInfo.init()
+    dynamic.dynamicStateCount = 2
+    dynamic.pDynamicStates = &dynamics
+    const formats = [1]vk.Format{ o.format }
+    var rendering = vk.PipelineRenderingCreateInfo.init()
+    rendering.colorAttachmentCount = 1
+    rendering.pColorAttachmentFormats = &formats
+    var info = vk.GraphicsPipelineCreateInfo.init()
+    if o.pass == 0 { info.pNext = unsafe { @ptrCast(*const anyopaque, &rendering) } }
+    info.renderPass = o.pass
+    info.stageCount = 2
+    info.pStages = &stages
+    info.pVertexInputState = &input
+    info.pInputAssemblyState = &assembly
+    info.pViewportState = &viewportState
+    info.pRasterizationState = &raster
+    info.pMultisampleState = &samples
+    info.pColorBlendState = &blend
+    info.pDynamicState = &dynamic
+    info.layout = layout
+    var made: vk.Pipeline = 0
+    const result = vk.createGraphicsPipelines(&deviceCommands, device, 0, 1, unsafe { @ptrCast([*]const vk.GraphicsPipelineCreateInfo, &info) }, null, unsafe { @ptrCast([*]vk.Pipeline, &made) })
+    gave(20, "vkCreateGraphicsPipelines", result)
+    vk.destroyShaderModule(&deviceCommands, device, stages[0].module, null)
+    vk.destroyShaderModule(&deviceCommands, device, stages[1].module, null)
+    return made
+}
+
+// ---------------------------------------------------------------------------
+// A frame
+
+pub const Frame = struct {
+    pipeline: vk.Pipeline
+    // The vertices (x, y, r, g, b each), indices of 16 or 32 bits (0:
+    // none), their count, the draw's count.
+    vertices: [80]f32
+    vertexCount: u32
+    indices: [16]u32
+    indexCount: u32
+    wide: bool
+    // The clear colour; a vkCmdClearAttachments rectangle after the draw
+    // (width 0: none) and its colour.
+    clearColour: [4]f32
+    rect: vk.Rect2D
+    rectColour: [4]f32
+    // A render pass and framebuffer instead of dynamic rendering.
+    pass: vk.RenderPass
+    framebuffer: vk.Framebuffer
+    // Push constants (the matrix and the scale of `transformed`).
+    push: [17]f32
+    // The barrier before the copy, its source access.
+    barrier: bool
+    sourceAccess: u32
+    // The draw's firstVertex (no indices), firstIndex and vertexOffset
+    // (indices); `twice`: the indexed draw, a draw without indices of the
+    // first three vertices, and the indexed draw again, in one command
+    // buffer.
+    firstVertex: u32
+    firstIndex: u32
+    vertexOffset: i32
+    twice: bool
+}
+
+pub fn frame() -> Frame {
+    var f: Frame = undefined
+    f.pipeline = 0
+    f.vertexCount = 0
+    f.indexCount = 0
+    f.wide = false
+    f.clearColour = [4]f32{ 0.0, 0.0, 0.0, 1.0 }
+    f.rect = vk.Rect2D.init()
+    f.rectColour = [4]f32{ 0.0, 0.0, 0.0, 0.0 }
+    f.pass = 0
+    f.framebuffer = 0
+    f.barrier = true
+    f.sourceAccess = vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+    f.firstVertex = 0
+    f.firstIndex = 0
+    f.vertexOffset = 0
+    f.twice = false
+    var k: usize = 0
+    while k < 17 {
+        f.push[k] = if k == 0 || k == 5 || k == 10 || k == 15 || k == 16 { 1.0 } else { 0.0 }
+        k += 1
+    }
+    return f
+}
+
+pub fn vertex(f: *Frame, x: f32, y: f32, r: f32, g: f32, b: f32) -> void {
+    const at = 5 * @intCast(usize, f.*.vertexCount)
+    f.*.vertices[at] = x
+    f.*.vertices[at + 1] = y
+    f.*.vertices[at + 2] = r
+    f.*.vertices[at + 3] = g
+    f.*.vertices[at + 4] = b
+    f.*.vertexCount += 1
+}
+
+fn imageBarrier(sourceStages: u32, targetStages: u32, sourceAccess: u32, targetAccess: u32) -> void {
+    var b = vk.ImageMemoryBarrier.init()
+    b.srcAccessMask = sourceAccess
+    b.dstAccessMask = targetAccess
+    b.oldLayout = vk.ImageLayout.colorAttachmentOptimal
+    b.newLayout = vk.ImageLayout.transferSrcOptimal
+    b.srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED
+    b.image = image
+    b.subresourceRange.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    b.subresourceRange.levelCount = 1
+    b.subresourceRange.layerCount = 1
+    vk.cmdPipelineBarrier(&deviceCommands, commandBuffer, sourceStages, targetStages, 0, 0, null, 0, null, 1, unsafe { @ptrCast([*]const vk.ImageMemoryBarrier, &b) })
+}
+
+// Records and submits the frame, waits: the submit's result.
+pub fn render(f: *const Frame) -> vk.Result {
+    device_copyWords(vertexBytes, @intFromPtr(&f.*.vertices), 5 * @intCast(usize, f.*.vertexCount))
+    if f.*.wide {
+        device_copyWords(indexBytes, @intFromPtr(&f.*.indices), @intCast(usize, f.*.indexCount))
+    } else {
+        const halves: [*]u16 = unsafe { @ptrFromInt([*]u16, indexBytes) }
+        var k: usize = 0
+        while k < @intCast(usize, f.*.indexCount) {
+            halves[k] = @intCast(u16, f.*.indices[k])
+            k += 1
+        }
+    }
+    var begin = vk.CommandBufferBeginInfo.init()
+    _ = vk.beginCommandBuffer(&deviceCommands, commandBuffer, &begin)
+    var area = vk.Rect2D.init()
+    area.extent.width = SIZE
+    area.extent.height = SIZE
+    var clearValue = vk.ClearValue.init()
+    clearValue.color.float32 = f.*.clearColour
+    if f.*.pass != 0 {
+        var info = vk.RenderPassBeginInfo.init()
+        info.renderPass = f.*.pass
+        info.framebuffer = f.*.framebuffer
+        info.renderArea = area
+        info.clearValueCount = 1
+        info.pClearValues = unsafe { @ptrCast([*]const vk.ClearValue, &clearValue) }
+        vk.cmdBeginRenderPass(&deviceCommands, commandBuffer, &info, vk.SubpassContents.inline_)
+    } else {
+        var target = vk.RenderingAttachmentInfo.init()
+        target.imageView = view
+        target.imageLayout = vk.ImageLayout.colorAttachmentOptimal
+        target.loadOp = vk.AttachmentLoadOp.clear
+        target.storeOp = vk.AttachmentStoreOp.store
+        target.clearValue = clearValue
+        var info = vk.RenderingInfo.init()
+        info.renderArea = area
+        info.layerCount = 1
+        info.colorAttachmentCount = 1
+        info.pColorAttachments = unsafe { @ptrCast([*]const vk.RenderingAttachmentInfo, &target) }
+        vk.cmdBeginRendering(&deviceCommands, commandBuffer, &info)
+    }
+    if f.*.pipeline != 0 {
+        vk.cmdBindPipeline(&deviceCommands, commandBuffer, vk.PipelineBindPoint.graphics, f.*.pipeline)
+        const offset: vk.DeviceSize = 0
+        vk.cmdBindVertexBuffers(&deviceCommands, commandBuffer, 0, 1, unsafe { @ptrCast([*]const vk.Buffer, &vertexBuffer) }, unsafe { @ptrCast([*]const vk.DeviceSize, &offset) })
+        var viewport = vk.Viewport.init()
+        viewport.width = @floatFromInt(f32, SIZE)
+        viewport.height = @floatFromInt(f32, SIZE)
+        viewport.maxDepth = 1.0
+        vk.cmdSetViewport(&deviceCommands, commandBuffer, 0, 1, unsafe { @ptrCast([*]const vk.Viewport, &viewport) })
+        vk.cmdSetScissor(&deviceCommands, commandBuffer, 0, 1, unsafe { @ptrCast([*]const vk.Rect2D, &area) })
+        vk.cmdPushConstants(&deviceCommands, commandBuffer, layout, vk.SHADER_STAGE_VERTEX_BIT, 0, 68, unsafe { @ptrCast(*const anyopaque, &f.*.push) })
+        if f.*.indexCount > 0 {
+            vk.cmdBindIndexBuffer(&deviceCommands, commandBuffer, indexBuffer, 0, if f.*.wide { vk.IndexType.uint32 } else { vk.IndexType.uint16 })
+            vk.cmdDrawIndexed(&deviceCommands, commandBuffer, f.*.indexCount - f.*.firstIndex, 1, f.*.firstIndex, f.*.vertexOffset, 0)
+            if f.*.twice {
+                vk.cmdDraw(&deviceCommands, commandBuffer, 3, 1, 0, 0)
+                vk.cmdDrawIndexed(&deviceCommands, commandBuffer, f.*.indexCount - f.*.firstIndex, 1, f.*.firstIndex, f.*.vertexOffset, 0)
+            }
+        } else {
+            vk.cmdDraw(&deviceCommands, commandBuffer, f.*.vertexCount - f.*.firstVertex, 1, f.*.firstVertex, 0)
+        }
+    }
+    if f.*.rect.extent.width != 0 {
+        var a = vk.ClearAttachment.init()
+        a.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+        a.colorAttachment = 0
+        a.clearValue.color.float32 = f.*.rectColour
+        var r = vk.ClearRect.init()
+        r.rect = f.*.rect
+        r.layerCount = 1
+        vk.cmdClearAttachments(&deviceCommands, commandBuffer, 1, unsafe { @ptrCast([*]const vk.ClearAttachment, &a) }, 1, unsafe { @ptrCast([*]const vk.ClearRect, &r) })
+    }
+    if f.*.pass != 0 {
+        vk.cmdEndRenderPass(&deviceCommands, commandBuffer)
+    } else {
+        vk.cmdEndRendering(&deviceCommands, commandBuffer)
+    }
+    if f.*.barrier { imageBarrier(vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, f.*.sourceAccess, vk.ACCESS_TRANSFER_READ_BIT) }
+    var region = vk.BufferImageCopy.init()
+    region.imageSubresource.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    region.imageSubresource.layerCount = 1
+    region.imageExtent.width = SIZE
+    region.imageExtent.height = SIZE
+    region.imageExtent.depth = 1
+    vk.cmdCopyImageToBuffer(&deviceCommands, commandBuffer, image, vk.ImageLayout.transferSrcOptimal, readBuffer, 1, unsafe { @ptrCast([*]const vk.BufferImageCopy, &region) })
+    var toHost = vk.MemoryBarrier.init()
+    toHost.srcAccessMask = vk.ACCESS_TRANSFER_WRITE_BIT
+    toHost.dstAccessMask = vk.ACCESS_HOST_READ_BIT
+    vk.cmdPipelineBarrier(&deviceCommands, commandBuffer, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.PIPELINE_STAGE_HOST_BIT, 0, 1, unsafe { @ptrCast([*]const vk.MemoryBarrier, &toHost) }, 0, null, 0, null)
+    const ended = vk.endCommandBuffer(&deviceCommands, commandBuffer)
+    if ended != vk.Result.success { return ended }
+    var submit = vk.SubmitInfo.init()
+    submit.commandBufferCount = 1
+    submit.pCommandBuffers = unsafe { @ptrCast([*]const vk.CommandBuffer, &commandBuffer) }
+    _ = vk.resetFences(&deviceCommands, device, 1, unsafe { @ptrCast([*]const vk.Fence, &fence) })
+    const result = vk.queueSubmit(&deviceCommands, graphicsQueue, 1, unsafe { @ptrCast([*]const vk.SubmitInfo, &submit) }, fence)
+    if result != vk.Result.success { return result }
+    return vk.waitForFences(&deviceCommands, device, 1, unsafe { @ptrCast([*]const vk.Fence, &fence) }, vk.TRUE, 1000000000)
+}
+
+fn device_copyWords(to: usize, from: usize, count: usize) -> void {
+    const target: [*]u32 = unsafe { @ptrFromInt([*]u32, to) }
+    const source: [*]const u32 = unsafe { @ptrFromInt([*]const u32, from) }
+    var k: usize = 0
+    while k < count {
+        target[k] = source[k]
+        k += 1
+    }
+}
+
+// The reference's draw of the frame's vertices (w 1, z 0).
+pub fn referenceOf(f: *const Frame, strip: bool, cull: u32, clockwise: bool, flat: bool, additive: bool) -> void {
+    var d: reference.Draw = undefined
+    d.count = 0
+    const count = if f.*.indexCount > 0 { f.*.indexCount } else { f.*.vertexCount }
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const v = if f.*.indexCount > 0 { @intCast(usize, f.*.indices[k]) } else { k }
+        d.vertices[k] = reference.Vertex.{ .x = @floatCast(f64, f.*.vertices[5 * v]), .y = @floatCast(f64, f.*.vertices[5 * v + 1]), .z = 0.0, .w = 1.0, .r = @floatCast(f64, f.*.vertices[5 * v + 2]), .g = @floatCast(f64, f.*.vertices[5 * v + 3]), .b = @floatCast(f64, f.*.vertices[5 * v + 4]) }
+        k += 1
+    }
+    d.count = @intCast(usize, count)
+    d.strip = strip
+    d.cull = cull
+    d.clockwise = clockwise
+    d.flat = flat
+    d.additive = additive
+    d.vx = 0.0
+    d.vy = 0.0
+    d.vw = @floatFromInt(f64, SIZE)
+    d.vh = @floatFromInt(f64, SIZE)
+    reference.draw(&d)
+}
+
+fn byteOf(c: f32) -> u32 {
+    const scaled = @floatCast(f64, c) * 255.0
+    var n = @intFromFloat(u32, @floor(scaled))
+    if scaled - @floor(scaled) >= 0.5 { n += 1 }
+    return n
+}
+
+// The read-back against the reference, pixel for pixel: the same pixels
+// covered (a pixel's colour other than the clear's where the reference
+// has the triangle's), each component within `tolerance`. `swapped`:
+// B8G8R8A8's bytes.
+pub var worst: u32 = 0 // (per run)
+pub var differing: usize = 0 // (per run)
+
+pub fn matches(tolerance: u32, swapped: bool) -> bool {
+    const bytes: [*]const u8 = unsafe { @ptrFromInt([*]const u8, readBytes) }
+    worst = 0
+    differing = 0
+    var p: usize = 0
+    while p < @intCast(usize, SIZE * SIZE) {
+        var c: usize = 0
+        while c < 4 {
+            const channel = if swapped && c == 0 { 2 } else if swapped && c == 2 { 0 } else { c }
+            const got = @intCast(u32, bytes[4 * p + channel])
+            const wanted = reference.pixels[4 * p + c]
+            const difference = if got > wanted { got - wanted } else { wanted - got }
+            if difference > worst { worst = difference }
+            if difference > tolerance { differing += 1 }
+            c += 1
+        }
+        p += 1
+    }
+    return differing == 0
+}
+
+pub fn coveredCount() -> usize {
+    var n: usize = 0
+    var p: usize = 0
+    while p < @intCast(usize, SIZE * SIZE) {
+        if reference.covered[p] > 0 { n += 1 }
+        p += 1
+    }
+    return n
+}
+
+pub fn mostCovered() -> u32 {
+    var n: u32 = 0
+    var p: usize = 0
+    while p < @intCast(usize, SIZE * SIZE) {
+        if reference.covered[p] > n { n = reference.covered[p] }
+        p += 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------------------------
+// The device and its queries
+
+fn testDevice() -> void {
+    // A card without a graphics ring: as stage (b), and as brixOS now.
+    card(false)
+    makeInstance()
+    var count: u32 = 0
+    vk.getPhysicalDeviceQueueFamilyProperties(&instanceCommands, physical, &count, null)
+    check(1, count == 1)
+    var extensions: u32 = 9
+    gave(2, "vkEnumerateDeviceExtensionProperties", vk.enumerateDeviceExtensionProperties(&instanceCommands, physical, null, &extensions, null))
+    check(3, extensions == 0)
+    var properties = vk.FormatProperties.init()
+    vk.getPhysicalDeviceFormatProperties(&instanceCommands, physical, vk.Format.r8g8b8a8Unorm, &properties)
+    check(4, properties.linearTilingFeatures == 0 && properties.optimalTilingFeatures == 0 && properties.bufferFeatures == 0)
+    check(5, makeDevice(0, 3) == vk.Result.errorExtensionNotPresent)
+    dropDevice()
+    // With a graphics ring.
+    card(true)
+    makeInstance()
+    vk.getPhysicalDeviceQueueFamilyProperties(&instanceCommands, physical, &count, null)
+    var families: [2]vk.QueueFamilyProperties = undefined
+    count = 2
+    vk.getPhysicalDeviceQueueFamilyProperties(&instanceCommands, physical, &count, &families)
+    check(6, count == 2 && families[0].queueFlags == (vk.QUEUE_COMPUTE_BIT | vk.QUEUE_TRANSFER_BIT) && families[1].queueFlags == (vk.QUEUE_GRAPHICS_BIT | vk.QUEUE_COMPUTE_BIT | vk.QUEUE_TRANSFER_BIT) && families[1].queueCount == 1)
+    var names: [3]vk.ExtensionProperties = undefined
+    extensions = 3
+    gave(7, "vkEnumerateDeviceExtensionProperties", vk.enumerateDeviceExtensionProperties(&instanceCommands, physical, null, &extensions, &names))
+    check(8, extensions == 3 && equal(names[2].extensionName[0..24], "VK_KHR_dynamic_rendering") && names[2].specVersion == 1)
+    vk.getPhysicalDeviceFormatProperties(&instanceCommands, physical, vk.Format.r8g8b8a8Unorm, &properties)
+    check(9, properties.linearTilingFeatures == driver.COLOUR_FEATURES && properties.optimalTilingFeatures == 0 && properties.bufferFeatures == 0)
+    vk.getPhysicalDeviceFormatProperties(&instanceCommands, physical, vk.Format.r32g32b32Sfloat, &properties)
+    check(15, properties.bufferFeatures == vk.FORMAT_FEATURE_VERTEX_BUFFER_BIT && properties.linearTilingFeatures == 0)
+    var imageProperties = vk.ImageFormatProperties.init()
+    var result = vk.getPhysicalDeviceImageFormatProperties(&instanceCommands, physical, vk.Format.b8g8r8a8Unorm, vk.ImageType.type2d, vk.ImageTiling.linear, vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &imageProperties)
+    gave(16, "vkGetPhysicalDeviceImageFormatProperties", result)
+    check(17, result == vk.Result.success && imageProperties.maxExtent.width == 16384 && imageProperties.maxMipLevels == 1 && imageProperties.sampleCounts == vk.SAMPLE_COUNT_1_BIT)
+    result = vk.getPhysicalDeviceImageFormatProperties(&instanceCommands, physical, vk.Format.r8g8b8a8Unorm, vk.ImageType.type2d, vk.ImageTiling.optimal, vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &imageProperties)
+    gave(18, "vkGetPhysicalDeviceImageFormatProperties", result)
+    check(19, result == vk.Result.errorFormatNotSupported)
+    result = makeDevice(1, 3)
+    gave(21, "vkCreateDevice", result)
+    check(22, result == vk.Result.success && graphicsQueue != 0 && deviceCommands.vkCmdBeginRendering != 0 && deviceCommands.vkCreateRenderPass2 != 0)
+}
+
+// ---------------------------------------------------------------------------
+// The pixels
+
+fn testPixels() -> void {
+    var range = vk.PushConstantRange.init()
+    range.stageFlags = vk.SHADER_STAGE_VERTEX_BIT
+    range.size = 68
+    var layoutInfo = vk.PipelineLayoutCreateInfo.init()
+    layoutInfo.pushConstantRangeCount = 1
+    layoutInfo.pPushConstantRanges = unsafe { @ptrCast([*]const vk.PushConstantRange, &range) }
+    _ = vk.createPipelineLayout(&deviceCommands, device, &layoutInfo, null, &layout)
+    check(23, makeTarget(vk.Format.r8g8b8a8Unorm))
+    check(24, makeBuffer(@intCast(u64, SIZE * SIZE * 4), vk.BUFFER_USAGE_TRANSFER_DST_BIT, &readBuffer, &readMemory, &readBytes))
+    check(25, makeBuffer(4096, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT, &vertexBuffer, &vertexMemory, &vertexBytes))
+    check(26, makeBuffer(4096, vk.BUFFER_USAGE_INDEX_BUFFER_BIT, &indexBuffer, &indexMemory, &indexBytes))
+    var poolInfo = vk.CommandPoolCreateInfo.init()
+    poolInfo.queueFamilyIndex = 1
+    _ = vk.createCommandPool(&deviceCommands, device, &poolInfo, null, &pool)
+    var allocation = vk.CommandBufferAllocateInfo.init()
+    allocation.commandPool = pool
+    allocation.level = vk.CommandBufferLevel.primary
+    allocation.commandBufferCount = 1
+    _ = vk.allocateCommandBuffers(&deviceCommands, device, &allocation, unsafe { @ptrCast([*]vk.CommandBuffer, &commandBuffer) })
+    var fenceInfo = vk.FenceCreateInfo.init()
+    _ = vk.createFence(&deviceCommands, device, &fenceInfo, null, &fence)
+    // The triangle, a colour for each vertex, without indices.
+    var o = options()
+    const plain = makePipeline(o)
+    check(27, plain != 0)
+    var f = frame()
+    f.pipeline = plain
+    vertex(&f, -0.75, 0.8, 1.0, 0.0, 0.0)
+    vertex(&f, 0.9, 0.6, 0.0, 1.0, 0.0)
+    vertex(&f, -0.1, -0.85, 0.0, 0.0, 1.0)
+    var result = render(&f)
+    gave(28, "vkWaitForFences", result)
+    check(29, result == vk.Result.success)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    referenceOf(&f, false, 0, false, false, false)
+    check(30, matches(1, false) && coveredCount() > 200)
+    // The same with 16-bit and 32-bit indices.
+    f.indices[0] = 0
+    f.indices[1] = 1
+    f.indices[2] = 2
+    f.indexCount = 3
+    result = render(&f)
+    check(31, result == vk.Result.success && matches(1, false))
+    f.wide = true
+    result = render(&f)
+    check(32, result == vk.Result.success && matches(1, false))
+    // A quad of two triangles with indices (a list), its shared edge's
+    // pixels covered once: added (ONE, ONE) to a dark clear, never twice.
+    o.additive = true
+    const added = makePipeline(o)
+    f = frame()
+    f.pipeline = added
+    f.clearColour = [4]f32{ 0.0, 0.0, 0.0, 0.0 }
+    vertex(&f, -0.8, -0.7, 0.25, 0.25, 0.25)
+    vertex(&f, 0.7, -0.8, 0.25, 0.25, 0.25)
+    vertex(&f, 0.8, 0.75, 0.25, 0.25, 0.25)
+    vertex(&f, -0.75, 0.8, 0.25, 0.25, 0.25)
+    const quad = [6]u32{ 0, 1, 2, 0, 2, 3 }
+    var k: usize = 0
+    while k < 6 {
+        f.indices[k] = quad[k]
+        k += 1
+    }
+    f.indexCount = 6
+    result = render(&f)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 0)
+    referenceOf(&f, false, 0, false, false, true)
+    check(33, result == vk.Result.success && mostCovered() == 1 && matches(0, false) && coveredCount() > 500)
+    if show {
+        say("quad: worst ")
+        sayNumber(@intCast(u64, worst))
+        say(" differing ")
+        sayNumber(@intCast(u64, differing))
+        say(" covered ")
+        sayNumber(@intCast(u64, coveredCount()))
+        say(" most ")
+        sayNumber(@intCast(u64, mostCovered()))
+        say("\n")
+    }
+    // The same quad as a strip of four without indices.
+    o.strip = true
+    const strip = makePipeline(o)
+    f.pipeline = strip
+    f.indexCount = 0
+    f.vertexCount = 0
+    vertex(&f, -0.8, -0.7, 0.25, 0.25, 0.25)
+    vertex(&f, 0.7, -0.8, 0.25, 0.25, 0.25)
+    vertex(&f, -0.75, 0.8, 0.25, 0.25, 0.25)
+    vertex(&f, 0.8, 0.75, 0.25, 0.25, 0.25)
+    result = render(&f)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 0)
+    referenceOf(&f, true, 0, false, false, true)
+    check(34, result == vk.Result.success && mostCovered() == 1 && matches(0, false))
+    // Culled and not, back faces culled: the triangle above is counter-
+    // clockwise on the screen (its area a > 0: x right, y down), so a front
+    // face with VK_FRONT_FACE_COUNTER_CLOCKWISE (drawn) and a back face with
+    // VK_FRONT_FACE_CLOCKWISE (culled).
+    o = options()
+    o.cull = vk.CULL_MODE_BACK_BIT
+    const culling = makePipeline(o)
+    f = frame()
+    f.pipeline = culling
+    vertex(&f, -0.75, 0.8, 1.0, 0.0, 0.0)
+    vertex(&f, 0.9, 0.6, 0.0, 1.0, 0.0)
+    vertex(&f, -0.1, -0.85, 0.0, 0.0, 1.0)
+    result = render(&f)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    referenceOf(&f, false, vk.CULL_MODE_BACK_BIT, false, false, false)
+    check(35, result == vk.Result.success && coveredCount() > 200 && matches(1, false))
+    o.clockwise = true
+    const clockwise = makePipeline(o)
+    f.pipeline = clockwise
+    result = render(&f)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    referenceOf(&f, false, vk.CULL_MODE_BACK_BIT, true, false, false)
+    check(36, result == vk.Result.success && coveredCount() == 0 && matches(0, false))
+    // Flat: the provoking (first) vertex's colour, exactly.
+    o = options()
+    o.fragment = triangle.Kind.flat
+    const flat = makePipeline(o)
+    f.pipeline = flat
+    result = render(&f)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    referenceOf(&f, false, 0, false, true, false)
+    check(37, result == vk.Result.success && matches(0, false))
+    // Through a matrix: half the size, moved right by a quarter.
+    o = options()
+    o.vertex = triangle.Kind.transformed
+    const transformed = makePipeline(o)
+    f.pipeline = transformed
+    f.push[0] = 0.5
+    f.push[5] = 0.5
+    f.push[12] = 0.25
+    result = render(&f)
+    var moved = f
+    k = 0
+    while k < 3 {
+        moved.vertices[5 * k] = f.vertices[5 * k] * 0.5 + 0.25
+        moved.vertices[5 * k + 1] = f.vertices[5 * k + 1] * 0.5
+        k += 1
+    }
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    referenceOf(&moved, false, 0, false, false, false)
+    check(38, result == vk.Result.success && matches(1, false) && coveredCount() > 40)
+    // The clears: the load operation's colour, and a rectangle cleared.
+    f = frame()
+    f.clearColour = [4]f32{ 0.2, 0.4, 0.6, 0.8 }
+    f.rect.offset.x = 5
+    f.rect.offset.y = 7
+    f.rect.extent.width = 11
+    f.rect.extent.height = 9
+    f.rectColour = [4]f32{ 1.0, 0.5, 0.0, 1.0 }
+    result = render(&f)
+    reference.clear(SIDE, SIDE, byteOf(0.2), byteOf(0.4), byteOf(0.6), byteOf(0.8))
+    var y: usize = 7
+    while y < 16 {
+        var x: usize = 5
+        while x < 16 {
+            const p = 4 * (y * @intCast(usize, SIZE) + x)
+            reference.pixels[p] = 255
+            reference.pixels[p + 1] = byteOf(0.5)
+            reference.pixels[p + 2] = 0
+            reference.pixels[p + 3] = 255
+            x += 1
+        }
+        y += 1
+    }
+    check(39, result == vk.Result.success && matches(0, false))
+    // A render pass and framebuffer: the triangle's pixels again.
+    var attachment = vk.AttachmentDescription.init()
+    attachment.format = vk.Format.r8g8b8a8Unorm
+    attachment.samples = vk.SAMPLE_COUNT_1_BIT
+    attachment.loadOp = vk.AttachmentLoadOp.clear
+    attachment.storeOp = vk.AttachmentStoreOp.store
+    attachment.finalLayout = vk.ImageLayout.transferSrcOptimal
+    var reference_ = vk.AttachmentReference.init()
+    reference_.attachment = 0
+    reference_.layout = vk.ImageLayout.colorAttachmentOptimal
+    var subpass = vk.SubpassDescription.init()
+    subpass.pipelineBindPoint = vk.PipelineBindPoint.graphics
+    subpass.colorAttachmentCount = 1
+    subpass.pColorAttachments = unsafe { @ptrCast([*]const vk.AttachmentReference, &reference_) }
+    var passInfo = vk.RenderPassCreateInfo.init()
+    passInfo.attachmentCount = 1
+    passInfo.pAttachments = unsafe { @ptrCast([*]const vk.AttachmentDescription, &attachment) }
+    passInfo.subpassCount = 1
+    passInfo.pSubpasses = unsafe { @ptrCast([*]const vk.SubpassDescription, &subpass) }
+    var pass: vk.RenderPass = 0
+    result = vk.createRenderPass(&deviceCommands, device, &passInfo, null, &pass)
+    gave(40, "vkCreateRenderPass", result)
+    var framebufferInfo = vk.FramebufferCreateInfo.init()
+    framebufferInfo.renderPass = pass
+    framebufferInfo.attachmentCount = 1
+    framebufferInfo.pAttachments = unsafe { @ptrCast([*]const vk.ImageView, &view) }
+    framebufferInfo.width = SIZE
+    framebufferInfo.height = SIZE
+    framebufferInfo.layers = 1
+    var framebuffer: vk.Framebuffer = 0
+    result = vk.createFramebuffer(&deviceCommands, device, &framebufferInfo, null, &framebuffer)
+    gave(41, "vkCreateFramebuffer", result)
+    o = options()
+    o.pass = pass
+    const passPipeline = makePipeline(o)
+    f = frame()
+    f.pipeline = passPipeline
+    f.pass = pass
+    f.framebuffer = framebuffer
+    vertex(&f, -0.75, 0.8, 1.0, 0.0, 0.0)
+    vertex(&f, 0.9, 0.6, 0.0, 1.0, 0.0)
+    vertex(&f, -0.1, -0.85, 0.0, 0.0, 1.0)
+    result = render(&f)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    referenceOf(&f, false, 0, false, false, false)
+    check(42, result == vk.Result.success && matches(1, false))
+    // The render pass's end applies the implicit dependency to VK_SUBPASS_
+    // EXTERNAL that Mesa's runtime gives every render pass (vk_render_
+    // pass.c: ALL_COMMANDS, the colour attachment's writes): the colour
+    // block flushed there, a barrier that only waits (no source access)
+    // gives the copy the pixels.
+    f.sourceAccess = 0
+    result = render(&f)
+    check(63, result == vk.Result.success && matches(1, false))
+    // Dynamic rendering has no such dependency: the copy without the
+    // barrier finds the colour block still holding the pixels, the host
+    // card refuses the copy engine's read.
+    f.pass = 0
+    f.framebuffer = 0
+    f.pipeline = plain
+    f.sourceAccess = vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+    f.barrier = false
+    result = render(&f)
+    check(43, result == vk.Result.errorDeviceLost && host.report().*.failure == run.Failure.memory && host.report().*.cacheFailure == cache.Failure.unflushed)
+    vk.destroyFramebuffer(&deviceCommands, device, framebuffer, null)
+    vk.destroyRenderPass(&deviceCommands, device, pass, null)
+    const pipelines = [9]vk.Pipeline{ plain, added, strip, culling, clockwise, flat, transformed, passPipeline, 0 }
+    k = 0
+    while k < 8 {
+        vk.destroyPipeline(&deviceCommands, device, pipelines[k], null)
+        k += 1
+    }
+}
+
+// B8G8R8A8: the same triangle, its bytes blue, green, red, alpha.
+fn testSwapped() -> void {
+    dropDevice()
+    card(true)
+    makeInstance()
+    check(44, makeDevice(1, 3) == vk.Result.success)
+    var layoutInfo = layoutInfoOf()
+    _ = vk.createPipelineLayout(&deviceCommands, device, &layoutInfo, null, &layout)
+    check(45, makeTarget(vk.Format.b8g8r8a8Unorm))
+    check(46, makeBuffer(@intCast(u64, SIZE * SIZE * 4), vk.BUFFER_USAGE_TRANSFER_DST_BIT, &readBuffer, &readMemory, &readBytes) && makeBuffer(4096, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT, &vertexBuffer, &vertexMemory, &vertexBytes) && makeBuffer(4096, vk.BUFFER_USAGE_INDEX_BUFFER_BIT, &indexBuffer, &indexMemory, &indexBytes))
+    var poolInfo = vk.CommandPoolCreateInfo.init()
+    poolInfo.queueFamilyIndex = 1
+    _ = vk.createCommandPool(&deviceCommands, device, &poolInfo, null, &pool)
+    var allocation = vk.CommandBufferAllocateInfo.init()
+    allocation.commandPool = pool
+    allocation.level = vk.CommandBufferLevel.primary
+    allocation.commandBufferCount = 1
+    _ = vk.allocateCommandBuffers(&deviceCommands, device, &allocation, unsafe { @ptrCast([*]vk.CommandBuffer, &commandBuffer) })
+    var fenceInfo = vk.FenceCreateInfo.init()
+    _ = vk.createFence(&deviceCommands, device, &fenceInfo, null, &fence)
+    var o = options()
+    o.format = vk.Format.b8g8r8a8Unorm
+    var f = frame()
+    f.pipeline = makePipeline(o)
+    vertex(&f, -0.75, 0.8, 1.0, 0.0, 0.0)
+    vertex(&f, 0.9, 0.6, 0.0, 1.0, 0.0)
+    vertex(&f, -0.1, -0.85, 0.0, 0.0, 1.0)
+    const result = render(&f)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    referenceOf(&f, false, 0, false, false, false)
+    check(47, result == vk.Result.success && matches(1, true))
+}
+
+var pushRange: vk.PushConstantRange = undefined
+
+pub fn layoutInfoOf() -> vk.PipelineLayoutCreateInfo {
+    pushRange = vk.PushConstantRange.init()
+    pushRange.stageFlags = vk.SHADER_STAGE_VERTEX_BIT
+    pushRange.size = 68
+    var info = vk.PipelineLayoutCreateInfo.init()
+    info.pushConstantRangeCount = 1
+    info.pPushConstantRanges = unsafe { @ptrCast([*]const vk.PushConstantRange, &pushRange) }
+    return info
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan 1.1's commands
+
+fn testVersion11() -> void {
+    var queueInfo = vk.DeviceQueueInfo2.init()
+    queueInfo.queueFamilyIndex = 1
+    var second: vk.Queue = 0
+    vk.getDeviceQueue2(&deviceCommands, device, &queueInfo, &second)
+    check(50, second == graphicsQueue)
+    // A buffer and an image bound by the ...2 forms, their needs asked so.
+    var info = vk.BufferCreateInfo.init()
+    info.size = 100
+    info.usage = vk.BUFFER_USAGE_VERTEX_BUFFER_BIT
+    var buffer: vk.Buffer = 0
+    _ = vk.createBuffer(&deviceCommands, device, &info, null, &buffer)
+    var needs = vk.BufferMemoryRequirementsInfo2.init()
+    needs.buffer = buffer
+    var dedicated = vk.MemoryDedicatedRequirements.init()
+    dedicated.prefersDedicatedAllocation = vk.TRUE
+    dedicated.requiresDedicatedAllocation = vk.TRUE
+    var requirements = vk.MemoryRequirements2.init()
+    requirements.pNext = unsafe { @ptrCast(*anyopaque, &dedicated) }
+    vk.getBufferMemoryRequirements2(&deviceCommands, device, &needs, &requirements)
+    check(51, requirements.memoryRequirements.size == 112 && requirements.memoryRequirements.alignment == 16 && dedicated.prefersDedicatedAllocation == vk.FALSE && dedicated.requiresDedicatedAllocation == vk.FALSE)
+    var allocation = vk.MemoryAllocateInfo.init()
+    allocation.allocationSize = 65536
+    allocation.memoryTypeIndex = hostVisible()
+    var memory: vk.DeviceMemory = 0
+    _ = vk.allocateMemory(&deviceCommands, device, &allocation, null, &memory)
+    var bind = vk.BindBufferMemoryInfo.init()
+    bind.buffer = buffer
+    bind.memory = memory
+    bind.memoryOffset = 4096
+    var result = vk.bindBufferMemory2(&deviceCommands, device, 1, unsafe { @ptrCast([*]const vk.BindBufferMemoryInfo, &bind) })
+    gave(52, "vkBindBufferMemory2", result)
+    check(53, result == vk.Result.success)
+    var imageNeeds = vk.ImageMemoryRequirementsInfo2.init()
+    imageNeeds.image = image
+    vk.getImageMemoryRequirements2(&deviceCommands, device, &imageNeeds, &requirements)
+    check(54, requirements.memoryRequirements.size == @intCast(u64, SIZE * SIZE * 4) && requirements.memoryRequirements.alignment == 256)
+    var imageBind = vk.BindImageMemoryInfo.init()
+    imageBind.image = image
+    imageBind.memory = memory
+    imageBind.memoryOffset = 8192
+    result = vk.bindImageMemory2(&deviceCommands, device, 1, unsafe { @ptrCast([*]const vk.BindImageMemoryInfo, &imageBind) })
+    gave(55, "vkBindImageMemory2", result)
+    check(56, result == vk.Result.success)
+    vk.trimCommandPool(&deviceCommands, device, pool, 0)
+    // The set layouts the stage makes, and one it does not.
+    var bindings: [2]vk.DescriptorSetLayoutBinding = undefined
+    bindings[0] = vk.DescriptorSetLayoutBinding.init()
+    bindings[0].binding = 0
+    bindings[0].descriptorType = vk.DescriptorType.storageBuffer
+    bindings[0].descriptorCount = 1
+    bindings[1] = vk.DescriptorSetLayoutBinding.init()
+    bindings[1].binding = 1
+    bindings[1].descriptorType = vk.DescriptorType.uniformBuffer
+    bindings[1].descriptorCount = 1
+    var setInfo = vk.DescriptorSetLayoutCreateInfo.init()
+    setInfo.bindingCount = 2
+    setInfo.pBindings = &bindings
+    var support = vk.DescriptorSetLayoutSupport.init()
+    vk.getDescriptorSetLayoutSupport(&deviceCommands, device, &setInfo, &support)
+    check(57, support.supported == vk.TRUE)
+    bindings[1].descriptorType = vk.DescriptorType.sampledImage
+    vk.getDescriptorSetLayoutSupport(&deviceCommands, device, &setInfo, &support)
+    check(58, support.supported == vk.FALSE)
+    bindings[1].descriptorType = vk.DescriptorType.uniformBuffer
+    // A set written by a template, and one by vkUpdateDescriptorSets: the
+    // same words.
+    var setLayout: vk.DescriptorSetLayout = 0
+    _ = vk.createDescriptorSetLayout(&deviceCommands, device, &setInfo, null, &setLayout)
+    var size = vk.DescriptorPoolSize.init()
+    size.type_ = vk.DescriptorType.storageBuffer
+    size.descriptorCount = 8
+    var poolInfo = vk.DescriptorPoolCreateInfo.init()
+    poolInfo.maxSets = 2
+    poolInfo.poolSizeCount = 1
+    poolInfo.pPoolSizes = unsafe { @ptrCast([*]const vk.DescriptorPoolSize, &size) }
+    var descriptorPool: vk.DescriptorPool = 0
+    _ = vk.createDescriptorPool(&deviceCommands, device, &poolInfo, null, &descriptorPool)
+    const layouts = [2]vk.DescriptorSetLayout{ setLayout, setLayout }
+    var setAllocation = vk.DescriptorSetAllocateInfo.init()
+    setAllocation.descriptorPool = descriptorPool
+    setAllocation.descriptorSetCount = 2
+    setAllocation.pSetLayouts = &layouts
+    var sets: [2]vk.DescriptorSet = undefined
+    _ = vk.allocateDescriptorSets(&deviceCommands, device, &setAllocation, &sets)
+    var infos: [2]vk.DescriptorBufferInfo = undefined
+    infos[0] = vk.DescriptorBufferInfo.init()
+    infos[0].buffer = buffer
+    infos[0].offset = 16
+    infos[0].range = 48
+    infos[1] = vk.DescriptorBufferInfo.init()
+    infos[1].buffer = buffer
+    infos[1].offset = 0
+    infos[1].range = vk.WHOLE_SIZE
+    var write = vk.WriteDescriptorSet.init()
+    write.dstSet = sets[0]
+    write.dstBinding = 0
+    write.descriptorCount = 2
+    write.descriptorType = vk.DescriptorType.storageBuffer
+    write.pBufferInfo = &infos
+    vk.updateDescriptorSets(&deviceCommands, device, 1, unsafe { @ptrCast([*]const vk.WriteDescriptorSet, &write) }, 0, null)
+    var entry = vk.DescriptorUpdateTemplateEntry.init()
+    entry.dstBinding = 0
+    entry.descriptorCount = 2
+    entry.descriptorType = vk.DescriptorType.storageBuffer
+    entry.offset = 0
+    entry.stride = @sizeOf(vk.DescriptorBufferInfo)
+    var templateInfo = vk.DescriptorUpdateTemplateCreateInfo.init()
+    templateInfo.descriptorUpdateEntryCount = 1
+    templateInfo.pDescriptorUpdateEntries = unsafe { @ptrCast([*]const vk.DescriptorUpdateTemplateEntry, &entry) }
+    templateInfo.templateType = vk.DescriptorUpdateTemplateType.descriptorSet
+    templateInfo.descriptorSetLayout = setLayout
+    var template: vk.DescriptorUpdateTemplate = 0
+    result = vk.createDescriptorUpdateTemplate(&deviceCommands, device, &templateInfo, null, &template)
+    gave(59, "vkCreateDescriptorUpdateTemplate", result)
+    vk.updateDescriptorSetWithTemplate(&deviceCommands, device, sets[1], template, unsafe { @ptrCast(*const anyopaque, &infos) })
+    const first: [*]const u32 = unsafe { @ptrFromInt([*]const u32, @intCast(usize, pipelineSetBytes(sets[0]))) }
+    const second_: [*]const u32 = unsafe { @ptrFromInt([*]const u32, @intCast(usize, pipelineSetBytes(sets[1]))) }
+    var same = true
+    var k: usize = 0
+    while k < 8 {
+        if first[k] != second_[k] { same = false }
+        k += 1
+    }
+    check(60, result == vk.Result.success && same && first[0] != 0 && first[2] == 48)
+    vk.destroyDescriptorUpdateTemplate(&deviceCommands, device, template, null)
+    vk.destroyDescriptorPool(&deviceCommands, device, descriptorPool, null)
+    vk.destroyDescriptorSetLayout(&deviceCommands, device, setLayout, null)
+    // One device in the group.
+    var features: u32 = 7
+    vk.getDeviceGroupPeerMemoryFeatures(&deviceCommands, device, 0, 0, 0, &features)
+    check(61, features == 0)
+    // vkCmdSetDeviceMask writes nothing, vkCmdDispatchBase at base 0 the
+    // words of vkCmdDispatch (none here: no pipeline bound, nothing).
+    var begin = vk.CommandBufferBeginInfo.init()
+    _ = vk.beginCommandBuffer(&deviceCommands, commandBuffer, &begin)
+    const cb = commands.bufferOf(commandBuffer)
+    const before = cb.*.at
+    vk.cmdSetDeviceMask(&deviceCommands, commandBuffer, 1)
+    vk.cmdDispatchBase(&deviceCommands, commandBuffer, 0, 0, 0, 1, 1, 1)
+    check(62, cb.*.at == before)
+    _ = vk.endCommandBuffer(&deviceCommands, commandBuffer)
+    vk.destroyBuffer(&deviceCommands, device, buffer, null)
+    vk.freeMemory(&deviceCommands, device, memory, null)
+}
+
+const pipelineModule = @import("../projects/brix/vulkan/pipeline.mlx")
+
+fn pipelineSetBytes(set: vk.DescriptorSet) -> u64 { return @intCast(u64, pipelineModule.setOf(set).*.bytes) }
+
+// ---------------------------------------------------------------------------
+// The review's checks: the second reference (support/raster_rules.mlx)
+// over many triangles, and what the first cases leave out
+
+// A device on a card whose shader arrays have `perArray` compute units,
+// its target (R8G8B8A8, SIZE x SIZE), buffers, command buffer and fence.
+fn freshDevice(perArray: u32) -> bool {
+    dropDevice()
+    arrayUnits = perArray
+    card(true)
+    arrayUnits = 9
+    makeInstance()
+    if makeDevice(1, 3) != vk.Result.success { return false }
+    var layoutInfo = layoutInfoOf()
+    _ = vk.createPipelineLayout(&deviceCommands, device, &layoutInfo, null, &layout)
+    if !makeTarget(vk.Format.r8g8b8a8Unorm) { return false }
+    if !makeBuffer(@intCast(u64, SIZE * SIZE * 4), vk.BUFFER_USAGE_TRANSFER_DST_BIT, &readBuffer, &readMemory, &readBytes) { return false }
+    if !makeBuffer(4096, vk.BUFFER_USAGE_VERTEX_BUFFER_BIT, &vertexBuffer, &vertexMemory, &vertexBytes) { return false }
+    if !makeBuffer(4096, vk.BUFFER_USAGE_INDEX_BUFFER_BIT, &indexBuffer, &indexMemory, &indexBytes) { return false }
+    var poolInfo = vk.CommandPoolCreateInfo.init()
+    poolInfo.queueFamilyIndex = 1
+    _ = vk.createCommandPool(&deviceCommands, device, &poolInfo, null, &pool)
+    var allocation = vk.CommandBufferAllocateInfo.init()
+    allocation.commandPool = pool
+    allocation.level = vk.CommandBufferLevel.primary
+    allocation.commandBufferCount = 1
+    _ = vk.allocateCommandBuffers(&deviceCommands, device, &allocation, unsafe { @ptrCast([*]vk.CommandBuffer, &commandBuffer) })
+    var fenceInfo = vk.FenceCreateInfo.init()
+    _ = vk.createFence(&deviceCommands, device, &fenceInfo, null, &fence)
+    return true
+}
+
+var seed: u64 = 0x9E3779B97F4A7C15
+
+fn next() -> u64 {
+    seed ^= seed << 13
+    seed ^= seed >> 7
+    seed ^= seed << 17
+    return seed
+}
+
+// A float in [lo, hi), a multiple of 1/64; a whole number in [lo, hi).
+fn between(lo: f32, hi: f32) -> f32 { return lo + @floatFromInt(f32, next() % @intCast(u64, (hi - lo) * 64.0)) / 64.0 }
+
+fn whole(lo: i64, hi: i64) -> i64 { return lo + @intCast(i64, next() % @intCast(u64, hi - lo)) }
+
+var rulePipelines: [8]vk.Pipeline = undefined
+
+// One case of the second reference drawn: its viewport and scissor, the
+// matrix's last row in the push constants, through the pipeline of its
+// cull mode and front face.
+fn renderCase(c: *const rules.Case) -> vk.Result {
+    var f = frame()
+    f.pipeline = rulePipelines[@intCast(usize, c.*.cull) * 2 + (if c.*.clockwise { @intCast(usize, 1) } else { 0 })]
+    var k: usize = 0
+    while k < 3 {
+        vertex(&f, c.*.x[k], c.*.y[k], c.*.r[k], c.*.g[k], c.*.b[k])
+        k += 1
+    }
+    f.push[3] = c.*.wx
+    f.push[7] = c.*.wy
+    device_copyWords(vertexBytes, @intFromPtr(&f.vertices), 15)
+    var begin = vk.CommandBufferBeginInfo.init()
+    _ = vk.beginCommandBuffer(&deviceCommands, commandBuffer, &begin)
+    var area = vk.Rect2D.init()
+    area.extent.width = SIZE
+    area.extent.height = SIZE
+    var target = vk.RenderingAttachmentInfo.init()
+    target.imageView = view
+    target.imageLayout = vk.ImageLayout.colorAttachmentOptimal
+    target.loadOp = vk.AttachmentLoadOp.clear
+    target.storeOp = vk.AttachmentStoreOp.store
+    target.clearValue = vk.ClearValue.init()
+    var info = vk.RenderingInfo.init()
+    info.renderArea = area
+    info.layerCount = 1
+    info.colorAttachmentCount = 1
+    info.pColorAttachments = unsafe { @ptrCast([*]const vk.RenderingAttachmentInfo, &target) }
+    vk.cmdBeginRendering(&deviceCommands, commandBuffer, &info)
+    vk.cmdBindPipeline(&deviceCommands, commandBuffer, vk.PipelineBindPoint.graphics, f.pipeline)
+    const offset: vk.DeviceSize = 0
+    vk.cmdBindVertexBuffers(&deviceCommands, commandBuffer, 0, 1, unsafe { @ptrCast([*]const vk.Buffer, &vertexBuffer) }, unsafe { @ptrCast([*]const vk.DeviceSize, &offset) })
+    var viewport = vk.Viewport.init()
+    viewport.x = c.*.vx
+    viewport.y = c.*.vy
+    viewport.width = c.*.vw
+    viewport.height = c.*.vh
+    viewport.maxDepth = 1.0
+    vk.cmdSetViewport(&deviceCommands, commandBuffer, 0, 1, unsafe { @ptrCast([*]const vk.Viewport, &viewport) })
+    var scissor = vk.Rect2D.init()
+    scissor.offset.x = c.*.sx
+    scissor.offset.y = c.*.sy
+    scissor.extent.width = c.*.sw
+    scissor.extent.height = c.*.sh
+    vk.cmdSetScissor(&deviceCommands, commandBuffer, 0, 1, unsafe { @ptrCast([*]const vk.Rect2D, &scissor) })
+    vk.cmdPushConstants(&deviceCommands, commandBuffer, layout, vk.SHADER_STAGE_VERTEX_BIT, 0, 68, unsafe { @ptrCast(*const anyopaque, &f.push) })
+    vk.cmdDraw(&deviceCommands, commandBuffer, 3, 1, 0, 0)
+    vk.cmdEndRendering(&deviceCommands, commandBuffer)
+    imageBarrier(vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk.PIPELINE_STAGE_TRANSFER_BIT, vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, vk.ACCESS_TRANSFER_READ_BIT)
+    var region = vk.BufferImageCopy.init()
+    region.imageSubresource.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    region.imageSubresource.layerCount = 1
+    region.imageExtent.width = SIZE
+    region.imageExtent.height = SIZE
+    region.imageExtent.depth = 1
+    vk.cmdCopyImageToBuffer(&deviceCommands, commandBuffer, image, vk.ImageLayout.transferSrcOptimal, readBuffer, 1, unsafe { @ptrCast([*]const vk.BufferImageCopy, &region) })
+    const ended = vk.endCommandBuffer(&deviceCommands, commandBuffer)
+    if ended != vk.Result.success { return ended }
+    var submit = vk.SubmitInfo.init()
+    submit.commandBufferCount = 1
+    submit.pCommandBuffers = unsafe { @ptrCast([*]const vk.CommandBuffer, &commandBuffer) }
+    _ = vk.resetFences(&deviceCommands, device, 1, unsafe { @ptrCast([*]const vk.Fence, &fence) })
+    const result = vk.queueSubmit(&deviceCommands, graphicsQueue, 1, unsafe { @ptrCast([*]const vk.SubmitInfo, &submit) }, fence)
+    if result != vk.Result.success { return result }
+    return vk.waitForFences(&deviceCommands, device, 1, unsafe { @ptrCast([*]const vk.Fence, &fence) }, vk.TRUE, 1000000000)
+}
+
+// The cases' tally: drawn (not halfway on the grid), refused by the host
+// card, with a pixel's coverage off, with a colour more than one unit
+// off; the pixels compared.
+var ruleCases: usize = 0
+var ruleRefused: usize = 0
+var ruleCoverage: usize = 0
+var ruleColour: usize = 0
+var ruleCovered: usize = 0
+
+fn ruleCase(c: *const rules.Case) -> void {
+    rules.expect(c)
+    if rules.ambiguous { return }
+    ruleCases += 1
+    if renderCase(c) != vk.Result.success {
+        ruleRefused += 1
+        return
+    }
+    const bytes: [*]const u8 = unsafe { @ptrFromInt([*]const u8, readBytes) }
+    var coverage = false
+    var colour = false
+    var p: usize = 0
+    while p < rules.N * rules.N {
+        const got = bytes[4 * p + 3] != 0
+        if got != rules.covered[p] {
+            coverage = true
+        } else if got {
+            ruleCovered += 1
+            var ch: usize = 0
+            while ch < 3 {
+                const g = @intCast(u32, bytes[4 * p + ch])
+                const w = rules.want[4 * p + ch]
+                if (if g > w { g - w } else { w - g }) > 1 { colour = true }
+                ch += 1
+            }
+        }
+        p += 1
+    }
+    if coverage { ruleCoverage += 1 }
+    if colour { ruleColour += 1 }
+}
+
+fn plainCase() -> rules.Case {
+    var c: rules.Case = undefined
+    c.wx = 0.0
+    c.wy = 0.0
+    c.cull = 0
+    c.clockwise = false
+    c.vx = 0.0
+    c.vy = 0.0
+    c.vw = @floatFromInt(f32, SIZE)
+    c.vh = @floatFromInt(f32, SIZE)
+    c.sx = 0
+    c.sy = 0
+    c.sw = SIZE
+    c.sh = SIZE
+    var k: usize = 0
+    while k < 3 {
+        c.r[k] = between(0.0, 1.0)
+        c.g[k] = between(0.0, 1.0)
+        c.b[k] = between(0.0, 1.0)
+        k += 1
+    }
+    return c
+}
+
+// The second reference against the driver and the host card: triangles
+// with perspective (w from 0.25 to 1.75 over them), in viewports moved,
+// smaller than the target and upside down, within scissors, every cull
+// mode with each front face; triangles whose vertices are pixels' centres
+// or corners (edges through centres: the tie rule); on one line; and huge
+// ones round the whole viewport (vertices up to 64 times its size away).
+fn testRules() -> void {
+    check(64, freshDevice(9))
+    var k: usize = 0
+    while k < 8 {
+        var o = options()
+        o.vertex = triangle.Kind.transformed
+        o.cull = @intCast(u32, k / 2)
+        o.clockwise = (k % 2) == 1
+        rulePipelines[k] = makePipeline(o)
+        k += 1
+    }
+    var n: usize = 0
+    while n < 400 {
+        var c = plainCase()
+        k = 0
+        while k < 3 {
+            c.x[k] = between(-1.5, 1.5)
+            c.y[k] = between(-1.5, 1.5)
+            k += 1
+        }
+        c.wx = between(-0.25, 0.25)
+        c.wy = between(-0.25, 0.25)
+        c.cull = @intCast(u32, next() % 4)
+        c.clockwise = (next() & 1) != 0
+        c.vx = @floatFromInt(f32, whole(-8, 12))
+        c.vy = @floatFromInt(f32, whole(-8, 12))
+        c.vw = @floatFromInt(f32, whole(4, 33))
+        c.vh = @floatFromInt(f32, whole(4, 33))
+        if (next() % 3) == 0 {
+            c.vy = c.vy + c.vh
+            c.vh = -c.vh
+        }
+        if (next() % 2) == 0 {
+            c.sx = @intCast(i32, whole(0, 20))
+            c.sy = @intCast(i32, whole(0, 20))
+            c.sw = @intCast(u32, whole(1, 33))
+            c.sh = @intCast(u32, whole(1, 33))
+        }
+        ruleCase(&c)
+        n += 1
+    }
+    n = 0
+    while n < 120 {
+        var c = plainCase()
+        k = 0
+        while k < 3 {
+            c.x[k] = (@floatFromInt(f32, whole(0, 64)) / 2.0 - 16.0) / 16.0
+            c.y[k] = (@floatFromInt(f32, whole(0, 64)) / 2.0 - 16.0) / 16.0
+            k += 1
+        }
+        c.cull = @intCast(u32, next() % 4)
+        c.clockwise = (next() & 1) != 0
+        ruleCase(&c)
+        n += 1
+    }
+    n = 0
+    while n < 40 {
+        var c = plainCase()
+        const ax = between(-1.0, 1.0)
+        const ay = between(-1.0, 1.0)
+        const dx = between(-0.5, 0.5)
+        const dy = between(-0.5, 0.5)
+        c.x[0] = ax
+        c.y[0] = ay
+        c.x[1] = ax + dx
+        c.y[1] = ay + dy
+        c.x[2] = ax + 2.0 * dx
+        c.y[2] = ay + 2.0 * dy
+        ruleCase(&c)
+        var h = plainCase()
+        const big = between(3.0, 64.0)
+        var fx: f32 = 1.0
+        var fy: f32 = 1.0
+        if (next() & 1) != 0 { fx = -1.0 }
+        if (next() & 1) != 0 { fy = -1.0 }
+        h.x[0] = -big * fx
+        h.y[0] = -big * fy
+        h.x[1] = (big + between(0.0, 4.0)) * fx * 2.0 - big * fx
+        h.y[1] = -big * fy
+        h.x[2] = -big * fx
+        h.y[2] = (big + between(0.0, 4.0)) * fy * 2.0 - big * fy
+        h.cull = @intCast(u32, next() % 4)
+        h.clockwise = (next() & 1) != 0
+        ruleCase(&h)
+        n += 1
+    }
+    if show {
+        say("second reference: ")
+        sayNumber(@intCast(u64, ruleCases))
+        say(" cases, ")
+        sayNumber(@intCast(u64, ruleRefused))
+        say(" refused, coverage off in ")
+        sayNumber(@intCast(u64, ruleCoverage))
+        say(", colour off in ")
+        sayNumber(@intCast(u64, ruleColour))
+        say(", pixels compared ")
+        sayNumber(@intCast(u64, ruleCovered))
+        say("\n")
+    }
+    check(65, ruleCases > 500 && ruleRefused == 0)
+    check(66, ruleCoverage == 0)
+    check(67, ruleColour == 0 && ruleCovered > 20000)
+    k = 0
+    while k < 8 {
+        vk.destroyPipeline(&deviceCommands, device, rulePipelines[k], null)
+        k += 1
+    }
+}
+
+// The pixels of the frame against the first reference's.
+fn drawnAs(f: *const Frame, strip: bool, cull: u32, clockwise: bool, additive: bool, tolerance: u32) -> bool {
+    const result = render(f)
+    referenceOf(f, strip, cull, clockwise, false, additive)
+    return result == vk.Result.success && matches(tolerance, false)
+}
+
+fn testCases() -> void {
+    check(68, freshDevice(9))
+    // A strip of four with back faces culled, either front face: its
+    // second triangle's vertices are taken turned round (i, i + 2, i + 1),
+    // so it faces as the first does.
+    var o = options()
+    o.strip = true
+    o.cull = vk.CULL_MODE_BACK_BIT
+    var f = frame()
+    f.pipeline = makePipeline(o)
+    vertex(&f, -0.8, -0.6, 1.0, 0.0, 0.0)
+    vertex(&f, -0.7, 0.7, 0.0, 1.0, 0.0)
+    vertex(&f, 0.6, -0.8, 0.0, 0.0, 1.0)
+    vertex(&f, 0.75, 0.6, 1.0, 1.0, 0.0)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    check(69, drawnAs(&f, true, 2, false, false, 1) && coveredCount() > 300)
+    o.clockwise = true
+    f.pipeline = makePipeline(o)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    check(70, drawnAs(&f, true, 2, true, false, 1) && coveredCount() == 0)
+    // Blending (ONE, ONE) over a target that is not black: the sum,
+    // clamped.
+    o = options()
+    o.additive = true
+    f = frame()
+    f.pipeline = makePipeline(o)
+    f.clearColour = [4]f32{ 0.25, 0.5, 0.75, 0.0 }
+    vertex(&f, -0.75, 0.8, 0.5, 0.25, 0.5)
+    vertex(&f, 0.9, 0.6, 0.5, 0.25, 0.5)
+    vertex(&f, -0.1, -0.85, 0.5, 0.25, 0.5)
+    reference.clear(SIDE, SIDE, byteOf(0.25), byteOf(0.5), byteOf(0.75), 0)
+    check(71, drawnAs(&f, false, 0, false, true, 1) && coveredCount() > 200)
+    // A write mask of red and alpha: green and blue keep the clear's.
+    o = options()
+    o.mask = vk.COLOR_COMPONENT_R_BIT | vk.COLOR_COMPONENT_A_BIT
+    f.pipeline = makePipeline(o)
+    f.clearColour = [4]f32{ 0.0, 0.5, 0.25, 0.0 }
+    const result = render(&f)
+    var masked = result == vk.Result.success
+    const bytes: [*]const u8 = unsafe { @ptrFromInt([*]const u8, readBytes) }
+    var p: usize = 0
+    var drawn: usize = 0
+    while p < @intCast(usize, SIZE * SIZE) {
+        if @intCast(u32, bytes[4 * p + 1]) != byteOf(0.5) || @intCast(u32, bytes[4 * p + 2]) != byteOf(0.25) { masked = false }
+        if bytes[4 * p + 3] == 255 {
+            drawn += 1
+            if bytes[4 * p] != 128 { masked = false }
+        }
+        p += 1
+    }
+    check(72, masked && drawn > 200)
+    // firstVertex: three vertices passed over; firstIndex and
+    // vertexOffset: two indices passed over and the indices 3 below the
+    // vertices.
+    o = options()
+    const plain = makePipeline(o)
+    f = frame()
+    f.pipeline = plain
+    vertex(&f, 0.9, 0.9, 1.0, 1.0, 1.0)
+    vertex(&f, 0.95, 0.9, 1.0, 1.0, 1.0)
+    vertex(&f, 0.9, 0.95, 1.0, 1.0, 1.0)
+    vertex(&f, -0.75, 0.8, 1.0, 0.0, 0.0)
+    vertex(&f, 0.9, 0.6, 0.0, 1.0, 0.0)
+    vertex(&f, -0.1, -0.85, 0.0, 0.0, 1.0)
+    var g = frame()
+    g.pipeline = plain
+    vertex(&g, -0.75, 0.8, 1.0, 0.0, 0.0)
+    vertex(&g, 0.9, 0.6, 0.0, 1.0, 0.0)
+    vertex(&g, -0.1, -0.85, 0.0, 0.0, 1.0)
+    reference.clear(SIDE, SIDE, 0, 0, 0, 255)
+    referenceOf(&g, false, 0, false, false, false)
+    f.firstVertex = 3
+    var drawnWith = render(&f)
+    check(73, drawnWith == vk.Result.success && matches(1, false))
+    f.firstVertex = 0
+    f.indices[0] = 7
+    f.indices[1] = 7
+    f.indices[2] = 0
+    f.indices[3] = 1
+    f.indices[4] = 2
+    f.indexCount = 5
+    f.firstIndex = 2
+    f.vertexOffset = 3
+    drawnWith = render(&f)
+    check(74, drawnWith == vk.Result.success && matches(1, false))
+    // An indexed draw, one without indices, an indexed one again in one
+    // command buffer: INDEX_TYPE again after the draw without indices
+    // (which overwrites VGT_INDEX_TYPE), else the host card refuses.
+    f.twice = true
+    f.indexCount = 3
+    f.indices[0] = 3
+    f.indices[1] = 4
+    f.indices[2] = 5
+    f.firstIndex = 0
+    f.vertexOffset = 0
+    drawnWith = render(&f)
+    check(75, drawnWith == vk.Result.success)
+    // The float operations' shader (support/spirv/review_shaders.mlx):
+    // (r - 0.25, g <= 0.5 ? 1 : 0, mix(b, 1, 0.25), fract(r + 1.25)) of
+    // (0.5, 0.25, 0): 0.25, 1, 0.25, 0.75; of (0.75, 0.75, 1): 0.5, 0, 1, 0.
+    o = options()
+    o.reckoned = true
+    f = frame()
+    f.pipeline = makePipeline(o)
+    check(76, f.pipeline != 0)
+    f.clearColour = [4]f32{ 0.0, 0.0, 0.0, 0.0 }
+    vertex(&f, -0.75, 0.8, 0.5, 0.25, 0.0)
+    vertex(&f, 0.9, 0.6, 0.5, 0.25, 0.0)
+    vertex(&f, -0.1, -0.85, 0.5, 0.25, 0.0)
+    var first = render(&f) == vk.Result.success
+    const at = 4 * (16 * @intCast(usize, SIZE) + 16)
+    first = first && bytes[at] == 64 && bytes[at + 1] == 255 && bytes[at + 2] == 64 && bytes[at + 3] == 191
+    check(77, first)
+    var k: usize = 0
+    while k < 3 {
+        f.vertices[5 * k + 2] = 0.75
+        f.vertices[5 * k + 3] = 0.75
+        f.vertices[5 * k + 4] = 1.0
+        k += 1
+    }
+    var second = render(&f) == vk.Result.success
+    second = second && bytes[at] == 128 && bytes[at + 1] == 0 && bytes[at + 2] == 255 && bytes[at + 3] == 0
+    check(78, second)
+}
+
+// The vertex shader's late allocation and RSRC3_VS's CU_EN follow the
+// card's compute units a shader array (ac_compute_late_alloc): 9 (the
+// RX 580's) 28 and 0xFFFE, 8 (a 32-unit Polaris 10) 24 and 0xFFFE, 4 two
+// waves and every unit, 2 none.
+fn lateAllocOf(perArray: u32, limit: u32, cuEnable: u32) -> bool {
+    if !freshDevice(perArray) { return false }
+    const made = makePipeline(options())
+    if made == 0 { return false }
+    const pipelineObject = graphicsModule.graphicsOf(made)
+    const count = pipelineObject.*.wordCount
+    var k: usize = 0
+    var found = false
+    while k + 5 < count {
+        const w = &pipelineObject.*.words
+        if w.*[k] == 0xC0017600 && w.*[k + 1] == 0x30000046 && w.*[k + 3] == 0xC0017600 && w.*[k + 4] == 0x47 {
+            found = w.*[k + 2] == (cuEnable | 0x3F0000) && w.*[k + 5] == limit
+        }
+        k += 1
+    }
+    return found
+}
+
+fn testLateAlloc() -> void {
+    check(79, lateAllocOf(9, 28, 0xFFFE))
+    check(80, lateAllocOf(8, 24, 0xFFFE))
+    check(81, lateAllocOf(4, 2, 0xFFFF))
+    check(82, lateAllocOf(2, 0, 0xFFFF))
+}
+
+// A linear image's layout as addrlib gives it (image.mlx): 24 x 8 pixels,
+// the row 32 (24 to a multiple of 16): 128 bytes a row, 1024 in all; 40 x
+// 3, the row 48, grown to 64 so that the image is a multiple of 64 pixels:
+// 256 bytes a row, 768 in all.
+fn layoutOf(width: u32, height: u32, rowPitch: u64, size: u64) -> bool {
+    var info = vk.ImageCreateInfo.init()
+    info.imageType = vk.ImageType.type2d
+    info.format = vk.Format.r8g8b8a8Unorm
+    info.extent.width = width
+    info.extent.height = height
+    info.extent.depth = 1
+    info.mipLevels = 1
+    info.arrayLayers = 1
+    info.samples = vk.SAMPLE_COUNT_1_BIT
+    info.tiling = vk.ImageTiling.linear
+    info.usage = vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.IMAGE_USAGE_TRANSFER_SRC_BIT
+    var made: vk.Image = 0
+    if vk.createImage(&deviceCommands, device, &info, null, &made) != vk.Result.success { return false }
+    var requirements: vk.MemoryRequirements = undefined
+    vk.getImageMemoryRequirements(&deviceCommands, device, made, &requirements)
+    var subresource = vk.ImageSubresource.init()
+    subresource.aspectMask = vk.IMAGE_ASPECT_COLOR_BIT
+    var placed = vk.SubresourceLayout.init()
+    vk.getImageSubresourceLayout(&deviceCommands, device, made, &subresource, &placed)
+    vk.destroyImage(&deviceCommands, device, made, null)
+    return placed.rowPitch == rowPitch && placed.size == size && requirements.size == size && requirements.alignment == 256
+}
+
+fn testLayout() -> void {
+    check(83, freshDevice(9))
+    check(84, layoutOf(24, 8, 128, 1024))
+    check(85, layoutOf(40, 3, 256, 768))
+}
+
+pub fn main(arguments: [][*]const u8) -> u8 {
+    show = arguments.length > 1
+    check(49, readRegistry())
+    testDevice()
+    if device != 0 { testPixels() }
+    if device != 0 { testSwapped() }
+    if device != 0 { testVersion11() }
+    testRules()
+    testCases()
+    testLateAlloc()
+    testLayout()
+    dropDevice()
+    if failed != 0 { return failed }
+    return 13
+}

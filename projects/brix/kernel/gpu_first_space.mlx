@@ -1,0 +1,578 @@
+// Stage 7 toward a Radeon that takes commands (a Polaris 10, the RX 580),
+// on top of stages 5 and 6 (gpu_compute.mlx, gpu_graphics.mlx): an address
+// space as a program will have it, made and used through the address
+// spaces' interface (gpu_space.mlx) and the ring's (gpu_ring.mlx). The
+// study's step V1 (/tmp/brix-next/gpu-accel-kernel.verified.md 2.3 to 2.6,
+// 5.9, 8.4 V1, as its second reading corrected them), built from Linux
+// 6.6's gmc_v8_0.c, amdgpu_vm.c, amdgpu_vm_pt.c, amdgpu_ib.c and
+// gfx_v8_0.c, with its self-test, its one line in the log and its way
+// back. And the stages of a boot from 3 to 7, and their way down.
+//
+// THE STEP (../engine_choice.mlx: the digit 7):
+// 7  V1  address space 1 taken for the kernel's own test: its directory and
+//        one page table in the driver's part of the card's memory; a page
+//        of the system's memory (the dma piece) mapped at 0x40000000 and
+//        a page of the card's memory at 0x40001000, both readable,
+//        writeable and executable as RADV maps every buffer; the seven
+//        fault interrupts on (gmc_v8_0_vm_fault_interrupt_state) and the
+//        graphics block's two (a privileged register or instruction in a
+//        ring's buffer: gfx_v8_0_late_init, as the study's 1.2 puts both
+//        kinds of fault interrupt in this step); on
+//        compute ring 0 a submission with the switch in front (the base
+//        register, the flush and its wait, the interrupt ring's number for
+//        the space, a fence) and a buffer in address space 1, lying in the
+//        mapped system page, that writes a word to each page; then a
+//        second that writes where nothing is mapped (page 0x12345); then a
+//        third, which shows the ring went on. Proved by the two words (one
+//        read in the system's memory, one through the aperture), the fault
+//        (source 146 or 147, VM_CONTEXT1_PROTECTION_FAULT_ADDR the page
+//        tried, the status with address space 1 and a write), the third
+//        buffer's word, and every table entry read back. Then the space is
+//        given back: its pages unmapped, its tables back to the pool, its
+//        base register the GART's table again and flushed, the interrupt
+//        ring's number for it as it was. A step that fails does the same
+//        and puts the fault interrupts back as they were; a pass leaves them
+//        on, as Linux's late_init does, for the programs' address spaces.
+//        When a buffer's work did not end (the ring hung in the space), the
+//        space is not given back but emptied and kept until the way down
+//        (gpu_space.mlx's `empty`): the GART's table named as its directory
+//        would let the stuck work read the GART's entries as a directory's.
+//        Faults the ring took before the step are said first; every fault
+//        of the step's buffers is told to its space before the space goes.
+//
+// THE ORDER OF A BOOT (`run`): stages 3 to 5 as gpu_compute.mlx runs them,
+// then G5, then V1, each only after the one before it passed.
+//
+// THE WAY DOWN (`stop`, the study's 8.7): the graphics ring said and its
+// interrupt and doorbell off (gpu_graphics.mlx), stage 5's way down (the
+// processors halted) and stages 2 to 4's; then any address space still
+// held given back and the fault interrupts as they were found.
+//
+// AROUND THE STEP, as every step: the temperature before and after, none
+// begun at 85 C or above; the picture watched with the log's lines kept off
+// the screen; the card alive afterwards. No register of the display's.
+//
+// The registers' fields are ../registers' (generated from Linux 6.6's
+// headers), the other numbers Linux 6.6's (ivsrcid_vislands30.h, vid.h):
+// tools/check_gpu_registers.py holds them. tests/507 lends a card.
+const engines = @import("./gpu_engines.mlx")
+const loaded = @import("./gpu_smc_sdma.mlx")
+const compute = @import("./gpu_compute.mlx")
+const graphics = @import("./gpu_graphics.mlx")
+const ring = @import("./gpu_ring.mlx")
+const spaces = @import("./gpu_space.mlx")
+
+// ---- The registers' fields: the graphics block's fault interrupts
+// (gfx_v8_0_set_priv_reg_fault_state and _priv_inst_fault_state).
+const gfx_8_0 = @import("../registers/gfx_8_0.mlx")
+pub const CP_INT_CNTL_RING0__PRIV_REG_INT_ENABLE: usize = gfx_8_0.CP_INT_CNTL_RING0__PRIV_REG_INT_ENABLE
+pub const CP_INT_CNTL_RING0__PRIV_INSTR_INT_ENABLE: usize = gfx_8_0.CP_INT_CNTL_RING0__PRIV_INSTR_INT_ENABLE
+
+// ---- This driver's own numbers.
+// The card addresses V1 maps its two pages at, and the page it writes to
+// where nothing is mapped (the study's example).
+pub const SYSTEM_AT: usize = 0x40000000
+pub const CARD_AT: usize = 0x40001000
+pub const UNMAPPED_AT: usize = 0x12345000
+// Where in the system page the three buffers lie and the words they write,
+// and what those words are.
+pub const FIRST_AT: usize = 0x000
+pub const SECOND_AT: usize = 0x100
+pub const THIRD_AT: usize = 0x200
+pub const WORD_AT: usize = 0x800
+pub const FIRST_WORD: usize = 0x71770001
+pub const CARD_WORD: usize = 0x71770002
+pub const STRAY_WORD: usize = 0x717700FF
+pub const THIRD_WORD: usize = 0x71770003
+// How long a fault's entry may come after the fence of its buffer.
+pub const FAULT_LATER_MS: usize = 100
+// (No such thing.)
+pub const NONE: usize = 0xFFFFFFFFFFFFFFFF
+
+// What stage 7 did and keeps.
+pub const FirstSpace = struct {
+    v1: engines.Outcome
+    // The space it took, its two pages (the system page's physical
+    // address, the card page's offset in the aperture), the two table
+    // entries as read back.
+    space: usize
+    system: usize
+    card: usize
+    systemEntry: usize
+    cardEntry: usize
+    // The three buffers' fences and how their waits ended.
+    fences: [3]usize
+    how: [3]ring.Waited
+    // The fault: how many came, the first one's words.
+    faults: usize
+    page: usize
+    status: usize
+    client: usize
+    source: usize
+    // The two control words of the address spaces as found, and whether
+    // V1 left the fault interrupts on.
+    controlWas: [2]usize
+    enabled: bool
+    // The graphics block's two fault interrupts as found.
+    privWas: usize
+    // The space was emptied and kept (its work did not end), with its
+    // card page, until the way down.
+    kept: bool
+    // The temperature before the step.
+    before: usize
+}
+
+// ---- Reaching the card.
+
+fn rd(e: *engines.Engines, number: usize) -> usize {
+    const read = e.*.hands.read
+    return @intCast(usize, read(number))
+}
+
+fn wr(e: *engines.Engines, number: usize, value: usize) -> void {
+    const write = e.*.hands.write
+    write(number, @intCast(u32, value & 0xFFFFFFFF))
+}
+
+fn say(e: *engines.Engines, text: []const u8) -> void {
+    const write = e.*.hands.say
+    write(text)
+}
+
+fn now(e: *engines.Engines) -> usize {
+    const clock = e.*.hands.now
+    return clock()
+}
+
+fn pause(e: *engines.Engines, microseconds: usize) -> void {
+    const wait = e.*.hands.pause
+    wait(microseconds)
+}
+
+fn aside(e: *engines.Engines, on: bool) -> void {
+    const put = e.*.hands.aside
+    put(on)
+}
+
+fn memoryRead(e: *engines.Engines, physical: usize) -> usize {
+    const read = e.*.hands.memoryRead
+    return @intCast(usize, read(physical))
+}
+
+fn memoryWrite(l: *loaded.Loaded, physical: usize, value: usize) -> void {
+    const write = l.*.more.memoryWrite
+    write(physical, @intCast(u32, value & 0xFFFFFFFF))
+}
+
+fn vramRead(e: *engines.Engines, at: usize) -> usize {
+    const read = e.*.hands.vramRead
+    return read(at)
+}
+
+fn vramWrite(e: *engines.Engines, at: usize, value: usize) -> void {
+    const write = e.*.hands.vramWrite
+    write(at, value)
+}
+
+fn dma(e: *engines.Engines, bytes: usize) -> usize {
+    const allocate = e.*.hands.dma
+    return allocate(bytes)
+}
+
+// ---- The log's words.
+
+fn decimal(e: *engines.Engines, value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var at: usize = 20
+    var rest = value
+    while true {
+        at -= 1
+        digits[at] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    say(e, digits[at..20])
+}
+
+fn hex(e: *engines.Engines, value: usize) -> void {
+    var digits: usize = 1
+    while digits < 16 && (value >> @intCast(u6, digits * 4)) != 0 { digits += 1 }
+    var text: [18]u8 = undefined
+    text[0] = 48
+    text[1] = 120
+    var k: usize = 0
+    while k < digits {
+        const digit = (value >> @intCast(u6, (digits - 1 - k) * 4)) & 15
+        text[2 + k] = @intCast(u8, if digit < 10 { 48 + digit } else { 87 + digit })
+        k += 1
+    }
+    say(e, text[0..2 + digits])
+}
+
+fn num(e: *engines.Engines, label: []const u8, value: usize) -> void {
+    say(e, label)
+    decimal(e, value)
+}
+
+fn word(e: *engines.Engines, label: []const u8, value: usize) -> void {
+    say(e, label)
+    hex(e, value)
+}
+
+// The card's temperature, the SMC's index put back as it was.
+fn temperature(e: *engines.Engines) -> usize {
+    const index = rd(e, engines.SMC_IND_INDEX_11)
+    const degrees = loaded.temperature(e)
+    wr(e, engines.SMC_IND_INDEX_11, index)
+    return degrees
+}
+
+// ---- The step.
+
+// The seven fault interrupts (gmc_v8_0_vm_fault_interrupt_state's bits).
+// The graphics block's two (gfx_v8_0_late_init's priv_reg_irq and
+// priv_inst_irq).
+pub fn privateFaults() -> usize { return CP_INT_CNTL_RING0__PRIV_REG_INT_ENABLE | CP_INT_CNTL_RING0__PRIV_INSTR_INT_ENABLE }
+
+pub fn faultInterrupts() -> usize { return spaces.VM_CONTEXT1_CNTL__RANGE_PROTECTION_FAULT_ENABLE_INTERRUPT | spaces.VM_CONTEXT1_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_INTERRUPT | spaces.VM_CONTEXT1_CNTL__PDE0_PROTECTION_FAULT_ENABLE_INTERRUPT | spaces.VM_CONTEXT1_CNTL__VALID_PROTECTION_FAULT_ENABLE_INTERRUPT | spaces.VM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_INTERRUPT | spaces.VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_INTERRUPT | spaces.VM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_INTERRUPT }
+
+// One word written to memory by a buffer (WRITE_DATA, to memory,
+// confirmed: gfx_v8_0_ring_test_ib's packet), at `at` of the system page.
+fn writeWord(l: *loaded.Loaded, page: usize, at: usize, address: usize, value: usize) -> void {
+    memoryWrite(l, page + at, ring.packet3(ring.PACKET3_WRITE_DATA, 3))
+    memoryWrite(l, page + at + 4, (compute.DST_MEMORY << @intCast(u6, ring.WRITE_DATA_DST_SEL_SHIFT)) | ring.WR_CONFIRM)
+    memoryWrite(l, page + at + 8, address & 0xFFFFFFFF)
+    memoryWrite(l, page + at + 12, address >> 32)
+    memoryWrite(l, page + at + 16, value)
+}
+
+// The record anew (nothing tried yet).
+pub fn begin(f: *FirstSpace) -> void {
+    f.*.v1 = engines.Outcome.not_tried
+    f.*.space = NONE
+    f.*.system = 0
+    f.*.card = NONE
+    f.*.systemEntry = 0
+    f.*.cardEntry = 0
+    f.*.fences[0] = NONE
+    f.*.fences[1] = NONE
+    f.*.fences[2] = NONE
+    f.*.how[0] = ring.Waited.late
+    f.*.how[1] = ring.Waited.late
+    f.*.how[2] = ring.Waited.late
+    f.*.faults = 0
+    f.*.page = 0
+    f.*.status = 0
+    f.*.client = 0
+    f.*.source = 0
+    f.*.controlWas[0] = 0
+    f.*.controlWas[1] = 0
+    f.*.enabled = false
+    f.*.privWas = 0
+    f.*.kept = false
+    f.*.before = 0
+}
+
+// The space given back (its pages unmapped, its tables, its base register,
+// its number as they were); whether its base register names the GART's
+// table again. When its work did not end it is emptied and kept instead,
+// with the card page, until the way down (`f.kept`).
+fn release(e: *engines.Engines, s: *spaces.Spaces, f: *FirstSpace) -> bool {
+    if f.*.space != NONE {
+        _ = spaces.unmap(e, s, f.*.space, SYSTEM_AT)
+        _ = spaces.unmap(e, s, f.*.space, CARD_AT)
+        if spaces.give(e, s, f.*.space) == spaces.NONE {
+            _ = spaces.empty(e, s, f.*.space)
+            f.*.kept = true
+            return false
+        }
+    }
+    if f.*.card != NONE {
+        spaces.givePages(s, f.*.card, 1)
+        f.*.card = NONE
+    }
+    if f.*.space == NONE { return true }
+    const was = f.*.space
+    f.*.space = NONE
+    return rd(e, ring.baseRegister(was)) == s.*.placeholder >> 12
+}
+
+// One buffer of `length` words at `at` of the system page run in the
+// space and waited for by its end-of-pipe entry; its fence (NONE: the ring
+// took nothing).
+fn runBuffer(e: *engines.Engines, l: *loaded.Loaded, c: *compute.Compute, s: *spaces.Spaces, f: *FirstSpace, k: usize, at: usize, length: usize) -> usize {
+    const r = &c.*.compute
+    f.*.fences[k] = spaces.submit(e, l, s, r, f.*.space, SYSTEM_AT + at, length, true)
+    if f.*.fences[k] == NONE { return NONE }
+    f.*.how[k] = ring.wait(e, l, r, f.*.fences[k], true, loaded.IB_TEST_TIMEOUT_MS)
+    return f.*.fences[k]
+}
+
+// V1. Whether it passed.
+pub fn firstSpace(e: *engines.Engines, l: *loaded.Loaded, c: *compute.Compute, g: *graphics.Graphics, s: *spaces.Spaces, f: *FirstSpace) -> bool {
+    e.*.began = now(e)
+    const r = &c.*.compute
+    if g.*.g5 != engines.Outcome.passed || !r.*.up {
+        f.*.v1 = engines.Outcome.refused
+        say(e, "gpu: step V1 refused: the graphics ring is not proved (step G5), or compute ring 0 does not run\n")
+        return false
+    }
+    if r.*.refused || r.*.hung {
+        f.*.v1 = engines.Outcome.refused
+        say(e, "gpu: step V1 refused: compute ring 0 takes no new work now (the temperature's mark, or it did not come to a fence)\n")
+        return false
+    }
+    if !e.*.ringUp {
+        f.*.v1 = engines.Outcome.refused
+        say(e, "gpu: step V1 refused: the interrupt ring does not run (a fault's entry could not come)\n")
+        return false
+    }
+    f.*.before = temperature(e)
+    if f.*.before >= loaded.MARK {
+        f.*.v1 = engines.Outcome.refused
+        num(e, "gpu: step V1 refused: the card is at ", f.*.before)
+        num(e, " C (no step begins at ", loaded.MARK)
+        say(e, " C or more)\n")
+        return false
+    }
+    if !s.*.up && !spaces.open(e, s) {
+        f.*.v1 = engines.Outcome.refused
+        say(e, "gpu: step V1 refused: the driver's part of the aperture has no room for the address spaces' tables (or the GART is not on)\n")
+        return false
+    }
+    // Faults the ring took before the step are not the step's: said now.
+    if r.*.spaceFaults != 0 { _ = spaces.collect(e, s, r) }
+    const mark = c.*.count
+    c.*.full = false
+    aside(e, true)
+    var before: engines.Picture = undefined
+    engines.look(e, &before)
+    var why: []const u8 = ""
+    var value = NONE
+    var waited = NONE
+    f.*.faults = 0
+
+    // The space and its two pages: the system's from the dma piece, the
+    // card's from the pool; their words as Linux's test sets its slot.
+    f.*.space = spaces.take(e, s, spaces.KERNEL)
+    if f.*.space == NONE { why = "no address space could be taken (none free, or its directory does not hold in the card's memory)" }
+    if why.length == 0 {
+        f.*.system = dma(e, engines.AMDGPU_GPU_PAGE_SIZE)
+        if f.*.system == 0 { why = "no page of the memory set aside for the card is left" }
+    }
+    var mapped = spaces.Mapped.done
+    if why.length == 0 {
+        mapped = spaces.map(e, s, f.*.space, SYSTEM_AT, spaces.Memory.system, f.*.system, spaces.READ | spaces.WRITE | spaces.EXECUTE)
+        if mapped != spaces.Mapped.done { why = "the system's page could not be mapped" }
+    }
+    if why.length == 0 {
+        f.*.card = spaces.takePages(e, s, 1)
+        if f.*.card == NONE || f.*.card == spaces.UNHELD {
+            f.*.card = NONE
+            why = "no page of the card's memory is left in the pool, or it does not hold what was written"
+        } else {
+            mapped = spaces.map(e, s, f.*.space, CARD_AT, spaces.Memory.card, f.*.card, spaces.READ | spaces.WRITE | spaces.EXECUTE)
+            if mapped != spaces.Mapped.done { why = "the card's page could not be mapped" }
+        }
+    }
+    if why.length == 0 {
+        f.*.systemEntry = spaces.entry(e, s, f.*.space, SYSTEM_AT)
+        f.*.cardEntry = spaces.entry(e, s, f.*.space, CARD_AT)
+        if f.*.systemEntry != spaces.entryWord(spaces.Memory.system, f.*.system, spaces.READ | spaces.WRITE | spaces.EXECUTE) || f.*.cardEntry != spaces.entryWord(spaces.Memory.card, f.*.card, spaces.READ | spaces.WRITE | spaces.EXECUTE) || s.*.tables[f.*.space] != 1 {
+            why = "a table entry does not read back as written: "
+            value = f.*.systemEntry
+        }
+    }
+
+    // The fault interrupts on (late_init's), then the three buffers.
+    if why.length == 0 {
+        f.*.controlWas[0] = rd(e, engines.VM_CONTEXT0_CNTL)
+        f.*.controlWas[1] = rd(e, engines.VM_CONTEXT1_CNTL)
+        compute.put(e, c, engines.VM_CONTEXT0_CNTL, f.*.controlWas[0] | faultInterrupts())
+        compute.put(e, c, engines.VM_CONTEXT1_CNTL, f.*.controlWas[1] | faultInterrupts())
+        f.*.privWas = rd(e, loaded.CP_INT_CNTL_RING0) & privateFaults()
+        compute.put(e, c, loaded.CP_INT_CNTL_RING0, rd(e, loaded.CP_INT_CNTL_RING0) | privateFaults())
+        memoryWrite(l, f.*.system + WORD_AT, loaded.TEST_BEFORE)
+        memoryWrite(l, f.*.system + WORD_AT + 4, loaded.TEST_BEFORE)
+        vramWrite(e, f.*.card, loaded.TEST_BEFORE)
+        writeWord(l, f.*.system, FIRST_AT, SYSTEM_AT + WORD_AT, FIRST_WORD)
+        writeWord(l, f.*.system, FIRST_AT + 20, CARD_AT, CARD_WORD)
+        writeWord(l, f.*.system, SECOND_AT, UNMAPPED_AT, STRAY_WORD)
+        writeWord(l, f.*.system, THIRD_AT, SYSTEM_AT + WORD_AT + 4, THIRD_WORD)
+        if runBuffer(e, l, c, s, f, 0, FIRST_AT, 10) == NONE {
+            why = "compute ring 0 took no submission in the address space"
+        } else if f.*.how[0] != ring.Waited.done {
+            why = "the first buffer did not end: "
+            waited = 0
+        } else if memoryRead(e, f.*.system + WORD_AT) != FIRST_WORD {
+            why = "the system's page was not written through the address space: its word reads "
+            value = memoryRead(e, f.*.system + WORD_AT)
+        } else if vramRead(e, f.*.card) & 0xFFFFFFFF != CARD_WORD {
+            why = "the card's page was not written through the address space: its word reads "
+            value = vramRead(e, f.*.card) & 0xFFFFFFFF
+        }
+    }
+    if why.length == 0 {
+        if runBuffer(e, l, c, s, f, 1, SECOND_AT, 5) == NONE {
+            why = "compute ring 0 took no second submission"
+        } else if f.*.how[1] != ring.Waited.done {
+            why = "the buffer that writes where nothing is mapped did not end: "
+            waited = 1
+        } else {
+            // A fault's entry may come after the fence of its buffer.
+            const started = now(e)
+            while r.*.spaceFaults == 0 && now(e) - started < FAULT_LATER_MS * 1000000 {
+                ring.entries(e, l, r)
+                pause(e, 10)
+            }
+            if r.*.spaceFaults != 0 {
+                f.*.source = r.*.spaceSource[0]
+                f.*.page = r.*.spacePage[0]
+                f.*.status = r.*.spaceStatus[0]
+                f.*.client = r.*.spaceClient[0]
+            }
+            f.*.faults = spaces.collect(e, s, r)
+            if f.*.faults == 0 {
+                why = "the write where nothing is mapped raised no fault within 100 ms after its fence"
+            } else if f.*.page != UNMAPPED_AT >> 12 {
+                why = "the fault names another page: "
+                value = f.*.page
+            } else if spaces.faultSpace(f.*.status) != f.*.space || !spaces.faultWrote(f.*.status) {
+                why = "the fault's status does not say a write in the address space: "
+                value = f.*.status
+            }
+        }
+    }
+    if why.length == 0 {
+        if runBuffer(e, l, c, s, f, 2, THIRD_AT, 5) == NONE {
+            why = "compute ring 0 took nothing after the fault"
+        } else if f.*.how[2] != ring.Waited.done {
+            why = "the ring did not go on after the fault: "
+            waited = 2
+        } else if memoryRead(e, f.*.system + WORD_AT + 4) != THIRD_WORD {
+            why = "the third buffer's word reads "
+            value = memoryRead(e, f.*.system + WORD_AT + 4)
+        }
+    }
+    // Every fault of the step's buffers told to its space (the kernel's own)
+    // before the space goes, on every way out.
+    if r.*.spaceFaults != 0 { _ = spaces.collect(e, s, r) }
+    const space = f.*.space
+    const directory = if space != NONE { spaces.directoryAddress(s, space) } else { 0 }
+    const back = release(e, s, f)
+    if why.length == 0 && f.*.kept { why = "the address space's work did not end" }
+    if why.length == 0 && !back { why = "the address space's base register does not name the GART's table again" }
+    if why.length == 0 && c.*.full { why = "more registers were to be kept than there is room for" }
+    const after = temperature(e)
+    const living = engines.alive(e, "V1")
+    var later: engines.Picture = undefined
+    engines.look(e, &later)
+    aside(e, false)
+    const minded = engines.changed(&before, &later)
+    if !living { why = "the card no longer answers as it did" }
+    if why.length != 0 || minded != engines.Change.none {
+        f.*.v1 = engines.Outcome.failed
+        say(e, "gpu: step V1 failed: ")
+        if !living {
+            say(e, why)
+        } else if why.length == 0 {
+            engines.sayChange(e, minded, &before, &later)
+        } else if waited != NONE {
+            say(e, why)
+            ring.sayWaited(e, r, f.*.how[waited])
+        } else if value != NONE {
+            say(e, why)
+            hex(e, value)
+        } else {
+            say(e, why)
+            if mapped != spaces.Mapped.done {
+                say(e, " (")
+                say(e, spaces.mappedWords(mapped))
+                say(e, ")")
+            }
+        }
+        // The way back: the space given back (above), the fault interrupts
+        // as before.
+        const restored = compute.putBack(e, c, mark)
+        if f.*.kept {
+            num(e, "; the address space emptied and kept until the way down (its work did not end), the fault interrupts as before (", restored)
+        } else {
+            num(e, "; the address space given back, its base register the GART's table again, the fault interrupts as before (", restored)
+        }
+        say(e, if r.*.hung { " registers); compute ring 0 takes no new work" } else { " registers)" })
+        num(e, "; ", f.*.before)
+        num(e, " C before, ", after)
+        say(e, " C after")
+        num(e, " (", (now(e) - e.*.began) / 1000000)
+        say(e, " ms)\n")
+        return false
+    }
+    f.*.v1 = engines.Outcome.passed
+    f.*.enabled = true
+    num(e, "gpu: step V1: address space ", space)
+    word(e, " (directory at ", directory)
+    say(e, ", one page table): a page of the system's memory at ")
+    hex(e, SYSTEM_AT)
+    word(e, " (entry ", f.*.systemEntry)
+    word(e, ") and one of the card's at ", CARD_AT)
+    word(e, " (entry ", f.*.cardEntry)
+    num(e, ") written through it on compute ring 0 (fence ", f.*.fences[0])
+    say(e, "); an unmapped write faulted as it should (")
+    spaces.sayFault(e, f.*.page, f.*.status, f.*.client, f.*.source)
+    num(e, "); the ring went on (fence ", f.*.fences[2])
+    say(e, "); the space given back, its base register the GART's table again; the fault interrupts stay on")
+    num(e, "; ", f.*.before)
+    num(e, " C before, ", after)
+    say(e, " C after")
+    engines.sayWatch(e, &before)
+    num(e, " (", (now(e) - e.*.began) / 1000000)
+    say(e, " ms)\n")
+    return true
+}
+
+// ---- The stages of a boot, the way down.
+
+// Stages 3 to 7 as far as `e.stage`: stages 3 to 5 as gpu_compute.mlx runs
+// them, then G5, then V1, each only after the one before it passed.
+pub fn run(e: *engines.Engines, l: *loaded.Loaded, c: *compute.Compute, g: *graphics.Graphics, s: *spaces.Spaces, f: *FirstSpace) -> void {
+    compute.run(e, l, c)
+    if e.*.stage < 6 || c.*.g4 != engines.Outcome.passed { return }
+    if !graphics.graphicsRing(e, l, c, g) { return }
+    if e.*.stage < 7 { return }
+    _ = firstSpace(e, l, c, g, s, f)
+}
+
+// The way down: the graphics ring's part, stage 5's and stages 2 to 4's
+// (the processors halted, the copy engines, the interrupt ring, the
+// doorbells); then every address space still held given back (a kept one
+// too: nothing runs in any now) with V1's card page, and the fault
+// interrupts as they were found.
+pub fn stop(e: *engines.Engines, l: *loaded.Loaded, c: *compute.Compute, g: *graphics.Graphics, s: *spaces.Spaces, f: *FirstSpace) -> void {
+    graphics.stop(e, c)
+    compute.stop(e, l, c)
+    var given: usize = 0
+    var n: usize = 1
+    while n < ring.SPACES {
+        if spaces.held(s, n) {
+            _ = spaces.giveStopped(e, s, n)
+            given += 1
+        }
+        n += 1
+    }
+    if f.*.kept {
+        if f.*.card != NONE { spaces.givePages(s, f.*.card, 1) }
+        f.*.card = NONE
+        f.*.space = NONE
+        f.*.kept = false
+    }
+    if f.*.enabled {
+        wr(e, engines.VM_CONTEXT0_CNTL, (rd(e, engines.VM_CONTEXT0_CNTL) & ~faultInterrupts()) | (f.*.controlWas[0] & faultInterrupts()))
+        wr(e, engines.VM_CONTEXT1_CNTL, (rd(e, engines.VM_CONTEXT1_CNTL) & ~faultInterrupts()) | (f.*.controlWas[1] & faultInterrupts()))
+        wr(e, loaded.CP_INT_CNTL_RING0, (rd(e, loaded.CP_INT_CNTL_RING0) & ~privateFaults()) | f.*.privWas)
+        f.*.enabled = false
+    }
+    if given != 0 || f.*.v1 == engines.Outcome.passed {
+        num(e, "gpu: the address spaces on the way down: ", given)
+        say(e, " given back, the fault interrupts as found\n")
+    }
+}

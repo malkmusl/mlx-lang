@@ -1,0 +1,680 @@
+// A display's mode changed while the system runs: the kernel's part.
+//
+// For every display (display.mlx) there is a state (display_modes.mlx's
+// `State`): the modes its monitor's EDID names, each with whether the
+// display's driver can set it; the mode that runs; a change that waits to
+// be confirmed. This file binds that to the machine:
+// - THE DRIVER of each display, behind display_modes.mlx's seam: QEMU's
+//   adapter (bochs.mlx); a Radeon's TMDS output (gpu.mlx, gpu_change.mlx);
+//   for every other display one that lists the modes and refuses each
+//   request with the reason (a Radeon's DisplayPort output; a display
+//   that is as the firmware left it).
+// - THE MONITOR'S EDID: what the loader passed on from the firmware, or
+//   more blocks when the display's driver has read them itself (QEMU's
+//   adapter keeps the EDID in its register memory; the Radeon's driver
+//   hands over what it read: gpu.mlx's `modeEdid`).
+// - A REQUEST of a program (native/displays.mlx: display_mode): `request`.
+//   After a change the display's record is the new picture's (display.mlx
+//   `show`: size, pitch, where its memory is), its node's size too, the
+//   kernel's console is on the new picture where it was on the old one
+//   (console.mlx `reshapeFramebuffer`), and the programs that hold the
+//   display's node learn of it: the count of the display's changes went
+//   up, which their handle's state shows until they have read the node
+//   again (native/objects.mlx).
+//   A PROGRAM THAT STILL HAS THE OLD PICTURE MAPPED keeps a mapping of
+//   the adapter's memory where the old picture was: it never faults, and
+//   what it draws there is not what the display shows (or lands in the
+//   new picture at the wrong place, where the two overlap). It has to
+//   read the node again and map it anew.
+// - THE CLOCK: the timer's tick (trap.mlx) calls `tick`; a change nobody
+//   confirmed within display_modes.CONFIRM_TIME is taken back by the
+//   kernel itself, and the log says so. Taking it back writes the display
+//   (on a Radeon for about a second), so the tick only notes it, and the
+//   trap's way back makes it (`due`), as it makes the GPU driver's own
+//   changes (gpu_together.mlx: the picture brought to where the monitor
+//   is, with a pending mode taken back first). A confirmation that comes
+//   after the time to confirm is over finds the mode taken back, whether
+//   or not the tick has come yet (display_modes.mlx's `confirmAt`).
+// - A RADEON'S MONITOR MOVED OR ANOTHER ONE PLUGGED IN: the modes are
+//   listed anew from the EDID its driver read there (`due`).
+// - WHAT IS REMEMBERED: a confirmed mode is written to
+//   /system/settings/display-modes (a line a display: its adapter, its
+//   monitor, the mode; display_modes.mlx has the text's form) and the
+//   volumes are committed. Where / is a disk's the file is there at the
+//   next boot, and `start` sets the mode then, in place of the monitor's
+//   own; a system that runs from its image alone forgets it when it is
+//   switched off (the image is not written). The boot's choice
+//   (../display_choice.mlx) goes before it: a boot that keeps the
+//   firmware's picture (the key F) sets nothing, a remembered mode
+//   neither; N pressed at this start means the monitor's own mode: the
+//   remembered one is not set and is forgotten. A remembered mode that
+//   was tried at a boot and failed (the display was written and the mode
+//   did not come) is forgotten too, and said: tried at every boot it
+//   would darken every start. One that cannot be set at a boot (nothing
+//   is written for it) stays remembered.
+const display = @import("./display.mlx")
+const displays = @import("./displays.mlx")
+const dm = @import("./display_modes.mlx")
+const bochs = @import("./bochs.mlx")
+const gpu = @import("./gpu.mlx")
+const console = @import("./console.mlx")
+const fbcon = @import("./fbcon.mlx")
+const vfs = @import("./vfs.mlx")
+const clock = @import("./clock.mlx")
+const volume = @import("./volume.mlx")
+const smp = @import("./smp.mlx")
+const choice = @import("../display_choice.mlx")
+const together = @import("./gpu_together.mlx")
+
+// The bytes a display's state adds to its node's record.
+pub const STATE_BYTES: usize = dm.STATE_WORDS * 8
+
+// What a request asks for (display_mode's second argument).
+pub const What = struct {
+    pub const ASK: usize = 1
+    pub const CONFIRM: usize = 2
+    pub const TAKE_BACK: usize = 3
+}
+
+// Each display's state; how many have one (0 before `start`); each
+// one's monitor's name (display_modes.monitorName) and whether its
+// monitor is one that stretches a mode that is not its own across its
+// screen (a real monitor is taken to; QEMU's shows a picture as it is).
+var states: [displays.MAX]dm.State = undefined // (per run)
+var bound: usize = 0 // (per run)
+var monitors: [displays.MAX]usize = undefined // (per run)
+var stretches: [displays.MAX]bool = undefined // (per run)
+// Whether any display has a change pending (the tick looks no further
+// when none has), and whether one is to be taken back (`due`).
+var pending: usize = 0 // (per run)
+var overdue = false // (per run)
+// How often the GPU driver's monitor had become another when its
+// display's modes were last listed.
+var gpuMonitors: usize = 0 // (per run)
+
+fn out(text: []const u8) -> void { console.out.write(text) }
+
+// A display no driver of ours sets: every mode is judged so, nothing is
+// ever written.
+fn firmwareJudge(which: usize, mode: *dm.Mode) -> void { mode.*.why = dm.Why.NO_DRIVER }
+
+fn firmwareSet(which: usize, mode: *const dm.Mode, picture: *dm.Picture) -> dm.Set { return dm.Set.refused }
+
+fn firmwareBack(which: usize, before: *const dm.Mode, picture: *dm.Picture) -> dm.Set { return dm.Set.refused }
+
+// "brixOS: display N: ".
+fn prefix(number: usize) -> void {
+    out("brixOS: display ")
+    console.out.decimal(number)
+    out(": ")
+}
+
+fn sayMode(mode: *const dm.Mode) -> void { dm.sayMode(out, mode) }
+
+fn driverName(kind: usize) -> []const u8 {
+    if kind == dm.Kind.QEMU { return "QEMU's adapter" }
+    if kind == dm.Kind.RADEON_TMDS { return "the Radeon's, for HDMI and DVI signalling" }
+    if kind == dm.Kind.RADEON_OTHER { return "the Radeon's" }
+    if kind == dm.Kind.RADEON_DP { return "the Radeon's, for DisplayPort" }
+    return "none"
+}
+
+// The monitor's EDID as the loader passed it on for display `d` (none:
+// no bytes).
+fn loaderEdid(d: *const display.Display) -> []const u8 {
+    const none = unsafe { @ptrFromInt([*]const u8, @intFromPtr(&monitors)) }
+    if d.*.edid == 0 || d.*.edidBytes == 0 { return none[0..0] }
+    return unsafe { @ptrFromInt([*]const u8, d.*.edid) }[0..d.*.edidBytes]
+}
+
+// Display `number`'s state made: its driver found, its monitor's modes
+// listed and judged, and said (a line on the screen too, the modes
+// themselves in the log alone).
+fn bind(number: usize) -> void {
+    const d = display.at(number)
+    var driver = dm.Driver.{ .kind = dm.Kind.FIRMWARE, .which = number, .timed = false, .anySize = false, .judge = firmwareJudge, .set = firmwareSet, .back = firmwareBack }
+    var bytes = loaderEdid(d)
+    var rate: usize = 0
+    stretches[number] = true
+    if d.*.vendor == bochs.VENDOR && d.*.device == bochs.DEVICE {
+        const which = bochs.attach(d.*.adapter, d.*.address)
+        if which != bochs.NONE {
+            driver = bochs.driver(which)
+            stretches[number] = false
+            if bytes.length == 0 { bytes = bochs.edid(which) }
+        }
+    } else if gpu.modeDisplay() == number {
+        driver = gpu.modeDriver()
+        rate = gpu.modeRate()
+        // (What the driver read over the monitor's own lines is the
+        // monitor that is there now, every block of it.)
+        const theirs = gpu.modeEdid()
+        if theirs.length != 0 { bytes = theirs }
+        gpuMonitors = gpu.monitorChanges()
+    }
+    const picture = dm.Picture.{ .address = d.*.address, .width = d.*.width, .height = d.*.height, .pitch = d.*.pitch }
+    const s = &states[number]
+    s.begin(&driver, bytes, &picture, rate, null)
+    monitors[number] = dm.monitorName(bytes)
+    var can: usize = 0
+    var k: usize = 0
+    while k < s.*.list.count {
+        if s.*.list.modes[k].why == dm.Why.NONE { can += 1 }
+        k += 1
+    }
+    prefix(number)
+    console.out.decimal(s.*.list.count)
+    out(if s.*.list.count == 1 { " mode" } else { " modes" })
+    if driver.kind == dm.Kind.FIRMWARE || driver.kind == dm.Kind.RADEON_OTHER {
+        out(", none of which can be set while the system runs: ")
+        out(dm.whyText(if driver.kind == dm.Kind.FIRMWARE { dm.Why.NO_DRIVER } else { dm.Why.OUTPUT }))
+    } else {
+        out(", of which its driver (")
+        out(driverName(driver.kind))
+        out(") can set ")
+        console.out.decimal(can)
+        if driver.kind == dm.Kind.QEMU {
+            out(", and any other size its ")
+            console.out.decimal(bochs.memoryOf(driver.which) / (1024 * 1024))
+            out(" MiB hold")
+        }
+    }
+    out("; it runs ")
+    sayMode(&s.*.runs)
+    out("\n")
+    const was = console.screen(false)
+    k = 0
+    while k < s.*.list.count {
+        const m = &s.*.list.modes[k]
+        prefix(number)
+        out("mode ")
+        sayMode(m)
+        if m.*.own { out(", the monitor's own") }
+        if m.same(&s.*.runs) { out(", runs now") }
+        if m.*.why != dm.Why.NONE && driver.kind != dm.Kind.FIRMWARE && driver.kind != dm.Kind.RADEON_OTHER {
+            out("; cannot be set: ")
+            dm.sayWhy(out, m.*.why, m.*.limit)
+        }
+        out("\n")
+        k += 1
+    }
+    if s.*.list.unnamed != 0 || s.*.list.beyond != 0 {
+        prefix(number)
+        console.out.decimal(s.*.list.unnamed)
+        out(" of the names in the monitor's EDID are none the tables here have a timing for, and ")
+        console.out.decimal(s.*.list.beyond)
+        out(" modes were more than are kept\n")
+    }
+    _ = console.screen(was)
+}
+
+// The monitor of display `number` says something else of itself than at
+// boot (the display's driver read more of its EDID over the monitor's
+// own lines, or another monitor was plugged in): its modes are listed
+// anew, from what the loader passed on or the driver has by now, and the
+// programs that hold the display's node are told to look again. For
+// whoever reads a monitor after the boot; what runs and what is pending
+// stay.
+pub fn relist(number: usize) -> void {
+    if number >= bound { return }
+    const s = &states[number]
+    var bytes = loaderEdid(display.at(number))
+    if s.*.driver.kind == dm.Kind.QEMU && bytes.length == 0 { bytes = bochs.edid(s.*.driver.which) }
+    if gpu.modeDisplay() == number {
+        const theirs = gpu.modeEdid()
+        if theirs.length != 0 { bytes = theirs }
+        gpuMonitors = gpu.monitorChanges()
+    }
+    s.relist(bytes)
+    monitors[number] = dm.monitorName(bytes)
+    display.noteChange(number)
+    const was = console.screen(false)
+    console.freshLine()
+    prefix(number)
+    out("its monitor's modes are listed anew: ")
+    console.out.decimal(s.*.list.count)
+    out(if s.*.list.count == 1 { " mode\n" } else { " modes\n" })
+    _ = console.screen(was)
+}
+
+// Display `number` shows another picture now (its state says which): the
+// display's record, its node's size, the console.
+fn adopt(number: usize) -> void {
+    const s = &states[number]
+    const p = &s.*.picture
+    var shapeWidth = p.*.width
+    var shapeHeight = p.*.height
+    if stretches[number] {
+        // A real monitor stretches a mode that is not its own across its
+        // screen: the screen's shape stays its own mode's.
+        var k: usize = 0
+        while k < s.*.list.count {
+            if s.*.list.modes[k].own {
+                shapeWidth = s.*.list.modes[k].width
+                shapeHeight = s.*.list.modes[k].height
+            }
+            k += 1
+        }
+    }
+    display.show(number, p.*.address, p.*.width, p.*.height, p.*.pitch, shapeWidth, shapeHeight)
+    const d = display.at(number)
+    const tree = vfs.fileSystem()
+    const devices = tree.lookup(vfs.Vfs.ROOT, "devices".pointer, 7)
+    if devices != vfs.Vfs.NONE {
+        const node = tree.lookup(devices, d.nodeName().pointer, d.nodeName().length)
+        if node != vfs.Vfs.NONE { tree.node(node).*.size = d.size() }
+    }
+    // The console on the new picture where it was on the old one; where a
+    // program draws, what the kernel would draw on in need.
+    _ = console.reshapeFramebuffer()
+    fbcon.follow()
+}
+
+// For the log alone, after a change on QEMU's adapter: how long the other
+// processors stood still for it (the Radeon's driver says its own).
+fn sayStood(number: usize) -> void {
+    if states[number].driver.kind != dm.Kind.QEMU { return }
+    const was = console.logOnly(true)
+    prefix(number)
+    out("the other processors stood still for the change, ")
+    console.out.decimal(bochs.stood() / 1000)
+    out(" us")
+    if bochs.deaf() != 0 {
+        out(" (")
+        console.out.decimal(bochs.deaf())
+        out(" did not say so)")
+    }
+    out("\n")
+    _ = console.logOnly(was)
+}
+
+fn countPending() -> void {
+    pending = 0
+    var k: usize = 0
+    while k < bound {
+        if states[k].pending { pending += 1 }
+        k += 1
+    }
+}
+
+// ---- What is remembered.
+
+const FILE = "display-modes"
+const ROOM: usize = 2048
+var text: [ROOM]u8 = undefined // (per run)
+var fresh: [ROOM]u8 = undefined // (per run)
+
+// /system/settings (made when there is none); NONE when there is no
+// /system.
+fn settingsDirectory() -> usize {
+    const tree = vfs.fileSystem()
+    const system = tree.resolve(vfs.Vfs.ROOT, "/system\x00".pointer)
+    if system < 0 { return vfs.Vfs.NONE }
+    const directory = tree.lookup(@bitCast(usize, system), "settings".pointer, 8)
+    if directory != vfs.Vfs.NONE { return directory }
+    const made = tree.makeDirectory(@bitCast(usize, system), "settings", 493)
+    return if made < 0 { vfs.Vfs.NONE } else { @bitCast(usize, made) }
+}
+
+// The file's text (nothing when there is no file).
+fn fileText() -> []const u8 {
+    const tree = vfs.fileSystem()
+    const directory = settingsDirectory()
+    if directory == vfs.Vfs.NONE { return text[0..0] }
+    const file = tree.lookup(directory, FILE.pointer, FILE.length)
+    if file == vfs.Vfs.NONE { return text[0..0] }
+    tree.ready(file)
+    const length = tree.read(file, 0, &text, ROOM)
+    return text[0..length]
+}
+
+// Where a write of the file ended (display_modes.mlx's `Written`: on a
+// disk, in memory alone, not at all).
+const Written = dm.Written
+
+// The file written with display `number`'s line for `mode` (null: its
+// line taken out), and the volumes committed. (When 2 KiB would not hold
+// every monitor's line, the lines confirmed longest ago are left out:
+// display_modes.mlx's `remember`.)
+fn fileWrite(number: usize, mode: ?*const dm.Kept) -> Written {
+    const tree = vfs.fileSystem()
+    const directory = settingsDirectory()
+    if directory == vfs.Vfs.NONE { return Written.not }
+    const d = display.at(number)
+    const old = fileText()
+    const length = dm.remember(old, d.*.vendor, d.*.device, monitors[number], mode, fresh[0..])
+    if length > ROOM { return Written.not }
+    var node = tree.lookup(directory, FILE.pointer, FILE.length)
+    if node == vfs.Vfs.NONE {
+        if length == 0 { return Written.not }
+        node = tree.create(vfs.NodeKind.file, 420)
+        if node == vfs.Vfs.NONE { return Written.not }
+        if tree.link(directory, FILE.pointer, FILE.length, node) < 0 {
+            tree.release(node)
+            return Written.not
+        }
+    } else {
+        tree.ready(node)
+        tree.truncate(node, 0)
+    }
+    if tree.write(node, 0, &fresh, length) != @intCast(isize, length) { return Written.not }
+    // (On a volume of a disk: there at the next boot once committed.)
+    if tree.node(directory).*.volume == 0 { return Written.memory }
+    return if volume.commitAll() { Written.disk } else { Written.not }
+}
+
+// The mode display `number` runs written down as the one the next boots
+// set.
+fn keep(number: usize) -> void {
+    const s = &states[number]
+    s.*.keep = false
+    const kept = dm.Kept.{ .width = s.*.kept.width, .height = s.*.kept.height, .millihertz = s.*.kept.millihertz }
+    const where = fileWrite(number, &kept)
+    prefix(number)
+    sayMode(&s.*.kept)
+    if where == Written.disk {
+        out(" is confirmed and remembered for this monitor (/system/settings/display-modes): the next boots set it\n")
+    } else if where == Written.memory {
+        out(" is confirmed; this system does not run from a disk, so it is not there after a restart\n")
+    } else {
+        out(" is confirmed, but /system/settings/display-modes could not be written: the next boots set the monitor's own mode\n")
+    }
+}
+
+// What a boot does with a mode remembered for display `number`.
+fn restore(number: usize, file: []const u8) -> void {
+    const s = &states[number]
+    const kind = s.*.driver.kind
+    if kind != dm.Kind.QEMU && kind != dm.Kind.RADEON_TMDS && kind != dm.Kind.RADEON_DP { return }
+    const d = display.at(number)
+    var kept: dm.Kept = undefined
+    if !dm.remembered(file, d.*.vendor, d.*.device, monitors[number], &kept) { return }
+    const mode = dm.sizeOnly(kept.width, kept.height, kept.millihertz, dm.Source.ASKED)
+    const decision = gpu.bootChoice()
+    prefix(number)
+    const rule = dm.atBoot(decision.*.key == 'N', choice.writes(decision.*.choice) && decision.*.choice != choice.Choice.rehearsal)
+    if rule == dm.AtBoot.forget {
+        const where = fileWrite(number, null)
+        out("N was pressed at this start: the mode remembered for this monitor, ")
+        sayMode(&mode)
+        out(dm.forgetText(true, where))
+        return
+    }
+    if rule == dm.AtBoot.leave {
+        out("the mode remembered for this monitor, ")
+        sayMode(&mode)
+        out(", is not set at this boot (the boot's choice sets no new mode); it stays remembered\n")
+        return
+    }
+    const answer = s.restore(kept.width, kept.height, kept.millihertz)
+    if answer == dm.Answer.confirmed {
+        adopt(number)
+        out("the mode remembered for this monitor is set: ")
+        sayMode(&s.*.runs)
+        out(if decision.*.looked { " (N while the machine starts sets the monitor's own mode again and forgets this one)\n" } else { " (/system/settings/display-modes holds it)\n" })
+    } else if answer == dm.Answer.already {
+        out("the mode remembered for this monitor runs: ")
+        sayMode(&s.*.runs)
+        out("\n")
+    } else if answer == dm.Answer.not_listed {
+        out("the mode remembered for this monitor, ")
+        sayMode(&mode)
+        out(", is none it names any more: not set\n")
+    } else if answer == dm.Answer.refused {
+        out("the mode remembered for this monitor, ")
+        sayMode(&mode)
+        out(", cannot be set: ")
+        dm.sayWhy(out, s.*.lastWhy, 0)
+        out("\n")
+    } else {
+        if answer == dm.Answer.failed_lost { display.noteChange(number) }
+        // (The display was written and the mode did not come: it is not
+        // tried again at every start, display_modes.mlx's
+        // `forgottenAfter`.)
+        var where = Written.not
+        if dm.forgottenAfter(answer) {
+            where = fileWrite(number, null)
+            s.forget()
+        }
+        out("the mode remembered for this monitor, ")
+        sayMode(&mode)
+        out(", could not be set")
+        out(if answer == dm.Answer.failed_back { "; the mode before runs" } else { ", and the mode before is not known to be back" })
+        // (What is said of it is where the file's write ended.)
+        out(dm.forgetText(false, where))
+    }
+}
+
+// Every display's modes listed and its driver bound; then the modes
+// remembered from an earlier boot set. Called once at boot, when the
+// displays are found, the volumes mounted, the GPU probed and the
+// processors found (smp.start).
+pub fn start() -> void {
+    bound = 0
+    pending = 0
+    smp.armHold()
+    var k: usize = 0
+    while k < display.count() && k < displays.MAX {
+        if display.at(k).*.present {
+            bind(k)
+            bound = k + 1
+        }
+        k += 1
+    }
+    if bound == 0 { return }
+    const file = fileText()
+    if file.length == 0 { return }
+    k = 0
+    while k < bound {
+        restore(k, file)
+        k += 1
+    }
+}
+
+// How many displays have a state.
+pub fn count() -> usize { return bound }
+
+// How many modes display `number` has, and mode `index`'s record
+// (dm.RECORD bytes).
+pub fn modes(number: usize) -> usize { return if number < bound { states[number].list.count } else { 0 } }
+
+pub fn record(number: usize, index: usize, into: [*]u8) -> void { states[number].record(index, into) }
+
+// What display `number`'s node says beyond its geometry (STATE_BYTES
+// bytes; zeros for a display without a state).
+pub fn describe(number: usize, into: [*]u8) -> void {
+    if number < bound {
+        states[number].describe(clock.system().monotonic(), into)
+        // (How often the picture changed is the display's own count, the
+        // one the handles' states go by.)
+        const changes = display.changes(number)
+        var b: usize = 0
+        while b < 8 {
+            into[b] = @intCast(u8, (changes >> @intCast(u6, b * 8)) & 0xFF)
+            b += 1
+        }
+        return
+    }
+    var k: usize = 0
+    while k < STATE_BYTES {
+        into[k] = 0
+        k += 1
+    }
+}
+
+// A program's request for display `number`: a mode asked for (`width`
+// by `height` at `millihertz`, 0: at any rate), the pending one
+// confirmed, or taken back. What came of it; the log says it in words.
+pub fn request(number: usize, what: usize, width: usize, height: usize, millihertz: usize) -> dm.Answer {
+    if number >= bound { return dm.Answer.not_listed }
+    const s = &states[number]
+    console.freshLine()
+    var answer = dm.Answer.none
+    if what == What.ASK {
+        const asked = dm.sizeOnly(width, height, millihertz, dm.Source.ASKED)
+        const before = s.*.runs
+        answer = s.ask(width, height, millihertz, clock.system().monotonic())
+        if answer == dm.Answer.busy || answer == dm.Answer.already { return answer }
+        if answer == dm.Answer.changed {
+            // (The time to confirm counts from when the mode runs, not
+            // from before a change that takes a card a second.)
+            s.*.deadline = clock.system().monotonic() + dm.CONFIRM_TIME
+            adopt(number)
+            sayStood(number)
+        }
+        prefix(number)
+        if answer == dm.Answer.changed {
+            out("it runs ")
+            sayMode(&s.*.runs)
+            out(" now (before: ")
+            sayMode(&before)
+            out("); unless that is confirmed within ")
+            console.out.decimal(dm.CONFIRM_TIME / 1000000000)
+            out(" seconds, the mode before comes back\n")
+        } else if answer == dm.Answer.not_listed {
+            out("it has no mode ")
+            sayMode(&asked)
+            out("\n")
+        } else if answer == dm.Answer.refused {
+            sayMode(&asked)
+            out(" cannot be set: ")
+            dm.sayWhy(out, s.*.lastWhy, 0)
+            out("\n")
+        } else {
+            if answer == dm.Answer.failed_lost { display.noteChange(number) }
+            out("the change to ")
+            sayMode(&asked)
+            out(if answer == dm.Answer.failed_back { " failed; the mode before runs\n" } else { " failed, and the mode before is not known to be back\n" })
+        }
+    } else if what == What.CONFIRM {
+        const was = s.*.runs
+        answer = s.confirmAt(clock.system().monotonic())
+        if answer == dm.Answer.confirmed && s.*.keep { keep(number) }
+        if answer != dm.Answer.confirmed && answer != dm.Answer.nothing_pending && answer != dm.Answer.busy { wentBack(number, &was, answer, false) }
+    } else if what == What.TAKE_BACK {
+        const was = s.*.runs
+        answer = s.takeBack()
+        if answer != dm.Answer.nothing_pending && answer != dm.Answer.busy { wentBack(number, &was, answer, false) }
+    }
+    countPending()
+    return answer
+}
+
+// What became of a pending mode's way back, said. `moved`: the kernel
+// took it back before the GPU's driver brings the picture to where the
+// monitor is now (gpu_together.mlx).
+fn wentBack(number: usize, was: *const dm.Mode, answer: dm.Answer, moved: bool) -> void {
+    const s = &states[number]
+    if answer == dm.Answer.taken_back || answer == dm.Answer.timed_out {
+        adopt(number)
+        sayStood(number)
+        prefix(number)
+        if moved {
+            sayMode(was)
+            out(" was not confirmed before the monitor was found elsewhere: the mode before is back, ")
+        } else if answer == dm.Answer.timed_out {
+            out("nobody confirmed ")
+            sayMode(was)
+            out(" within ")
+            console.out.decimal(dm.CONFIRM_TIME / 1000000000)
+            out(" seconds: the mode before is back, ")
+        } else {
+            sayMode(was)
+            out(" is taken back: the mode before is back, ")
+        }
+        sayMode(&s.*.runs)
+        out("\n")
+        return
+    }
+    display.noteChange(number)
+    prefix(number)
+    if moved && answer == dm.Answer.failed_back {
+        // (Nothing was written: the mode before is not one for the
+        // monitor that is there now.)
+        sayMode(was)
+        out(" waited to be confirmed when another monitor came; the mode before cannot be set for it, so ")
+        sayMode(was)
+        out(" stays and waits no more\n")
+        return
+    }
+    out("the mode before ")
+    sayMode(was)
+    out(if answer == dm.Answer.failed_back { " could not be put back: " } else { " could not be put back, and what the display shows is not known: " })
+    sayMode(was)
+    out(" stays the mode the kernel counts on\n")
+}
+
+// The timer's tick (in its interrupt): whether a change nobody
+// confirmed in time is to be taken back, made on the trap's way back
+// (`due`).
+pub fn tick() -> void {
+    if pending == 0 { return }
+    const now = clock.system().monotonic()
+    var k: usize = 0
+    while k < bound {
+        if states[k].pending && now >= states[k].deadline { overdue = true }
+        k += 1
+    }
+}
+
+// What the timer's tick found to be done to a display, made once its
+// interrupt is over: trap.mlx calls this on every trap's way back, and on
+// nearly all of them there is nothing to do. A change nobody confirmed in
+// time taken back; the GPU driver's change to follow its monitor
+// (gpu_together.mlx: a pending mode taken back first); the modes listed
+// anew when that monitor is another.
+pub fn due() -> void {
+    if overdue {
+        overdue = false
+        const now = clock.system().monotonic()
+        var k: usize = 0
+        while k < bound {
+            const s = &states[k]
+            if s.*.pending && now >= s.*.deadline {
+                const was = s.*.runs
+                console.freshLine()
+                if s.tick(now) {
+                    // (The display's driver was changing it: nothing was
+                    // written, the mode still waits, taken back at the
+                    // next trap.)
+                    if s.*.last == dm.Answer.busy {
+                        overdue = true
+                    } else {
+                        wentBack(k, &was, s.*.last, false)
+                    }
+                }
+            }
+            k += 1
+        }
+        countPending()
+    }
+    // (Nearly every trap ends here: nothing of the GPU's is due.)
+    if !gpu.changeDue() && gpu.monitorChanges() == gpuMonitors { return }
+    const number = gpu.modeDisplay()
+    if number >= bound {
+        // (The card shows none of the kernel's displays: its picture is
+        // followed all the same, there is no list of modes to keep.)
+        _ = gpu.carryDue(null)
+        gpuMonitors = gpu.monitorChanges()
+        return
+    }
+    if gpu.changeDue() {
+        const s = &states[number]
+        const was = s.*.runs
+        console.freshLine()
+        const came = gpu.carryDue(s)
+        if came == together.Due.withdrawn {
+            wentBack(number, &was, s.*.last, true)
+            countPending()
+        } else if came == together.Due.made {
+            // (The picture's memory, size and pitch are as they were; the
+            // monitor may be another, the list of modes is its monitor's
+            // and the rate may be another one: the programs look again.)
+            const theirs = gpu.modeEdid()
+            if theirs.length != 0 { monitors[number] = dm.monitorName(theirs) }
+            gpuMonitors = gpu.monitorChanges()
+            display.noteChange(number)
+        }
+    }
+    if gpu.monitorChanges() != gpuMonitors { relist(number) }
+}

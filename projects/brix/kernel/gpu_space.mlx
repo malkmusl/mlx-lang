@@ -1,0 +1,790 @@
+// The programs' address spaces on a Radeon (a Polaris 10, the RX 580) as
+// one small interface of the kernel's, beside the ring's (gpu_ring.mlx):
+// what a context on the card (gpu_offer.mlx's contexts, the gpu handles
+// of the native calls 80 to 85) has of the card's memory, and how its
+// work is switched to it. Stage 7 (gpu_first_space.mlx) is its first
+// user; the native calls gpu_memory, gpu_map, gpu_unmap, gpu_submit and
+// gpu_fence are to be built on it and on the ring's. The study's 2.3 to
+// 2.6, 5.9 and 9 (/tmp/brix-next/gpu-accel-kernel.verified.md, as its
+// second reading corrected them), from Linux 6.6's gmc_v8_0.c,
+// amdgpu_vm.c, amdgpu_vm_pt.c, amdgpu_vm_cpu.c, amdgpu_ttm.c, amdgpu_gmc.c
+// and amdgpu_ids.c.
+//
+// WHAT AN ADDRESS SPACE IS: one of the card's fifteen (1 to 15; 0 is the
+// kernel's, the GART), two levels as Linux sizes them for this machine
+// (gpu_engines.mlx's MAX_PFN and BLOCK_SIZE: 64 GiB, a directory of 16384
+// entries, page tables of 1024 entries that map 4 MiB each), its directory
+// and tables in the driver's part of the card's memory. A directory entry
+// names a table by its card address, valid in bit 0
+// (amdgpu_gmc_get_pde_for_bo); a table's entry names a page with the
+// bits of the study's 2.3: valid; for a page of the system's memory its
+// bus address with the system bit, and the snooped bit when it is mapped
+// cached; for a page of the card's memory its offset in the card's memory
+// (amdgpu_vm_update_range: vram_base_offset, which gmc_v8_0_sw_init makes
+// 0 on a card that is no APU, plus the page's place: the study's 2.3 says
+// "its card address", the source says otherwise and wins), not snooped
+// (amdgpu_vram_mgr_new: write-combined); readable, writeable, executable
+// as the mapping asks (amdgpu_vm_bo_update, gmc_v8_0_get_vm_pte). The
+// processor writes the entries through the aperture, then flushes the
+// host path (amdgpu_vm_cpu_update and _commit, vi_flush_hdp).
+//
+// THE INTERFACE:
+// - `open`: the interface on the card once the GART is on (stage 1): its
+//   pool in the driver's part from 2 MiB on (M1 proved the first 2 MiB,
+//   which stages 1 to 4 use; a piece of the pool is cleared and read back
+//   when it is taken);
+// - `take`: an address space for a context, the lowest free of 1 to 7
+//   (Linux's own clients' range, amdgpu_ids.c; 8 to 15 got the other
+//   subsystem's shader memory words at G1 and are kept back until one of
+//   them has passed stage 7 by itself, as the study's 5.3 says), with its
+//   directory cleared; `give`: every table back, the base register back to
+//   the GART's table and flushed, the interrupt ring's number for it as it
+//   was, refused (NONE) while a ring has not come to the last fence of the
+//   space's work; `empty`, for a space whose work cannot end (a ring hung
+//   in it): every entry of its tables 0 and the space flushed, so that
+//   whatever the stuck work still asks of it faults to the default page, and
+//   the space kept,
+//   with its pages, until the way down (`giveStopped`, once the processors
+//   are halted); `idle`: whether every ring has passed the space's work
+//   (what a program's pages wait for before they are freed);
+// - `map`, `unmap`: a page of the system's memory (cached or
+//   write-combined) or of the card's at a card address of the space, read,
+//   write, execute as asked; the table it needs taken and named in the
+//   directory; each entry read back, the host path flushed; what a
+//   program may not map (the driver's part, the bottom 2 MiB that Linux
+//   keeps, AMDGPU_VA_RESERVED_SIZE, an address beyond 40 bits) refused;
+// - `submit`: a buffer in the space on a ring, the switch and the flush
+//   emitted in front of it by the ring (ring.submitIn: the space's base
+//   register = its directory, VM_INVALIDATE_REQUEST, the number the
+//   interrupt ring gives its faults, as amdgpu_vm_flush emits them; every
+//   submission flushes, as Linux does for an address space whose tables
+//   the processor writes); refused while the space's work on the other
+//   ring has not ended: this card flushes no address space that another
+//   engine still uses (amdgpu_vm_manager_init: concurrent flushes only from
+//   Vega10 on; amdgpu_vmid_grab_idle and _grab_used then take a space idle
+//   on every other ring for a flush), so a space runs on one ring at a
+//   time;
+// - `collect`: the memory controller's faults a ring's wait took (sources
+//   146 and 147, gmc_v8_0_process_interrupt) told to the space they
+//   belong to (the status' address space) when the entry's number (the
+//   one IH_VMID_n_LUT gave it: Linux names a fault's process by it,
+//   entry->pasid) is that space's holder's, so that a fault taken late is
+//   never told to a context that took the space since; each said in a line
+//   with its page, read or write, protections and client.
+//
+// The numbers are Linux 6.6's (gmc_8_1_d.h, gmc_8_1_sh_mask.h, oss_3_0_d.h,
+// bif_5_0_d.h, amdgpu_vm.h, ivsrcid_vislands30.h): tools/check_gpu_registers.py
+// holds every one of them against those files. tests/507 lends a card that
+// is a table.
+const engines = @import("./gpu_engines.mlx")
+const loaded = @import("./gpu_smc_sdma.mlx")
+const ring = @import("./gpu_ring.mlx")
+
+// ---- The registers' fields (gmc_8_1_sh_mask.h).
+// A fault's status: the protections it broke, the client that asked, a
+// write, the address space.
+pub const VM_CONTEXT1_PROTECTION_FAULT_STATUS__PROTECTIONS: usize = 0xFF
+pub const VM_CONTEXT1_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_ID: usize = 0x1FF000
+pub const VM_CONTEXT1_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_RW: usize = 0x1000000
+pub const VM_CONTEXT1_PROTECTION_FAULT_STATUS__VMID: usize = 0x1E000000
+// The seven fault interrupts of an address space (the same bits in
+// VM_CONTEXT0_CNTL and VM_CONTEXT1_CNTL: gmc_v8_0_vm_fault_interrupt_state).
+pub const VM_CONTEXT1_CNTL__RANGE_PROTECTION_FAULT_ENABLE_INTERRUPT: usize = 0x8
+pub const VM_CONTEXT1_CNTL__DUMMY_PAGE_PROTECTION_FAULT_ENABLE_INTERRUPT: usize = 0x40
+pub const VM_CONTEXT1_CNTL__PDE0_PROTECTION_FAULT_ENABLE_INTERRUPT: usize = 0x200
+pub const VM_CONTEXT1_CNTL__VALID_PROTECTION_FAULT_ENABLE_INTERRUPT: usize = 0x1000
+pub const VM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_INTERRUPT: usize = 0x8000
+pub const VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_INTERRUPT: usize = 0x40000
+pub const VM_CONTEXT1_CNTL__EXECUTE_PROTECTION_FAULT_ENABLE_INTERRUPT: usize = 0x200000
+// The interrupt ring's number of an address space (oss_3_0_sh_mask.h).
+pub const IH_VMID_0_LUT__PASID: usize = 0xFFFF
+
+// ---- Linux's numbers that are no register.
+// The bottom of every address space, 2 MiB, is the kernel's (amdgpu_vm.h).
+pub const AMDGPU_VA_RESERVED_SIZE: usize = 0x200000
+// A directory's entries and bytes, a table's (2^BLOCK_SIZE entries of 8
+// bytes: amdgpu_vm_pt_entries_mask, amdgpu_vm_pt_size).
+pub const DIRECTORY_ENTRIES: usize = engines.MAX_PFN >> @intCast(u6, engines.BLOCK_SIZE)
+pub const DIRECTORY_BYTES: usize = DIRECTORY_ENTRIES * engines.ENTRY_BYTES
+pub const TABLE_ENTRIES: usize = @intCast(usize, 1) << @intCast(u6, engines.BLOCK_SIZE)
+pub const TABLE_BYTES: usize = TABLE_ENTRIES * engines.ENTRY_BYTES
+// The card addresses a DMA of this card reaches (amdgpu_gmc's 40 bits).
+pub const DMA_BITS: usize = 40
+
+// ---- This driver's own numbers.
+// What a mapping allows (the native call gpu_map's flags: read 1, write 2,
+// execute 4).
+pub const READ: usize = 1
+pub const WRITE: usize = 2
+pub const EXECUTE: usize = 4
+// The address spaces handed out: 1 to HANDED.
+pub const HANDED: usize = 7
+// Where the pool begins in the driver's part, its pages, its words of
+// bits.
+pub const POOL_AT: usize = 2 * 1024 * 1024
+pub const POOL_PAGES: usize = (engines.DRIVER_PART - POOL_AT) / engines.AMDGPU_GPU_PAGE_SIZE
+pub const POOL_WORDS: usize = POOL_PAGES / 64
+// The context that is the kernel's own (stage 7's test), and the number
+// the interrupt ring gives its faults; a program's context n has n + 1.
+pub const KERNEL: usize = 0xFFFFFFFE
+pub const KERNEL_PASID: usize = 0xFFFF
+// The faults kept per address space (the first said word for word).
+pub const KEPT_FAULTS: usize = 4
+// The rings a space's work goes to: compute ring 0 (0) and the graphics
+// ring (1).
+pub const RINGS: usize = 2
+// (No such thing; a piece of the card's memory that does not hold what
+// was written.)
+pub const NONE: usize = 0xFFFFFFFFFFFFFFFF
+pub const UNHELD: usize = 0xFFFFFFFFFFFFFFFE
+
+// What memory a page is.
+pub const Memory = enum(u8) { system, write_combined, card }
+
+// How a map or an unmap ended.
+pub const Mapped = enum(u8) { done, not_open, not_taken, not_on_a_page, reserved, beyond, unreachable, driver_part, already, nothing_there, no_room, does_not_hold, kept }
+
+// A map's or an unmap's end in words.
+pub fn mappedWords(m: Mapped) -> []const u8 {
+    if m == Mapped.done { return "done" }
+    if m == Mapped.not_open { return "the interface is not open" }
+    if m == Mapped.not_taken { return "the address space is held by no context" }
+    if m == Mapped.not_on_a_page { return "an address not on a page, or flags beyond read, write and execute" }
+    if m == Mapped.reserved { return "the bottom 2 MiB are the kernel's" }
+    if m == Mapped.beyond { return "beyond the address space's 64 GiB" }
+    if m == Mapped.unreachable { return "memory the card cannot reach" }
+    if m == Mapped.driver_part { return "the driver's part of the card's memory" }
+    if m == Mapped.already { return "something is mapped there already" }
+    if m == Mapped.nothing_there { return "nothing is mapped there" }
+    if m == Mapped.no_room { return "no room left for a page table" }
+    if m == Mapped.kept { return "the address space's work did not end: it is kept empty until the rings are stopped" }
+    return "a table entry does not hold what was written"
+}
+
+pub const Spaces = struct {
+    // Open: the pool's first byte in the aperture, the card address of the
+    // card's memory's first byte, its size, the driver's part's first
+    // byte, the GART's table's card address (each space's base register
+    // until a ring switches to it).
+    up: bool
+    pool: usize
+    vramStart: usize
+    vramBytes: usize
+    driverAt: usize
+    placeholder: usize
+    // The pool's pages taken, a bit each.
+    used: [POOL_WORDS]usize
+    // Each address space: its context (NONE: free), its directory's place
+    // in the aperture, its tables, its pages mapped, whether a ring was
+    // switched to it (its base register written), whether the interrupt
+    // ring's table was given its number, and what that word held before.
+    owner: [ring.SPACES]usize
+    directory: [ring.SPACES]usize
+    tables: [ring.SPACES]usize
+    pages: [ring.SPACES]usize
+    switched: [ring.SPACES]bool
+    told: [ring.SPACES]bool
+    lutWas: [ring.SPACES]usize
+    // Its last submission on each of the two rings: the ring's record (so
+    // that the ring's fence word can be read) and the fence's number
+    // (NONE: none); whether it was emptied with its work not ended, and is
+    // kept until the way down.
+    lastRecord: [ring.SPACES][RINGS]usize
+    lastFence: [ring.SPACES][RINGS]usize
+    kept: [ring.SPACES]bool
+    // Its faults: how many, and the first ones' page, status, client,
+    // source.
+    faults: [ring.SPACES]usize
+    faultPage: [ring.SPACES][KEPT_FAULTS]usize
+    faultStatus: [ring.SPACES][KEPT_FAULTS]usize
+    faultClient: [ring.SPACES][KEPT_FAULTS]usize
+    faultSource: [ring.SPACES][KEPT_FAULTS]usize
+    // Faults told to no context (of an address space no context holds,
+    // or whose entry carries another number than its holder's);
+    // submissions that carried the switch.
+    stray: usize
+    switches: usize
+}
+
+// ---- Reaching the card.
+
+fn rd(e: *engines.Engines, number: usize) -> usize {
+    const read = e.*.hands.read
+    return @intCast(usize, read(number))
+}
+
+fn wr(e: *engines.Engines, number: usize, value: usize) -> void {
+    const write = e.*.hands.write
+    write(number, @intCast(u32, value & 0xFFFFFFFF))
+}
+
+fn say(e: *engines.Engines, text: []const u8) -> void {
+    const write = e.*.hands.say
+    write(text)
+}
+
+fn vramRead(e: *engines.Engines, at: usize) -> usize {
+    const read = e.*.hands.vramRead
+    return read(at)
+}
+
+fn vramWrite(e: *engines.Engines, at: usize, value: usize) -> void {
+    const write = e.*.hands.vramWrite
+    write(at, value)
+}
+
+fn memoryRead(e: *engines.Engines, physical: usize) -> usize {
+    const read = e.*.hands.memoryRead
+    return @intCast(usize, read(physical))
+}
+
+fn hex(e: *engines.Engines, value: usize) -> void {
+    var digits: usize = 1
+    while digits < 16 && (value >> @intCast(u6, digits * 4)) != 0 { digits += 1 }
+    var text: [18]u8 = undefined
+    text[0] = 48
+    text[1] = 120
+    var k: usize = 0
+    while k < digits {
+        const digit = (value >> @intCast(u6, (digits - 1 - k) * 4)) & 15
+        text[2 + k] = @intCast(u8, if digit < 10 { 48 + digit } else { 87 + digit })
+        k += 1
+    }
+    say(e, text[0..2 + digits])
+}
+
+fn decimal(e: *engines.Engines, value: usize) -> void {
+    var digits: [20]u8 = undefined
+    var at: usize = 20
+    var rest = value
+    while true {
+        at -= 1
+        digits[at] = @intCast(u8, 48 + rest % 10)
+        rest = rest / 10
+        if rest == 0 { break }
+    }
+    say(e, digits[at..20])
+}
+
+// The host path flushed after the processor wrote the card's memory
+// through the aperture (vi_flush_hdp without a ring: written, read back).
+pub fn flushHostPath(e: *engines.Engines) -> void {
+    wr(e, engines.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+    _ = rd(e, engines.HDP_MEM_COHERENCY_FLUSH_CNTL)
+}
+
+// ---- The pool.
+
+fn taken(s: *const Spaces, page: usize) -> bool { return (s.*.used[page / 64] >> @intCast(u6, page % 64)) & 1 != 0 }
+
+fn mark(s: *Spaces, page: usize, on: bool) -> void {
+    const bit = @intCast(usize, 1) << @intCast(u6, page % 64)
+    if on { s.*.used[page / 64] |= bit } else { s.*.used[page / 64] &= ~bit }
+}
+
+// `count` pages of the pool that lie together, cleared and read back: the
+// first one's place in the aperture, NONE when no run is free, UNHELD when
+// the piece does not hold what was written (it stays free). (Stage 7's
+// test takes its card page from here too.)
+pub fn takePages(e: *engines.Engines, s: *Spaces, count: usize) -> usize {
+    var first: usize = 0
+    while first + count <= POOL_PAGES {
+        var k: usize = 0
+        while k < count && !taken(s, first + k) { k += 1 }
+        if k == count {
+            const at = s.*.pool + first * engines.AMDGPU_GPU_PAGE_SIZE
+            const bytes = count * engines.AMDGPU_GPU_PAGE_SIZE
+            var b: usize = 0
+            while b < bytes {
+                vramWrite(e, at + b, 0)
+                b += 8
+            }
+            b = 0
+            while b < bytes {
+                if vramRead(e, at + b) != 0 { return UNHELD }
+                b += 8
+            }
+            k = 0
+            while k < count {
+                mark(s, first + k, true)
+                k += 1
+            }
+            return at
+        }
+        first += k + 1
+    }
+    return NONE
+}
+
+pub fn givePages(s: *Spaces, at: usize, count: usize) -> void {
+    if at < s.*.pool { return }
+    const first = (at - s.*.pool) / engines.AMDGPU_GPU_PAGE_SIZE
+    var k: usize = 0
+    while k < count && first + k < POOL_PAGES {
+        mark(s, first + k, false)
+        k += 1
+    }
+}
+
+// How many of the pool's pages are taken.
+pub fn poolTaken(s: *const Spaces) -> usize {
+    var count: usize = 0
+    var page: usize = 0
+    while page < POOL_PAGES {
+        if taken(s, page) { count += 1 }
+        page += 1
+    }
+    return count
+}
+
+// ---- Open, take, give.
+
+// Nothing open, nothing taken.
+pub fn begin(s: *Spaces) -> void {
+    s.*.up = false
+    s.*.pool = 0
+    s.*.vramStart = 0
+    s.*.vramBytes = 0
+    s.*.driverAt = 0
+    s.*.placeholder = 0
+    var k: usize = 0
+    while k < POOL_WORDS {
+        s.*.used[k] = 0
+        k += 1
+    }
+    var n: usize = 0
+    while n < ring.SPACES {
+        s.*.owner[n] = NONE
+        s.*.directory[n] = NONE
+        s.*.tables[n] = 0
+        s.*.pages[n] = 0
+        s.*.switched[n] = false
+        s.*.told[n] = false
+        s.*.lutWas[n] = 0
+        s.*.faults[n] = 0
+        forget(s, n)
+        n += 1
+    }
+    s.*.stray = 0
+    s.*.switches = 0
+}
+
+// No work of `space` on any ring, nothing kept.
+fn forget(s: *Spaces, space: usize) -> void {
+    var k: usize = 0
+    while k < RINGS {
+        s.*.lastRecord[space][k] = NONE
+        s.*.lastFence[space][k] = NONE
+        k += 1
+    }
+    s.*.kept[space] = false
+}
+
+// Which of a space's two rings `r` is.
+fn slot(r: *const ring.Ring) -> usize { return if r.*.kind == ring.Kind.graphics { 1 } else { 0 } }
+
+// Whether every ring but slot `but` (NONE: every ring) has come to the last
+// fence of `space`'s work on it: its fence word holds that number or a
+// later one (32-bit numbers that wrap, as the ring's wait reads them).
+fn idleBut(e: *engines.Engines, s: *const Spaces, space: usize, but: usize) -> bool {
+    var k: usize = 0
+    while k < RINGS {
+        const record = s.*.lastRecord[space][k]
+        if k != but && record != NONE && (memoryRead(e, record + ring.FENCE_SLOT) -% s.*.lastFence[space][k]) & 0x80000000 != 0 { return false }
+        k += 1
+    }
+    return true
+}
+
+// Whether every ring has passed what was submitted in `space`: its pages
+// may be given back and its tables unmade.
+pub fn idle(e: *engines.Engines, s: *const Spaces, space: usize) -> bool { return idleBut(e, s, space, NONE) }
+
+// The interface on the card: once the GART is on (stage 1, whose table
+// every space's base register names until a ring switches to it) and the
+// driver's part of the aperture holds the pool. Whether it is open.
+pub fn open(e: *engines.Engines, s: *Spaces) -> bool {
+    if e.*.m2 != engines.Outcome.passed || e.*.limit == 0 || e.*.limit + engines.DRIVER_PART > e.*.card.view { return false }
+    s.*.vramStart = e.*.found.vramStart
+    s.*.vramBytes = e.*.found.vramBytes
+    s.*.driverAt = e.*.limit
+    s.*.pool = e.*.limit + POOL_AT
+    s.*.placeholder = e.*.table
+    s.*.up = true
+    return true
+}
+
+// The number the interrupt ring gives the faults of a context's space.
+pub fn pasidOf(context: usize) -> usize {
+    if context == KERNEL { return KERNEL_PASID }
+    return (context + 1) & IH_VMID_0_LUT__PASID
+}
+
+// An address space for `context`: the lowest free of 1 to HANDED, its
+// directory taken from the pool and cleared; NONE when the interface is
+// not open, every one is held, or the pool has no room.
+pub fn take(e: *engines.Engines, s: *Spaces, context: usize) -> usize {
+    if !s.*.up || context == NONE { return NONE }
+    var n: usize = 1
+    while n <= HANDED {
+        if s.*.owner[n] == NONE {
+            const at = takePages(e, s, DIRECTORY_BYTES / engines.AMDGPU_GPU_PAGE_SIZE)
+            if at == NONE || at == UNHELD { return NONE }
+            s.*.owner[n] = context
+            s.*.directory[n] = at
+            s.*.tables[n] = 0
+            s.*.pages[n] = 0
+            s.*.switched[n] = false
+            s.*.told[n] = false
+            s.*.lutWas[n] = rd(e, ring.IH_VMID_0_LUT + n)
+            s.*.faults[n] = 0
+            forget(s, n)
+            return n
+        }
+        n += 1
+    }
+    return NONE
+}
+
+// Whether `space` is held (by anyone).
+pub fn held(s: *const Spaces, space: usize) -> bool { return space != 0 && space < ring.SPACES && s.*.owner[space] != NONE }
+
+// The card address of `space`'s directory (what its base register is
+// given, >> 12).
+pub fn directoryAddress(s: *const Spaces, space: usize) -> usize { return s.*.vramStart + s.*.directory[space] }
+
+// Directory entry `index` of `space` (0: none).
+pub fn directoryEntry(e: *engines.Engines, s: *const Spaces, space: usize, index: usize) -> usize {
+    if !held(s, space) || index >= DIRECTORY_ENTRIES { return 0 }
+    return vramRead(e, s.*.directory[space] + index * engines.ENTRY_BYTES)
+}
+
+// The aperture's place of the table entry that maps `address` in `space`
+// (NONE: no table yet).
+fn entryPlace(e: *engines.Engines, s: *const Spaces, space: usize, address: usize) -> usize {
+    const page = address >> 12
+    const pde = directoryEntry(e, s, space, page >> @intCast(u6, engines.BLOCK_SIZE))
+    if pde & engines.AMDGPU_PTE_VALID == 0 { return NONE }
+    const table = (pde & engines.PTE_ADDRESS) -% s.*.vramStart
+    return table + (page & (TABLE_ENTRIES - 1)) * engines.ENTRY_BYTES
+}
+
+// The table entry that maps `address` in `space` (0: none).
+pub fn entry(e: *engines.Engines, s: *const Spaces, space: usize, address: usize) -> usize {
+    if !held(s, space) { return 0 }
+    const at = entryPlace(e, s, space, address)
+    if at == NONE { return 0 }
+    return vramRead(e, at)
+}
+
+// A table entry's word for a page (the study's 2.3 as the source has it):
+// its address (a bus address, or the offset in the card's memory), valid,
+// system and snooped for the system's memory mapped cached, system alone
+// for write-combined, then executable, readable, writeable as asked.
+pub fn entryWord(kind: Memory, address: usize, flags: usize) -> usize {
+    var word = (address & engines.PTE_ADDRESS) | engines.AMDGPU_PTE_VALID
+    if kind == Memory.system { word |= engines.AMDGPU_PTE_SYSTEM | engines.AMDGPU_PTE_SNOOPED }
+    if kind == Memory.write_combined { word |= engines.AMDGPU_PTE_SYSTEM }
+    if flags & EXECUTE != 0 { word |= engines.AMDGPU_PTE_EXECUTABLE }
+    if flags & READ != 0 { word |= engines.AMDGPU_PTE_READABLE }
+    if flags & WRITE != 0 { word |= engines.AMDGPU_PTE_WRITEABLE }
+    return word
+}
+
+// A page (`kind`, at `address`: its bus address, or its offset in the
+// card's memory) mapped at card address `at` of `space`, `flags` read,
+// write, execute; the table it needs taken and named in the directory
+// first. Each entry read back, then the host path flushed.
+pub fn map(e: *engines.Engines, s: *Spaces, space: usize, at: usize, kind: Memory, address: usize, flags: usize) -> Mapped {
+    if !s.*.up { return Mapped.not_open }
+    if !held(s, space) { return Mapped.not_taken }
+    if s.*.kept[space] { return Mapped.kept }
+    if at & 0xFFF != 0 || address & 0xFFF != 0 || flags & ~(READ | WRITE | EXECUTE) != 0 { return Mapped.not_on_a_page }
+    if at < AMDGPU_VA_RESERVED_SIZE { return Mapped.reserved }
+    return place(e, s, space, at, kind, address, flags)
+}
+
+// The same for a page of the kernel's own in the bottom 2 MiB of a
+// program's space, which `map` keeps from the program (the native calls'
+// copies of a context's streams, gpu_work.mlx): only there.
+pub fn mapReserved(e: *engines.Engines, s: *Spaces, space: usize, at: usize, kind: Memory, address: usize, flags: usize) -> Mapped {
+    if !s.*.up { return Mapped.not_open }
+    if !held(s, space) { return Mapped.not_taken }
+    if s.*.kept[space] { return Mapped.kept }
+    if at & 0xFFF != 0 || address & 0xFFF != 0 || flags & ~(READ | WRITE | EXECUTE) != 0 { return Mapped.not_on_a_page }
+    if at >= AMDGPU_VA_RESERVED_SIZE { return Mapped.reserved }
+    return place(e, s, space, at, kind, address, flags)
+}
+
+// `map` past its checks of the space and the address's place.
+fn place(e: *engines.Engines, s: *Spaces, space: usize, at: usize, kind: Memory, address: usize, flags: usize) -> Mapped {
+    if at >> 12 >= engines.MAX_PFN { return Mapped.beyond }
+    if kind != Memory.card && address >> @intCast(u6, DMA_BITS) != 0 { return Mapped.unreachable }
+    if kind == Memory.card && address >= s.*.vramBytes { return Mapped.unreachable }
+    // The driver's part (the GART's table, the spaces' tables, the SMC's
+    // memory) is no program's to reach.
+    if kind == Memory.card && s.*.owner[space] != KERNEL && address >= s.*.driverAt && address < s.*.driverAt + engines.DRIVER_PART { return Mapped.driver_part }
+    const index = (at >> 12) >> @intCast(u6, engines.BLOCK_SIZE)
+    var pde = directoryEntry(e, s, space, index)
+    if pde & engines.AMDGPU_PTE_VALID == 0 {
+        // amdgpu_vm_pt_alloc and amdgpu_vm_pde_update: a table cleared,
+        // its card address | valid in the directory.
+        const table = takePages(e, s, TABLE_BYTES / engines.AMDGPU_GPU_PAGE_SIZE)
+        if table == NONE { return Mapped.no_room }
+        if table == UNHELD { return Mapped.does_not_hold }
+        pde = ((s.*.vramStart + table) & engines.PTE_ADDRESS) | engines.AMDGPU_PTE_VALID
+        const place = s.*.directory[space] + index * engines.ENTRY_BYTES
+        vramWrite(e, place, pde)
+        if vramRead(e, place) != pde {
+            givePages(s, table, TABLE_BYTES / engines.AMDGPU_GPU_PAGE_SIZE)
+            vramWrite(e, place, 0)
+            return Mapped.does_not_hold
+        }
+        s.*.tables[space] += 1
+    }
+    const place = entryPlace(e, s, space, at)
+    if vramRead(e, place) & engines.AMDGPU_PTE_VALID != 0 { return Mapped.already }
+    const word = entryWord(kind, address, flags)
+    vramWrite(e, place, word)
+    if vramRead(e, place) != word {
+        vramWrite(e, place, 0)
+        return Mapped.does_not_hold
+    }
+    @fence(seq_cst)
+    flushHostPath(e)
+    s.*.pages[space] += 1
+    return Mapped.done
+}
+
+// The page at card address `at` of `space` unmapped (its entry 0, as
+// amdgpu_vm_clear_freed writes it on this card), the host path flushed;
+// the table stays until the space is given back.
+pub fn unmap(e: *engines.Engines, s: *Spaces, space: usize, at: usize) -> Mapped {
+    if !s.*.up { return Mapped.not_open }
+    if !held(s, space) { return Mapped.not_taken }
+    if s.*.kept[space] { return Mapped.kept }
+    if at & 0xFFF != 0 { return Mapped.not_on_a_page }
+    const place = entryPlace(e, s, space, at)
+    if place == NONE || vramRead(e, place) & engines.AMDGPU_PTE_VALID == 0 { return Mapped.nothing_there }
+    vramWrite(e, place, 0)
+    if vramRead(e, place) != 0 { return Mapped.does_not_hold }
+    @fence(seq_cst)
+    flushHostPath(e)
+    s.*.pages[space] -= 1
+    return Mapped.done
+}
+
+// `space` given back, its rings having passed what was submitted in it:
+// every table and its directory back to the pool; when a ring was switched
+// to it, its base register back to the GART's table and flushed, and the
+// interrupt ring's number for it as it was. How many tables; NONE, with
+// nothing written, while a ring has not come to the last fence of its work
+// (the GART's table named as its directory would let that work's next
+// access read the GART's entries as a directory's; `empty` is for a space
+// whose work cannot end).
+pub fn give(e: *engines.Engines, s: *Spaces, space: usize) -> usize {
+    if !held(s, space) { return 0 }
+    if !idle(e, s, space) { return NONE }
+    return back(e, s, space)
+}
+
+// The same on the way down, the processors halted and their queues let go
+// (nothing runs in any space whatever its fences say): a kept space too.
+pub fn giveStopped(e: *engines.Engines, s: *Spaces, space: usize) -> usize {
+    if !held(s, space) { return 0 }
+    return back(e, s, space)
+}
+
+// `space`, whose work did not come to its last fence (a ring hung in it),
+// made harmless and kept: every entry of its tables 0 (the directory still
+// names the tables, so that the way down finds them), the host path
+// flushed, the space flushed by register, so that whatever the stuck work
+// still asks of it finds no valid entry and faults to the default page; its
+// base register still names its directory, its tables and pages stay out of
+// the pool, and nothing more is mapped or run in it until the way down
+// gives it back (`giveStopped`). How many entries were emptied.
+pub fn empty(e: *engines.Engines, s: *Spaces, space: usize) -> usize {
+    if !held(s, space) { return 0 }
+    var count: usize = 0
+    var tables: usize = 0
+    var index: usize = 0
+    while index < DIRECTORY_ENTRIES && tables < s.*.tables[space] {
+        const pde = directoryEntry(e, s, space, index)
+        if pde & engines.AMDGPU_PTE_VALID != 0 {
+            const table = (pde & engines.PTE_ADDRESS) -% s.*.vramStart
+            var k: usize = 0
+            while k < TABLE_ENTRIES {
+                if vramRead(e, table + k * engines.ENTRY_BYTES) & engines.AMDGPU_PTE_VALID != 0 {
+                    vramWrite(e, table + k * engines.ENTRY_BYTES, 0)
+                    count += 1
+                }
+                k += 1
+            }
+            tables += 1
+        }
+        index += 1
+    }
+    @fence(seq_cst)
+    flushHostPath(e)
+    wr(e, engines.VM_INVALIDATE_REQUEST, @intCast(usize, 1) << @intCast(u6, space))
+    s.*.pages[space] = 0
+    s.*.kept[space] = true
+    return count
+}
+
+// Every table and the directory back to the pool, the base register and the
+// number as they were.
+fn back(e: *engines.Engines, s: *Spaces, space: usize) -> usize {
+    var count: usize = 0
+    var index: usize = 0
+    while index < DIRECTORY_ENTRIES && count < s.*.tables[space] {
+        const pde = directoryEntry(e, s, space, index)
+        if pde & engines.AMDGPU_PTE_VALID != 0 {
+            givePages(s, (pde & engines.PTE_ADDRESS) -% s.*.vramStart, TABLE_BYTES / engines.AMDGPU_GPU_PAGE_SIZE)
+            count += 1
+        }
+        index += 1
+    }
+    givePages(s, s.*.directory[space], DIRECTORY_BYTES / engines.AMDGPU_GPU_PAGE_SIZE)
+    if s.*.switched[space] {
+        wr(e, ring.baseRegister(space), s.*.placeholder >> 12)
+        wr(e, engines.VM_INVALIDATE_REQUEST, @intCast(usize, 1) << @intCast(u6, space))
+    }
+    if s.*.told[space] { wr(e, ring.IH_VMID_0_LUT + space, s.*.lutWas[space]) }
+    s.*.owner[space] = NONE
+    s.*.directory[space] = NONE
+    s.*.tables[space] = 0
+    s.*.pages[space] = 0
+    s.*.switched[space] = false
+    s.*.told[space] = false
+    forget(s, space)
+    return count
+}
+
+// ---- Work in an address space.
+
+// The switch a submission in `space` carries (ring.Switch): its directory,
+// the number of its faults, the flush (always: the processor writes the
+// tables), the interrupt ring's table told the number once, the context,
+// the memory sync when `sync` (the kernel's own buffers).
+pub fn switchOf(s: *const Spaces, space: usize, sync: bool) -> ring.Switch {
+    return ring.Switch.{ .space = space, .directory = directoryAddress(s, space), .pasid = pasidOf(s.*.owner[space]), .flush = true, .lut = !s.*.told[space], .context = s.*.owner[space], .sync = sync }
+}
+
+// A buffer of `length` words at card address `address` of `space` run on
+// ring `r` with the switch in front: its fence's number, NONE when the
+// space is not held or kept, when the space's work on the other ring has
+// not ended (the flush in front would come while that ring still uses the
+// space), or when the ring takes nothing (ring.submitIn's reasons). The
+// fence is kept as the space's last on that ring.
+pub fn submit(e: *engines.Engines, l: *loaded.Loaded, s: *Spaces, r: *ring.Ring, space: usize, address: usize, length: usize, sync: bool) -> usize {
+    if !s.*.up || !held(s, space) || s.*.kept[space] { return NONE }
+    const k = slot(r)
+    if !idleBut(e, s, space, k) { return NONE }
+    const sw = switchOf(s, space, sync)
+    const fence = ring.submitIn(e, l, r, address, length, &sw)
+    if fence == ring.NONE { return NONE }
+    s.*.switched[space] = true
+    s.*.told[space] = true
+    s.*.switches += 1
+    s.*.lastRecord[space][k] = r.*.record
+    s.*.lastFence[space][k] = fence
+    return fence
+}
+
+// ---- Faults.
+
+// A fault's address space, client, and whether it was a write, from its
+// status (gmc_v8_0_vm_decode_fault).
+pub fn faultSpace(status: usize) -> usize { return (status & VM_CONTEXT1_PROTECTION_FAULT_STATUS__VMID) >> 25 }
+
+pub fn faultWrote(status: usize) -> bool { return status & VM_CONTEXT1_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_RW != 0 }
+
+pub fn faultClientId(status: usize) -> usize { return (status & VM_CONTEXT1_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_ID) >> 12 }
+
+// The client's four characters, its highest byte first (as Linux prints
+// them), a byte that is no letter, digit or space as a dot.
+pub fn sayClient(e: *engines.Engines, client: usize) -> void {
+    var text: [4]u8 = undefined
+    var k: usize = 0
+    while k < 4 {
+        const byte = (client >> @intCast(u6, 24 - 8 * k)) & 0xFF
+        const plain = byte == 32 || (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        text[k] = @intCast(u8, if plain { byte } else { 46 })
+        k += 1
+    }
+    say(e, text[0..4])
+}
+
+// One fault in words: "page 0x12345, a write, protections 0x10, client
+// "CPC " (0x42); status 0x...; source 146 (no valid entry)".
+pub fn sayFault(e: *engines.Engines, page: usize, status: usize, client: usize, source: usize) -> void {
+    say(e, "page ")
+    hex(e, page)
+    say(e, if faultWrote(status) { ", a write" } else { ", a read" })
+    say(e, ", protections ")
+    hex(e, status & VM_CONTEXT1_PROTECTION_FAULT_STATUS__PROTECTIONS)
+    say(e, ", client \"")
+    sayClient(e, client)
+    say(e, "\" (")
+    hex(e, faultClientId(status))
+    say(e, "); status ")
+    hex(e, status)
+    say(e, "; source ")
+    decimal(e, source)
+    say(e, if source == ring.VISLANDS30_IV_SRCID_GFX_PAGE_INV_FAULT { " (no valid entry)" } else { " (not allowed)" })
+}
+
+// The memory controller's faults ring `r`'s waits took, told to the
+// address spaces they belong to (the status' address space, when the
+// entry's number is its holder's) and each said in a line; the ring's
+// record of them emptied. How many.
+pub fn collect(e: *engines.Engines, s: *Spaces, r: *ring.Ring) -> usize {
+    const count = r.*.spaceFaults
+    var k: usize = 0
+    while k < count && k < ring.FAULTS {
+        const status = r.*.spaceStatus[k]
+        const page = r.*.spacePage[k]
+        const space = faultSpace(status)
+        const number = (r.*.spaceWord[k] >> 16) & IH_VMID_0_LUT__PASID
+        say(e, "gpu: a fault in address space ")
+        decimal(e, space)
+        if held(s, space) && pasidOf(s.*.owner[space]) != number {
+            s.*.stray += 1
+            say(e, " (not its holder's: the fault's number is ")
+            hex(e, number)
+            say(e, ")")
+        } else if held(s, space) {
+            const n = s.*.faults[space]
+            if n < KEPT_FAULTS {
+                s.*.faultPage[space][n] = page
+                s.*.faultStatus[space][n] = status
+                s.*.faultClient[space][n] = r.*.spaceClient[k]
+                s.*.faultSource[space][n] = r.*.spaceSource[k]
+            }
+            s.*.faults[space] = n + 1
+            if s.*.owner[space] == KERNEL {
+                say(e, " (the kernel's own)")
+            } else {
+                say(e, " (context ")
+                decimal(e, s.*.owner[space])
+                say(e, ")")
+            }
+        } else {
+            s.*.stray += 1
+            say(e, " (held by no context)")
+        }
+        say(e, ": ")
+        sayFault(e, page, status, r.*.spaceClient[k], r.*.spaceSource[k])
+        say(e, "\n")
+        k += 1
+    }
+    if count > ring.FAULTS {
+        say(e, "gpu: ")
+        decimal(e, count - ring.FAULTS)
+        say(e, " more faults of the memory controller, not kept\n")
+        s.*.stray += count - ring.FAULTS
+    }
+    r.*.spaceFaults = 0
+    return count
+}

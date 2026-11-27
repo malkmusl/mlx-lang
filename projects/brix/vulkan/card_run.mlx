@@ -1,0 +1,761 @@
+// The host card's engine: a submit's streams executed as the card's
+// compute engine (MEC) would execute them, the study's 8.1. A decoder
+// walks the packets (4.1), keeps the register values the SET_*_REG
+// packets set, does what the preamble's packets do (4.2: the wait for the
+// shaders and the caches' actions, card_cache.mlx), and at a dispatch
+// (4.3) runs the shader COMPUTE_PGM_LO and _HI name in the interpreter
+// (wave.mlx), wave by wave, with the entry registers 4.3 and 5.2 give:
+// the user data words COMPUTE_PGM_RSRC2's USER_SGPR counts from s0 on (the
+// first two are the scratch descriptor's and stay unwritten: nothing
+// spills), then the work group's id in x, y, z as TGID_X_EN .. TGID_Z_EN
+// say, and in v0 .. v2 the invocation's id in its group as TIDIG_COMP_CNT
+// says. The copy and fill packets of 7.6 (DMA_DATA, on the compute
+// queue, as the study chooses) run memory to memory.
+//
+// IT REFUSES what it does not know, with the stream and the word where it
+// stands: a packet that is not one of those below, a packet that runs past
+// its stream, a register outside the four ranges, a read of a register no
+// stream of the submit set (the registers live for one submit: the
+// preamble sets them at every submit), a shader address that is not
+// mapped executable, a value of a register the interpreter does not model
+// (scratch, a trap handler, shared memory, the group size word, another
+// float mode) or that the card's record contradicts (COMPUTE_RESOURCE_
+// LIMITS by the compute units and shader engines the record gives: the
+// study's silent need 4; a shader engine with no compute unit enabled), a
+// shader that stops in the interpreter, a cache's stale word or a race
+// card_cache.mlx sees, a stream whose length is not a multiple of 8, and
+// the copy engine still running when the kernel's fence is written.
+//
+// The packets it knows, each in the form RADV gives it on a compute ring
+// of GFX8 (the compute bit on DISPATCH_DIRECT and ACQUIRE_MEM alone, no
+// predicate):
+//   NOP (its words skipped; the one-word padding)
+//   SET_SH_REG, SET_CONFIG_REG, SET_CONTEXT_REG, SET_UCONFIG_REG
+//   EVENT_WRITE CS_PARTIAL_FLUSH (index 4)
+//   ACQUIRE_MEM over all of memory with SH_ICACHE, SH_KCACHE, TCL1, TC and
+//     TC_WB actions
+//   DISPATCH_DIRECT with the initiator 0x45 (no offsets)
+//   DMA_DATA: a copy (source and destination in memory), a fill (the data
+//     word), the zero-byte wait (CP_SYNC); RAW_WAIT; a prefetch into L2
+//     (radv_cs_cp_dma_prefetch), which moves nothing.
+//
+// A STREAM OF THE GRAPHICS RING (stage (c), the study's 4.2 and 4.4; a
+// card whose record lists a graphics ring) is read the same way, with the
+// packets RADV gives the graphics ring of GFX8 beside those above (the
+// compute bit on DISPATCH_DIRECT alone: PKT3_SHADER_TYPE_S(1); no
+// ACQUIRE_MEM, SURFACE_SYNC in its place):
+//   CONTEXT_CONTROL with CC0_UPDATE_LOAD_ENABLES and CC1_UPDATE_SHADOW_
+//     ENABLES (it changes nothing here: no shadowing)
+//   CLEAR_STATE: every context register back to the clear state (the
+//     kernel's table, gpu_clear_state.mlx: Linux's clearstate_vi.h, which
+//     the kernel's graphics ring sends at its start); a context register
+//     the table does not have is unset again
+//   SET_SH_REG with the index 3 (radeon_set_sh_reg_idx) for SPI_SHADER_
+//     PGM_RSRC3_VS and _PS, one register each; SET_UCONFIG_REG with the
+//     index 1 for VGT_PRIMITIVE_TYPE (radeon_set_uconfig_reg_idx)
+//   EVENT_WRITE VS_PARTIAL_FLUSH, PS_PARTIAL_FLUSH (index 4; the shaders
+//     waited for, as CS_PARTIAL_FLUSH), PIPELINESTAT_START, FLUSH_AND_
+//     INV_CB_META, FLUSH_AND_INV_DB_META (index 0; nothing here: no
+//     statistics, no metadata, no depth target)
+//   EVENT_WRITE_EOP FLUSH_AND_INV_CB_DATA_TS (index 5, nothing written:
+//     si_cs_emit_write_event_eop's EOP_DATA_SEL_DISCARD): the draws done,
+//     the colour block's cache flushed (card_cache.mlx)
+//   SURFACE_SYNC over all of memory (CP_COHER_CNTL, 0xffffffff, 0, poll
+//     0xA): ACQUIRE_MEM's actions and CB_ACTION_ENA with CB0 .. CB7_DEST_
+//     BASE_ENA (the colour block's cache flushed), DB_ACTION_ENA with
+//     DB_DEST_BASE_ENA (nothing: no depth target)
+//   PFP_SYNC_ME (the prefetcher waits for the engine: one engine here)
+//   INDEX_TYPE, NUM_INSTANCES (kept for the draws after them; a draw
+//     without indices overwrites the index type, so INDEX_TYPE must come
+//     again before the next DRAW_INDEX_2: radv_cmd_buffer.c "On GFX7 and
+//     later, non-indexed draws overwrite VGT_INDEX_TYPE")
+//   DRAW_INDEX_AUTO with DI_SRC_SEL_AUTO_INDEX, DRAW_INDEX_2 with
+//     DI_SRC_SEL_DMA: a draw, card_draw.mlx (the fixed part and the two
+//     shaders), which reads its registers through `read` here
+// and the kernel's fence after the streams flushes the colour block's
+// cache too (gfx_v8_0_ring_emit_fence_gfx: CACHE_FLUSH_AND_INV_TS_EVENT).
+const std = @import("std")
+const packets = @import("./packets.mlx")
+const cache = @import("./card_cache.mlx")
+const wave = @import("./wave.mlx")
+const decode = @import("./decode.mlx")
+const encode = @import("./encode.mlx")
+const isa = @import("./isa.mlx")
+const gp = @import("./graphics_packets.mlx")
+const draw = @import("./card_draw.mlx")
+const clear = @import("../kernel/gpu_clear_state.mlx")
+
+// Why a submit failed.
+pub const Failure = enum(u8) {
+    none,
+    // A stream's length is not a multiple of 8 words.
+    padding,
+    // A word that is no type-3 packet's header.
+    header,
+    // A packet that runs past its stream.
+    overrun,
+    // A packet the host card does not know (detail: its opcode).
+    packet,
+    // The compute bit where RADV does not set it, or not where it does;
+    // the predicate.
+    form,
+    // A register outside the four ranges (detail: its offset).
+    range,
+    // A register the dispatch reads that no stream of the submit set
+    // (detail: its offset).
+    unset,
+    // A register's value the card does not take or the interpreter does
+    // not model (detail: its offset, detail2: the value).
+    value,
+    // The shader's address is not mapped executable (detail: it).
+    shader,
+    // The shader stopped in the interpreter (stop, pc, detail).
+    wave,
+    // What card_cache.mlx refused (cacheFailure, where, the address).
+    memory,
+    // An event other than CS_PARTIAL_FLUSH, an ACQUIRE_MEM of a part of
+    // memory or another action, a DMA_DATA of another form.
+    action,
+    // A draw needs what the model of the fixed part does not have (detail:
+    // card_draw.mlx's Unknown, detail2 what it says).
+    draw,
+    // A draw before the packet that gives what it needs (INDEX_TYPE for
+    // DRAW_INDEX_2, NUM_INSTANCES; detail: that packet's opcode).
+    order,
+}
+
+pub const Report = struct {
+    failure: Failure
+    // The stream (0 the first of the submit) and its word.
+    stream: usize
+    word: usize
+    detail: u64
+    detail2: u64
+    // The interpreter's stop, its word in the shader and what it said.
+    stop: wave.Stop
+    pc: usize
+    stopDetail: u64
+    cacheFailure: cache.Failure
+    where: cache.Where
+    // The dispatches run.
+    dispatches: usize
+    // The draws run (a graphics ring's).
+    draws: usize
+}
+
+pub var report: Report = undefined // (per run)
+
+// A stream as the host card reads it: its words in the process, and
+// whether it is a graphics ring's.
+pub const Stream = struct {
+    words: [*]const u32
+    count: usize
+    graphics: bool
+}
+
+// What the card's record says that a dispatch depends on.
+pub const Card = struct {
+    computeUnits: u32
+    shaderEngines: u32
+    // Units in the last place added to every v_rcp_f32 (wave.mlx's
+    // rcpError: the card's reciprocal is not the host's, the study's
+    // 11.14); 0 the host's own.
+    rcpError: i32
+    // The tile mode table as the kernel programs it (GB_TILE_MODE0 .. 31:
+    // a draw's colour target names its entry).
+    tileModes: [32]u32
+}
+
+// ---------------------------------------------------------------------------
+// The registers of the four ranges
+
+const CONFIG_REGS: usize = (packets.CONFIG_END - packets.CONFIG_START) / 4
+const SH_REGS: usize = (packets.SH_END - packets.SH_START) / 4
+const CONTEXT_REGS: usize = (packets.CONTEXT_END - packets.CONTEXT_START) / 4
+const UCONFIG_REGS: usize = (packets.UCONFIG_END - packets.UCONFIG_START) / 4
+const REGS: usize = CONFIG_REGS + SH_REGS + CONTEXT_REGS + UCONFIG_REGS
+
+var values: [REGS]u32 = undefined // (per run)
+var set: [REGS]bool = undefined // (per run)
+
+// The slot of the register at byte `offset` (REGS: none).
+fn slotOf(offset: usize) -> usize {
+    if offset >= packets.CONFIG_START && offset < packets.CONFIG_END { return (offset - packets.CONFIG_START) / 4 }
+    if offset >= packets.SH_START && offset < packets.SH_END { return CONFIG_REGS + (offset - packets.SH_START) / 4 }
+    if offset >= packets.CONTEXT_START && offset < packets.CONTEXT_END { return CONFIG_REGS + SH_REGS + (offset - packets.CONTEXT_START) / 4 }
+    if offset >= packets.UCONFIG_START && offset < packets.UCONFIG_END { return CONFIG_REGS + SH_REGS + CONTEXT_REGS + (offset - packets.UCONFIG_START) / 4 }
+    return REGS
+}
+
+// What a stream of the submit set the register at `offset` to (a test's
+// look), and whether one did.
+pub fn register(offset: usize, value: *u32) -> bool {
+    const slot = slotOf(offset)
+    if slot == REGS || !set[slot] { return false }
+    value.* = values[slot]
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Failures
+
+var streamAt: usize = 0 // (per run)
+var wordAt: usize = 0 // (per run)
+
+fn failed(failure: Failure, detail: u64, detail2: u64) -> bool {
+    if report.failure == Failure.none {
+        report.failure = failure
+        report.stream = streamAt
+        report.word = wordAt
+        report.detail = detail
+        report.detail2 = detail2
+    }
+    return false
+}
+
+// What card_cache.mlx refused, at the packet that ran.
+fn memoryFailed() -> bool {
+    report.cacheFailure = cache.failure
+    report.where = cache.failureWhere
+    return failed(Failure.memory, cache.failureAddress, @intCast(u64, cache.failureGot) << 32 | @intCast(u64, cache.failureTrue))
+}
+
+// The value of a register the dispatch reads, or a failure.
+fn read(offset: usize, value: *u32) -> bool {
+    const slot = slotOf(offset)
+    if slot == REGS || !set[slot] { return failed(Failure.unset, @intCast(u64, offset), 0) }
+    value.* = values[slot]
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The submit
+
+var card: Card = undefined // (per run)
+
+// Runs `streams` in order, as one submit of the context whose mappings
+// card_cache.mlx holds, and the kernel's fence after them: true, or false
+// with `report` saying why and where.
+pub fn run(streams: []const Stream, facts: Card) -> bool {
+    card = facts
+    report.failure = Failure.none
+    report.stream = 0
+    report.word = 0
+    report.detail = 0
+    report.detail2 = 0
+    report.stop = wave.Stop.done
+    report.pc = 0
+    report.stopDetail = 0
+    report.cacheFailure = cache.Failure.none
+    report.where = cache.Where.memory
+    report.dispatches = 0
+    report.draws = 0
+    cache.failure = cache.Failure.none
+    indexTypeSet = false
+    instancesSet = false
+    var graphics = false
+    var k: usize = 0
+    while k < REGS {
+        set[k] = false
+        k += 1
+    }
+    streamAt = 0
+    while streamAt < streams.length {
+        wordAt = 0
+        if streams[streamAt].graphics { graphics = true }
+        if !runStream(&streams[streamAt]) { return false }
+        streamAt += 1
+    }
+    // The kernel's fence: the shaders done, L2 written back; the copy
+    // engine must be done by now. On the graphics ring the colour block's
+    // cache is flushed by it too.
+    wordAt = 0
+    if graphics { cache.colourFlush() }
+    if !cache.fence() { return memoryFailed() }
+    return true
+}
+
+fn runStream(stream: *const Stream) -> bool {
+    const words = stream.*.words
+    const count = stream.*.count
+    if count % packets.PAD_WORDS != 0 { return failed(Failure.padding, @intCast(u64, count), 0) }
+    var at: usize = 0
+    while at < count {
+        wordAt = at
+        const head = words[at]
+        if head == packets.NOP_PAD {
+            at += 1
+            continue
+        }
+        if packets.kindOf(head) != 3 { return failed(Failure.header, @intCast(u64, head), 0) }
+        const length = @intCast(usize, packets.countOf(head)) + 2
+        if at + length > count { return failed(Failure.overrun, @intCast(u64, head), 0) }
+        const opcode = packets.opcodeOf(head)
+        const body = words + (at + 1)
+        const compute = (head & packets.COMPUTE_BIT) != 0
+        if (head & packets.PREDICATE_BIT) != 0 { return failed(Failure.form, @intCast(u64, head), 0) }
+        const graphics = stream.*.graphics
+        const wantsCompute = opcode == packets.PKT3_DISPATCH_DIRECT || (opcode == packets.PKT3_ACQUIRE_MEM && !graphics)
+        if compute != wantsCompute && opcode != packets.PKT3_NOP { return failed(Failure.form, @intCast(u64, head), 0) }
+        if graphics && opcode != packets.PKT3_NOP && opcode != packets.PKT3_ACQUIRE_MEM && graphicsPacket(opcode, body, length) {
+            if report.failure != Failure.none { return false }
+            at += length
+            continue
+        }
+        if report.failure != Failure.none { return false }
+        if opcode == packets.PKT3_NOP {
+            // (its words skipped)
+        } else if opcode == packets.PKT3_SET_SH_REG {
+            if !setRegisters(body, length - 1, packets.SH_START, packets.SH_END) { return false }
+        } else if opcode == packets.PKT3_SET_CONFIG_REG {
+            if !setRegisters(body, length - 1, packets.CONFIG_START, packets.CONFIG_END) { return false }
+        } else if opcode == packets.PKT3_SET_CONTEXT_REG {
+            if !setRegisters(body, length - 1, packets.CONTEXT_START, packets.CONTEXT_END) { return false }
+        } else if opcode == packets.PKT3_SET_UCONFIG_REG {
+            if !setRegisters(body, length - 1, packets.UCONFIG_START, packets.UCONFIG_END) { return false }
+        } else if opcode == packets.PKT3_EVENT_WRITE {
+            if length != 2 || body[0] != packets.event(packets.CS_PARTIAL_FLUSH, packets.EVENT_INDEX_PARTIAL) { return failed(Failure.action, @intCast(u64, opcode), @intCast(u64, body[0])) }
+            cache.shadersDone()
+        } else if opcode == packets.PKT3_ACQUIRE_MEM && !graphics {
+            if length != 7 || !acquire(body) { return false }
+        } else if opcode == packets.PKT3_DISPATCH_DIRECT {
+            if length != 5 || !dispatch(body) { return false }
+        } else if opcode == packets.PKT3_DMA_DATA {
+            if length != 7 || !dmaData(body) { return false }
+        } else {
+            return failed(Failure.packet, @intCast(u64, opcode), @intCast(u64, head))
+        }
+        at += length
+    }
+    return true
+}
+
+// A SET_*_REG packet's `words` (the offset word, then the values) in the
+// range [start, end).
+fn setRegisters(words: [*]const u32, count: usize, start: usize, end: usize) -> bool {
+    if count < 2 { return failed(Failure.overrun, 0, 0) }
+    // The offset word's index field (bits 28 and up: radv_cs.h's
+    // radeon_set_sh_reg_idx) is not taken: the compute registers have none.
+    if (words[0] >> 16) != 0 { return failed(Failure.range, @intCast(u64, words[0]), 0) }
+    const first = start + 4 * @intCast(usize, words[0])
+    const many = count - 1
+    if first + 4 * many > end { return failed(Failure.range, @intCast(u64, first + 4 * many - 4), 0) }
+    var k: usize = 0
+    while k < many {
+        const slot = slotOf(first + 4 * k)
+        values[slot] = words[1 + k]
+        set[slot] = true
+        k += 1
+    }
+    return true
+}
+
+// ACQUIRE_MEM: CP_COHER_CNTL's actions over all of memory.
+fn acquire(words: [*]const u32) -> bool {
+    const actions = words[0]
+    if words[1] != packets.COHER_SIZE_ALL || words[2] != packets.COHER_SIZE_HI_ALL || words[3] != 0 || words[4] != 0 { return failed(Failure.action, @intCast(u64, packets.PKT3_ACQUIRE_MEM), @intCast(u64, words[1])) }
+    const known = packets.CP_COHER_CNTL__SH_ICACHE_ACTION_ENA | packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA | packets.CP_COHER_CNTL__TCL1_ACTION_ENA | packets.CP_COHER_CNTL__TC_ACTION_ENA | packets.CP_COHER_CNTL__TC_WB_ACTION_ENA
+    if (actions & ~known) != 0 { return failed(Failure.action, @intCast(u64, packets.CP_COHER_CNTL), @intCast(u64, actions)) }
+    if (actions & packets.CP_COHER_CNTL__SH_ICACHE_ACTION_ENA) != 0 { cache.invalidateInstruction() }
+    if (actions & packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA) != 0 { cache.invalidateScalar() }
+    if (actions & packets.CP_COHER_CNTL__TCL1_ACTION_ENA) != 0 { cache.invalidateVector() }
+    if (actions & packets.CP_COHER_CNTL__TC_WB_ACTION_ENA) != 0 { cache.writeBack() }
+    if (actions & packets.CP_COHER_CNTL__TC_ACTION_ENA) != 0 {
+        if !cache.invalidateLevel2() { return memoryFailed() }
+    }
+    return true
+}
+
+// DMA_DATA: a copy, a fill, a wait or a prefetch.
+fn dmaData(words: [*]const u32) -> bool {
+    const control = words[0]
+    const command = words[5]
+    const source = @intCast(u64, words[1]) | @intCast(u64, words[2]) << 32
+    const target = @intCast(u64, words[3]) | @intCast(u64, words[4]) << 32
+    const sourceSel = packets.get(control, packets.DMA_DATA__SRC_SEL)
+    const targetSel = packets.get(control, packets.DMA_DATA__DST_SEL)
+    const sync = (control & packets.DMA_DATA__CP_SYNC) != 0
+    const bytes = @intCast(u64, command & packets.DMA_DATA__BYTE_COUNT)
+    const rawWait = (command & packets.DMA_DATA__RAW_WAIT) != 0
+    // Only the fields RADV sets on this generation: the selects and
+    // CP_SYNC; the count, DIS_WC (a prefetch's) and RAW_WAIT.
+    if (control & ~(packets.DMA_DATA__SRC_SEL | packets.DMA_DATA__DST_SEL | packets.DMA_DATA__CP_SYNC)) != 0 || (command & ~(packets.DMA_DATA__BYTE_COUNT | packets.DMA_DATA__DIS_WC | packets.DMA_DATA__RAW_WAIT)) != 0 { return failed(Failure.action, @intCast(u64, packets.PKT3_DMA_DATA), @intCast(u64, control)) }
+    const prefetch = sourceSel == packets.SRC_SEL_L2 && targetSel == packets.DST_SEL_L2 && source == target && (command & packets.DMA_DATA__DIS_WC) != 0
+    if prefetch {
+        // It pulls the shader's code into L2 and moves nothing.
+        return true
+    }
+    if targetSel != packets.DST_SEL_ADDRESS || (command & packets.DMA_DATA__DIS_WC) != 0 { return failed(Failure.action, @intCast(u64, packets.PKT3_DMA_DATA), @intCast(u64, control)) }
+    var filling = false
+    if sourceSel == packets.SRC_SEL_DATA {
+        filling = true
+        // (The data is a word: radv_cp_dma_clear_buffer passes the value
+        // where the source address goes, its high word 0.)
+        if words[2] != 0 || (target & 3) != 0 || (bytes & 3) != 0 { return failed(Failure.action, @intCast(u64, packets.PKT3_DMA_DATA), @intCast(u64, words[2])) }
+    } else if sourceSel != packets.SRC_SEL_ADDRESS {
+        return failed(Failure.action, @intCast(u64, packets.PKT3_DMA_DATA), @intCast(u64, control))
+    }
+    if !cache.copy(target, source, words[1], filling, bytes, rawWait) { return memoryFailed() }
+    // CP_SYNC: the engine waits for every copy, this one too.
+    if sync { cache.copiesDone() }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The graphics ring's packets
+
+var indexType: u32 = 0 // (per run)
+var indexTypeSet = false // (per run)
+var instances: u32 = 0 // (per run)
+var instancesSet = false // (per run)
+
+// A packet of the graphics ring that the compute ring does not have, or
+// has in another form: true when it was one (done, or failed with the
+// report), false when the common part reads it.
+fn graphicsPacket(opcode: u32, body: [*]const u32, length: usize) -> bool {
+    if opcode == packets.PKT3_SET_SH_REG {
+        _ = setShaderRegisters(body, length - 1)
+    } else if opcode == packets.PKT3_SET_UCONFIG_REG && (body[0] >> gp.SH_REG_INDEX_SHIFT) != 0 {
+        // VGT_PRIMITIVE_TYPE with the index 1, one register
+        const offset = packets.UCONFIG_START + 4 * @intCast(usize, body[0] & 0xFFFF)
+        if (body[0] >> gp.SH_REG_INDEX_SHIFT) != gp.PRIMITIVE_TYPE_INDEX || (body[0] & 0x0FFF0000) != 0 || length != 3 || offset != gp.VGT_PRIMITIVE_TYPE {
+            _ = failed(Failure.range, @intCast(u64, body[0]), 0)
+        } else {
+            values[slotOf(offset)] = body[1]
+            set[slotOf(offset)] = true
+        }
+    } else if opcode == packets.PKT3_EVENT_WRITE {
+        if length != 2 { return failed(Failure.action, @intCast(u64, opcode), 0) || true }
+        const e = body[0]
+        const partial = packets.EVENT_INDEX_PARTIAL
+        if e == packets.event(packets.CS_PARTIAL_FLUSH, partial) || e == packets.event(gp.VS_PARTIAL_FLUSH, partial) || e == packets.event(gp.PS_PARTIAL_FLUSH, partial) {
+            cache.shadersDone()
+        } else if e != packets.event(gp.PIPELINESTAT_START, gp.EVENT_INDEX_OTHER) && e != packets.event(gp.FLUSH_AND_INV_CB_META, gp.EVENT_INDEX_OTHER) && e != packets.event(gp.FLUSH_AND_INV_DB_META, gp.EVENT_INDEX_OTHER) {
+            _ = failed(Failure.action, @intCast(u64, opcode), @intCast(u64, e))
+        }
+    } else if opcode == gp.PKT3_EVENT_WRITE_EOP {
+        // FLUSH_AND_INV_CB_DATA_TS, nothing written, no interrupt.
+        if length != 6 || body[0] != packets.event(gp.FLUSH_AND_INV_CB_DATA_TS, gp.EVENT_INDEX_TS) || body[1] != 0 || body[2] != 0 || body[3] != 0 || body[4] != 0 {
+            _ = failed(Failure.action, @intCast(u64, opcode), @intCast(u64, body[0]))
+        } else {
+            cache.shadersDone()
+            cache.colourFlush()
+        }
+    } else if opcode == gp.PKT3_SURFACE_SYNC {
+        if length != 5 { return failed(Failure.action, @intCast(u64, opcode), 0) || true }
+        _ = surfaceSync(body)
+    } else if opcode == gp.PKT3_CONTEXT_CONTROL {
+        if length != 3 || body[0] != gp.CC0_UPDATE_LOAD_ENABLES || body[1] != gp.CC1_UPDATE_SHADOW_ENABLES { _ = failed(Failure.action, @intCast(u64, opcode), @intCast(u64, body[0])) }
+    } else if opcode == gp.PKT3_CLEAR_STATE {
+        if length != 2 || body[0] != 0 {
+            _ = failed(Failure.action, @intCast(u64, opcode), 0)
+        } else {
+            clearState()
+        }
+    } else if opcode == gp.PKT3_PFP_SYNC_ME {
+        if length != 2 || body[0] != 0 { _ = failed(Failure.action, @intCast(u64, opcode), 0) }
+    } else if opcode == gp.PKT3_INDEX_TYPE {
+        if length != 2 || body[0] > gp.VGT_INDEX_32 {
+            _ = failed(Failure.action, @intCast(u64, opcode), @intCast(u64, body[0]))
+        } else {
+            indexType = body[0]
+            indexTypeSet = true
+        }
+    } else if opcode == gp.PKT3_NUM_INSTANCES {
+        if length != 2 {
+            _ = failed(Failure.action, @intCast(u64, opcode), 0)
+        } else {
+            instances = body[0]
+            instancesSet = true
+        }
+    } else if opcode == gp.PKT3_DRAW_INDEX_AUTO {
+        if length != 3 || body[1] != gp.DI_SRC_SEL_AUTO_INDEX {
+            _ = failed(Failure.action, @intCast(u64, opcode), @intCast(u64, body[1]))
+        } else {
+            _ = runDraw(false, body[0], 0, 0)
+            // (VGT_INDEX_TYPE overwritten by the draw)
+            indexTypeSet = false
+        }
+    } else if opcode == gp.PKT3_DRAW_INDEX_2 {
+        if length != 6 || body[4] != gp.DI_SRC_SEL_DMA {
+            _ = failed(Failure.action, @intCast(u64, opcode), @intCast(u64, body[4]))
+        } else if !indexTypeSet {
+            _ = failed(Failure.order, @intCast(u64, gp.PKT3_INDEX_TYPE), 0)
+        } else {
+            const address = @intCast(u64, body[1]) | @intCast(u64, body[2]) << 32
+            const size: u64 = if indexType == gp.VGT_INDEX_32 { 4 } else { 2 }
+            if (address & (size - 1)) != 0 || body[2] > 0xFFFF {
+                _ = failed(Failure.action, @intCast(u64, opcode), address)
+            } else {
+                _ = runDraw(true, body[3], address, body[0])
+            }
+        }
+    } else {
+        return false
+    }
+    return true
+}
+
+// SET_SH_REG on the graphics ring: as the compute ring's, and one
+// register of SPI_SHADER_PGM_RSRC3_VS or _PS with the index 3.
+fn setShaderRegisters(words: [*]const u32, count: usize) -> bool {
+    if count < 2 { return failed(Failure.overrun, 0, 0) }
+    const index = words[0] >> gp.SH_REG_INDEX_SHIFT
+    if index == 0 { return setRegisters(words, count, packets.SH_START, packets.SH_END) }
+    const offset = packets.SH_START + 4 * @intCast(usize, words[0] & 0xFFFF)
+    if index != gp.RSRC3_INDEX || (words[0] & 0x0FFF0000) != 0 || count != 2 || (offset != gp.SPI_SHADER_PGM_RSRC3_VS && offset != gp.SPI_SHADER_PGM_RSRC3_PS) { return failed(Failure.range, @intCast(u64, words[0]), 0) }
+    const slot = slotOf(offset)
+    values[slot] = words[1]
+    set[slot] = true
+    return true
+}
+
+// SURFACE_SYNC: ACQUIRE_MEM's actions and the colour block's flush.
+fn surfaceSync(words: [*]const u32) -> bool {
+    const actions = words[0]
+    if words[1] != gp.SURFACE_SIZE_ALL || words[2] != 0 || words[3] != gp.SURFACE_POLL { return failed(Failure.action, @intCast(u64, gp.PKT3_SURFACE_SYNC), @intCast(u64, words[1])) }
+    const colour = gp.CP_COHER_CNTL__CB_ACTION_ENA | gp.CP_COHER_CNTL__CB_DEST_BASE_ALL
+    // (the depth block's actions: no depth target at this stage, nothing
+    // to flush)
+    const depth = gp.CP_COHER_CNTL__DB_ACTION_ENA | gp.CP_COHER_CNTL__DB_DEST_BASE_ENA
+    const known = packets.CP_COHER_CNTL__SH_ICACHE_ACTION_ENA | packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA | packets.CP_COHER_CNTL__TCL1_ACTION_ENA | packets.CP_COHER_CNTL__TC_ACTION_ENA | packets.CP_COHER_CNTL__TC_WB_ACTION_ENA | colour | depth
+    if (actions & ~known) != 0 || ((actions & colour) != 0 && (actions & colour) != colour) || ((actions & depth) != 0 && (actions & depth) != depth) { return failed(Failure.action, @intCast(u64, packets.CP_COHER_CNTL), @intCast(u64, actions)) }
+    if (actions & colour) != 0 { cache.colourFlush() }
+    if (actions & packets.CP_COHER_CNTL__SH_ICACHE_ACTION_ENA) != 0 { cache.invalidateInstruction() }
+    if (actions & packets.CP_COHER_CNTL__SH_KCACHE_ACTION_ENA) != 0 { cache.invalidateScalar() }
+    if (actions & packets.CP_COHER_CNTL__TCL1_ACTION_ENA) != 0 { cache.invalidateVector() }
+    if (actions & packets.CP_COHER_CNTL__TC_WB_ACTION_ENA) != 0 { cache.writeBack() }
+    if (actions & packets.CP_COHER_CNTL__TC_ACTION_ENA) != 0 {
+        if !cache.invalidateLevel2() { return memoryFailed() }
+    }
+    return true
+}
+
+// CLEAR_STATE: the context registers as the clear state has them, the
+// others unset.
+fn clearState() -> void {
+    var k = CONFIG_REGS + SH_REGS
+    while k < CONFIG_REGS + SH_REGS + CONTEXT_REGS {
+        set[k] = false
+        k += 1
+    }
+    var at: usize = 0
+    var r: usize = 0
+    while r < clear.RUN_FIRST.length {
+        var n: usize = 0
+        while n < clear.RUN_COUNT[r] {
+            // (the table's offsets are in words)
+            const slot = slotOf(4 * (clear.RUN_FIRST[r] + n))
+            values[slot] = clear.VALUES[at]
+            set[slot] = true
+            at += 1
+            n += 1
+        }
+        r += 1
+    }
+}
+
+// The draw's host functions (card_draw.mlx's Host): the failures recorded
+// here, at the draw's packet.
+fn drawRead(offset: usize, value: *u32) -> bool { return read(offset, value) }
+
+fn drawRefuse(offset: u64, value: u64) -> bool { return failed(Failure.value, offset, value) }
+
+fn drawUnknown(what: u64, detail: u64) -> bool { return failed(Failure.draw, what, detail) }
+
+fn drawStopped(address: u64, stop: wave.Stop, pc: usize, detail: u64) -> bool {
+    report.stop = stop
+    report.pc = pc
+    report.stopDetail = detail
+    return failed(Failure.wave, address, @intCast(u64, pc))
+}
+
+fn drawMemory() -> bool { return memoryFailed() }
+
+fn runDraw(indexed: bool, count: u32, address: u64, most: u32) -> bool {
+    if !instancesSet { return failed(Failure.order, @intCast(u64, gp.PKT3_NUM_INSTANCES), 0) }
+    const host = draw.Host.{ .read = drawRead, .refuse = drawRefuse, .unknown = drawUnknown, .stopped = drawStopped, .memory = drawMemory }
+    const facts = draw.Card.{ .tileModes = card.tileModes, .rcpError = card.rcpError }
+    report.draws += 1
+    return draw.draw(host, facts, indexed, count, address, most, indexType, instances)
+}
+
+// ---------------------------------------------------------------------------
+// A dispatch
+
+const MOST_CODE: usize = 16384
+
+var code: [MOST_CODE]u32 = undefined // (per run)
+var memory: wave.Memory = undefined // (per run)
+var result: wave.Result = undefined // (per run)
+
+fn port() -> wave.Port {
+    return wave.Port.{ .scalarRead = cache.scalarRead, .vectorRead = cache.vectorRead, .vectorWrite = cache.vectorWrite }
+}
+
+// The shader's words from `address` through the instruction cache, as far
+// as its end: the first s_endpgm no branch before it jumps beyond. Its
+// length, or 0 with a failure.
+fn fetchShader(address: u64) -> usize {
+    var fetched: usize = 0
+    var at: usize = 0
+    var furthest: usize = 0
+    while true {
+        // Every word an instruction can take (an instruction is at most
+        // two words and a literal).
+        while fetched < at + 3 && fetched < MOST_CODE {
+            var word: u32 = 0
+            const where = address + 4 * @intCast(u64, fetched)
+            if !cache.mapped(where, cache.EXECUTE) { break }
+            if !cache.fetch(where, &word) { return 0 }
+            code[fetched] = word
+            fetched += 1
+        }
+        if at >= fetched {
+            _ = failed(Failure.shader, address + 4 * @intCast(u64, at), 0)
+            return 0
+        }
+        var inst: encode.Inst = undefined
+        const length = decode.decode(code[0..fetched], at, &inst)
+        if length == 0 {
+            _ = failed(Failure.shader, address + 4 * @intCast(u64, at), @intCast(u64, code[at]))
+            return 0
+        }
+        if inst.op.format == isa.Format.sopp {
+            const name = decode.name(inst.op)
+            if inst.op.number == isa.S_ENDPGM.number && at >= furthest { return at + length }
+            if startsWith(name, "s_branch") || startsWith(name, "s_cbranch") {
+                const distance = @intCast(i64, @bitCast(i16, @intCast(u16, inst.imm & 0xFFFF)))
+                const target = @intCast(i64, at + length) + distance
+                if target > 0 && @intCast(usize, target) > furthest { furthest = @intCast(usize, target) }
+            }
+        }
+        at += length
+    }
+    return 0
+}
+
+fn startsWith(text: []const u8, prefix: []const u8) -> bool {
+    if text.length < prefix.length { return false }
+    var k: usize = 0
+    while k < prefix.length {
+        if text[k] != prefix[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// The shader engines' compute units enabled (COMPUTE_STATIC_THREAD_MGMT_
+// SE0 .. SE3): each engine the record counts must have one.
+const THREAD_MGMT = [_]usize{ packets.COMPUTE_STATIC_THREAD_MGMT_SE0, packets.COMPUTE_STATIC_THREAD_MGMT_SE1, packets.COMPUTE_STATIC_THREAD_MGMT_SE2, packets.COMPUTE_STATIC_THREAD_MGMT_SE3 }
+
+fn dispatch(words: [*]const u32) -> bool {
+    const groupsX = words[0]
+    const groupsY = words[1]
+    const groupsZ = words[2]
+    const initiator = words[3]
+    const wanted = packets.COMPUTE_DISPATCH_INITIATOR__COMPUTE_SHADER_EN | packets.COMPUTE_DISPATCH_INITIATOR__FORCE_START_AT_000 | packets.COMPUTE_DISPATCH_INITIATOR__ORDER_MODE
+    if initiator != wanted { return failed(Failure.value, @intCast(u64, packets.COMPUTE_DISPATCH_INITIATOR), @intCast(u64, initiator)) }
+    var low: u32 = 0
+    var high: u32 = 0
+    var rsrc1: u32 = 0
+    var rsrc2: u32 = 0
+    var limits: u32 = 0
+    var sizes: [3]u32 = undefined
+    if !read(packets.COMPUTE_PGM_LO, &low) || !read(packets.COMPUTE_PGM_HI, &high) { return false }
+    if !read(packets.COMPUTE_PGM_RSRC1, &rsrc1) || !read(packets.COMPUTE_PGM_RSRC2, &rsrc2) || !read(packets.COMPUTE_RESOURCE_LIMITS, &limits) { return false }
+    if !read(packets.COMPUTE_NUM_THREAD_X, &sizes[0]) || !read(packets.COMPUTE_NUM_THREAD_Y, &sizes[1]) || !read(packets.COMPUTE_NUM_THREAD_Z, &sizes[2]) { return false }
+    var engine: usize = 0
+    while engine < @intCast(usize, card.shaderEngines) && engine < 4 {
+        var enabled: u32 = 0
+        if !read(THREAD_MGMT[engine], &enabled) { return false }
+        if enabled == 0 { return failed(Failure.value, @intCast(u64, THREAD_MGMT[engine]), 0) }
+        engine += 1
+    }
+    // The shader's address: COMPUTE_PGM_LO the address >> 8, _HI's DATA
+    // bits 47:40.
+    if (high & ~packets.COMPUTE_PGM_HI__DATA) != 0 { return failed(Failure.value, @intCast(u64, packets.COMPUTE_PGM_HI), @intCast(u64, high)) }
+    const address = @intCast(u64, low) << 8 | @intCast(u64, high) << 40
+    // RSRC1: the counts, f32 denormals flushed (the interpreter's), DX10
+    // clamp as RADV sets it, nothing else.
+    const rsrc1Known = packets.COMPUTE_PGM_RSRC1__VGPRS | packets.COMPUTE_PGM_RSRC1__SGPRS | packets.COMPUTE_PGM_RSRC1__FLOAT_MODE | packets.COMPUTE_PGM_RSRC1__DX10_CLAMP
+    if (rsrc1 & ~rsrc1Known) != 0 || packets.get(rsrc1, packets.COMPUTE_PGM_RSRC1__FLOAT_MODE) != packets.FP_16_64_DENORMS || (rsrc1 & packets.COMPUTE_PGM_RSRC1__DX10_CLAMP) == 0 { return failed(Failure.value, @intCast(u64, packets.COMPUTE_PGM_RSRC1), @intCast(u64, rsrc1)) }
+    // RSRC2: no scratch, no trap handler, no group size word, no shared
+    // memory, no exceptions.
+    const rsrc2Known = packets.COMPUTE_PGM_RSRC2__USER_SGPR | packets.COMPUTE_PGM_RSRC2__TGID_X_EN | packets.COMPUTE_PGM_RSRC2__TGID_Y_EN | packets.COMPUTE_PGM_RSRC2__TGID_Z_EN | packets.COMPUTE_PGM_RSRC2__TIDIG_COMP_CNT
+    const components = packets.get(rsrc2, packets.COMPUTE_PGM_RSRC2__TIDIG_COMP_CNT)
+    if (rsrc2 & ~rsrc2Known) != 0 || components > 2 { return failed(Failure.value, @intCast(u64, packets.COMPUTE_PGM_RSRC2), @intCast(u64, rsrc2)) }
+    // The group: NUM_THREAD_FULL each, no partial group, 1024 invocations
+    // at most (their product taken in 64 bits: three 16-bit sizes pass 32).
+    var axis: usize = 0
+    while axis < 3 {
+        if (sizes[axis] & packets.COMPUTE_NUM_THREAD_X__NUM_THREAD_PARTIAL) != 0 || sizes[axis] == 0 { return failed(Failure.value, @intCast(u64, packets.COMPUTE_NUM_THREAD_X + 4 * axis), @intCast(u64, sizes[axis])) }
+        axis += 1
+    }
+    const product = @intCast(u64, sizes[0]) * @intCast(u64, sizes[1]) * @intCast(u64, sizes[2])
+    if product > 1024 { return failed(Failure.value, @intCast(u64, packets.COMPUTE_NUM_THREAD_X), product) }
+    const invocations = @intCast(u32, product)
+    const waves = (invocations + 63) / 64
+    const expected = packets.resourceLimits(waves, card.computeUnits, card.shaderEngines)
+    if limits != expected { return failed(Failure.value, @intCast(u64, packets.COMPUTE_RESOURCE_LIMITS), @intCast(u64, limits)) }
+    // The entry state.
+    var launch: wave.Launch = undefined
+    launch.vgprs = (packets.get(rsrc1, packets.COMPUTE_PGM_RSRC1__VGPRS) + 1) * 4
+    // Of the scalar registers RSRC1 gives, the last two are VCC's: the
+    // shader addresses the rest (ACO's get_addr_sgpr_from_waves: the
+    // allocation less get_extra_sgprs, 2 on GFX8 without XNACK).
+    launch.sgprs = (packets.get(rsrc1, packets.COMPUTE_PGM_RSRC1__SGPRS) + 1) * 8 - packets.VCC_SGPRS
+    launch.userCount = packets.get(rsrc2, packets.COMPUTE_PGM_RSRC2__USER_SGPR)
+    var u: u32 = 2
+    while u < launch.userCount {
+        if !read(packets.COMPUTE_USER_DATA_0 + 4 * @intCast(usize, u), &launch.user[@intCast(usize, u)]) { return false }
+        u += 1
+    }
+    launch.groupIdX = (rsrc2 & packets.COMPUTE_PGM_RSRC2__TGID_X_EN) != 0
+    launch.groupIdY = (rsrc2 & packets.COMPUTE_PGM_RSRC2__TGID_Y_EN) != 0
+    launch.groupIdZ = (rsrc2 & packets.COMPUTE_PGM_RSRC2__TGID_Z_EN) != 0
+    launch.localIdComponents = components
+    launch.groupSizeX = sizes[0]
+    launch.groupSizeY = sizes[1]
+    launch.groupSizeZ = sizes[2]
+    launch.rcpError = card.rcpError
+    launch.maxSteps = 50000000
+    // The code, through the instruction cache.
+    const length = fetchShader(address)
+    if length == 0 {
+        if cache.failure != cache.Failure.none { return memoryFailed() }
+        return false
+    }
+    if groupsX == 0 || groupsY == 0 || groupsZ == 0 { return true }
+    report.dispatches += 1
+    cache.dispatch = @intCast(u32, report.dispatches)
+    wave.portMemory(&memory, port())
+    wave.dispatch(code[0..length], &launch, groupsX, groupsY, groupsZ, &memory, &result)
+    if result.stop != wave.Stop.done {
+        report.stop = result.stop
+        report.pc = result.pc
+        report.stopDetail = result.detail
+        if cache.failure != cache.Failure.none { return memoryFailed() }
+        return failed(Failure.wave, address, @intCast(u64, result.pc))
+    }
+    return true
+}
+
+// The failure in plain words.
+pub fn failureText(failure: Failure) -> []const u8 {
+    if failure == Failure.none { return "none" }
+    if failure == Failure.padding { return "a stream's length is not a multiple of 8 words" }
+    if failure == Failure.header { return "a word that is no packet's header" }
+    if failure == Failure.overrun { return "a packet runs past its stream" }
+    if failure == Failure.packet { return "a packet the host card does not know" }
+    if failure == Failure.form { return "a packet's compute bit or predicate not as RADV sets it" }
+    if failure == Failure.range { return "a register outside the four ranges" }
+    if failure == Failure.unset { return "a register no stream of the submit set" }
+    if failure == Failure.value { return "a register's value the card does not take" }
+    if failure == Failure.shader { return "the shader's address is not mapped executable" }
+    if failure == Failure.wave { return "the shader stopped in the interpreter" }
+    if failure == Failure.memory { return "the card's memory or caches refused" }
+    if failure == Failure.draw { return "a draw needs what the model of the fixed part does not have" }
+    if failure == Failure.order { return "a draw before the packet that gives what it needs" }
+    return "an action the host card does not know"
+}

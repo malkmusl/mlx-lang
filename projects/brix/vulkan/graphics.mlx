@@ -1,0 +1,630 @@
+// The driver's graphics pipelines (stage (c), the study's 8.2 (c) and 4.4).
+//
+// A GRAPHICS PIPELINE is a vertex and a fragment shader compiled by our
+// compiler (shader.mlx: the vertex shader with the pipeline's vertex
+// input, ir.vertexInputs), each at a 256-byte boundary below 4 GiB, and
+// the words of the pipeline's registers in the order RADV's radv_pipeline_
+// emit_pm4 gives them for a pipeline of a VS and a PS on GFX8:
+//   radv_pipeline_emit_blend_state  SPI_SHADER_COL_FORMAT, CB_SHADER_MASK
+//                                   (SPI_SHADER_32_ABGR and 0xF for each
+//                                   target the shader writes and the
+//                                   pipeline has: our compiler's exports
+//                                   are 32-bit, RADV's narrower formats
+//                                   are a later stage's)
+//   radv_emit_vgt_gs_mode           VGT_PRIMITIVEID_EN 0, VGT_GS_MODE 0
+//   radv_emit_hw_vs                 SPI_SHADER_PGM_LO_VS .. RSRC2_VS,
+//                                   SPI_VS_OUT_CONFIG (the parameters, at
+//                                   least one), SPI_SHADER_POS_FORMAT
+//                                   (4COMP), PA_CL_VS_OUT_CNTL 0,
+//                                   VGT_REUSE_OFF 0, SPI_SHADER_PGM_RSRC3_VS
+//                                   with the index 3 (CU_EN and the late
+//                                   allocation as ac_compute_late_alloc
+//                                   gives them for the card's compute
+//                                   units an array: 0xFFFE and 28 for the
+//                                   RX 580's 9, 24 for 8; WAVE_LIMIT 0x3F),
+//                                   SPI_SHADER_LATE_ALLOC_VS
+//   radv_emit_fragment_shader       SPI_SHADER_PGM_LO_PS .. RSRC2_PS,
+//                                   SPI_PS_INPUT_ENA and _ADDR (PERSP_
+//                                   CENTER), SPI_PS_IN_CONTROL (NUM_INTERP),
+//                                   SPI_SHADER_Z_FORMAT (ZERO)
+//   radv_emit_ps_inputs             SPI_PS_INPUT_CNTL_n: the vertex shader's
+//                                   parameter of input n's location,
+//                                   FLAT_SHADE for a flat one, OFFSET 0x20
+//                                   (the default value) when the vertex
+//                                   shader writes none
+//   radv_emit_vgt_vertex_reuse      VGT_VERTEX_REUSE_BLOCK_CNTL 30
+//                                   (Polaris 10 and later on GFX8)
+//   radv_emit_vgt_shader_config     VGT_SHADER_STAGES_EN 0 (a real VS)
+//   radv_emit_vgt_gs_out            VGT_GS_OUT_PRIM_TYPE TRISTRIP
+// RSRC1 and RSRC2 are compute's formulas (pipeline.mlx) for the stages'
+// entries: the vertex shader's 10 user words and VGPR_COMP_CNT 1 (v0 the
+// vertex, v1 the instance), the fragment shader's 6 and the primitive
+// mask after them, I and J in v0 and v1.
+//
+// THE STATE THE DRAW WRITES (render.mlx) is kept here as the pipeline
+// gives it: the topology (VGT_PRIMITIVE_TYPE: si_translate_prim's
+// DI_PT_TRILIST, DI_PT_TRISTRIP), PA_SU_SC_MODE_CNTL (CULL_FRONT,
+// CULL_BACK, FACE: radv_get_pa_su_sc_mode_cntl), CB_COLOR_CONTROL (ROP3
+// copy, CB_NORMAL when a target is written, else CB_DISABLE:
+// radv_emit_logic_op), CB_TARGET_MASK (the write masks), CB_BLENDn_CONTROL
+// (radv_emit_color_blend: the factors normalised for MIN and MAX, RB+'s
+// removal of the destination applied as RADV applies it, SEPARATE_ALPHA
+// when alpha differs), the blend constants, viewport and scissor unless
+// they are dynamic.
+//
+// WHAT IT TAKES: two stages, VS and FS, entry "main", no specialization;
+// triangle lists and strips without primitive restart; fill, any cull
+// mode, either front face, no depth bias, no depth clamp, no rasterizer
+// discard, line width 1; one sample, no sample shading, no alpha to
+// coverage; no depth or stencil test; no logic op; blend factors other
+// than the dual-source ones and SRC_ALPHA_SATURATE; one viewport and
+// scissor; the dynamic states viewport, scissor and blend constants;
+// vertex attributes of R32, R32G32, R32G32B32 and R32G32B32A32 in SFLOAT,
+// UINT or SINT at offsets the format's components fit before the
+// stride; at most 8 colour targets of the stage's formats. Anything else
+// is refused with VK_ERROR_UNKNOWN.
+const std = @import("std")
+const vk = @import("std.vulkan")
+const gpucard = @import("std.gpucard")
+const device = @import("./device.mlx")
+const packets = @import("./packets.mlx")
+const gp = @import("./graphics_packets.mlx")
+const shader = @import("./shader.mlx")
+const ir = @import("./shader_ir.mlx")
+const pipeline = @import("./pipeline.mlx")
+const image = @import("./image.mlx")
+
+const DeviceObject = device.DeviceObject
+
+// The pipeline's own registers' words (the most a pipeline has: 8 inputs
+// and the rest).
+pub const MOST_WORDS: usize = 160
+pub const MOST_BINDINGS: usize = 16
+
+pub const GraphicsPipelineObject = struct {
+    // pipeline.KIND_GRAPHICS (vkDestroyPipeline and vkCmdBindPipeline
+    // tell the kinds apart by it).
+    kind: u32
+    vs: device.Block
+    ps: device.Block
+    vsFacts: shader.Facts
+    psFacts: shader.Facts
+    layout: usize
+    words: [160]u32
+    wordCount: usize
+    // The draw's state.
+    topology: u32
+    strides: [16]u32
+    suScModeCntl: u32
+    colourControl: u32
+    targetMask: u32
+    blend: [8]u32
+    blendConstants: [4]u32
+    dynamicViewport: bool
+    dynamicScissor: bool
+    dynamicBlend: bool
+    viewport: vk.Viewport
+    scissor: vk.Rect2D
+    targets: u32
+}
+
+pub fn graphicsOf(handle: vk.Pipeline) -> *GraphicsPipelineObject { return unsafe { @ptrFromInt(*GraphicsPipelineObject, handle) } }
+
+// The kind of a pipeline: both kinds' first field.
+pub fn kindOf(handle: vk.Pipeline) -> u32 {
+    const first: *const u32 = unsafe { @ptrFromInt(*const u32, handle) }
+    return first.*
+}
+
+// The values the pipeline's words take (the sources named above).
+// ac_compute_late_alloc (ac_shader_util.c) before GFX10, without NGG and
+// without scratch, min_good_cu_per_sa the compute units of a shader
+// array: no late allocation with 2 or fewer, 2 waves with 4 or fewer,
+// else 4 for each of them but 2; the vertex shader kept off one compute
+// unit (CU_EN 0xFFFE) when that is more than 2.
+pub const LATE_ALLOC_NONE_AT: u32 = 2
+pub const LATE_ALLOC_FEW_AT: u32 = 4
+pub const LATE_ALLOC_FEW: u32 = 2
+pub const LATE_ALLOC_PER_CU: u32 = 4
+pub const LATE_ALLOC_SPARED: u32 = 2
+pub const CU_EN_ALL: u32 = 0xFFFF
+pub const CU_EN_ONE_OFF: u32 = 0xFFFE
+pub const RSRC3_VS_WAVE_LIMIT: u32 = 0x3F0000
+
+// The vertex shader's late allocation for `perArray` compute units a
+// shader array, and its RSRC3's CU_EN.
+pub fn lateAlloc(perArray: u32, limit: *u32, cuEnable: *u32) -> void {
+    limit.* = 0
+    cuEnable.* = CU_EN_ALL
+    if perArray <= LATE_ALLOC_NONE_AT { return }
+    limit.* = if perArray <= LATE_ALLOC_FEW_AT { LATE_ALLOC_FEW } else { (perArray - LATE_ALLOC_SPARED) * LATE_ALLOC_PER_CU }
+    if limit.* > LATE_ALLOC_FEW { cuEnable.* = CU_EN_ONE_OFF }
+}
+pub const VERTEX_REUSE_DEPTH: u32 = 30
+pub const OUTPRIM_TRISTRIP: u32 = 2
+// SPI_PS_INPUT_CNTL_n's OFFSET of an input no vertex shader output
+// writes (radv's input_mask_to_ps_inputs: S_028644_OFFSET(0x20)).
+pub const INPUT_DEFAULT: u32 = 0x20
+
+// ---------------------------------------------------------------------------
+// The words
+
+var words: [*]u32 = undefined // (per run)
+var at: usize = 0 // (per run)
+
+fn word(value: u32) -> void {
+    words[at] = value
+    at += 1
+}
+
+fn context(offset: usize, count: u32) -> void {
+    word(packets.header(packets.PKT3_SET_CONTEXT_REG, count, false))
+    word(@intCast(u32, (offset - packets.CONTEXT_START) / 4))
+}
+
+fn contextOne(offset: usize, value: u32) -> void {
+    context(offset, 1)
+    word(value)
+}
+
+fn shaderRegisters(offset: usize, count: u32) -> void {
+    word(packets.header(packets.PKT3_SET_SH_REG, count, false))
+    word(@intCast(u32, (offset - packets.SH_START) / 4))
+}
+
+// SPI_SHADER_PGM_RSRC1 of a stage (compute's formula: pipeline.mlx).
+fn rsrc1Of(facts: *const shader.Facts, entrySgprs: u32, entryVgprs: u32) -> u32 {
+    const vgprs = roundUp(largest(largest(facts.*.vgprs, entryVgprs), 4), 4)
+    const sgprs = largest(roundUp(largest(facts.*.sgprs + 2, 16), 16), entrySgprs + 5)
+    return packets.put(gp.SPI_SHADER_PGM_RSRC1__VGPRS, (vgprs - 1) / 4) | packets.put(gp.SPI_SHADER_PGM_RSRC1__SGPRS, (sgprs - 1) / 8) | packets.put(gp.SPI_SHADER_PGM_RSRC1__FLOAT_MODE, packets.FP_16_64_DENORMS) | gp.SPI_SHADER_PGM_RSRC1__DX10_CLAMP
+}
+
+fn roundUp(value: u32, to: u32) -> u32 { return (value + to - 1) / to * to }
+
+fn largest(a: u32, b: u32) -> u32 { return if a > b { a } else { b } }
+
+fn buildWords(made: *GraphicsPipelineObject, perArray: u32) -> void {
+    words = &made.*.words
+    at = 0
+    const vsf = &made.*.vsFacts
+    const psf = &made.*.psFacts
+    // radv_pipeline_emit_blend_state
+    var colourFormat: u32 = 0
+    var shaderMask: u32 = 0
+    var t: u32 = 0
+    while t < 8 {
+        if (psf.*.colourTargets >> @intCast(u5, t)) & 1 != 0 && (made.*.targets >> @intCast(u5, t)) & 1 != 0 {
+            colourFormat |= gp.SPI_SHADER_32_ABGR << @intCast(u5, 4 * t)
+            shaderMask |= @intCast(u32, 0xF) << @intCast(u5, 4 * t)
+        }
+        t += 1
+    }
+    contextOne(gp.SPI_SHADER_COL_FORMAT, colourFormat)
+    contextOne(gp.CB_SHADER_MASK, shaderMask)
+    // radv_emit_vgt_gs_mode
+    contextOne(gp.VGT_PRIMITIVEID_EN, 0)
+    contextOne(gp.VGT_GS_MODE, 0)
+    // radv_emit_hw_vs
+    shaderRegisters(gp.SPI_SHADER_PGM_LO_VS, 4)
+    word(@intCast(u32, made.*.vs.address >> 8))
+    word(@intCast(u32, made.*.vs.address >> 40))
+    word(rsrc1Of(vsf, vsf.*.userSgprs, vsf.*.vgprComponents + 1) | packets.put(gp.SPI_SHADER_PGM_RSRC1_VS__VGPR_COMP_CNT, vsf.*.vgprComponents))
+    word(packets.put(gp.SPI_SHADER_PGM_RSRC2__USER_SGPR, vsf.*.userSgprs))
+    const parameters = largest(vsf.*.parameters, 1)
+    contextOne(gp.SPI_VS_OUT_CONFIG, packets.put(gp.SPI_VS_OUT_CONFIG__VS_EXPORT_COUNT, parameters - 1))
+    contextOne(gp.SPI_SHADER_POS_FORMAT, packets.put(gp.SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT, gp.SPI_SHADER_4COMP))
+    contextOne(gp.PA_CL_VS_OUT_CNTL, 0)
+    contextOne(gp.VGT_REUSE_OFF, 0)
+    word(packets.header(packets.PKT3_SET_SH_REG, 1, false))
+    word(@intCast(u32, (gp.SPI_SHADER_PGM_RSRC3_VS - packets.SH_START) / 4) | gp.RSRC3_INDEX << gp.SH_REG_INDEX_SHIFT)
+    var lateLimit: u32 = 0
+    var cuEnable: u32 = 0
+    lateAlloc(perArray, &lateLimit, &cuEnable)
+    word(cuEnable | RSRC3_VS_WAVE_LIMIT)
+    shaderRegisters(gp.SPI_SHADER_LATE_ALLOC_VS, 1)
+    word(lateLimit)
+    // radv_emit_fragment_shader
+    shaderRegisters(gp.SPI_SHADER_PGM_LO_PS, 4)
+    word(@intCast(u32, made.*.ps.address >> 8))
+    word(@intCast(u32, made.*.ps.address >> 40))
+    word(rsrc1Of(psf, psf.*.userSgprs + 1, 2))
+    word(packets.put(gp.SPI_SHADER_PGM_RSRC2__USER_SGPR, psf.*.userSgprs))
+    context(gp.SPI_PS_INPUT_ENA, 2)
+    word(gp.SPI_PS_INPUT_ENA__PERSP_CENTER_ENA)
+    word(gp.SPI_PS_INPUT_ENA__PERSP_CENTER_ENA)
+    contextOne(gp.SPI_PS_IN_CONTROL, packets.put(gp.SPI_PS_IN_CONTROL__NUM_INTERP, psf.*.interpolated))
+    contextOne(gp.SPI_SHADER_Z_FORMAT, gp.SPI_SHADER_ZERO)
+    // radv_emit_ps_inputs
+    if psf.*.interpolated > 0 {
+        context(gp.SPI_PS_INPUT_CNTL_0, psf.*.interpolated)
+        var n: u32 = 0
+        while n < psf.*.interpolated {
+            const location = psf.*.interpLocation[@intCast(usize, n)]
+            const parameter = if location < 16 { vsf.*.parameterOf[@intCast(usize, location)] } else { ir.NONE }
+            var cntl = if parameter == ir.NONE { INPUT_DEFAULT } else { packets.put(gp.SPI_PS_INPUT_CNTL__OFFSET, parameter) }
+            if parameter != ir.NONE && (psf.*.interpFlat >> @intCast(u5, n)) & 1 != 0 { cntl |= gp.SPI_PS_INPUT_CNTL__FLAT_SHADE }
+            word(cntl)
+            n += 1
+        }
+    }
+    // radv_emit_vgt_vertex_reuse, radv_emit_vgt_shader_config,
+    // radv_emit_vgt_gs_out
+    contextOne(gp.VGT_VERTEX_REUSE_BLOCK_CNTL, VERTEX_REUSE_DEPTH)
+    contextOne(gp.VGT_SHADER_STAGES_EN, 0)
+    contextOne(gp.VGT_GS_OUT_PRIM_TYPE, OUTPRIM_TRISTRIP)
+    made.*.wordCount = at
+}
+
+// ---------------------------------------------------------------------------
+// The state
+
+// The vertex formats of the stage: their components and number format.
+pub fn vertexFormat(format: vk.Format, components: *u32, number: *u32) -> bool {
+    if format == vk.Format.r32Sfloat || format == vk.Format.r32g32Sfloat || format == vk.Format.r32g32b32Sfloat || format == vk.Format.r32g32b32a32Sfloat {
+        number.* = ir.NUMBER_FLOAT
+    } else if format == vk.Format.r32Uint || format == vk.Format.r32g32Uint || format == vk.Format.r32g32b32Uint || format == vk.Format.r32g32b32a32Uint {
+        number.* = ir.NUMBER_UINT
+    } else if format == vk.Format.r32Sint || format == vk.Format.r32g32Sint || format == vk.Format.r32g32b32Sint || format == vk.Format.r32g32b32a32Sint {
+        number.* = ir.NUMBER_SINT
+    } else {
+        return false
+    }
+    if format == vk.Format.r32Sfloat || format == vk.Format.r32Uint || format == vk.Format.r32Sint { components.* = 1 }
+    if format == vk.Format.r32g32Sfloat || format == vk.Format.r32g32Uint || format == vk.Format.r32g32Sint { components.* = 2 }
+    if format == vk.Format.r32g32b32Sfloat || format == vk.Format.r32g32b32Uint || format == vk.Format.r32g32b32Sint { components.* = 3 }
+    if format == vk.Format.r32g32b32a32Sfloat || format == vk.Format.r32g32b32a32Uint || format == vk.Format.r32g32b32a32Sint { components.* = 4 }
+    return true
+}
+
+// radv_translate_blend_factor for the factors the stage takes (GFX6's
+// numbers), or 0xFF.
+fn blendFactor(factor: vk.BlendFactor) -> u32 {
+    if factor == vk.BlendFactor.zero { return gp.BLEND_ZERO }
+    if factor == vk.BlendFactor.one { return gp.BLEND_ONE }
+    if factor == vk.BlendFactor.srcColor { return gp.BLEND_SRC_COLOR }
+    if factor == vk.BlendFactor.oneMinusSrcColor { return gp.BLEND_ONE_MINUS_SRC_COLOR }
+    if factor == vk.BlendFactor.dstColor { return gp.BLEND_DST_COLOR }
+    if factor == vk.BlendFactor.oneMinusDstColor { return gp.BLEND_ONE_MINUS_DST_COLOR }
+    if factor == vk.BlendFactor.srcAlpha { return gp.BLEND_SRC_ALPHA }
+    if factor == vk.BlendFactor.oneMinusSrcAlpha { return gp.BLEND_ONE_MINUS_SRC_ALPHA }
+    if factor == vk.BlendFactor.dstAlpha { return gp.BLEND_DST_ALPHA }
+    if factor == vk.BlendFactor.oneMinusDstAlpha { return gp.BLEND_ONE_MINUS_DST_ALPHA }
+    if factor == vk.BlendFactor.constantColor { return gp.BLEND_CONSTANT_COLOR }
+    if factor == vk.BlendFactor.oneMinusConstantColor { return gp.BLEND_ONE_MINUS_CONSTANT_COLOR }
+    if factor == vk.BlendFactor.constantAlpha { return gp.BLEND_CONSTANT_ALPHA }
+    if factor == vk.BlendFactor.oneMinusConstantAlpha { return gp.BLEND_ONE_MINUS_CONSTANT_ALPHA }
+    return 0xFF
+}
+
+// radv_translate_blend_function.
+fn blendFunction(op: vk.BlendOp) -> u32 {
+    if op == vk.BlendOp.subtract { return gp.COMB_SRC_MINUS_DST }
+    if op == vk.BlendOp.reverseSubtract { return gp.COMB_DST_MINUS_SRC }
+    if op == vk.BlendOp.min { return gp.COMB_MIN_DST_SRC }
+    if op == vk.BlendOp.max { return gp.COMB_MAX_DST_SRC }
+    return gp.COMB_DST_PLUS_SRC
+}
+
+// radv_blend_remove_dst: func(src * DST, dst * 0) as func(src * 0, dst *
+// SRC), subtractions reversed.
+fn removeDestination(op: *vk.BlendOp, source: *vk.BlendFactor, target: *vk.BlendFactor, expected: vk.BlendFactor, replacement: vk.BlendFactor) -> void {
+    if source.* == expected && target.* == vk.BlendFactor.zero {
+        source.* = vk.BlendFactor.zero
+        target.* = replacement
+        if op.* == vk.BlendOp.subtract {
+            op.* = vk.BlendOp.reverseSubtract
+        } else if op.* == vk.BlendOp.reverseSubtract {
+            op.* = vk.BlendOp.subtract
+        }
+    }
+}
+
+// CB_BLENDn_CONTROL of an attachment's blend (radv_emit_color_blend), or
+// 0xFFFFFFFF when the stage does not take it.
+pub fn blendControl(state: *const vk.PipelineColorBlendAttachmentState) -> u32 {
+    if state.*.blendEnable == vk.FALSE { return 0 }
+    var eqRGB = state.*.colorBlendOp
+    var eqA = state.*.alphaBlendOp
+    var srcRGB = state.*.srcColorBlendFactor
+    var dstRGB = state.*.dstColorBlendFactor
+    var srcA = state.*.srcAlphaBlendFactor
+    var dstA = state.*.dstAlphaBlendFactor
+    if @intFromEnum(eqRGB) > 4 || @intFromEnum(eqA) > 4 { return 0xFFFFFFFF }
+    // radv_normalize_blend_factor
+    if eqRGB == vk.BlendOp.min || eqRGB == vk.BlendOp.max {
+        srcRGB = vk.BlendFactor.one
+        dstRGB = vk.BlendFactor.one
+    }
+    if eqA == vk.BlendOp.min || eqA == vk.BlendOp.max {
+        srcA = vk.BlendFactor.one
+        dstA = vk.BlendFactor.one
+    }
+    removeDestination(&eqRGB, &srcRGB, &dstRGB, vk.BlendFactor.dstColor, vk.BlendFactor.srcColor)
+    removeDestination(&eqA, &srcA, &dstA, vk.BlendFactor.dstColor, vk.BlendFactor.srcColor)
+    removeDestination(&eqA, &srcA, &dstA, vk.BlendFactor.dstAlpha, vk.BlendFactor.srcAlpha)
+    const parts = [4]u32{ blendFactor(srcRGB), blendFactor(dstRGB), blendFactor(srcA), blendFactor(dstA) }
+    if parts[0] == 0xFF || parts[1] == 0xFF || parts[2] == 0xFF || parts[3] == 0xFF { return 0xFFFFFFFF }
+    var control = gp.CB_BLEND0_CONTROL__ENABLE | packets.put(gp.CB_BLEND0_CONTROL__COLOR_COMB_FCN, blendFunction(eqRGB)) | packets.put(gp.CB_BLEND0_CONTROL__COLOR_SRCBLEND, parts[0]) | packets.put(gp.CB_BLEND0_CONTROL__COLOR_DESTBLEND, parts[1])
+    if srcA != srcRGB || dstA != dstRGB || eqA != eqRGB {
+        control |= gp.CB_BLEND0_CONTROL__SEPARATE_ALPHA_BLEND | packets.put(gp.CB_BLEND0_CONTROL__ALPHA_COMB_FCN, blendFunction(eqA)) | packets.put(gp.CB_BLEND0_CONTROL__ALPHA_SRCBLEND, parts[2]) | packets.put(gp.CB_BLEND0_CONTROL__ALPHA_DESTBLEND, parts[3])
+    }
+    return control
+}
+
+fn floatWord(value: f32) -> u32 { return @bitCast(u32, value) }
+
+const Chained = struct {
+    sType: vk.StructureType
+    pNext: ?*const anyopaque
+}
+
+// The colour targets of a pipeline made for dynamic rendering (VkPipeline
+// RenderingCreateInfo in the chain), or of its render pass's subpass;
+// false when one is not of the stage.
+fn targetsOf(info: *const vk.GraphicsPipelineCreateInfo, targets: *u32, count: *u32) -> bool {
+    targets.* = 0
+    count.* = 0
+    if info.*.renderPass != 0 {
+        const p = image.passOf(info.*.renderPass)
+        if info.*.subpass != 0 { return false }
+        var k: usize = 0
+        while k < @intCast(usize, p.*.colourCount) {
+            if p.*.colours[k] != vk.ATTACHMENT_UNUSED { targets.* |= @intCast(u32, 1) << @intCast(u5, k) }
+            k += 1
+        }
+        count.* = p.*.colourCount
+        return true
+    }
+    var next = info.*.pNext
+    while next != null {
+        const chained: *const Chained = unsafe { @ptrCast(*const Chained, next.?) }
+        if chained.*.sType == vk.StructureType.pipelineRenderingCreateInfo {
+            const rendering: *const vk.PipelineRenderingCreateInfo = unsafe { @ptrCast(*const vk.PipelineRenderingCreateInfo, next.?) }
+            if rendering.*.viewMask != 0 || rendering.*.colorAttachmentCount > 8 || rendering.*.depthAttachmentFormat != vk.Format.undefined_ || rendering.*.stencilAttachmentFormat != vk.Format.undefined_ { return false }
+            var k: usize = 0
+            while k < @intCast(usize, rendering.*.colorAttachmentCount) {
+                const format = rendering.*.pColorAttachmentFormats.?[k]
+                if format != vk.Format.undefined_ {
+                    if !image.colourFormat(format) { return false }
+                    targets.* |= @intCast(u32, 1) << @intCast(u5, k)
+                }
+                k += 1
+            }
+            count.* = rendering.*.colorAttachmentCount
+            return true
+        }
+        next = chained.*.pNext
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Creation
+
+pub var lastFailure: shader.Failure = undefined // (per run)
+
+const MOST_CODE: usize = 16384
+
+var compiled: [MOST_CODE]u32 = undefined // (per run)
+
+fn sameName(name: ?[*]const u8, text: []const u8) -> bool {
+    if name == null { return false }
+    var k: usize = 0
+    while k < text.length {
+        if name.?[k] != text[k] { return false }
+        k += 1
+    }
+    return name.?[text.length] == 0
+}
+
+// A stage compiled into its block: false when the compiler refused it or
+// it is not that stage.
+fn compileStage(owner: *DeviceObject, stage: *const vk.PipelineShaderStageCreateInfo, wanted: ir.Stage, facts: *shader.Facts, block: *device.Block) -> bool {
+    const module = pipeline.moduleWords(stage.*.module)
+    if !shader.compile(module, std.page_allocator.init(), compiled[0..], facts, &lastFailure) { return false }
+    if facts.*.stage != wanted { return false }
+    if !device.ownBlock(owner, facts.*.words * 4, gpucard.Access.READ | gpucard.Access.EXECUTE, true, block) { return false }
+    const target: [*]u32 = unsafe { @ptrFromInt([*]u32, block.*.bytes) }
+    var k: usize = 0
+    while k < facts.*.words {
+        target[k] = compiled[k]
+        k += 1
+    }
+    return true
+}
+
+fn takes(info: *const vk.GraphicsPipelineCreateInfo) -> bool {
+    if info.*.flags != 0 || info.*.stageCount != 2 || info.*.pTessellationState != null || info.*.layout == 0 { return false }
+    const ia = info.*.pInputAssemblyState
+    if ia == null || ia.?.*.primitiveRestartEnable != vk.FALSE || (ia.?.*.topology != vk.PrimitiveTopology.triangleList && ia.?.*.topology != vk.PrimitiveTopology.triangleStrip) { return false }
+    const rs = info.*.pRasterizationState
+    if rs == null || rs.?.*.depthClampEnable != vk.FALSE || rs.?.*.rasterizerDiscardEnable != vk.FALSE || rs.?.*.polygonMode != vk.PolygonMode.fill || rs.?.*.depthBiasEnable != vk.FALSE || rs.?.*.lineWidth != 1.0 { return false }
+    const ms = info.*.pMultisampleState
+    if ms == null || ms.?.*.rasterizationSamples != vk.SAMPLE_COUNT_1_BIT || ms.?.*.sampleShadingEnable != vk.FALSE || ms.?.*.alphaToCoverageEnable != vk.FALSE || ms.?.*.alphaToOneEnable != vk.FALSE { return false }
+    if ms.?.*.pSampleMask != null && (ms.?.*.pSampleMask.?[0] & 1) == 0 { return false }
+    const ds = info.*.pDepthStencilState
+    if ds != null && (ds.?.*.depthTestEnable != vk.FALSE || ds.?.*.depthWriteEnable != vk.FALSE || ds.?.*.depthBoundsTestEnable != vk.FALSE || ds.?.*.stencilTestEnable != vk.FALSE) { return false }
+    const vp = info.*.pViewportState
+    if vp == null || vp.?.*.viewportCount != 1 || vp.?.*.scissorCount != 1 { return false }
+    const cb = info.*.pColorBlendState
+    if cb != null && cb.?.*.logicOpEnable != vk.FALSE { return false }
+    return true
+}
+
+fn createOne(owner: *DeviceObject, info: *const vk.GraphicsPipelineCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: *vk.Pipeline) -> vk.Result {
+    into.* = 0
+    lastFailure.kind = ir.Failure.none
+    if !takes(info) { return vk.Result.errorUnknown }
+    var vertexStage: usize = 2
+    var fragmentStage: usize = 2
+    var k: usize = 0
+    while k < 2 {
+        const s = &info.*.pStages.?[k]
+        if s.*.module == 0 || !sameName(s.*.pName, "main") || s.*.pSpecializationInfo != null || s.*.flags != 0 { return vk.Result.errorUnknown }
+        if s.*.stage == vk.SHADER_STAGE_VERTEX_BIT { vertexStage = k }
+        if s.*.stage == vk.SHADER_STAGE_FRAGMENT_BIT { fragmentStage = k }
+        k += 1
+    }
+    if vertexStage == 2 || fragmentStage == 2 { return vk.Result.errorUnknown }
+    var targets: u32 = 0
+    var targetCount: u32 = 0
+    if !targetsOf(info, &targets, &targetCount) { return vk.Result.errorUnknown }
+    // The dynamic states.
+    var dynamicViewport = false
+    var dynamicScissor = false
+    var dynamicBlend = false
+    if info.*.pDynamicState != null {
+        const d = info.*.pDynamicState.?
+        k = 0
+        while k < @intCast(usize, d.*.dynamicStateCount) {
+            const state = d.*.pDynamicStates.?[k]
+            if state == vk.DynamicState.viewport {
+                dynamicViewport = true
+            } else if state == vk.DynamicState.scissor {
+                dynamicScissor = true
+            } else if state == vk.DynamicState.blendConstants {
+                dynamicBlend = true
+            } else {
+                return vk.Result.errorUnknown
+            }
+            k += 1
+        }
+    }
+    const vp = info.*.pViewportState.?
+    if (!dynamicViewport && vp.*.pViewports == null) || (!dynamicScissor && vp.*.pScissors == null) { return vk.Result.errorUnknown }
+    // The vertex input, for the compiler.
+    ir.clearVertexInputs()
+    var strides: [16]u32 = undefined
+    var perInstance: u32 = 0
+    k = 0
+    while k < MOST_BINDINGS {
+        strides[k] = 0
+        k += 1
+    }
+    const input = info.*.pVertexInputState
+    if input != null {
+        k = 0
+        while k < @intCast(usize, input.?.*.vertexBindingDescriptionCount) {
+            const b = &input.?.*.pVertexBindingDescriptions.?[k]
+            if b.*.binding >= @intCast(u32, MOST_BINDINGS) || b.*.stride > 2048 { return vk.Result.errorUnknown }
+            strides[@intCast(usize, b.*.binding)] = b.*.stride
+            if b.*.inputRate == vk.VertexInputRate.instance { perInstance |= @intCast(u32, 1) << @intCast(u5, b.*.binding) }
+            k += 1
+        }
+        k = 0
+        while k < @intCast(usize, input.?.*.vertexAttributeDescriptionCount) {
+            const a = &input.?.*.pVertexAttributeDescriptions.?[k]
+            var components: u32 = 0
+            var number: u32 = 0
+            if a.*.location >= 16 || a.*.binding >= @intCast(u32, MOST_BINDINGS) || !vertexFormat(a.*.format, &components, &number) || a.*.offset > 2047 { return vk.Result.errorUnknown }
+            ir.vertexInputs[@intCast(usize, a.*.location)] = ir.VertexInput.{ .used = true, .binding = a.*.binding, .offset = a.*.offset, .components = components, .number = number, .perInstance = (perInstance >> @intCast(u5, a.*.binding)) & 1 != 0 }
+            k += 1
+        }
+    }
+    const address = device.allocate(callbacks, @sizeOf(GraphicsPipelineObject), vk.SystemAllocationScope.object)
+    if address == 0 { return vk.Result.errorOutOfHostMemory }
+    const made = graphicsOf(address)
+    made.*.kind = pipeline.KIND_GRAPHICS
+    made.*.vs.memory = 0
+    made.*.ps.memory = 0
+    if !compileStage(owner, &info.*.pStages.?[vertexStage], ir.Stage.vertex, &made.*.vsFacts, &made.*.vs) {
+        dropMade(owner, callbacks, made)
+        return vk.Result.errorUnknown
+    }
+    if !compileStage(owner, &info.*.pStages.?[fragmentStage], ir.Stage.fragment, &made.*.psFacts, &made.*.ps) {
+        dropMade(owner, callbacks, made)
+        return vk.Result.errorUnknown
+    }
+    // What the shaders read must be in the layout: set 0's bindings, the
+    // push words.
+    const layout = pipeline.pipelineLayoutOf(info.*.layout)
+    const bindings = made.*.vsFacts.bindings | made.*.psFacts.bindings
+    const pushWords = largest(made.*.vsFacts.pushWords, made.*.psFacts.pushWords)
+    if pushWords * 4 > layout.*.pushBytes || (bindings != 0 && (layout.*.setCount == 0 || (bindings & ~pipeline.setLayoutOf(layout.*.sets[0]).*.present) != 0)) {
+        dropMade(owner, callbacks, made)
+        return vk.Result.errorUnknown
+    }
+    made.*.layout = info.*.layout
+    made.*.targets = targets
+    k = 0
+    while k < MOST_BINDINGS {
+        made.*.strides[k] = strides[k]
+        k += 1
+    }
+    // The draw's state.
+    const ia = info.*.pInputAssemblyState.?
+    made.*.topology = if ia.*.topology == vk.PrimitiveTopology.triangleStrip { gp.DI_PT_TRISTRIP } else { gp.DI_PT_TRILIST }
+    const rs = info.*.pRasterizationState.?
+    made.*.suScModeCntl = (if (rs.*.cullMode & vk.CULL_MODE_FRONT_BIT) != 0 { gp.PA_SU_SC_MODE_CNTL__CULL_FRONT } else { 0 }) | (if (rs.*.cullMode & vk.CULL_MODE_BACK_BIT) != 0 { gp.PA_SU_SC_MODE_CNTL__CULL_BACK } else { 0 }) | (if rs.*.frontFace == vk.FrontFace.clockwise { gp.PA_SU_SC_MODE_CNTL__FACE } else { 0 })
+    made.*.targetMask = 0
+    k = 0
+    while k < 8 {
+        made.*.blend[k] = 0
+        k += 1
+    }
+    k = 0
+    while k < 4 {
+        made.*.blendConstants[k] = 0
+        k += 1
+    }
+    const cb = info.*.pColorBlendState
+    if cb != null {
+        if cb.?.*.attachmentCount != targetCount {
+            dropMade(owner, callbacks, made)
+            return vk.Result.errorUnknown
+        }
+        k = 0
+        while k < @intCast(usize, cb.?.*.attachmentCount) {
+            const control = blendControl(&cb.?.*.pAttachments.?[k])
+            if control == 0xFFFFFFFF {
+                dropMade(owner, callbacks, made)
+                return vk.Result.errorUnknown
+            }
+            made.*.blend[k] = control
+            if (targets >> @intCast(u5, k)) & 1 != 0 { made.*.targetMask |= (cb.?.*.pAttachments.?[k].colorWriteMask & 0xF) << @intCast(u5, 4 * k) }
+            k += 1
+        }
+        k = 0
+        while k < 4 {
+            made.*.blendConstants[k] = floatWord(cb.?.*.blendConstants[k])
+            k += 1
+        }
+    }
+    made.*.colourControl = packets.put(gp.CB_COLOR_CONTROL__ROP3, gp.ROP3_COPY) | packets.put(gp.CB_COLOR_CONTROL__MODE, if made.*.targetMask != 0 { gp.CB_NORMAL } else { 0 })
+    made.*.dynamicViewport = dynamicViewport
+    made.*.dynamicScissor = dynamicScissor
+    made.*.dynamicBlend = dynamicBlend
+    if !dynamicViewport { made.*.viewport = vp.*.pViewports.?[0] }
+    if !dynamicScissor { made.*.scissor = vp.*.pScissors.?[0] }
+    buildWords(made, owner.*.computeUnitsPerArray)
+    into.* = address
+    return vk.Result.success
+}
+
+fn dropMade(owner: *DeviceObject, callbacks: ?*const vk.AllocationCallbacks, made: *GraphicsPipelineObject) -> void {
+    if made.*.vs.memory != 0 { device.dropBlock(owner, &made.*.vs) }
+    if made.*.ps.memory != 0 { device.dropBlock(owner, &made.*.ps) }
+    device.release(callbacks, @intFromPtr(made), @sizeOf(GraphicsPipelineObject))
+}
+
+pub fn createGraphicsPipelines(handle: vk.Device, cache: vk.PipelineCache, count: u32, infos: ?[*]const vk.GraphicsPipelineCreateInfo, callbacks: ?*const vk.AllocationCallbacks, into: ?[*]vk.Pipeline) -> vk.Result {
+    const owner = device.deviceOf(handle)
+    var result = vk.Result.success
+    var k: usize = 0
+    while k < @intCast(usize, count) {
+        const made = createOne(owner, &infos.?[k], callbacks, &into.?[k])
+        if made != vk.Result.success && result == vk.Result.success { result = made }
+        k += 1
+    }
+    return result
+}
+
+// vkDestroyPipeline of either kind.
+pub fn destroyPipeline(handle: vk.Device, given: vk.Pipeline, callbacks: ?*const vk.AllocationCallbacks) -> void {
+    if given == 0 { return }
+    if kindOf(given) != pipeline.KIND_GRAPHICS {
+        pipeline.destroyPipeline(handle, given, callbacks)
+        return
+    }
+    dropMade(device.deviceOf(handle), callbacks, graphicsOf(given))
+}

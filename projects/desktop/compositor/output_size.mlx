@@ -1,0 +1,273 @@
+// The output takes another size while the compositor runs: the display's
+// mode was changed (brixOS: drm.brixos.mlx follows the kernel's display,
+// whoever asked for the mode, and the kernel putting the mode before
+// back). Everything laid out for the old size is laid out for the new
+// one, and every client is told what concerns it (part of the shell,
+// called through entries.outputResized):
+//
+// - the panels (layer surfaces: the top bar, the dock, the launcher) are
+//   configured to their new size where they stretch along an edge, and
+//   placed against their edges again; the edges they reserve with them
+//   (protocols.outputResized);
+// - maximized windows take the new work area and the tiled columns fill
+//   it (protocols.updateReserves), fullscreen windows (the greeter's
+//   among them) the whole output, windows snapped to a half or a
+//   quarter their new half or quarter;
+// - every other window stays where it was in proportion to the screen:
+//   the room beside it is shared out as before, and a window larger than
+//   the new work area is made its size (`keepInside`); the rectangle a
+//   maximized or snapped window goes back to likewise;
+// - the lock's surfaces are configured to cover the output again;
+// - each wl_output and xdg_output a client bound says the new mode and
+//   size (`keep` remembers them as they are bound); a capture session of
+//   the output hears its buffers' new size at its next frame
+//   (capture.mlx's fulfil does that for any change of size);
+// - the pointer stays on the screen and everything is drawn again.
+const wl = @import("std.wayland")
+const ui = @import("std.ui")
+const state = @import("./state.mlx")
+const scene = @import("./scene.mlx")
+const shell = @import("./shell.mlx")
+const windows_module = @import("./windows.mlx")
+const protocols_module = @import("./protocols.mlx")
+
+const Compositor = state.Compositor
+const Surface = state.Surface
+
+// ---------------------------------------------------------------------------
+// The layout, pure: where a rectangle goes in a work area that changed
+
+fn smaller(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+fn larger(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+
+// Along one axis: a stretch of `length` that began `offset` after the
+// area's start, in an area of `before` that is `after` long now: its new
+// length (at most the area) and its new offset. The room the stretch
+// left in the area is shared out as before (half the room on its left
+// side before: half of it after); one that reached out of the area is
+// brought inside it.
+fn along(offset: i32, length: i32, before: i32, after: i32, newOffset: *i32) -> i32 {
+    const kept = larger(1, smaller(length, after))
+    const roomBefore = before - length
+    const roomAfter = after - kept
+    var at: i32 = 0
+    if roomBefore > 0 && roomAfter > 0 {
+        const inside = larger(0, smaller(offset, roomBefore))
+        // (In 64 bits: a screen's pixels times a screen's pixels; to the
+        // nearest pixel, so that a change and its way back put the window
+        // where it was.)
+        at = @intCast(i32, (@intCast(i64, inside) * @intCast(i64, roomAfter) + @intCast(i64, roomBefore / 2)) / @intCast(i64, roomBefore))
+    }
+    newOffset.* = larger(0, smaller(at, larger(0, roomAfter)))
+    return kept
+}
+
+// Where `window` (a window's outer rectangle: its frame and title bar
+// with it) goes when the work area was `before` and is `after` now: kept
+// where it was in proportion to the area, inside the new one, and no
+// larger than it.
+pub fn keepInside(window: ui.Rect, before: ui.Rect, after: ui.Rect) -> ui.Rect {
+    var x: i32 = 0
+    var y: i32 = 0
+    const width = along(window.x - before.x, window.width, before.width, after.width, &x)
+    const height = along(window.y - before.y, window.height, before.height, after.height, &y)
+    return ui.rect(after.x + x, after.y + y, width, height)
+}
+
+// The work area of an output of `width` by `height` with the edges the
+// panels reserve now (what it was before the change: the panels have not
+// been laid out for the new size yet).
+fn areaOf(compositor: *const Compositor, width: usize, height: usize) -> ui.Rect {
+    return ui.rect(compositor.*.reserveLeft, compositor.*.reserveTop, @intCast(i32, width) - compositor.*.reserveLeft - compositor.*.reserveRight, @intCast(i32, height) - compositor.*.reserveTop - compositor.*.reserveBottom)
+}
+
+// ---------------------------------------------------------------------------
+// The outputs clients bound
+
+fn resourceAt(address: usize) -> *state.SeatResource {
+    unsafe { return @ptrFromInt(*state.SeatResource, address) }
+}
+
+// A wl_output or an xdg_output (`kind`: SEAT_OUTPUT, SEAT_XDG_OUTPUT) a
+// client bound, remembered until it goes so it hears of a new size.
+pub fn keep(compositor: *Compositor, object: wl.server.Object, kind: u8) -> void {
+    const memory = state.allocate(compositor, @sizeOf(state.SeatResource))
+    const record = resourceAt(@intFromPtr(memory))
+    record.*.compositor = compositor
+    record.*.object = object
+    record.*.kind = kind
+    compositor.*.outputs = state.listAppend(compositor.*.outputs, @intFromPtr(memory))
+    wl.server.setDestroyHandler(object, if kind == state.SEAT_OUTPUT { onOutputDestroyed } else { onXdgOutputDestroyed }, state.contextOf(memory))
+}
+
+fn forget(context: *anyopaque) -> void {
+    const record = resourceAt(@intFromPtr(context))
+    const compositor = record.*.compositor
+    compositor.*.outputs = state.listRemove(compositor.*.outputs, @intFromPtr(context))
+    unsafe { state.release(compositor, @ptrCast([*]u8, context), @sizeOf(state.SeatResource)) }
+}
+
+pub fn onOutputDestroyed(context: *anyopaque, object: wl.server.Object) -> void { forget(context) }
+
+pub fn onXdgOutputDestroyed(context: *anyopaque, object: wl.server.Object) -> void { forget(context) }
+
+// What a wl_output says of the output: its place and size (in
+// millimetres at 96 pixels an inch, as bindOutput says it), its mode.
+pub fn describeOutput(compositor: *Compositor, output: wl.wl_output.Resource) -> void {
+    const width = @intCast(i32, compositor.*.width)
+    const height = @intCast(i32, compositor.*.height)
+    output.sendGeometry(0, 0, (width * 254) / 960, (height * 254) / 960, @intCast(i32, @intFromEnum(wl.wl_output.Subpixel.unknown)), "Mlx", "nested output", @intCast(i32, @intFromEnum(wl.wl_output.Transform.normal)))
+    const refresh = if compositor.*.outputMillihertz != 0 { @intCast(i32, compositor.*.outputMillihertz) } else { 60000 }
+    output.sendMode(@intFromEnum(wl.wl_output.Mode.current) | @intFromEnum(wl.wl_output.Mode.preferred), width, height, refresh)
+}
+
+fn tellOutputs(compositor: *Compositor) -> void {
+    var index: usize = 0
+    while index < compositor.*.outputs.length {
+        const record = resourceAt(state.listAt(compositor.*.outputs, index))
+        if record.*.kind == state.SEAT_OUTPUT {
+            const output = wl.wl_output.Resource.fromObject(record.*.object)
+            describeOutput(compositor, output)
+            if wl.server.objectVersion(record.*.object) >= 2 { output.sendDone() }
+        } else {
+            const output = wl.zxdg_output_v1.Resource.fromObject(record.*.object)
+            output.sendLogicalSize(@intCast(i32, compositor.*.width), @intCast(i32, compositor.*.height))
+            // From version 3 the wl_output's done ends it.
+            if wl.server.objectVersion(record.*.object) < 3 { output.sendDone() }
+        }
+        index += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The windows
+
+// A floating window (one no state places) kept inside the new work area.
+fn keepWindow(surface: *Surface, before: ui.Rect, after: ui.Rect) -> void {
+    const frame = scene.frameWidth(surface)
+    const title = scene.titleHeight(surface)
+    const outer = ui.rect(scene.windowX(surface) - frame, scene.windowY(surface) - frame - title, scene.windowWidth(surface) + 2 * frame, scene.windowHeight(surface) + 2 * frame + title)
+    const placed = keepInside(outer, before, after)
+    if placed.width < outer.width || placed.height < outer.height {
+        // Larger than the screen now: it is asked for the size that fits.
+        surface.*.configuredWidth = placed.width - 2 * frame
+        surface.*.configuredHeight = placed.height - 2 * frame - title
+        windows_module.configureToplevel(surface)
+    }
+    windows_module.moveWindowTo(surface, placed.x + frame, placed.y + frame + title)
+    if surface.*.compositor.*.verbose {
+        state.say("output: ")
+        state.sayTitle(surface)
+        state.say(" kept at ")
+        state.sayInteger(placed.x)
+        state.say(",")
+        state.sayInteger(placed.y)
+        state.say(", ")
+        state.sayInteger(placed.width)
+        state.say("x")
+        state.sayInteger(placed.height)
+        state.say(" with its frame\n")
+    }
+}
+
+// The rectangle a maximized, fullscreen or snapped window goes back to,
+// and the one a column goes back to when its workspace stops tiling,
+// kept inside the new work area too.
+fn keepRestore(surface: *Surface, before: ui.Rect, after: ui.Rect) -> void {
+    const frame = scene.frameWidth(surface)
+    const title = scene.titleHeight(surface)
+    if surface.*.hasFloat {
+        const float = keepInside(ui.rect(surface.*.floatX - frame, surface.*.floatY - frame - title, surface.*.floatWidth + 2 * frame, surface.*.floatHeight + 2 * frame + title), before, after)
+        surface.*.floatX = float.x + frame
+        surface.*.floatY = float.y + frame + title
+        surface.*.floatWidth = float.width - 2 * frame
+        surface.*.floatHeight = float.height - 2 * frame - title
+    }
+    if !surface.*.hasRestore { return }
+    const outer = ui.rect(surface.*.restoreX - frame, surface.*.restoreY - frame - title, surface.*.restoreWidth + 2 * frame, surface.*.restoreHeight + 2 * frame + title)
+    const placed = keepInside(outer, before, after)
+    surface.*.restoreX = placed.x + frame
+    surface.*.restoreY = placed.y + frame + title
+    surface.*.restoreWidth = placed.width - 2 * frame
+    surface.*.restoreHeight = placed.height - 2 * frame - title
+}
+
+// ---------------------------------------------------------------------------
+// The change
+
+// The output is `compositor.width` by `compositor.height` now; it was
+// `oldWidth` by `oldHeight`.
+pub fn resized(compositor: *Compositor, oldWidth: usize, oldHeight: usize) -> void {
+    const before = areaOf(compositor, oldWidth, oldHeight)
+    // The panels first: the edges they reserve make the work area, and
+    // with it where maximized windows and the tiled columns go.
+    protocols_module.outputResized(compositor)
+    const after = scene.workArea(compositor)
+    var index: usize = 0
+    while index < compositor.*.surfaces.length {
+        const surface = state.surfaceAt(state.listAt(compositor.*.surfaces, index))
+        index += 1
+        if surface.*.role == state.ROLE_LOCK && surface.*.hasLockSurface {
+            surface.*.lockWidth = @intCast(i32, compositor.*.width)
+            surface.*.lockHeight = @intCast(i32, compositor.*.height)
+            surface.*.x = 0
+            surface.*.y = 0
+            wl.ext_session_lock_surface_v1.Resource.fromObject(surface.*.lockSurface).sendConfigure(compositor.*.server.nextSerial(), @intCast(u32, surface.*.lockWidth), @intCast(u32, surface.*.lockHeight))
+            continue
+        }
+        if !windows_module.isWindow(surface) || !surface.*.mapped { continue }
+        keepRestore(surface, before, after)
+        if surface.*.fullscreen {
+            const whole = windows_module.stateRect(surface)
+            surface.*.configuredWidth = whole.width
+            surface.*.configuredHeight = whole.height
+            windows_module.configureToplevel(surface)
+            windows_module.pinState(surface)
+            continue
+        }
+        // (Maximized ones and the columns: updateReserves has them.)
+        if surface.*.tiled || surface.*.maximized { continue }
+        if surface.*.snapped != state.SNAP_NONE && surface.*.snapped != state.SNAP_TOP {
+            windows_module.snapTo(surface, surface.*.snapped)
+            continue
+        }
+        keepWindow(surface, before, after)
+    }
+    tellOutputs(compositor)
+    if compositor.*.pointerX >= @intCast(i32, compositor.*.width) { compositor.*.pointerX = @intCast(i32, compositor.*.width) - 1 }
+    if compositor.*.pointerY >= @intCast(i32, compositor.*.height) { compositor.*.pointerY = @intCast(i32, compositor.*.height) - 1 }
+    windows_module.refreshPointerFocus(compositor)
+    scene.damageAll(compositor)
+    if compositor.*.verbose {
+        state.say("output: ")
+        state.sayNumber(oldWidth)
+        state.say("x")
+        state.sayNumber(oldHeight)
+        state.say(" is ")
+        state.sayNumber(compositor.*.width)
+        state.say("x")
+        state.sayNumber(compositor.*.height)
+        state.say(" now; work area ")
+        state.sayInteger(after.width)
+        state.say("x")
+        state.sayInteger(after.height)
+        state.say(" at ")
+        state.sayInteger(after.x)
+        state.say(",")
+        state.sayInteger(after.y)
+        state.say("\n")
+    }
+}
+
+// The handlers by name (shell_table.mlx: a reloaded shell finds them).
+pub const HANDLER_COUNT: usize = 2
+
+pub fn handlerAddress(index: usize) -> usize {
+    if index == 0 { return @intFromPtr(onOutputDestroyed) }
+    return @intFromPtr(onXdgOutputDestroyed)
+}
+
+pub fn handlerName(index: usize) -> []const u8 {
+    if index == 0 { return "output_size.onOutputDestroyed" }
+    return "output_size.onXdgOutputDestroyed"
+}

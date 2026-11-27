@@ -36,4 +36,5 @@
 #define __NR_getrandom SYS_getrandom
 #define __NR_memfd_create SYS_memfd_create
 #define __NR_tgkill SYS_tgkill
+#define __NR_sched_getaffinity SYS_sched_getaffinity
 #endif
