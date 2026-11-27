@@ -24,13 +24,51 @@ pub const Memory = struct {
     pub const GIB: usize = 0x40000000
     pub const HUGE: usize = 0x200000
     pub const MAPPED_LIMIT: usize = 64 * GIB
-    // The processors that run the kernel (more stay halted), each with
-    // its share of the arena.
-    pub const MAX_CPUS: usize = 8
-    pub const ARENA_PER_CPU: usize = ARENA_SIZE / MAX_CPUS
+    // The processors that run the kernel: every one the firmware lists,
+    // up to what an MADT names (two large processors' threads; x2APIC ids
+    // beyond 255 among them). What each one has is made for the
+    // processors found at boot (smp.mlx), not for this many: the bound is
+    // for the few small tables that are by number (a word or a flag each).
+    pub const MAX_CPUS: usize = 256
+    // The aggregate arena divided among the processors found: the first
+    // one's share (ARENA_FIRST, from ARENA: the boot runs in it) as with
+    // eight, and the rest of the region for the others, ARENA_MOST each at
+    // most, ARENA_LEAST at least. Where the region holds fewer such shares
+    // than there are others, the rest have ARENA_LEAST of the frames'
+    // memory each (arenaShare, arenasInRegion). The arena is a bump that
+    // every entry from user mode empties (trap.mlx): a system call takes a
+    // few KiB of it (6.5 KiB at most in tools/check_brix.sh's and 2 KiB in
+    // check_brix_desktop.sh's runs, measured), and one that runs out of
+    // it stops the kernel.
+    pub const ARENA_FIRST: usize = 0x400000
+    pub const ARENA_MOST: usize = 0x400000
+    pub const ARENA_LEAST: usize = 0x80000
+    // (Shares are whole steps of this.)
+    pub const ARENA_STEP: usize = 0x10000
 
-    // Processor `cpu`'s arena.
-    pub fn arenaOf(cpu: usize) -> usize { return ARENA + cpu * ARENA_PER_CPU }
+    // The share of each processor but the first when `others` more than
+    // it run the kernel.
+    pub fn arenaShare(others: usize) -> usize {
+        if others == 0 { return ARENA_MOST }
+        const even = (ARENA_SIZE - ARENA_FIRST) / others / ARENA_STEP * ARENA_STEP
+        if even > ARENA_MOST { return ARENA_MOST }
+        if even < ARENA_LEAST { return ARENA_LEAST }
+        return even
+    }
+
+    // How many of those others have their share in the region (the
+    // first ones); the rest have theirs of the frames.
+    pub fn arenasInRegion(others: usize) -> usize {
+        const room = (ARENA_SIZE - ARENA_FIRST) / arenaShare(others)
+        return if others < room { others } else { room }
+    }
+
+    // Processor `cpu`'s arena in the region (physical), for 1 <= cpu <=
+    // arenasInRegion(others); the first processor's is at ARENA.
+    pub fn arenaOf(cpu: usize, others: usize) -> usize {
+        if cpu == 0 { return ARENA }
+        return ARENA + ARENA_FIRST + (cpu - 1) * arenaShare(others)
+    }
 
     // The kernel's view of physical memory (all of it, to MAPPED_LIMIT).
     pub fn virtual(physical: usize) -> usize { return KERNEL_VIRTUAL + physical }
@@ -47,9 +85,12 @@ pub const Blob = struct {
     pub const CODE64: usize = 0x500
     pub const IDT: usize = 0x1000
     pub const STUBS: usize = 0x2000
-    // The GDT (a TSS descriptor per processor), the processors' TSSs
-    // (TSS_SIZE each) and their blocks (PerCpu, PERCPU_SIZE each; the
-    // kernel's GS base).
+    // The first processor's GDT (its own TSS's descriptor after the
+    // segments), TSS (TSS_SIZE) and block (PerCpu, PERCPU_SIZE; the
+    // kernel's GS base). The others' are made by the kernel when it
+    // starts them, for as many as it found (smp.mlx): a GDT with a TSS
+    // descriptor each (GDTR64 is pointed at it, the others load it), and
+    // a TSS and block each in a page above its trap stack.
     pub const GDT: usize = 0x3000
     pub const TSS: usize = 0x3400
     pub const TSS_SIZE: usize = 0x80
@@ -83,36 +124,51 @@ pub const Blob = struct {
     // Where a part of the blob is in the kernel's view.
     pub fn virtual(offset: usize) -> usize { return Memory.KERNEL_VIRTUAL + Memory.BLOB + offset }
 
-    // Processor `cpu`'s TSS and block, in the kernel's view.
-    pub fn tssOf(cpu: usize) -> usize { return virtual(TSS + cpu * TSS_SIZE) }
-    pub fn perCpuOf(cpu: usize) -> usize { return virtual(PERCPU + cpu * PERCPU_SIZE) }
+    // The first processor's TSS and block, in the kernel's view.
+    pub fn firstTss() -> usize { return virtual(TSS) }
+    pub fn firstPerCpu() -> usize { return virtual(PERCPU) }
 }
 
-// A processor's block (Blob.PERCPU + its number * PERCPU_SIZE; the
-// kernel's GS base on it): the top of its trap stack (SYSCALL's entry
-// takes it), a word for the user stack pointer, its arena, its number.
+// A processor's block (the first one's at Blob.PERCPU, another's in the
+// page above its trap stack; the kernel's GS base on it): the top of its
+// trap stack (SYSCALL's entry takes it), a word for the user stack
+// pointer, its arena, its number. Its TSS follows it in that page
+// (TSS_AT), PERCPU_SIZE and TSS_SIZE as in the blob.
 pub const PerCpu = struct {
     pub const TRAP_STACK: usize = 0x00
     pub const USER_RSP: usize = 0x08
     pub const ARENA_BASE: usize = 0x10
     pub const ARENA_END: usize = 0x18
     pub const INDEX: usize = 0x20
+    pub const TSS_AT: usize = 0x40
 }
 
-// The other processors' trampoline: copied to START (below 1 MiB, where a
-// startup IPI's vector names it: START / 4096), real mode to long mode
-// with the boot page tables; STARTED counts the processors that got there
-// (each takes its number from it), then they go on in the blob's code64
-// (Info.NEXT) and into the kernel's brix_ap.
+// The other processors' trampoline: its code (SIZE bytes) copied to START
+// (below 1 MiB, where a startup IPI's vector names it: START / 4096),
+// real mode to long mode with the boot page tables. There each processor
+// says its local APIC's id (CPUID), counts itself in STARTED (the old
+// count + 1 is its number) unless the kernel closed the count (CLOSED:
+// it waited long enough; one that comes after halts there for good) or
+// its number is past ROOM (the blocks the kernel made), writes its id
+// at IDS + 4 * its number, takes its block's address from BLOCKS + 8 *
+// its number (rbp), and goes on in the blob's code64 (Info.NEXT) and
+// into the kernel's brix_ap. The counter, the room and the two tables
+// are in the same page, after the code; the kernel writes them before
+// the first startup IPI.
 pub const Ap = struct {
     pub const START: usize = 0x8000
     pub const SIZE: usize = 0x200
     pub const CODE16: usize = 0x000
     pub const CODE32: usize = 0x040
     pub const CODE64: usize = 0x0A0
-    pub const GDT: usize = 0x100
-    pub const GDTR: usize = 0x120
-    pub const STARTED: usize = 0x130
+    pub const GDT: usize = 0x180
+    pub const GDTR: usize = 0x1A0
+    pub const STARTED: usize = 0x1B0
+    pub const ROOM: usize = 0x1B4
+    pub const BLOCKS: usize = 0x200
+    pub const IDS: usize = 0xA00
+    pub const END: usize = 0xE00
+    pub const CLOSED: usize = 0x80000000
 }
 
 // The boot info's fields (u64 each, at Blob.BOOT_INFO + these).
