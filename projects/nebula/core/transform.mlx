@@ -1,0 +1,2123 @@
+// nebula core: the geometry of pixels: everything that moves, scales,
+// rotates, shears or distorts a Device (scaling and rotating the image, the
+// layer transform tool, mirroring, the transform mask, pasting at another
+// size, thumbnails).
+//
+// A Matrix says where a place goes: nine doubles, row after row,
+//
+//     | a b c |     x' = (a x + b y + c) / w
+//     | d e f |     y' = (d x + e y + f) / w
+//     | g h i |     w  =  g x + h y + i
+//
+// (g = h = 0: an affine one, whose i only divides everything; anything
+// else is a perspective, and what it puts behind the eye, w <= 0, is not
+// drawn). Places are the image's, x right and y down, a pixel (x, y)
+// covering the square from (x, y) to (x + 1, y + 1) with its middle at
+// (x + 0.5, y + 0.5); a positive angle turns clockwise on the screen.
+//
+//     var m = transform.rotation(angle, cx, cy)
+//     const zoom = transform.scaling(2.0, 2.0, cx, cy)
+//     m = transform.multiply(&zoom, &m)                 // turn, then zoom
+//     device.begin(layer)
+//     const changed = transform.transformDevice(layer, &m, transform.BICUBIC)
+//     const change = device.commit(layer)
+//
+// Three kinds of work:
+//
+//   exact         flipHorizontal, flipVertical, rotate90/180/270 (all of a
+//                 device's pixels about a rectangle) and offset (the
+//                 pixels of a rectangle around its edges) move pixels and
+//                 change none; they go tile by tile.
+//   resample()    every pixel of an area of the result is the source's
+//                 colour at the place the matrix brings there, weighed
+//                 with a filter (below). transformInto, scaleDevice and
+//                 rotateDevice are it with the area (and the matrix)
+//                 worked out, transformDevice does it to a device itself.
+//   scalePixels() the same for a plain buffer (thumbnails, the levels of
+//                 a zoomed-out view).
+//
+// The filters: NEAREST (the nearest pixel, unchanged), BILINEAR (the four
+// around), BICUBIC (Catmull-Rom over 4 x 4: it goes through the pixels, so
+// what is not moved stays what it was, and is sharper than Mitchell's at
+// the price of a slight overshoot at hard edges), LANCZOS3 (6 x 6), BOX
+// (the mean of the source area a result pixel covers). All weighing is
+// done on alpha-weighted colours (a transparent pixel's colour counts for
+// nothing, so edges do not darken) and brought back to straight 8 bit
+// rounded to nearest; a result without alpha is stored as 0.
+//
+// How resample() works:
+//
+//   - A matrix that only moves by whole pixels copies.
+//   - A matrix that only scales and moves (the usual case, and the one
+//     that has to be exact) is done in two passes with tables of
+//     contributions, one per column and one per row: each source row is
+//     weighed into a row of the result's width, and that into the result
+//     rows it belongs to, in floats. When a direction shrinks, the filter
+//     is widened by that much (up to 2x), and beyond 2x the box takes
+//     over on its own: every source pixel counts with the part of it a
+//     result pixel covers, so nothing aliases when 4000 pixels become 400.
+//   - Any other matrix is done pixel by pixel through its inverse (a
+//     place to a 4096th of a pixel for BILINEAR, in whole numbers; to a
+//     1024th for BICUBIC and LANCZOS3, whose weights are looked up).
+//     Where it shrinks by more than 2x in a direction, each result pixel
+//     is the mean of a grid of samples spread over it, as many as source
+//     pixels lie under it in each direction (32 x 32 at most; beyond
+//     that the mean is of a part), each a bilinear one. BOX is such a
+//     mean always, of the pixels the samples fall into (not shrinking:
+//     the one nearest pixel).
+//
+// Work goes block by block (squares of 64 x 64: the result's tiles in two
+// passes, the image's own squares pixel by pixel), each reading the source
+// rectangle it needs into memory of core/scratch.mlx: never the layer as
+// a whole. A block none of the source's tiles reaches is the source's
+// default and is not computed. Outside its tiles the source is its
+// default pixel, so a mask (opaque greys) is transformed like a layer.
+// A result pixel is the same wherever the result device sits and however
+// the area is cut into calls: places are worked out from the image's
+// origin, never from a block's corner.
+//
+// Not done here: transforming a selection's outline as a path, liquify
+// and cage or mesh warps (only what one matrix describes), and resampling
+// in a colour space other than the pixels' own (the weighing is in the
+// 8 bit values as they are, not in linear light).
+const std = @import("std")
+const math = @import("std.math")
+const device_module = @import("./device.mlx")
+const geom = @import("./geom.mlx")
+const scratch = @import("./scratch.mlx")
+
+pub const Device = device_module.Device
+pub const Rect = geom.Rect
+
+// The filters (see above), and how many there are for a list of them
+// (filterTitle names each).
+pub const NEAREST: u8 = 0
+pub const BILINEAR: u8 = 1
+pub const BICUBIC: u8 = 2
+pub const LANCZOS3: u8 = 3
+pub const BOX: u8 = 4
+pub const FILTERS: usize = 5
+
+const FILTER_NAMES = [5][]const u8{ "Nearest neighbour", "Bilinear", "Bicubic", "Lanczos", "Box (area)" }
+const FILTER_GERMAN = [5][]const u8{ "Nächster Nachbar", "Bilinear", "Bikubisch", "Lanczos", "Box (Fläche)" }
+
+// What a filter is called (a number past BOX: what resample() takes it
+// for, BILINEAR).
+pub fn filterTitle(filter: u8, german: bool) -> []const u8 {
+    const index: usize = if filter < 5 { @intCast(usize, filter) } else { 1 }
+    return if german { FILTER_GERMAN[index] } else { FILTER_NAMES[index] }
+}
+
+// Places farther from the origin than this are not looked at (nothing is
+// painted there, and whole pixel numbers stay inside an i32 with room).
+const FAR: f64 = 268435456.0
+const FAR_PIXELS: i32 = 268435456
+
+// ---------------------------------------------------------------------------
+// The matrix
+
+pub const Matrix = struct {
+    a: f64
+    b: f64
+    c: f64
+    d: f64
+    e: f64
+    f: f64
+    g: f64
+    h: f64
+    i: f64
+}
+
+pub const Point = struct {
+    x: f64
+    y: f64
+}
+
+// Four corners, clockwise from the one that is the top left of what was
+// mapped: top left, top right, bottom right, bottom left.
+pub const Quad = struct {
+    x0: f64
+    y0: f64
+    x1: f64
+    y1: f64
+    x2: f64
+    y2: f64
+    x3: f64
+    y3: f64
+}
+
+// An affine matrix in the terms a person sets: shear, then scale, then
+// rotation (radians, clockwise), all about the origin, then the move:
+// translation(x, y) * rotation(rotation, 0, 0) * scaling(scaleX, scaleY,
+// 0, 0) * shearing(shear, 0, 0, 0). A mirrored matrix has a negative
+// scaleY.
+pub const Parts = struct {
+    x: f64
+    y: f64
+    rotation: f64
+    scaleX: f64
+    scaleY: f64
+    shear: f64
+}
+
+fn absolute(value: f64) -> f64 { return if value < 0.0 { -value } else { value } }
+
+// The matrix that changes nothing.
+pub fn identity() -> Matrix {
+    return Matrix.{ .a = 1.0, .b = 0.0, .c = 0.0, .d = 0.0, .e = 1.0, .f = 0.0, .g = 0.0, .h = 0.0, .i = 1.0 }
+}
+
+// Everything moved by (dx, dy).
+pub fn translation(dx: f64, dy: f64) -> Matrix {
+    return Matrix.{ .a = 1.0, .b = 0.0, .c = dx, .d = 0.0, .e = 1.0, .f = dy, .g = 0.0, .h = 0.0, .i = 1.0 }
+}
+
+// Everything `sx` times as far from (cx, cy) across and `sy` times down
+// (a negative one mirrors).
+pub fn scaling(sx: f64, sy: f64, cx: f64, cy: f64) -> Matrix {
+    return Matrix.{ .a = sx, .b = 0.0, .c = cx - sx * cx, .d = 0.0, .e = sy, .f = cy - sy * cy, .g = 0.0, .h = 0.0, .i = 1.0 }
+}
+
+// Everything turned by `radians` around (cx, cy), clockwise on the screen
+// for a positive angle. Quarter turns come out exact (a cosine that is
+// nothing but the rounding of pi is taken as 0).
+pub fn rotation(radians: f64, cx: f64, cy: f64) -> Matrix {
+    var cosine = math.cos(radians)
+    var sine = math.sin(radians)
+    if absolute(cosine) < 1.0e-15 {
+        cosine = 0.0
+        sine = if sine < 0.0 { -1.0 } else { 1.0 }
+    }
+    if absolute(sine) < 1.0e-15 {
+        sine = 0.0
+        cosine = if cosine < 0.0 { -1.0 } else { 1.0 }
+    }
+    return Matrix.{ .a = cosine, .b = -sine, .c = cx - cosine * cx + sine * cy, .d = sine, .e = cosine, .f = cy - sine * cx - cosine * cy, .g = 0.0, .h = 0.0, .i = 1.0 }
+}
+
+// Everything pushed sideways by `kx` times its height below (cx, cy) and
+// down by `ky` times its distance right of it.
+pub fn shearing(kx: f64, ky: f64, cx: f64, cy: f64) -> Matrix {
+    return Matrix.{ .a = 1.0, .b = kx, .c = -kx * cy, .d = ky, .e = 1.0, .f = -ky * cx, .g = 0.0, .h = 0.0, .i = 1.0 }
+}
+
+// The matrix product left * right: what `right` does, then what `left`
+// does (apply(multiply(l, r), p) is apply(l, apply(r, p))).
+pub fn multiply(left: *const Matrix, right: *const Matrix) -> Matrix {
+    return Matrix.{
+        .a = left.*.a * right.*.a + left.*.b * right.*.d + left.*.c * right.*.g,
+        .b = left.*.a * right.*.b + left.*.b * right.*.e + left.*.c * right.*.h,
+        .c = left.*.a * right.*.c + left.*.b * right.*.f + left.*.c * right.*.i,
+        .d = left.*.d * right.*.a + left.*.e * right.*.d + left.*.f * right.*.g,
+        .e = left.*.d * right.*.b + left.*.e * right.*.e + left.*.f * right.*.h,
+        .f = left.*.d * right.*.c + left.*.e * right.*.f + left.*.f * right.*.i,
+        .g = left.*.g * right.*.a + left.*.h * right.*.d + left.*.i * right.*.g,
+        .h = left.*.g * right.*.b + left.*.h * right.*.e + left.*.i * right.*.h,
+        .i = left.*.g * right.*.c + left.*.h * right.*.f + left.*.i * right.*.i,
+    }
+}
+
+// The matrix that undoes `m` into `into`. False (and `into` untouched)
+// when there is none: `m` squeezes the plane onto a line or a point.
+pub fn invert(m: *const Matrix, into: *Matrix) -> bool {
+    const a = m.*.a
+    const b = m.*.b
+    const c = m.*.c
+    const d = m.*.d
+    const e = m.*.e
+    const f = m.*.f
+    const g = m.*.g
+    const h = m.*.h
+    const i = m.*.i
+    const ca = e * i - f * h
+    const cb = f * g - d * i
+    const cc = d * h - e * g
+    const det = a * ca + b * cb + c * cc
+    // Nothing next to what it was added up from: lost to rounding.
+    const size = absolute(a * ca) + absolute(b * cb) + absolute(c * cc)
+    if !(absolute(det) > size * 1.0e-14) { return false }
+    // Divided, not multiplied by 1 / det: an affine matrix's inverse then
+    // has its i exactly 1 and its g and h exactly 0.
+    into.* = Matrix.{
+        .a = ca / det,
+        .b = (c * h - b * i) / det,
+        .c = (b * f - c * e) / det,
+        .d = cb / det,
+        .e = (a * i - c * g) / det,
+        .f = (c * d - a * f) / det,
+        .g = cc / det,
+        .h = (b * g - a * h) / det,
+        .i = (a * e - b * d) / det,
+    }
+    return true
+}
+
+// Where (x, y) goes. A place on the matrix's vanishing line (w = 0) comes
+// out very far away, one behind it mirrored through it, as the arithmetic
+// has it: resample() and mapRect() leave such places out themselves.
+pub fn apply(m: *const Matrix, x: f64, y: f64) -> Point {
+    const px = m.*.a * x + m.*.b * y + m.*.c
+    const py = m.*.d * x + m.*.e * y + m.*.f
+    var w = m.*.g * x + m.*.h * y + m.*.i
+    if w == 1.0 { return Point.{ .x = px, .y = py } }
+    if w == 0.0 { w = 1.0e-300 }
+    return Point.{ .x = px / w, .y = py / w }
+}
+
+// Whether the matrix keeps parallels parallel (no perspective).
+pub fn isAffine(m: *const Matrix) -> bool {
+    return m.*.g == 0.0 && m.*.h == 0.0 && m.*.i != 0.0
+}
+
+// Whether the matrix only moves, by whole pixels (by m.c / m.i across and
+// m.f / m.i down): then nothing has to be weighed.
+pub fn isTranslation(m: *const Matrix) -> bool {
+    if !isAffine(m) { return false }
+    const i = m.*.i
+    if m.*.a != i || m.*.e != i || m.*.b != 0.0 || m.*.d != 0.0 { return false }
+    const dx = m.*.c / i
+    const dy = m.*.f / i
+    if !(absolute(dx) <= FAR) || !(absolute(dy) <= FAR) { return false }
+    return @floor(dx) == dx && @floor(dy) == dy
+}
+
+// The four corners of a rectangle of pixels.
+pub fn quadOf(area: Rect) -> Quad {
+    const left = @floatFromInt(f64, area.x)
+    const top = @floatFromInt(f64, area.y)
+    const right = left + @floatFromInt(f64, area.width)
+    const bottom = top + @floatFromInt(f64, area.height)
+    return Quad.{ .x0 = left, .y0 = top, .x1 = right, .y1 = top, .x2 = right, .y2 = bottom, .x3 = left, .y3 = bottom }
+}
+
+// Where the matrix brings four corners.
+pub fn mapQuad(m: *const Matrix, quad: *const Quad) -> Quad {
+    const p0 = apply(m, quad.*.x0, quad.*.y0)
+    const p1 = apply(m, quad.*.x1, quad.*.y1)
+    const p2 = apply(m, quad.*.x2, quad.*.y2)
+    const p3 = apply(m, quad.*.x3, quad.*.y3)
+    return Quad.{ .x0 = p0.x, .y0 = p0.y, .x1 = p1.x, .y1 = p1.y, .x2 = p2.x, .y2 = p2.y, .x3 = p3.x, .y3 = p3.y }
+}
+
+// The perspective that brings the unit square's corners (0, 0), (1, 0),
+// (1, 1), (0, 1) onto the quad's, in that order, into `into`. False when
+// there is none that keeps the square in front of the eye: the corners in
+// a line, or a quad that is not convex.
+pub fn unitToQuad(quad: *const Quad, into: *Matrix) -> bool {
+    const dx1 = quad.*.x1 - quad.*.x2
+    const dx2 = quad.*.x3 - quad.*.x2
+    const dx3 = quad.*.x0 - quad.*.x1 + quad.*.x2 - quad.*.x3
+    const dy1 = quad.*.y1 - quad.*.y2
+    const dy2 = quad.*.y3 - quad.*.y2
+    const dy3 = quad.*.y0 - quad.*.y1 + quad.*.y2 - quad.*.y3
+    var g: f64 = 0.0
+    var h: f64 = 0.0
+    if dx3 != 0.0 || dy3 != 0.0 {
+        // Not a parallelogram: the two terms of the divide come from the
+        // far corner (1, 1) having to land on its place too.
+        const den = dx1 * dy2 - dx2 * dy1
+        if den == 0.0 { return false }
+        g = (dx3 * dy2 - dx2 * dy3) / den
+        h = (dx1 * dy3 - dx3 * dy1) / den
+    }
+    // w at the square's corners is 1, 1 + g, 1 + g + h, 1 + h.
+    if !(1.0 + g > 0.0) || !(1.0 + h > 0.0) || !(1.0 + g + h > 0.0) { return false }
+    const made = Matrix.{
+        .a = quad.*.x1 - quad.*.x0 + g * quad.*.x1,
+        .b = quad.*.x3 - quad.*.x0 + h * quad.*.x3,
+        .c = quad.*.x0,
+        .d = quad.*.y1 - quad.*.y0 + g * quad.*.y1,
+        .e = quad.*.y3 - quad.*.y0 + h * quad.*.y3,
+        .f = quad.*.y0,
+        .g = g,
+        .h = h,
+        .i = 1.0,
+    }
+    var back: Matrix = undefined
+    if !invert(&made, &back) { return false }
+    into.* = made
+    return true
+}
+
+// The perspective that brings the corners of `from` (a rectangle of
+// pixels: its outer corners) onto the quad's: what the perspective
+// transform tool makes of its four handles. False as unitToQuad, and for
+// an empty rectangle.
+pub fn toQuad(from: Rect, quad: *const Quad, into: *Matrix) -> bool {
+    if geom.isEmpty(from) { return false }
+    var unit: Matrix = undefined
+    if !unitToQuad(quad, &unit) { return false }
+    const width = @floatFromInt(f64, from.width)
+    const height = @floatFromInt(f64, from.height)
+    const onto_unit = Matrix.{ .a = 1.0 / width, .b = 0.0, .c = -@floatFromInt(f64, from.x) / width, .d = 0.0, .e = 1.0 / height, .f = -@floatFromInt(f64, from.y) / height, .g = 0.0, .h = 0.0, .i = 1.0 }
+    into.* = multiply(&unit, &onto_unit)
+    return true
+}
+
+// The other way round: the quad's corners onto those of `onto` (a
+// picture taken at an angle set straight). False as toQuad().
+pub fn fromQuad(quad: *const Quad, onto: Rect, into: *Matrix) -> bool {
+    var forward: Matrix = undefined
+    if !toQuad(onto, quad, &forward) { return false }
+    return invert(&forward, into)
+}
+
+// The move, turn, scale and shear an affine matrix is made of (its g and
+// h are not looked at). compose() of them is the matrix again.
+pub fn decompose(m: *const Matrix) -> Parts {
+    const i = if m.*.i == 0.0 { 1.0 } else { m.*.i }
+    const a = m.*.a / i
+    const b = m.*.b / i
+    const d = m.*.d / i
+    const e = m.*.e / i
+    var parts = Parts.{ .x = m.*.c / i, .y = m.*.f / i, .rotation = 0.0, .scaleX = 0.0, .scaleY = 0.0, .shear = 0.0 }
+    const along = @sqrt(a * a + d * d)
+    if along > 0.0 {
+        // The first column is the x axis turned and stretched; the second,
+        // turned back, is the shear (along x) and the y stretch.
+        const cosine = a / along
+        const sine = d / along
+        parts.rotation = math.atan2(d, a)
+        parts.scaleX = along
+        parts.scaleY = cosine * e - sine * b
+        parts.shear = (cosine * b + sine * e) / along
+    } else {
+        // Nothing left of the x axis: the y axis alone says the turn.
+        parts.rotation = math.atan2(-b, e)
+        parts.scaleY = @sqrt(b * b + e * e)
+    }
+    return parts
+}
+
+// The affine matrix of a move, turn, scale and shear (see Parts).
+pub fn compose(parts: *const Parts) -> Matrix {
+    const cosine = math.cos(parts.*.rotation)
+    const sine = math.sin(parts.*.rotation)
+    const sx = parts.*.scaleX
+    const sy = parts.*.scaleY
+    const k = parts.*.shear
+    return Matrix.{ .a = cosine * sx, .b = cosine * sx * k - sine * sy, .c = parts.*.x, .d = sine * sx, .e = sine * sx * k + cosine * sy, .f = parts.*.y, .g = 0.0, .h = 0.0, .i = 1.0 }
+}
+
+// The polygon of `count` corners (x, y, w each) at `from` cut down to
+// where p x + q y + r w >= 0, into `to`; how many corners are left (one
+// more than before at most).
+fn cut(from: [*]const f64, count: usize, to: [*]f64, p: f64, q: f64, r: f64) -> usize {
+    var made: usize = 0
+    var index: usize = 0
+    while index < count {
+        const next: usize = if index + 1 == count { 0 } else { index + 1 }
+        const x0 = from[index * 3]
+        const y0 = from[index * 3 + 1]
+        const w0 = from[index * 3 + 2]
+        const x1 = from[next * 3]
+        const y1 = from[next * 3 + 1]
+        const w1 = from[next * 3 + 2]
+        const side0 = p * x0 + q * y0 + r * w0
+        const side1 = p * x1 + q * y1 + r * w1
+        if side0 >= 0.0 {
+            to[made * 3] = x0
+            to[made * 3 + 1] = y0
+            to[made * 3 + 2] = w0
+            made += 1
+        }
+        if (side0 >= 0.0 && side1 < 0.0) || (side0 < 0.0 && side1 >= 0.0) {
+            const t = side0 / (side0 - side1)
+            to[made * 3] = x0 + (x1 - x0) * t
+            to[made * 3 + 1] = y0 + (y1 - y0) * t
+            to[made * 3 + 2] = w0 + (w1 - w0) * t
+            made += 1
+        }
+        index += 1
+    }
+    return made
+}
+
+// Doubles the cutting needs: two polygons of up to 12 corners.
+const CUT_WORK: usize = 72
+
+// The box around where `m` brings the rectangle from (x0, y0) to (x1, y1),
+// left, top, right, bottom into `box`; only the part in front of the eye
+// (w > 0) and no farther out than FAR counts. False: no such part.
+fn boxOf(m: *const Matrix, x0: f64, y0: f64, x1: f64, y1: f64, work: [*]f64, box: [*]f64) -> bool {
+    const first = work
+    const second = work + 36
+    // An affine matrix has no behind: one written with a negative i is
+    // the same matrix with every sign turned.
+    const sign: f64 = if m.*.g == 0.0 && m.*.h == 0.0 && m.*.i < 0.0 { -1.0 } else { 1.0 }
+    var index: usize = 0
+    while index < 4 {
+        const x = if index == 0 || index == 3 { x0 } else { x1 }
+        const y = if index < 2 { y0 } else { y1 }
+        first[index * 3] = sign * (m.*.a * x + m.*.b * y + m.*.c)
+        first[index * 3 + 1] = sign * (m.*.d * x + m.*.e * y + m.*.f)
+        first[index * 3 + 2] = sign * (m.*.g * x + m.*.h * y + m.*.i)
+        index += 1
+    }
+    // x / w and y / w between -FAR and FAR, said without dividing; the
+    // four together leave only w > 0.
+    var count = cut(first, 4, second, -1.0, 0.0, FAR)
+    count = cut(second, count, first, 1.0, 0.0, FAR)
+    count = cut(first, count, second, 0.0, -1.0, FAR)
+    count = cut(second, count, first, 0.0, 1.0, FAR)
+    var any = false
+    index = 0
+    while index < count {
+        const w = first[index * 3 + 2]
+        if w > 0.0 {
+            const x = math.clamp(first[index * 3] / w, -FAR, FAR)
+            const y = math.clamp(first[index * 3 + 1] / w, -FAR, FAR)
+            if !any {
+                box[0] = x
+                box[1] = y
+                box[2] = x
+                box[3] = y
+                any = true
+            } else {
+                if x < box[0] { box[0] = x }
+                if y < box[1] { box[1] = y }
+                if x > box[2] { box[2] = x }
+                if y > box[3] { box[3] = y }
+            }
+        }
+        index += 1
+    }
+    return any
+}
+
+// An edge within this of a whole number is that number: a quarter turn's
+// corners land on 99.99999999999999, which is not one pixel more.
+const SNAP: f64 = 0.0000001
+
+// The rectangle of pixels around where the matrix brings `area` (its
+// outer corners). Under a perspective only what stays in front of the eye
+// counts, and nothing farther than 2^28 pixels from the origin; empty
+// when nothing is left, or `area` is.
+pub fn mapRect(m: *const Matrix, area: Rect) -> Rect {
+    if geom.isEmpty(area) { return geom.empty() }
+    var work: [72]f64 = undefined
+    var box: [4]f64 = undefined
+    const left = @floatFromInt(f64, area.x)
+    const top = @floatFromInt(f64, area.y)
+    if !boxOf(m, left, top, left + @floatFromInt(f64, area.width), top + @floatFromInt(f64, area.height), &work, &box) { return geom.empty() }
+    return geom.fromBounds(box[0] + SNAP, box[1] + SNAP, box[2] - SNAP, box[3] - SNAP)
+}
+
+// ---------------------------------------------------------------------------
+// Exact: pixels moved, none changed
+
+const FLIP_H: u8 = 0
+const FLIP_V: u8 = 1
+const TURN_90: u8 = 2
+const TURN_180: u8 = 3
+const TURN_270: u8 = 4
+
+fn sane(area: Rect) -> bool {
+    return area.x >= -FAR_PIXELS && area.x <= FAR_PIXELS && area.y >= -FAR_PIXELS && area.y <= FAR_PIXELS && area.width <= FAR_PIXELS && area.height <= FAR_PIXELS
+}
+
+// The parts of a rectangle each square of 64 x 64 of a grid holds (the
+// tiles of a device whose place is (origin_x, origin_y); the image's own
+// squares for (0, 0)), one after the other: var walk = blocksOf(x, y,
+// area), then next(&walk, &block) until it says false.
+const Blocks = struct {
+    left: i32
+    top: i32
+    right: i32
+    bottom: i32
+    originX: i32
+    originY: i32
+    tx: i32
+    ty: i32
+}
+
+fn blocksOf(origin_x: i32, origin_y: i32, area: Rect) -> Blocks {
+    const left = area.x - origin_x
+    const top = area.y - origin_y
+    return Blocks.{ .left = left, .top = top, .right = left + area.width, .bottom = top + area.height, .originX = origin_x, .originY = origin_y, .tx = left >> 6, .ty = top >> 6 }
+}
+
+fn next(walk: *Blocks, block: *Rect) -> bool {
+    if walk.*.right <= walk.*.left || walk.*.bottom <= walk.*.top { return false }
+    if walk.*.tx > (walk.*.right - 1) >> 6 {
+        walk.*.tx = walk.*.left >> 6
+        walk.*.ty += 1
+    }
+    if walk.*.ty > (walk.*.bottom - 1) >> 6 { return false }
+    const col0 = if walk.*.left > walk.*.tx * 64 { walk.*.left } else { walk.*.tx * 64 }
+    const col1 = if walk.*.right < walk.*.tx * 64 + 64 { walk.*.right } else { walk.*.tx * 64 + 64 }
+    const row0 = if walk.*.top > walk.*.ty * 64 { walk.*.top } else { walk.*.ty * 64 }
+    const row1 = if walk.*.bottom < walk.*.ty * 64 + 64 { walk.*.bottom } else { walk.*.ty * 64 + 64 }
+    block.* = geom.rect(col0 + walk.*.originX, row0 + walk.*.originY, col1 - col0, row1 - row0)
+    walk.*.tx += 1
+    return true
+}
+
+// A tile's 4096 pixels mirrored or turned into `target`.
+fn orient(target: [*]u32, source: [*]const u32, kind: u8) -> void {
+    var row: usize = 0
+    while row < 64 {
+        const line = target + row * 64
+        var column: usize = 0
+        if kind == FLIP_V {
+            device_module.copyWords(line, source + (63 - row) * 64, 64)
+        } else if kind == FLIP_H {
+            while column < 64 {
+                line[column] = source[row * 64 + 63 - column]
+                column += 1
+            }
+        } else if kind == TURN_180 {
+            while column < 64 {
+                line[column] = source[4095 - row * 64 - column]
+                column += 1
+            }
+        } else if kind == TURN_90 {
+            while column < 64 {
+                line[column] = source[(63 - column) * 64 + row]
+                column += 1
+            }
+        } else {
+            while column < 64 {
+                line[column] = source[column * 64 + 63 - row]
+                column += 1
+            }
+        }
+        row += 1
+    }
+}
+
+// Whether all of a tile's pixels are `blank`.
+fn blankTile(pixels: [*]const u32, blank: u32) -> bool {
+    var index: usize = 0
+    while index < device_module.TILE_PIXELS {
+        if pixels[index] != blank { return false }
+        index += 1
+    }
+    return true
+}
+
+// The 64 x 64 pixels at `from` (64 a row) into `device` with their top
+// left at (x, y): of each row only what lies from its first pixel that is
+// not `blank` to its last, so that no tile is made where nothing but the
+// default lands. False when memory ran out.
+fn placeSquare(device: *Device, x: i32, y: i32, from: [*]const u32, blank: u32) -> bool {
+    var row: usize = 0
+    while row < 64 {
+        const line = from + row * 64
+        var first: usize = 0
+        while first < 64 && line[first] == blank { first += 1 }
+        if first < 64 {
+            var last: usize = 63
+            while line[last] == blank { last -= 1 }
+            const span = geom.rect(x + @intCast(i32, first), y + @intCast(i32, row), @intCast(i32, last - first + 1), 1)
+            if !device_module.writeRect(device, span, line + first, 64) { return false }
+        }
+        row += 1
+    }
+    return true
+}
+
+// Every tile of the device mirrored or turned to its new place. The
+// device is emptied and filled from a copy that shares its tiles; when
+// memory runs out the copy is put back. A tile of nothing but the default
+// is not written, and one that lands across tiles writes only what is
+// not the default: afterwards the device has a tile exactly where a pixel
+// is not the default (else every move would leave a rim of empty tiles
+// around what it moved, and the device would grow with each one).
+fn reorient(device: *Device, about: Rect, kind: u8) -> bool {
+    if device_module.tileCount(device) == 0 { return true }
+    if !sane(about) { return false }
+    const kept = device_module.copy(device)
+    if kept == null { return false }
+    const snapshot = kept.?
+    var keys = std.ArrayList(u64).init(device.*.allocator)
+    defer keys.deinit()
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const turned = scratch.words(pool, device_module.TILE_PIXELS)
+    var whole = turned != null && device_module.keys(snapshot, &keys)
+    if whole {
+        device_module.clear(device)
+        const ax = @intCast(i64, about.x)
+        const ay = @intCast(i64, about.y)
+        const aw = @intCast(i64, about.width)
+        const ah = @intCast(i64, about.height)
+        const ox = @intCast(i64, device.*.x)
+        const oy = @intCast(i64, device.*.y)
+        const blank = snapshot.*.defaultPixel
+        for key in keys.items() {
+            const tx = device_module.keyX(key)
+            const ty = device_module.keyY(key)
+            const source = device_module.tileRead(snapshot, tx, ty)
+            if source == null || blankTile(source.?, blank) { continue }
+            // Where the tile's square lies now, and where it goes: (u, v)
+            // from the rectangle's corner becomes (w - 1 - u, v) mirrored,
+            // (h - 1 - v, u) a quarter turn on, and so on; a square of 64
+            // stays one.
+            const sx = @intCast(i64, tx) * 64 + ox
+            const sy = @intCast(i64, ty) * 64 + oy
+            const u = sx - ax
+            const v = sy - ay
+            var dx = sx
+            var dy = sy
+            if kind == FLIP_H {
+                dx = ax + aw - u - 64
+            } else if kind == FLIP_V {
+                dy = ay + ah - v - 64
+            } else if kind == TURN_180 {
+                dx = ax + aw - u - 64
+                dy = ay + ah - v - 64
+            } else if kind == TURN_90 {
+                dx = ax + ah - v - 64
+                dy = ay + u
+            } else {
+                dx = ax + v
+                dy = ay + aw - u - 64
+            }
+            // Both the image's places and the device's own must stay well
+            // inside an i32 (readRect and writeRect count in them).
+            const lx = dx - ox
+            const ly = dy - oy
+            if dx < -1073741824 || dx > 1073741824 || dy < -1073741824 || dy > 1073741824 || lx < -1073741824 || lx > 1073741824 || ly < -1073741824 || ly > 1073741824 {
+                whole = false
+                break
+            }
+            if lx & 63 == 0 && ly & 63 == 0 {
+                // Tile onto tile: turned straight into it.
+                const target = device_module.tileWrite(device, @intCast(i32, lx >> 6), @intCast(i32, ly >> 6))
+                if target == null {
+                    whole = false
+                    break
+                }
+                orient(target.?, source.?, kind)
+            } else {
+                orient(turned.?, source.?, kind)
+                if !placeSquare(device, @intCast(i32, dx), @intCast(i32, dy), turned.?, blank) {
+                    whole = false
+                    break
+                }
+            }
+        }
+        if !whole { _ = device_module.assign(device, snapshot) }
+    }
+    scratch.release(pool, mark)
+    device_module.destroy(snapshot)
+    return whole
+}
+
+// All of the device's pixels mirrored left to right about the upright
+// middle line of `about` (the image's rectangle to mirror the image, a
+// layer's bounds to mirror it in place): the pixel in the rectangle's
+// first column goes to its last. Pixels outside the rectangle are
+// mirrored about the same line. False, with the device as it was, when
+// memory ran out, when `about` lies farther out than 2^28 pixels, or when
+// pixels would land farther than 2^30 from the origin or from the
+// device's place (this and the turns below).
+pub fn flipHorizontal(device: *Device, about: Rect) -> bool {
+    return reorient(device, about, FLIP_H)
+}
+
+// The same top to bottom about the level middle line of `about`.
+pub fn flipVertical(device: *Device, about: Rect) -> bool {
+    return reorient(device, about, FLIP_V)
+}
+
+// All of the device's pixels a quarter turn clockwise, as rotating an
+// image does: what was in `about` is afterwards in the rectangle of its
+// height and width at the same top left corner (rotatedRect(about)), the
+// pixel of its top left corner in that one's top right; pixels outside
+// `about` turn with it. Four of them, about `about` and rotatedRect(about)
+// in turn or about the same rectangle, are nothing. False as for
+// flipHorizontal().
+pub fn rotate90(device: *Device, about: Rect) -> bool {
+    return reorient(device, about, TURN_90)
+}
+
+// Half a turn: what was in `about` is in it again, upside down.
+pub fn rotate180(device: *Device, about: Rect) -> bool {
+    return reorient(device, about, TURN_180)
+}
+
+// A quarter turn anticlockwise (three clockwise): what was in `about` is
+// in rotatedRect(about), the pixel of its top left corner in that one's
+// bottom left.
+pub fn rotate270(device: *Device, about: Rect) -> bool {
+    return reorient(device, about, TURN_270)
+}
+
+// Where rotate90() and rotate270() put what was in `about`.
+pub fn rotatedRect(about: Rect) -> Rect {
+    return geom.rect(about.x, about.y, about.height, about.width)
+}
+
+// The pixels of `part` in `device` are those of `source` (dx, dy) to the
+// left of and above them, block by block.
+fn moveInto(device: *Device, source: *Device, part: Rect, dx: i32, dy: i32, pool: *scratch.Pool) -> bool {
+    if geom.isEmpty(part) { return true }
+    const mark = scratch.mark(pool)
+    const buffer = scratch.words(pool, device_module.TILE_PIXELS)
+    if buffer == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    var whole = true
+    var walk = blocksOf(device.*.x, device.*.y, part)
+    var block: Rect = undefined
+    while next(&walk, &block) {
+        const from = geom.moved(block, -dx, -dy)
+        if !device_module.touches(source, from) {
+            if !device_module.fill(device, block, source.*.defaultPixel) { whole = false }
+        } else {
+            device_module.readRect(source, from, buffer.?, @intCast(usize, block.width))
+            if !store(device, block, buffer.?) { whole = false }
+        }
+    }
+    scratch.release(pool, mark)
+    return whole
+}
+
+// The pixels of `area` pushed by (dx, dy), those leaving it on one side
+// coming in again on the other (Offset Layer); nothing outside `area`
+// changes. False, with the device as it was, when memory ran out or when
+// `area` lies farther out, or is longer, than 2^28 pixels.
+pub fn offset(device: *Device, area: Rect, dx: i32, dy: i32) -> bool {
+    if geom.isEmpty(area) { return true }
+    if !sane(area) { return false }
+    const mx = ((dx % area.width) + area.width) % area.width
+    const my = ((dy % area.height) + area.height) % area.height
+    if mx == 0 && my == 0 { return true }
+    if !device_module.touches(device, area) { return true }
+    const kept = device_module.copy(device)
+    if kept == null { return false }
+    const pool = scratch.common()
+    // Four parts: what stays inside moves by (mx, my); what would leave
+    // on the right or below comes from a width or a height back.
+    var whole = moveInto(device, kept.?, geom.rect(area.x + mx, area.y + my, area.width - mx, area.height - my), mx, my, pool)
+    whole = whole && moveInto(device, kept.?, geom.rect(area.x, area.y + my, mx, area.height - my), mx - area.width, my, pool)
+    whole = whole && moveInto(device, kept.?, geom.rect(area.x + mx, area.y, area.width - mx, my), mx, my - area.height, pool)
+    whole = whole && moveInto(device, kept.?, geom.rect(area.x, area.y, mx, my), mx - area.width, my - area.height, pool)
+    if !whole { _ = device_module.assign(device, kept.?) }
+    device_module.destroy(kept.?)
+    return whole
+}
+
+// ---------------------------------------------------------------------------
+// Filters and sums
+
+// How far a filter reaches from the place it weighs around, in source
+// pixels (wider by as much as it shrinks).
+fn support(filter: u8) -> f64 {
+    if filter == BICUBIC { return 2.0 }
+    if filter == LANCZOS3 { return 3.0 }
+    if filter == BILINEAR { return 1.0 }
+    return 0.5
+}
+
+// The weight of a pixel `at` pixels from the place (BILINEAR, BICUBIC and
+// LANCZOS3; the box counts areas, see buildAxis).
+fn kernel(filter: u8, at: f64) -> f64 {
+    const x = if at < 0.0 { -at } else { at }
+    if filter == BICUBIC {
+        // Catmull-Rom: the cubic through the pixels whose slope at each
+        // is that of its two neighbours.
+        if x < 1.0 { return (1.5 * x - 2.5) * x * x + 1.0 }
+        if x < 2.0 { return ((2.5 - 0.5 * x) * x - 4.0) * x + 2.0 }
+        return 0.0
+    }
+    if filter == LANCZOS3 {
+        if x < 0.000000001 { return 1.0 }
+        if x >= 3.0 { return 0.0 }
+        const turn = math.pi * x
+        return 3.0 * math.sin(turn) * math.sin(turn / 3.0) / (turn * turn)
+    }
+    return if x < 1.0 { 1.0 - x } else { 0.0 }
+}
+
+// The weights of BICUBIC's four and LANCZOS3's six pixels in a row for
+// each 1024th of a pixel the place lies past the second (third) of them,
+// each row summing to 1: the pixel by pixel path looks them up. Filled at
+// the first use.
+const PHASES: usize = 1024
+const PHASES_IN_ONE: f64 = 1024.0
+var cubicWeights: [4100]f32 = undefined
+var lanczosWeights: [6150]f32 = undefined
+var weightsReady: bool = false
+
+fn fillWeights(table: [*]f32, filter: u8, taps: usize) -> void {
+    const before = @floatFromInt(f64, taps / 2 - 1)
+    var phase: usize = 0
+    while phase <= PHASES {
+        const fraction = @floatFromInt(f64, phase) / PHASES_IN_ONE
+        var sum: f64 = 0.0
+        var tap: usize = 0
+        while tap < taps {
+            sum += kernel(filter, @floatFromInt(f64, tap) - before - fraction)
+            tap += 1
+        }
+        tap = 0
+        while tap < taps {
+            table[phase * taps + tap] = @floatCast(f32, kernel(filter, @floatFromInt(f64, tap) - before - fraction) / sum)
+            tap += 1
+        }
+        phase += 1
+    }
+}
+
+fn floats(pool: *scratch.Pool, count: usize) -> ?[*]f32 {
+    const memory = scratch.bytes(pool, count * 4)
+    if memory == null { return null }
+    unsafe { return @ptrCast([*]f32, memory.?) }
+}
+
+// `count` pixels' weighed sums (alpha, 0 to 255, and each colour times
+// alpha: four floats a pixel) as straight pixels: the colours divided by
+// the alpha again, everything rounded to nearest and held in 0 to 255
+// (the sharper filters swing past both ends). Without alpha a pixel is 0.
+// (Written out for each colour: a call a pixel costs more than the sums.)
+fn settleRow(sums: [*]const f32, count: usize, out: [*]u32) -> void {
+    var index: usize = 0
+    while index < count {
+        const a = sums[index * 4]
+        if !(a >= 0.5) {
+            out[index] = 0
+        } else {
+            const scale = 1.0 / a
+            const r = sums[index * 4 + 1] * scale + 0.5
+            const g = sums[index * 4 + 2] * scale + 0.5
+            const b = sums[index * 4 + 3] * scale + 0.5
+            var pixel: u32 = if a >= 254.5 { 0xFF000000 } else { @intFromFloat(u32, a + 0.5) << 24 }
+            if r >= 255.0 { pixel |= 0x00FF0000 } else if r >= 1.0 { pixel |= @intFromFloat(u32, r) << 16 }
+            if g >= 255.0 { pixel |= 0x0000FF00 } else if g >= 1.0 { pixel |= @intFromFloat(u32, g) << 8 }
+            if b >= 255.0 { pixel |= 0x000000FF } else if b >= 1.0 { pixel |= @intFromFloat(u32, b) }
+            out[index] = pixel
+        }
+        index += 1
+    }
+}
+
+// The same of whole sums whose weights add up to `total`.
+inline fn settled(sa: u64, sr: u64, sg: u64, sb: u64, total: u64) -> u32 {
+    const alpha = (sa + total / 2) / total
+    if alpha == 0 { return 0 }
+    const half = sa / 2
+    return (@intCast(u32, alpha) << 24) | (@intCast(u32, (sr + half) / sa) << 16) | (@intCast(u32, (sg + half) / sa) << 8) | @intCast(u32, (sb + half) / sa)
+}
+
+// ---------------------------------------------------------------------------
+// Resampling: what all paths share
+
+// A source window of more pixels than this is not read at once: the
+// block is halved until its window fits.
+const WINDOW_PIXELS: i64 = 1048576
+// Beyond this shrink the box takes over from the other filters.
+const SHRINK_FOR_BOX: f64 = 2.000001
+// The most samples in a direction a result pixel is the mean of.
+const MOST_SAMPLES: f64 = 32.0
+// The two-pass path's limits: a shrink it still does, the weights of one
+// table, the source pixels read at once.
+const MOST_SHRINK: f64 = 4096.0
+const TABLE_WEIGHTS: usize = 1048576
+const BATCH_PIXELS: usize = 65536
+// The convenience functions make no result of more pixels than this.
+const MOST_RESULT: i64 = 4294967296
+
+const Job = struct {
+    source: *Device
+    into: *Device
+    pool: *scratch.Pool
+    // From a place of the result to the source's.
+    inverse: Matrix
+    affine: bool
+    filter: u8
+    // What a result pixel without a source is.
+    blank: u32
+    // Whether the source is transparent where it has no tile.
+    clear: bool
+    // The source's tiles, and the rectangle around them all.
+    keys: [*]const u64
+    keyCount: usize
+    extent: Rect
+    // Doubles for cutting (CUT_WORK and 4 for a box).
+    work: [*]f64
+    // How many source pixels a step right and a step down in the result
+    // are (an affine matrix: everywhere; else in the block at hand).
+    spanX: f64
+    spanY: f64
+}
+
+// Whether any of the source's tiles lies in `area`.
+fn anyTile(job: *Job, area: Rect) -> bool {
+    if geom.isEmpty(area) || job.*.keyCount == 0 { return false }
+    const left = @intCast(i64, area.x) - @intCast(i64, job.*.source.*.x)
+    const top = @intCast(i64, area.y) - @intCast(i64, job.*.source.*.y)
+    const tx0 = left >> 6
+    const ty0 = top >> 6
+    const tx1 = (left + @intCast(i64, area.width) - 1) >> 6
+    const ty1 = (top + @intCast(i64, area.height) - 1) >> 6
+    // Few places: asked one by one. Many: every tile asked whether it is
+    // one of them (a window near a vanishing line spans millions).
+    if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= 16 { return device_module.touches(job.*.source, area) }
+    var index: usize = 0
+    while index < job.*.keyCount {
+        const tx = @intCast(i64, device_module.keyX(job.*.keys[index]))
+        const ty = @intCast(i64, device_module.keyY(job.*.keys[index]))
+        if tx >= tx0 && tx <= tx1 && ty >= ty0 && ty <= ty1 { return true }
+        index += 1
+    }
+    return false
+}
+
+// A block's pixels into the result; a block that is all the result's
+// default makes no tile.
+fn store(into: *Device, block: Rect, pixels: [*]const u32) -> bool {
+    const width = @intCast(usize, block.width)
+    const count = width * @intCast(usize, block.height)
+    const blank = into.*.defaultPixel
+    var index: usize = 0
+    while index < count && pixels[index] == blank { index += 1 }
+    if index == count { return device_module.fill(into, block, blank) }
+    return device_module.writeRect(into, block, pixels, width)
+}
+
+// ---------------------------------------------------------------------------
+// Resampling pixel by pixel (any matrix)
+
+// The source rectangle the pixels of `block` are made from, with `reach`
+// pixels around for the filter. False: no pixel of the block has a source
+// (all of it lies behind the vanishing line or too far out).
+fn footprint(job: *Job, block: Rect, reach: i32, need: *Rect) -> bool {
+    const box = job.*.work + CUT_WORK
+    const left = @floatFromInt(f64, block.x)
+    const top = @floatFromInt(f64, block.y)
+    if !boxOf(&job.*.inverse, left, top, left + @floatFromInt(f64, block.width), top + @floatFromInt(f64, block.height), job.*.work, box) { return false }
+    // A place p reads the pixels from floor(p - 0.5) on.
+    const x0 = @intFromFloat(i32, @floor(box[0] - 0.5)) - reach
+    const y0 = @intFromFloat(i32, @floor(box[1] - 0.5)) - reach
+    const x1 = @intFromFloat(i32, @floor(box[2] - 0.5)) + reach + 1
+    const y1 = @intFromFloat(i32, @floor(box[3] - 0.5)) + reach + 1
+    need.* = geom.rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    return true
+}
+
+// How many source pixels a step right and a step down in the result are
+// at (x, y): into the job's spans where more than they hold. False: the
+// place has no source.
+fn measure(job: *Job, x: f64, y: f64) -> bool {
+    const n = &job.*.inverse
+    const w = n.*.g * x + n.*.h * y + n.*.i
+    if !(w > 0.0) { return false }
+    const sx = (n.*.a * x + n.*.b * y + n.*.c) / w
+    const sy = (n.*.d * x + n.*.e * y + n.*.f) / w
+    if !(sx > -FAR && sx < FAR && sy > -FAR && sy < FAR) { return false }
+    const xx = (n.*.a - sx * n.*.g) / w
+    const yx = (n.*.d - sy * n.*.g) / w
+    const xy = (n.*.b - sx * n.*.h) / w
+    const yy = (n.*.e - sy * n.*.h) / w
+    const across = @sqrt(xx * xx + yx * yx)
+    const down = @sqrt(xy * xy + yy * yy)
+    if across > job.*.spanX { job.*.spanX = across }
+    if down > job.*.spanY { job.*.spanY = down }
+    return true
+}
+
+// How many samples in a direction that is `span` source pixels a result
+// pixel: one for each, as far as that is paid for.
+fn samplesFor(span: f64) -> usize {
+    if !(span > 1.0) { return 1 }
+    if span >= MOST_SAMPLES { return @intFromFloat(usize, MOST_SAMPLES) }
+    return @intFromFloat(usize, @ceil(span - 0.001))
+}
+
+// NEAREST: each result pixel is the source pixel its middle falls into,
+// as it is.
+fn nearestBlock(job: *Job, block: Rect, need: Rect, window: [*]const u32, out: [*]u32) -> void {
+    const na = job.*.inverse.a
+    const nb = job.*.inverse.b
+    const nc = job.*.inverse.c
+    const nd = job.*.inverse.d
+    const ne = job.*.inverse.e
+    const nf = job.*.inverse.f
+    const ng = job.*.inverse.g
+    const nh = job.*.inverse.h
+    const ni = job.*.inverse.i
+    const affine = job.*.affine
+    const blank = job.*.blank
+    const stride = @intCast(usize, need.width)
+    const last_x = @intCast(i64, need.width) - 1
+    const last_y = @intCast(i64, need.height) - 1
+    const base_x = @intCast(i64, need.x)
+    const base_y = @intCast(i64, need.y)
+    var at: usize = 0
+    var row: i32 = 0
+    while row < block.height {
+        const y = @floatFromInt(f64, block.y + row) + 0.5
+        const row_x = nb * y + nc
+        const row_y = ne * y + nf
+        const row_w = nh * y + ni
+        var column: i32 = 0
+        while column < block.width {
+            const x = @floatFromInt(f64, block.x + column) + 0.5
+            var sx = na * x + row_x
+            var sy = nd * x + row_y
+            var seen = true
+            if !affine {
+                const w = ng * x + row_w
+                if w > 0.0 {
+                    sx = sx / w
+                    sy = sy / w
+                } else {
+                    seen = false
+                }
+            }
+            if seen && sx > -FAR && sx < FAR && sy > -FAR && sy < FAR {
+                var ix = @intFromFloat(i64, @floor(sx)) - base_x
+                var iy = @intFromFloat(i64, @floor(sy)) - base_y
+                if ix < 0 { ix = 0 } else if ix > last_x { ix = last_x }
+                if iy < 0 { iy = 0 } else if iy > last_y { iy = last_y }
+                out[at] = window[@intCast(usize, iy) * stride + @intCast(usize, ix)]
+            } else {
+                out[at] = blank
+            }
+            at += 1
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// BILINEAR: the four pixels around the place, weighed by how near each
+// is, in whole numbers (a place to a 4096th of a pixel; the weights of
+// the four add up to 2^24).
+fn bilinearBlock(job: *Job, block: Rect, need: Rect, window: [*]const u32, out: [*]u32) -> void {
+    const na = job.*.inverse.a
+    const nb = job.*.inverse.b
+    const nc = job.*.inverse.c
+    const nd = job.*.inverse.d
+    const ne = job.*.inverse.e
+    const nf = job.*.inverse.f
+    const ng = job.*.inverse.g
+    const nh = job.*.inverse.h
+    const ni = job.*.inverse.i
+    const affine = job.*.affine
+    const blank = job.*.blank
+    const stride = @intCast(usize, need.width)
+    // The last place whose right and lower neighbours are in the window.
+    const last_x = (@intCast(i64, need.width) - 1) * 4096 - 1
+    const last_y = (@intCast(i64, need.height) - 1) * 4096 - 1
+    const base_x = @intCast(i64, need.x) * 4096
+    const base_y = @intCast(i64, need.y) * 4096
+    var at: usize = 0
+    var row: i32 = 0
+    while row < block.height {
+        const y = @floatFromInt(f64, block.y + row) + 0.5
+        const row_x = nb * y + nc
+        const row_y = ne * y + nf
+        const row_w = nh * y + ni
+        var column: i32 = 0
+        while column < block.width {
+            const x = @floatFromInt(f64, block.x + column) + 0.5
+            var sx = na * x + row_x
+            var sy = nd * x + row_y
+            var seen = true
+            if !affine {
+                const w = ng * x + row_w
+                if w > 0.0 {
+                    sx = sx / w
+                    sy = sy / w
+                } else {
+                    seen = false
+                }
+            }
+            if seen && sx > -FAR && sx < FAR && sy > -FAR && sy < FAR {
+                var fx = @intFromFloat(i64, @floor((sx - 0.5) * 4096.0 + 0.5)) - base_x
+                var fy = @intFromFloat(i64, @floor((sy - 0.5) * 4096.0 + 0.5)) - base_y
+                if fx < 0 { fx = 0 } else if fx > last_x { fx = last_x }
+                if fy < 0 { fy = 0 } else if fy > last_y { fy = last_y }
+                const corner = window + (@intCast(usize, fy >> 12) * stride + @intCast(usize, fx >> 12))
+                const p00 = corner[0]
+                const p10 = corner[1]
+                const p01 = corner[stride]
+                const p11 = corner[stride + 1]
+                if p00 == p10 && p00 == p01 && p00 == p11 {
+                    out[at] = if p00 >> 24 == 0 { 0 } else { p00 }
+                } else {
+                    const tx = @intCast(u64, fx & 4095)
+                    const ty = @intCast(u64, fy & 4095)
+                    const w00 = (4096 - tx) * (4096 - ty)
+                    const w10 = tx * (4096 - ty)
+                    const w01 = (4096 - tx) * ty
+                    const w11 = tx * ty
+                    if (p00 & p10 & p01 & p11) >> 24 == 255 {
+                        // All four opaque: nothing to weigh by alpha.
+                        const r = (w00 * @intCast(u64, (p00 >> 16) & 255) + w10 * @intCast(u64, (p10 >> 16) & 255) + w01 * @intCast(u64, (p01 >> 16) & 255) + w11 * @intCast(u64, (p11 >> 16) & 255) + 8388608) >> 24
+                        const g = (w00 * @intCast(u64, (p00 >> 8) & 255) + w10 * @intCast(u64, (p10 >> 8) & 255) + w01 * @intCast(u64, (p01 >> 8) & 255) + w11 * @intCast(u64, (p11 >> 8) & 255) + 8388608) >> 24
+                        const b = (w00 * @intCast(u64, p00 & 255) + w10 * @intCast(u64, p10 & 255) + w01 * @intCast(u64, p01 & 255) + w11 * @intCast(u64, p11 & 255) + 8388608) >> 24
+                        out[at] = 0xFF000000 | (@intCast(u32, r) << 16) | (@intCast(u32, g) << 8) | @intCast(u32, b)
+                    } else {
+                        const a00 = w00 * @intCast(u64, p00 >> 24)
+                        const a10 = w10 * @intCast(u64, p10 >> 24)
+                        const a01 = w01 * @intCast(u64, p01 >> 24)
+                        const a11 = w11 * @intCast(u64, p11 >> 24)
+                        const sr = a00 * @intCast(u64, (p00 >> 16) & 255) + a10 * @intCast(u64, (p10 >> 16) & 255) + a01 * @intCast(u64, (p01 >> 16) & 255) + a11 * @intCast(u64, (p11 >> 16) & 255)
+                        const sg = a00 * @intCast(u64, (p00 >> 8) & 255) + a10 * @intCast(u64, (p10 >> 8) & 255) + a01 * @intCast(u64, (p01 >> 8) & 255) + a11 * @intCast(u64, (p11 >> 8) & 255)
+                        const sb = a00 * @intCast(u64, p00 & 255) + a10 * @intCast(u64, p10 & 255) + a01 * @intCast(u64, p01 & 255) + a11 * @intCast(u64, p11 & 255)
+                        out[at] = settled(a00 + a10 + a01 + a11, sr, sg, sb, 16777216)
+                    }
+                }
+            } else {
+                out[at] = blank
+            }
+            at += 1
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// BICUBIC and LANCZOS3: the 4 x 4 or 6 x 6 pixels around the place, each
+// weighed by the table's weight of its column times that of its row. The
+// window is `weighed` here: alpha and colour times alpha, four floats a
+// pixel (weighRow), so that a pixel is not taken apart sixteen times.
+fn weighedBlock(job: *Job, block: Rect, need: Rect, weighed: [*]const f32, sums: [*]f32, out: [*]u32) -> void {
+    const na = job.*.inverse.a
+    const nb = job.*.inverse.b
+    const nc = job.*.inverse.c
+    const nd = job.*.inverse.d
+    const ne = job.*.inverse.e
+    const nf = job.*.inverse.f
+    const ng = job.*.inverse.g
+    const nh = job.*.inverse.h
+    const ni = job.*.inverse.i
+    const affine = job.*.affine
+    // The blank pixel as sums.
+    const blank_a = @floatFromInt(f32, job.*.blank >> 24)
+    const blank_r = blank_a * @floatFromInt(f32, (job.*.blank >> 16) & 255)
+    const blank_g = blank_a * @floatFromInt(f32, (job.*.blank >> 8) & 255)
+    const blank_b = blank_a * @floatFromInt(f32, job.*.blank & 255)
+    const width = @intCast(usize, block.width)
+    var taps: usize = 4
+    var table: [*]const f32 = &cubicWeights
+    if job.*.filter == LANCZOS3 {
+        taps = 6
+        table = &lanczosWeights
+    }
+    const before = @intCast(i64, taps / 2 - 1)
+    const stride = @intCast(usize, need.width) * 4
+    const last_x = @intCast(i64, need.width) - @intCast(i64, taps)
+    const last_y = @intCast(i64, need.height) - @intCast(i64, taps)
+    const base_x = @intCast(i64, need.x) + before
+    const base_y = @intCast(i64, need.y) + before
+    var row: i32 = 0
+    while row < block.height {
+        const y = @floatFromInt(f64, block.y + row) + 0.5
+        const row_x = nb * y + nc
+        const row_y = ne * y + nf
+        const row_w = nh * y + ni
+        var at: usize = 0
+        var column: i32 = 0
+        while column < block.width {
+            const x = @floatFromInt(f64, block.x + column) + 0.5
+            var sx = na * x + row_x
+            var sy = nd * x + row_y
+            var seen = true
+            if !affine {
+                const w = ng * x + row_w
+                if w > 0.0 {
+                    sx = sx / w
+                    sy = sy / w
+                } else {
+                    seen = false
+                }
+            }
+            if seen && sx > -FAR && sx < FAR && sy > -FAR && sy < FAR {
+                const u = sx - 0.5
+                const v = sy - 0.5
+                const whole_u = @floor(u)
+                const whole_v = @floor(v)
+                var ix = @intFromFloat(i64, whole_u) - base_x
+                var iy = @intFromFloat(i64, whole_v) - base_y
+                if ix < 0 { ix = 0 } else if ix > last_x { ix = last_x }
+                if iy < 0 { iy = 0 } else if iy > last_y { iy = last_y }
+                const across = table + @intFromFloat(usize, (u - whole_u) * PHASES_IN_ONE + 0.5) * taps
+                const down = table + @intFromFloat(usize, (v - whole_v) * PHASES_IN_ONE + 0.5) * taps
+                var a: f32 = 0.0
+                var r: f32 = 0.0
+                var g: f32 = 0.0
+                var b: f32 = 0.0
+                var line = weighed + (@intCast(usize, iy) * stride + @intCast(usize, ix) * 4)
+                var j: usize = 0
+                if taps == 4 {
+                    const x0 = across[0]
+                    const x1 = across[1]
+                    const x2 = across[2]
+                    const x3 = across[3]
+                    while j < 4 {
+                        const weight = down[j]
+                        a += weight * (x0 * line[0] + x1 * line[4] + x2 * line[8] + x3 * line[12])
+                        r += weight * (x0 * line[1] + x1 * line[5] + x2 * line[9] + x3 * line[13])
+                        g += weight * (x0 * line[2] + x1 * line[6] + x2 * line[10] + x3 * line[14])
+                        b += weight * (x0 * line[3] + x1 * line[7] + x2 * line[11] + x3 * line[15])
+                        line += stride
+                        j += 1
+                    }
+                } else {
+                    while j < taps {
+                        const weight_down = down[j]
+                        var pixel = line
+                        var i: usize = 0
+                        while i < taps {
+                            const weight = weight_down * across[i]
+                            a += weight * pixel[0]
+                            r += weight * pixel[1]
+                            g += weight * pixel[2]
+                            b += weight * pixel[3]
+                            pixel += 4
+                            i += 1
+                        }
+                        line += stride
+                        j += 1
+                    }
+                }
+                sums[at] = a
+                sums[at + 1] = r
+                sums[at + 2] = g
+                sums[at + 3] = b
+            } else {
+                sums[at] = blank_a
+                sums[at + 1] = blank_r
+                sums[at + 2] = blank_g
+                sums[at + 3] = blank_b
+            }
+            at += 4
+            column += 1
+        }
+        settleRow(sums, width, out + @intCast(usize, row) * width)
+        row += 1
+    }
+}
+
+// Shrinking, and BOX: each result pixel is the mean of a grid of samples
+// spread over it, one per source pixel under it in each direction
+// (samplesFor): bilinear ones (`smooth`) or, for BOX, the pixels the
+// samples fall into. A sample without a source counts as the blank pixel.
+fn sampledBlock(job: *Job, block: Rect, need: Rect, window: [*]const u32, out: [*]u32, smooth: bool) -> void {
+    const na = job.*.inverse.a
+    const nb = job.*.inverse.b
+    const nc = job.*.inverse.c
+    const nd = job.*.inverse.d
+    const ne = job.*.inverse.e
+    const nf = job.*.inverse.f
+    const ng = job.*.inverse.g
+    const nh = job.*.inverse.h
+    const ni = job.*.inverse.i
+    const affine = job.*.affine
+    const count_x = samplesFor(job.*.spanX)
+    const count_y = samplesFor(job.*.spanY)
+    const step_x = 1.0 / @floatFromInt(f64, count_x)
+    const step_y = 1.0 / @floatFromInt(f64, count_y)
+    const unit: u64 = if smooth { 16777216 } else { 1 }
+    const total = unit * count_x * count_y
+    const blank_a = unit * @intCast(u64, job.*.blank >> 24)
+    const blank_r = blank_a * @intCast(u64, (job.*.blank >> 16) & 255)
+    const blank_g = blank_a * @intCast(u64, (job.*.blank >> 8) & 255)
+    const blank_b = blank_a * @intCast(u64, job.*.blank & 255)
+    const stride = @intCast(usize, need.width)
+    const last_x = (@intCast(i64, need.width) - 1) * 4096 - 1
+    const last_y = (@intCast(i64, need.height) - 1) * 4096 - 1
+    const base_x = @intCast(i64, need.x) * 4096
+    const base_y = @intCast(i64, need.y) * 4096
+    var at: usize = 0
+    var row: i32 = 0
+    while row < block.height {
+        var column: i32 = 0
+        while column < block.width {
+            var sa: u64 = 0
+            var sr: u64 = 0
+            var sg: u64 = 0
+            var sb: u64 = 0
+            var j: usize = 0
+            while j < count_y {
+                const y = @floatFromInt(f64, block.y + row) + (@floatFromInt(f64, j) + 0.5) * step_y
+                const row_x = nb * y + nc
+                const row_y = ne * y + nf
+                const row_w = nh * y + ni
+                var i: usize = 0
+                while i < count_x {
+                    const x = @floatFromInt(f64, block.x + column) + (@floatFromInt(f64, i) + 0.5) * step_x
+                    var sx = na * x + row_x
+                    var sy = nd * x + row_y
+                    var seen = true
+                    if !affine {
+                        const w = ng * x + row_w
+                        if w > 0.0 {
+                            sx = sx / w
+                            sy = sy / w
+                        } else {
+                            seen = false
+                        }
+                    }
+                    if seen && sx > -FAR && sx < FAR && sy > -FAR && sy < FAR {
+                        var fx: i64 = 0
+                        var fy: i64 = 0
+                        if smooth {
+                            fx = @intFromFloat(i64, @floor((sx - 0.5) * 4096.0 + 0.5)) - base_x
+                            fy = @intFromFloat(i64, @floor((sy - 0.5) * 4096.0 + 0.5)) - base_y
+                        } else {
+                            // The pixel the sample falls into.
+                            fx = @intFromFloat(i64, @floor(sx)) * 4096 - base_x
+                            fy = @intFromFloat(i64, @floor(sy)) * 4096 - base_y
+                        }
+                        if fx < 0 { fx = 0 } else if fx > last_x { fx = last_x }
+                        if fy < 0 { fy = 0 } else if fy > last_y { fy = last_y }
+                        const corner = window + (@intCast(usize, fy >> 12) * stride + @intCast(usize, fx >> 12))
+                        if smooth {
+                            const p00 = corner[0]
+                            const p10 = corner[1]
+                            const p01 = corner[stride]
+                            const p11 = corner[stride + 1]
+                            const tx = @intCast(u64, fx & 4095)
+                            const ty = @intCast(u64, fy & 4095)
+                            const a00 = (4096 - tx) * (4096 - ty) * @intCast(u64, p00 >> 24)
+                            const a10 = tx * (4096 - ty) * @intCast(u64, p10 >> 24)
+                            const a01 = (4096 - tx) * ty * @intCast(u64, p01 >> 24)
+                            const a11 = tx * ty * @intCast(u64, p11 >> 24)
+                            sa += a00 + a10 + a01 + a11
+                            sr += a00 * @intCast(u64, (p00 >> 16) & 255) + a10 * @intCast(u64, (p10 >> 16) & 255) + a01 * @intCast(u64, (p01 >> 16) & 255) + a11 * @intCast(u64, (p11 >> 16) & 255)
+                            sg += a00 * @intCast(u64, (p00 >> 8) & 255) + a10 * @intCast(u64, (p10 >> 8) & 255) + a01 * @intCast(u64, (p01 >> 8) & 255) + a11 * @intCast(u64, (p11 >> 8) & 255)
+                            sb += a00 * @intCast(u64, p00 & 255) + a10 * @intCast(u64, p10 & 255) + a01 * @intCast(u64, p01 & 255) + a11 * @intCast(u64, p11 & 255)
+                        } else {
+                            const p = corner[0]
+                            const alpha = @intCast(u64, p >> 24)
+                            sa += alpha
+                            sr += alpha * @intCast(u64, (p >> 16) & 255)
+                            sg += alpha * @intCast(u64, (p >> 8) & 255)
+                            sb += alpha * @intCast(u64, p & 255)
+                        }
+                    } else {
+                        sa += blank_a
+                        sr += blank_r
+                        sg += blank_g
+                        sb += blank_b
+                    }
+                    i += 1
+                }
+                j += 1
+            }
+            out[at] = settled(sa, sr, sg, sb, total)
+            at += 1
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// One result pixel whose source window is too large to read (next to a
+// vanishing line): the mean of the most samples there are, each read
+// from the device by itself.
+fn lonePixel(job: *Job, at_x: i32, at_y: i32) -> bool {
+    const n = &job.*.inverse
+    const count = @intFromFloat(usize, MOST_SAMPLES)
+    const step = 1.0 / MOST_SAMPLES
+    const blank = job.*.blank
+    var sa: u64 = 0
+    var sr: u64 = 0
+    var sg: u64 = 0
+    var sb: u64 = 0
+    var j: usize = 0
+    while j < count {
+        const y = @floatFromInt(f64, at_y) + (@floatFromInt(f64, j) + 0.5) * step
+        var i: usize = 0
+        while i < count {
+            const x = @floatFromInt(f64, at_x) + (@floatFromInt(f64, i) + 0.5) * step
+            const w = n.*.g * x + n.*.h * y + n.*.i
+            var p = blank
+            if w > 0.0 {
+                const sx = (n.*.a * x + n.*.b * y + n.*.c) / w
+                const sy = (n.*.d * x + n.*.e * y + n.*.f) / w
+                if sx > -FAR && sx < FAR && sy > -FAR && sy < FAR {
+                    p = device_module.pixel(job.*.source, @intFromFloat(i32, @floor(sx)), @intFromFloat(i32, @floor(sy)))
+                }
+            }
+            const alpha = @intCast(u64, p >> 24)
+            sa += alpha
+            sr += alpha * @intCast(u64, (p >> 16) & 255)
+            sg += alpha * @intCast(u64, (p >> 8) & 255)
+            sb += alpha * @intCast(u64, p & 255)
+            i += 1
+        }
+        j += 1
+    }
+    return device_module.fill(job.*.into, geom.rect(at_x, at_y, 1, 1), settled(sa, sr, sg, sb, count * count))
+}
+
+// One block of the result, pixel by pixel. False when memory ran out.
+fn generalBlock(job: *Job, block: Rect) -> bool {
+    const filter = job.*.filter
+    const reach: i32 = if filter == BICUBIC { 2 } else if filter == LANCZOS3 { 3 } else { 1 }
+    var need: Rect = undefined
+    if !footprint(job, block, reach, &need) || !anyTile(job, need) {
+        return device_module.fill(job.*.into, block, job.*.blank)
+    }
+    if @intCast(i64, need.width) * @intCast(i64, need.height) > WINDOW_PIXELS {
+        if block.width == 1 && block.height == 1 { return lonePixel(job, block.x, block.y) }
+        var first = block
+        var second = block
+        if block.width >= block.height {
+            first.width = block.width / 2
+            second.x = block.x + first.width
+            second.width = block.width - first.width
+        } else {
+            first.height = block.height / 2
+            second.y = block.y + first.height
+            second.height = block.height - first.height
+        }
+        return generalBlock(job, first) && generalBlock(job, second)
+    }
+    if !job.*.affine {
+        // A perspective shrinks more the farther away: the block is
+        // sampled as the corner that shrinks most of the image's square of
+        // 64 x 64 it lies in needs (the square's, not the block's: the
+        // same however the area was cut).
+        const left = @floatFromInt(f64, block.x & -64)
+        const top = @floatFromInt(f64, block.y & -64)
+        const right = left + 64.0
+        const bottom = top + 64.0
+        job.*.spanX = 0.0
+        job.*.spanY = 0.0
+        var seen = measure(job, left, top)
+        seen = measure(job, right, top) && seen
+        seen = measure(job, right, bottom) && seen
+        seen = measure(job, left, bottom) && seen
+        if !seen {
+            job.*.spanX = MOST_SAMPLES
+            job.*.spanY = MOST_SAMPLES
+        }
+    }
+    const pool = job.*.pool
+    const mark = scratch.mark(pool)
+    const window = scratch.words(pool, @intCast(usize, need.width) * @intCast(usize, need.height))
+    const out = scratch.words(pool, @intCast(usize, block.width) * @intCast(usize, block.height))
+    if window == null || out == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    const count = @intCast(usize, need.width) * @intCast(usize, need.height)
+    device_module.readRect(job.*.source, need, window.?, @intCast(usize, need.width))
+    if filter == NEAREST {
+        nearestBlock(job, block, need, window.?, out.?)
+    } else if filter == BOX || job.*.spanX > SHRINK_FOR_BOX || job.*.spanY > SHRINK_FOR_BOX {
+        sampledBlock(job, block, need, window.?, out.?, filter != BOX)
+    } else if filter == BILINEAR {
+        bilinearBlock(job, block, need, window.?, out.?)
+    } else {
+        const weighed = floats(pool, count * 4)
+        const sums = floats(pool, @intCast(usize, block.width) * 4)
+        if weighed == null || sums == null {
+            scratch.release(pool, mark)
+            return false
+        }
+        weighRow(window.?, count, weighed.?)
+        weighedBlock(job, block, need, weighed.?, sums.?, out.?)
+    }
+    const whole = store(job.*.into, block, out.?)
+    scratch.release(pool, mark)
+    return whole
+}
+
+// ---------------------------------------------------------------------------
+// Resampling in two passes (a matrix that scales and moves)
+
+// One direction's table of contributions: for each result pixel the first
+// source pixel that makes it, how many do, and the weight of each (they
+// add up to 1), `stride` weights a result pixel.
+const Axis = struct {
+    first: [*]i32
+    count: [*]i32
+    weights: [*]f32
+    stride: usize
+}
+
+// The most source pixels one result pixel is made of when a result pixel
+// is `step` source pixels.
+fn tableStride(filter: u8, step: f64) -> usize {
+    if filter == BOX || step > SHRINK_FOR_BOX { return @intFromFloat(usize, step) + 3 }
+    const stretch = if step > 1.0 { step } else { 1.0 }
+    return @intFromFloat(usize, 2.0 * support(filter) * stretch) + 3
+}
+
+// The table for the `length` result pixels from `start` on, where result
+// place p is the source's scale * p + shift. A shrinking direction widens
+// the filter by as much; one that shrinks by more than 2x, and BOX, count
+// each source pixel by the part of it under the result pixel. `clamped`:
+// source pixels before `low` and from `high` on count as the nearest one
+// inside (a picture's edge repeated). False without memory.
+fn buildAxis(pool: *scratch.Pool, axis: *Axis, start: i32, length: usize, scale: f64, shift: f64, filter: u8, clamped: bool, low: i32, high: i32) -> bool {
+    const step = if scale < 0.0 { -scale } else { scale }
+    const boxed = filter == BOX || step > SHRINK_FOR_BOX
+    const stretch = if step > 1.0 { step } else { 1.0 }
+    const radius = if boxed { step * 0.5 } else { support(filter) * stretch }
+    const stride = tableStride(filter, step)
+    const first = scratch.ints(pool, length)
+    const count = scratch.ints(pool, length)
+    const weights = floats(pool, length * stride)
+    if first == null || count == null || weights == null { return false }
+    axis.*.first = first.?
+    axis.*.count = count.?
+    axis.*.weights = weights.?
+    axis.*.stride = stride
+    var index: usize = 0
+    while index < length {
+        const center = scale * (@floatFromInt(f64, start) + @floatFromInt(f64, index) + 0.5) + shift
+        const into = weights.? + index * stride
+        // The source pixels from j0 to j1 can count.
+        var j0: i32 = 0
+        var j1: i32 = 0
+        if boxed {
+            j0 = @intFromFloat(i32, @floor(center - radius))
+            j1 = @intFromFloat(i32, @ceil(center + radius)) - 1
+        } else {
+            j0 = @intFromFloat(i32, @ceil(center - radius - 0.5))
+            j1 = @intFromFloat(i32, @floor(center + radius - 0.5))
+        }
+        if j1 < j0 { j1 = j0 }
+        var from = j0
+        var to = j1
+        if clamped {
+            from = geom.clampInt(j0, low, high - 1)
+            to = geom.clampInt(j1, low, high - 1)
+        }
+        const taken = @intCast(usize, to - from + 1)
+        var tap: usize = 0
+        while tap < taken {
+            into[tap] = 0.0
+            tap += 1
+        }
+        var sum: f64 = 0.0
+        var j = j0
+        while j <= j1 {
+            var weight: f64 = 0.0
+            if boxed {
+                // The part of pixel j (from j to j + 1) under the result
+                // pixel (from center - radius to center + radius).
+                const left = math.max(@floatFromInt(f64, j), center - radius)
+                const right = math.min(@floatFromInt(f64, j) + 1.0, center + radius)
+                if right > left { weight = right - left }
+            } else {
+                weight = kernel(filter, (@floatFromInt(f64, j) + 0.5 - center) / stretch)
+            }
+            const slot = if clamped { geom.clampInt(j, low, high - 1) } else { j }
+            into[@intCast(usize, slot - from)] += @floatCast(f32, weight)
+            sum += weight
+            j += 1
+        }
+        if sum > 0.000000001 || sum < -0.000000001 {
+            const scale_all = @floatCast(f32, 1.0 / sum)
+            tap = 0
+            while tap < taken {
+                into[tap] = into[tap] * scale_all
+                tap += 1
+            }
+            first.?[index] = from
+            count.?[index] = @intCast(i32, taken)
+        } else {
+            // Nothing under it (a result pixel far thinner than a source
+            // pixel, between two): the pixel its middle falls into.
+            const nearest = @intFromFloat(i32, @floor(center))
+            first.?[index] = if clamped { geom.clampInt(nearest, low, high - 1) } else { nearest }
+            count.?[index] = 1
+            into[0] = 1.0
+        }
+        index += 1
+    }
+    return true
+}
+
+// `count` pixels as alpha and colour times alpha, four floats each.
+fn weighRow(source: [*]const u32, count: usize, into: [*]f32) -> void {
+    var index: usize = 0
+    while index < count {
+        const p = source[index]
+        const a = @floatFromInt(f32, p >> 24)
+        into[index * 4] = a
+        into[index * 4 + 1] = a * @floatFromInt(f32, (p >> 16) & 255)
+        into[index * 4 + 2] = a * @floatFromInt(f32, (p >> 8) & 255)
+        into[index * 4 + 3] = a * @floatFromInt(f32, p & 255)
+        index += 1
+    }
+}
+
+// The first pass: one weighed source row (its first pixel is source pixel
+// `low`, it ends before `high`; what lies outside counts as nothing) made
+// into the `width` result pixels the table has from entry `at` on.
+fn acrossRow(axis: *const Axis, at: usize, width: usize, row: [*]const f32, low: i32, high: i32, into: [*]f32) -> void {
+    const stride = axis.*.stride
+    var index: usize = 0
+    while index < width {
+        const entry = at + index
+        const first = axis.*.first[entry]
+        var from = first
+        var to = first + axis.*.count[entry]
+        if from < low { from = low }
+        if to > high { to = high }
+        var a: f32 = 0.0
+        var r: f32 = 0.0
+        var g: f32 = 0.0
+        var b: f32 = 0.0
+        if to > from {
+            var weight = axis.*.weights + (entry * stride + @intCast(usize, from - first))
+            var pixel = row + @intCast(usize, from - low) * 4
+            var left = @intCast(usize, to - from)
+            while left > 0 {
+                const w = weight[0]
+                a += w * pixel[0]
+                r += w * pixel[1]
+                g += w * pixel[2]
+                b += w * pixel[3]
+                weight += 1
+                pixel += 4
+                left -= 1
+            }
+        }
+        into[index * 4] = a
+        into[index * 4 + 1] = r
+        into[index * 4 + 2] = g
+        into[index * 4 + 3] = b
+        index += 1
+    }
+}
+
+// The second pass: source row `row` (already `width` result pixels wide,
+// in `line`) added with its weight to each of the `height` result rows
+// (the table's from entry `at` on) it is part of.
+fn downInto(sums: [*]f32, width: usize, height: usize, line: [*]const f32, row: i32, axis: *const Axis, at: usize) -> void {
+    const floats_wide = width * 4
+    var index: usize = 0
+    while index < height {
+        const entry = at + index
+        const tap = row - axis.*.first[entry]
+        if tap >= 0 && tap < axis.*.count[entry] {
+            const w = axis.*.weights[entry * axis.*.stride + @intCast(usize, tap)]
+            if w != 0.0 {
+                var target = sums + index * floats_wide
+                var from = line
+                var left = width
+                while left > 0 {
+                    target[0] += w * from[0]
+                    target[1] += w * from[1]
+                    target[2] += w * from[2]
+                    target[3] += w * from[3]
+                    target += 4
+                    from += 4
+                    left -= 1
+                }
+            }
+        }
+        index += 1
+    }
+}
+
+// The sums of `width` x `height` result pixels as straight pixels, `stride`
+// words a row.
+fn settleRows(sums: [*]const f32, width: usize, height: usize, out: [*]u32, stride: usize) -> void {
+    var row: usize = 0
+    while row < height {
+        settleRow(sums + row * width * 4, width, out + row * stride)
+        row += 1
+    }
+}
+
+// One block of the result from the two tables (its columns are the x
+// table's entries from `at_x` on, its rows the y table's from `at_y`).
+fn scaleBlock(job: *Job, block: Rect, xs: *const Axis, ys: *const Axis, at_x: usize, at_y: usize) -> bool {
+    const width = @intCast(usize, block.width)
+    const height = @intCast(usize, block.height)
+    // The source columns and rows the block is made of.
+    var col0 = xs.*.first[at_x]
+    var col1 = col0 + xs.*.count[at_x]
+    var index: usize = 1
+    while index < width {
+        const first = xs.*.first[at_x + index]
+        if first < col0 { col0 = first }
+        if first + xs.*.count[at_x + index] > col1 { col1 = first + xs.*.count[at_x + index] }
+        index += 1
+    }
+    var row0 = ys.*.first[at_y]
+    var row1 = row0 + ys.*.count[at_y]
+    index = 1
+    while index < height {
+        const first = ys.*.first[at_y + index]
+        if first < row0 { row0 = first }
+        if first + ys.*.count[at_y + index] > row1 { row1 = first + ys.*.count[at_y + index] }
+        index += 1
+    }
+    if !anyTile(job, geom.rect(col0, row0, col1 - col0, row1 - row0)) {
+        return device_module.fill(job.*.into, block, job.*.blank)
+    }
+    const clear = job.*.clear
+    if clear {
+        // Transparent where no tile is: what lies outside the tiles'
+        // rectangle adds nothing and is not read.
+        const extent = job.*.extent
+        if col0 < extent.x { col0 = extent.x }
+        if col1 > extent.x + extent.width { col1 = extent.x + extent.width }
+        if row0 < extent.y { row0 = extent.y }
+        if row1 > extent.y + extent.height { row1 = extent.y + extent.height }
+    }
+    const wide = @intCast(usize, col1 - col0)
+    var rows_at_once = BATCH_PIXELS / wide
+    if rows_at_once < 1 { rows_at_once = 1 }
+    if rows_at_once > @intCast(usize, row1 - row0) { rows_at_once = @intCast(usize, row1 - row0) }
+    const pool = job.*.pool
+    const mark = scratch.mark(pool)
+    const sums = floats(pool, width * height * 4)
+    const line = floats(pool, width * 4)
+    const weighed = floats(pool, wide * 4)
+    const read = scratch.words(pool, wide * rows_at_once)
+    const out = scratch.words(pool, width * height)
+    if sums == null || line == null || weighed == null || read == null || out == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    index = 0
+    while index < width * height * 4 {
+        sums.?[index] = 0.0
+        index += 1
+    }
+    var row = row0
+    while row < row1 {
+        var rows = @intCast(i32, rows_at_once)
+        if rows > row1 - row { rows = row1 - row }
+        const batch = geom.rect(col0, row, col1 - col0, rows)
+        const empty = !anyTile(job, batch)
+        if !empty {
+            device_module.readRect(job.*.source, batch, read.?, wide)
+        } else if !clear {
+            // Rows of nothing but the default (a mask's, outside its
+            // tiles): weighed as any such row read would be (the same
+            // sums to the bit, wherever the block's edges lie), once for
+            // all of them.
+            index = 0
+            while index < wide {
+                weighRow(&job.*.blank, 1, weighed.? + index * 4)
+                index += 1
+            }
+            acrossRow(xs, at_x, width, weighed.?, col0, col1, line.?)
+        }
+        if !empty || !clear {
+            var each: i32 = 0
+            while each < rows {
+                if !empty {
+                    weighRow(read.? + @intCast(usize, each) * wide, wide, weighed.?)
+                    acrossRow(xs, at_x, width, weighed.?, col0, col1, line.?)
+                }
+                downInto(sums.?, width, height, line.?, row + each, ys, at_y)
+                each += 1
+            }
+        }
+        row += rows
+    }
+    settleRows(sums.?, width, height, out.?, width)
+    const whole = store(job.*.into, block, out.?)
+    scratch.release(pool, mark)
+    return whole
+}
+
+// All of `area` in two passes, in strips whose tables stay small.
+fn scaleArea(job: *Job, area: Rect) -> bool {
+    const pool = job.*.pool
+    const filter = job.*.filter
+    const scale_x = job.*.inverse.a
+    const scale_y = job.*.inverse.e
+    var strip_w = @intCast(i32, TABLE_WEIGHTS / tableStride(filter, job.*.spanX))
+    var strip_h = @intCast(i32, TABLE_WEIGHTS / tableStride(filter, job.*.spanY))
+    if strip_w < 64 { strip_w = 64 }
+    if strip_h < 64 { strip_h = 64 }
+    var whole = true
+    var x = area.x
+    while whole && x < area.x + area.width {
+        const w = if area.x + area.width - x < strip_w { area.x + area.width - x } else { strip_w }
+        const outer = scratch.mark(pool)
+        var xs: Axis = undefined
+        whole = buildAxis(pool, &xs, x, @intCast(usize, w), scale_x, job.*.inverse.c, filter, false, 0, 0)
+        var y = area.y
+        while whole && y < area.y + area.height {
+            const h = if area.y + area.height - y < strip_h { area.y + area.height - y } else { strip_h }
+            const inner = scratch.mark(pool)
+            var ys: Axis = undefined
+            whole = buildAxis(pool, &ys, y, @intCast(usize, h), scale_y, job.*.inverse.f, filter, false, 0, 0)
+            if whole {
+                var walk = blocksOf(job.*.into.*.x, job.*.into.*.y, geom.rect(x, y, w, h))
+                var block: Rect = undefined
+                while whole && next(&walk, &block) {
+                    whole = scaleBlock(job, block, &xs, &ys, @intCast(usize, block.x - x), @intCast(usize, block.y - y))
+                }
+            }
+            scratch.release(pool, inner)
+            y += h
+        }
+        scratch.release(pool, outer)
+        x += w
+    }
+    return whole
+}
+
+// Whether the two-pass path's source pixel numbers for `area` stay well
+// inside what an i32 holds.
+fn scaleFits(job: *Job, area: Rect) -> bool {
+    const n = &job.*.inverse
+    const room = FAR - 8.0 * MOST_SHRINK
+    const x0 = n.*.a * @floatFromInt(f64, area.x) + n.*.c
+    const x1 = n.*.a * @floatFromInt(f64, area.x + area.width) + n.*.c
+    const y0 = n.*.e * @floatFromInt(f64, area.y) + n.*.f
+    const y1 = n.*.e * @floatFromInt(f64, area.y + area.height) + n.*.f
+    return x0 > -room && x0 < room && x1 > -room && x1 < room && y0 > -room && y0 < room && y1 > -room && y1 < room
+}
+
+// ---------------------------------------------------------------------------
+// Resampling: the entry
+
+// Every pixel of `area` in `into` becomes the colour `source` has at the
+// place `matrix` brings there (the matrix says where the source's places
+// go, as the transform tool shows it), weighed with `filter` (NEAREST ...
+// BOX, another number is BILINEAR; see the module's header for how).
+// Outside its tiles the source is its default pixel; a result pixel
+// without alpha is stored as 0 (NEAREST and a move by whole pixels copy
+// pixels as they are). Pixels of `into` outside `area` stay. The time is
+// that of the area's tiles (a block no source tile reaches is cheap, not
+// free): give the area the result can be in, coverage() says it.
+// False, with nothing or only part of the area written, when memory ran
+// out, when the matrix has no inverse, when `source` is `into`, or when
+// the area lies farther out, or is longer, than 2^28 pixels.
+pub fn resample(source: *Device, into: *Device, matrix: *const Matrix, filter: u8, area: Rect) -> bool {
+    if geom.isEmpty(area) { return true }
+    if @intFromPtr(source) == @intFromPtr(into) || !sane(area) { return false }
+    var job: Job = undefined
+    if !invert(matrix, &job.inverse) { return false }
+    job.affine = isAffine(&job.inverse)
+    if job.affine && job.inverse.i != 1.0 {
+        const i = job.inverse.i
+        job.inverse = Matrix.{ .a = job.inverse.a / i, .b = job.inverse.b / i, .c = job.inverse.c / i, .d = job.inverse.d / i, .e = job.inverse.e / i, .f = job.inverse.f / i, .g = 0.0, .h = 0.0, .i = 1.0 }
+    }
+    const pool = scratch.common()
+    if isTranslation(&job.inverse) {
+        return moveInto(into, source, area, -@intFromFloat(i32, job.inverse.c), -@intFromFloat(i32, job.inverse.f), pool)
+    }
+    job.source = source
+    job.into = into
+    job.pool = pool
+    job.filter = if filter > BOX { BILINEAR } else { filter }
+    job.clear = source.*.defaultPixel >> 24 == 0
+    job.blank = if job.clear && job.filter != NEAREST { 0 } else { source.*.defaultPixel }
+    if device_module.tileCount(source) == 0 { return device_module.fill(into, area, job.blank) }
+    var keys = std.ArrayList(u64).init(source.*.allocator)
+    defer keys.deinit()
+    if !device_module.keys(source, &keys) { return false }
+    job.keys = keys.items().pointer
+    job.keyCount = keys.count()
+    job.extent = device_module.extent(source)
+    job.spanX = @sqrt(job.inverse.a * job.inverse.a + job.inverse.d * job.inverse.d)
+    job.spanY = @sqrt(job.inverse.b * job.inverse.b + job.inverse.e * job.inverse.e)
+    if !weightsReady {
+        fillWeights(&cubicWeights, BICUBIC, 4)
+        fillWeights(&lanczosWeights, LANCZOS3, 6)
+        weightsReady = true
+    }
+    const mark = scratch.mark(pool)
+    const work = scratch.doubles(pool, CUT_WORK + 4)
+    if work == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    job.work = work.?
+    var whole = true
+    if job.affine && job.filter != NEAREST && job.inverse.b == 0.0 && job.inverse.d == 0.0 && job.spanX <= MOST_SHRINK && job.spanY <= MOST_SHRINK && scaleFits(&job, area) {
+        whole = scaleArea(&job, area)
+    } else {
+        // In the image's own squares, not the result device's tiles: what
+        // a perspective decides for a square (below) is the same wherever
+        // the result device sits and however the area is cut.
+        var walk = blocksOf(0, 0, area)
+        var block: Rect = undefined
+        while whole && next(&walk, &block) {
+            whole = generalBlock(&job, block)
+        }
+    }
+    scratch.release(pool, mark)
+    return whole
+}
+
+// The rectangle of the result the pixels of the source's `area` can show
+// in under `matrix` with `filter`: where they land (mapRect) and as far
+// around as the filter spreads them, a pixel or two more rather than
+// less. The area to hand to resample() for a source that is its default
+// outside `area`. Empty for an empty area and for one farther out than
+// 2^28 pixels.
+pub fn coverage(area: Rect, matrix: *const Matrix, filter: u8) -> Rect {
+    if geom.isEmpty(area) || !sane(area) { return geom.empty() }
+    const reach: i32 = if filter == BICUBIC { 2 } else if filter == LANCZOS3 { 3 } else { 1 }
+    return geom.grown(mapRect(matrix, geom.grown(area, reach)), reach + 1)
+}
+
+// The rectangle around where `matrix` brings what the device holds (its
+// pixels that are not its default); empty for an empty device.
+pub fn transformedBounds(device: *Device, matrix: *const Matrix) -> Rect {
+    return mapRect(matrix, device_module.exactBounds(device))
+}
+
+// What the convenience functions hand to resample(): where the source's
+// content can show. False when the matrix has no inverse (the content
+// would be squeezed to nothing), and when the area is more than 2^32
+// pixels (a perspective whose vanishing line runs through the content):
+// no result is made of either.
+fn resultArea(source: *Device, matrix: *const Matrix, filter: u8, area: *Rect) -> bool {
+    var back: Matrix = undefined
+    if !invert(matrix, &back) { return false }
+    area.* = coverage(device_module.exactBounds(source), matrix, filter)
+    return @intCast(i64, area.*.width) * @intCast(i64, area.*.height) <= MOST_RESULT
+}
+
+// `source` under `matrix` into `into`, wherever its content lands (and
+// nowhere else: `into` is taken to hold nothing but the source's default
+// there before). False as resample(), and when the result would be more
+// than 2^32 pixels.
+pub fn transformInto(source: *Device, into: *Device, matrix: *const Matrix, filter: u8) -> bool {
+    var area: Rect = undefined
+    if !resultArea(source, matrix, filter, &area) { return false }
+    return resample(source, into, matrix, filter, area)
+}
+
+// `source` scaled by `scale_x` across and `scale_y` down about
+// (origin_x, origin_y), the place that stays where it is, into `into`
+// (see transformInto).
+pub fn scaleDevice(source: *Device, into: *Device, scale_x: f64, scale_y: f64, filter: u8, origin_x: f64, origin_y: f64) -> bool {
+    const m = scaling(scale_x, scale_y, origin_x, origin_y)
+    return transformInto(source, into, &m, filter)
+}
+
+// `source` turned by `radians` (clockwise) around (center_x, center_y)
+// into `into` (see transformInto).
+pub fn rotateDevice(source: *Device, into: *Device, radians: f64, center_x: f64, center_y: f64, filter: u8) -> bool {
+    const m = rotation(radians, center_x, center_y)
+    return transformInto(source, into, &m, filter)
+}
+
+// The device's own pixels under `matrix`: made in a device of its own and
+// put in the place of what was there (between the caller's begin() and
+// commit() it is one change). A move by whole pixels only moves the
+// device. The image's rectangle that looks different: around what was
+// and what is; empty when nothing changed, which is also the case when
+// the matrix has no inverse, the result would be more than 2^32 pixels,
+// a move would take the device's place farther than 2^30 from the origin,
+// or memory ran out while making it (the device is as it was then).
+pub fn transformDevice(device: *Device, matrix: *const Matrix, filter: u8) -> Rect {
+    const before = device_module.exactBounds(device)
+    if geom.isEmpty(before) { return geom.empty() }
+    if isTranslation(matrix) {
+        const dx = @intFromFloat(i32, matrix.*.c / matrix.*.i)
+        const dy = @intFromFloat(i32, matrix.*.f / matrix.*.i)
+        if dx == 0 && dy == 0 { return geom.empty() }
+        // A device's place stays within 2^30 (the room its arithmetic has).
+        const x = @intCast(i64, device.*.x) + @intCast(i64, dx)
+        const y = @intCast(i64, device.*.y) + @intCast(i64, dy)
+        if x < -1073741824 || x > 1073741824 || y < -1073741824 || y > 1073741824 { return geom.empty() }
+        device_module.moveBy(device, dx, dy)
+        return geom.unite(before, geom.moved(before, dx, dy))
+    }
+    var area: Rect = undefined
+    if !resultArea(device, matrix, filter, &area) { return geom.empty() }
+    const made = device_module.create(device.*.allocator, device.*.defaultPixel)
+    if made == null { return geom.empty() }
+    device_module.moveTo(made.?, device.*.x, device.*.y)
+    // Room for the result's tiles first: assign() empties the device
+    // before it places them, and must not run out of memory halfway.
+    const done = resample(device, made.?, matrix, filter, area) && device.*.tiles.ensureTotalCapacity(device_module.tileCount(made.?))
+    if done { _ = device_module.assign(device, made.?) }
+    device_module.destroy(made.?)
+    if !done { return geom.empty() }
+    return geom.unite(before, area)
+}
+
+// ---------------------------------------------------------------------------
+// Plain buffers
+
+// The `sw` x `sh` straight pixels at `source` (`sstride` words from one
+// row to the next) scaled to `dw` x `dh` at `into` (`dstride` a row): a
+// thumbnail, a level of a zoomed-out view. The filters are resample()'s
+// two-pass ones (the box on its own beyond a 2x shrink; NEAREST copies).
+// Past the picture's edges its outermost pixels count again, so the
+// borders do not fade into nothing as a layer's do. The buffers must not
+// overlap. False without memory, and for a source without pixels or a
+// side longer than 2^28.
+pub fn scalePixels(source: [*]const u32, sw: usize, sh: usize, sstride: usize, into: [*]u32, dw: usize, dh: usize, dstride: usize, filter: u8) -> bool {
+    if dw == 0 || dh == 0 { return true }
+    const most = @intCast(usize, FAR_PIXELS)
+    if sw == 0 || sh == 0 || sw > most || sh > most || dw > most || dh > most { return false }
+    var y: usize = 0
+    if sw == dw && sh == dh {
+        while y < dh {
+            device_module.copyWords(into + y * dstride, source + y * sstride, dw)
+            y += 1
+        }
+        return true
+    }
+    if filter == NEAREST {
+        // The source pixel under each result pixel's middle.
+        while y < dh {
+            const from = source + ((y * 2 + 1) * sh / (dh * 2)) * sstride
+            const target = into + y * dstride
+            var x: usize = 0
+            while x < dw {
+                target[x] = from[(x * 2 + 1) * sw / (dw * 2)]
+                x += 1
+            }
+            y += 1
+        }
+        return true
+    }
+    const kind = if filter > BOX { BILINEAR } else { filter }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    var xs: Axis = undefined
+    var ys: Axis = undefined
+    var band = BATCH_PIXELS / dw
+    if band < 1 { band = 1 }
+    if band > dh { band = dh }
+    const made = buildAxis(pool, &xs, 0, dw, @floatFromInt(f64, sw) / @floatFromInt(f64, dw), 0.0, kind, true, 0, @intCast(i32, sw)) && buildAxis(pool, &ys, 0, dh, @floatFromInt(f64, sh) / @floatFromInt(f64, dh), 0.0, kind, true, 0, @intCast(i32, sh))
+    const sums = floats(pool, dw * band * 4)
+    const line = floats(pool, dw * 4)
+    const weighed = floats(pool, sw * 4)
+    if !made || sums == null || line == null || weighed == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    // A band of result rows at a time: each source row it needs is made
+    // as wide as the result and added to the rows it is part of.
+    while y < dh {
+        const rows = if dh - y < band { dh - y } else { band }
+        var index: usize = 0
+        while index < dw * rows * 4 {
+            sums.?[index] = 0.0
+            index += 1
+        }
+        var row0 = ys.first[y]
+        var row1 = row0 + ys.count[y]
+        index = 1
+        while index < rows {
+            const first = ys.first[y + index]
+            if first < row0 { row0 = first }
+            if first + ys.count[y + index] > row1 { row1 = first + ys.count[y + index] }
+            index += 1
+        }
+        var row = row0
+        while row < row1 {
+            weighRow(source + @intCast(usize, row) * sstride, sw, weighed.?)
+            acrossRow(&xs, 0, dw, weighed.?, 0, @intCast(i32, sw), line.?)
+            downInto(sums.?, dw, rows, line.?, row, &ys, y)
+            row += 1
+        }
+        settleRows(sums.?, dw, rows, into + y * dstride, dstride)
+        y += rows
+    }
+    scratch.release(pool, mark)
+    return true
+}

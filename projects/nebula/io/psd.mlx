@@ -1,0 +1,1099 @@
+// nebula io: Photoshop documents (.psd) read and written, and PackBits
+// (the run-length code of their channels, and of TIFF's strips:
+// io/tiff.mlx).
+//
+//     var report: ora.Report = undefined
+//     const status = psd.write(image, &options, &bytes, &report)   // report.lossy
+//     const status = psd.read(allocator, bytes, &result, &report)  // report.skipped, report.space
+//
+// A PSD is big-endian sections: a header ("8BPS", version 1, channels,
+// height, width, depth, colour mode), colour mode data, image resources
+// (blocks "8BIM", an id, a name, data; 0x03ED is the resolution), the
+// layers (a record for each, then each one's channels: compression,
+// rows) and the merged image (all channels after each other).
+//
+// Reading: RGB and greyscale of 8 and 16 bits (16 rounded to 8); other
+// colour modes, 1 and 32 bits and PSB (version 2) are refused with
+// Status.unsupported (the mode in the report's `space`). Each layer
+// record becomes a paint layer of its rectangle (outside the canvas too),
+// its opacity, its blend key's mode (the list below), visibility (flags
+// bit 1), alpha lock ("transparency protected", flags bit 0) and clipping
+// (inherit alpha); its name from its "luni" block (UTF-16) or else its
+// Pascal name (Latin-1). Groups come from "lsct" blocks: the records go
+// from the lowest to the topmost, a group's divider (3) below its layers
+// and the group's own record (1 open, 2 closed: folded) above them, its
+// mode "pass" a pass-through group. Channels: red, green, blue (grey),
+// alpha (-1); user masks (-2) and others are passed over. Raw and
+// PackBits channel data are read, ZIP (2, 3) is not (such a channel stays
+// empty and the report's `skipped` is set). A file without layers is the
+// merged image as one layer "Background" (alpha from its fourth channel,
+// a grey one's second). Not read: 16-bit layers kept in an "Lr16" block
+// (the merged image is read then), layer masks, effects, text, smart
+// objects, adjustment layers (these come as the pixels they hold).
+//
+// Writing: 8-bit RGB with alpha: a record for every layer from the
+// lowest up (groups as divider, layers, group record with "lsct"; a
+// pass-through group's key "pass"), each layer's four channels (alpha,
+// red, green, blue) of its exact bounds PackBits-compressed row by row,
+// the name as Pascal name (what is not ASCII as "?") and as "luni"; the
+// merged image (red, green, blue and its alpha, PackBits); the resolution
+// (0x03ED, pixels an inch). A layer of more than LARGEST pixels on a side
+// (or farther from the canvas than ora.FARTHEST) keeps only what is on the
+// canvas, and sets the report's `lossy`. What a PSD has no word for is written as
+// ora.flatten() makes it (filter layers in Normal mode: the composite
+// stays where what is below them is opaque) and sets the report's `lossy`,
+// as does a mode without a blend key (written as "norm").
+//
+// Blend keys (Photoshop's, and Krita's reading of them): norm Normal, diss
+// Dissolve, dark Darken, "mul " Multiply, idiv Color Burn, lbrn Linear
+// Burn, dkCl Darker Color, lite Lighten, scrn Screen, "div " Color Dodge,
+// lddg Linear Dodge (Addition), lgCl Lighter Color, over Overlay, sLit
+// Soft Light (Photoshop), hLit Hard Light, vLit Vivid Light, lLit Linear
+// Light, pLit Pin Light, hMix Hard Mix (Photoshop), diff Difference, smud
+// Exclusion, fsub Subtract, fdiv Divide, "hue " Hue, "sat " Saturation,
+// colr Color, "lum " Luminosity.
+const std = @import("std")
+const png = @import("./png.mlx")
+const ora = @import("./ora.mlx")
+const formats = @import("./formats.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const device_module = @import("../core/device.mlx")
+const node_module = @import("../core/node.mlx")
+const image_module = @import("../core/image.mlx")
+const render = @import("../core/render.mlx")
+const blend = @import("../core/blend.mlx")
+const scratch = @import("../core/scratch.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Report = ora.Report
+
+// The most pixels on a side (Photoshop's own limit for a PSD).
+pub const LARGEST: i64 = 30000
+
+// ---------------------------------------------------------------------------
+// PackBits
+
+// `count` bytes unpacked from `from` at `at.*` into `into`, `at.*` moved
+// past what was read. False when `from` ends first or a run would make
+// more than `count` (what was made stays).
+pub fn unpackBits(from: []const u8, at: *usize, into: [*]u8, count: usize) -> bool {
+    var made: usize = 0
+    var place = at.*
+    while made < count {
+        if place >= from.length { return false }
+        const head = @intCast(usize, from[place])
+        place += 1
+        if head < 128 {
+            const length = head + 1
+            if length > count - made || length > from.length - place { return false }
+            std.mem.copy(into + made, from.pointer + place, length)
+            made += length
+            place += length
+        } else if head > 128 {
+            const length = 257 - head
+            if length > count - made || place >= from.length { return false }
+            std.mem.set(into + made, from[place], length)
+            made += length
+            place += 1
+        }
+    }
+    at.* = place
+    return true
+}
+
+// `count` bytes at `from` packed at the end of `into`: runs of three or
+// more equal bytes as runs, the rest as literal stretches (each at most
+// 128). False without memory.
+pub fn packBits(from: [*]const u8, count: usize, into: *std.ArrayList(u8)) -> bool {
+    var at: usize = 0
+    while at < count {
+        var run: usize = 1
+        while at + run < count && run < 128 && from[at + run] == from[at] { run += 1 }
+        if run >= 3 {
+            if !into.*.append(@intCast(u8, 257 - run)) || !into.*.append(from[at]) { return false }
+            at += run
+            continue
+        }
+        // A literal stretch, up to where a run of three begins.
+        var end = at
+        while end < count && end - at < 128 {
+            if end + 2 < count && from[end] == from[end + 1] && from[end] == from[end + 2] { break }
+            end += 1
+        }
+        if !into.*.append(@intCast(u8, end - at - 1)) || !into.*.appendSlice(from[at..end]) { return false }
+        at = end
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Blend keys
+
+const KEYS: usize = 28
+const BLEND_KEYS = [28]u32{
+    0x6E6F726D, 0x64697373, 0x6461726B, 0x6D756C20, 0x69646976, 0x6C62726E, 0x646B436C,
+    0x6C697465, 0x7363726E, 0x64697620, 0x6C646467, 0x6C67436C, 0x6F766572, 0x734C6974,
+    0x684C6974, 0x764C6974, 0x6C4C6974, 0x704C6974, 0x684D6978, 0x64696666, 0x736D7564,
+    0x66737562, 0x66646976, 0x68756520, 0x73617420, 0x636F6C72, 0x6C756D20, 0x70617373,
+}
+const BLEND_MODES = [28]u16{
+    blend.NORMAL, blend.DISSOLVE, blend.DARKEN, blend.MULTIPLY, blend.BURN, blend.LINEAR_BURN, blend.DARKER_COLOR,
+    blend.LIGHTEN, blend.SCREEN, blend.DODGE, blend.ADDITION, blend.LIGHTER_COLOR, blend.OVERLAY, blend.SOFT_LIGHT_PHOTOSHOP,
+    blend.HARD_LIGHT, blend.VIVID_LIGHT, blend.LINEAR_LIGHT, blend.PIN_LIGHT, blend.HARD_MIX_PHOTOSHOP, blend.DIFFERENCE, blend.EXCLUSION,
+    blend.SUBTRACT, blend.DIVIDE, blend.HUE, blend.SATURATION, blend.COLOR, blend.LUMINOSITY, blend.NORMAL,
+}
+const PASS: u32 = 0x70617373
+const NORM: u32 = 0x6E6F726D
+
+// The mode of a blend key (`known`: whether it is one of the list).
+fn modeOf(key: u32, known: *bool) -> u16 {
+    var index: usize = 0
+    while index < KEYS {
+        if BLEND_KEYS[index] == key {
+            known.* = true
+            return BLEND_MODES[index]
+        }
+        index += 1
+    }
+    known.* = false
+    return blend.NORMAL
+}
+
+// The blend key of a mode ("norm" and `known` false for one without).
+fn keyOf(mode: u16, known: *bool) -> u32 {
+    var index: usize = 0
+    while index + 1 < KEYS {
+        if BLEND_MODES[index] == mode {
+            known.* = true
+            return BLEND_KEYS[index]
+        }
+        index += 1
+    }
+    known.* = false
+    return NORM
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+fn get16(bytes: []const u8, at: usize) -> usize { return @intCast(usize, std.mem.readU16Big(bytes.pointer, at)) }
+fn get32(bytes: []const u8, at: usize) -> usize { return @intCast(usize, std.mem.readU32Big(bytes.pointer, at)) }
+fn getSigned32(bytes: []const u8, at: usize) -> i64 { return @intCast(i64, @bitCast(i32, std.mem.readU32Big(bytes.pointer, at))) }
+
+// What a layer record says, and where its channels are.
+const Record = struct {
+    top: i64
+    left: i64
+    bottom: i64
+    right: i64
+    // Its channels in `channels` (from `first`, `count` of them).
+    first: usize
+    count: usize
+    key: u32
+    opacity: u8
+    clipping: u8
+    flags: u8
+    nameAt: usize
+    nameLength: usize
+    // The "luni" name: where its UTF-16 is and how many units.
+    unicodeAt: usize
+    unicodeLength: usize
+    // "lsct": the kind (0 none) and its blend key (0 none).
+    section: usize
+    sectionKey: u32
+}
+
+const Channel = struct {
+    id: i64
+    // Where its data begins (the compression first) and how long it is.
+    at: usize
+    length: usize
+}
+
+// How a channel's rows are read, a band at a time.
+const Cursor = struct {
+    // The place of the channel's colour in a pixel (16: red, 8: green, 0:
+    // blue, 24: alpha; 32: grey into all three).
+    shift: u32
+    compression: usize
+    // Where the next row's data is, and (PackBits) its count.
+    at: usize
+    countAt: usize
+    end: usize
+}
+
+const Reading = struct {
+    allocator: Allocator
+    bytes: []const u8
+    depth: usize
+    grey: bool
+    records: std.ArrayList(Record)
+    channels: std.ArrayList(Channel)
+    // The groups open now (the divider's group), the root at the bottom.
+    groups: std.ArrayList(*node_module.Node)
+    // A name made UTF-8. (Here, not as a local: a buffer whose slice is
+    // handed on is a new value of the arena at every call.)
+    name: [512]u8
+}
+
+// Latin-1 `from` as UTF-8 into `into` (`capacity` bytes); its length.
+fn latin(from: []const u8, into: [*]u8, capacity: usize) -> usize {
+    var length: usize = 0
+    for byte in from {
+        if byte < 128 {
+            if length + 1 > capacity { break }
+            into[length] = byte
+            length += 1
+        } else {
+            if length + 2 > capacity { break }
+            into[length] = 0xC0 | (byte >> 6)
+            into[length + 1] = 0x80 | (byte & 63)
+            length += 2
+        }
+    }
+    return length
+}
+
+// `units` UTF-16 big-endian units at `at` of `bytes` as UTF-8 into
+// `into`; its length (an unpaired surrogate becomes U+FFFD).
+fn fromUtf16(bytes: []const u8, at: usize, units: usize, into: [*]u8, capacity: usize) -> usize {
+    var length: usize = 0
+    var index: usize = 0
+    while index < units {
+        var code = get16(bytes, at + index * 2)
+        index += 1
+        if code >= 0xD800 && code < 0xDC00 && index < units {
+            const low = get16(bytes, at + index * 2)
+            if low >= 0xDC00 && low < 0xE000 {
+                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                index += 1
+            } else {
+                code = 0xFFFD
+            }
+        } else if code >= 0xD800 && code < 0xE000 {
+            code = 0xFFFD
+        }
+        if code == 0 { continue }
+        const need: usize = if code < 0x80 { 1 } else if code < 0x800 { 2 } else if code < 0x10000 { 3 } else { 4 }
+        if length + need > capacity { break }
+        if need == 1 {
+            into[length] = @intCast(u8, code)
+        } else if need == 2 {
+            into[length] = @intCast(u8, 0xC0 | (code >> 6))
+            into[length + 1] = @intCast(u8, 0x80 | (code & 63))
+        } else if need == 3 {
+            into[length] = @intCast(u8, 0xE0 | (code >> 12))
+            into[length + 1] = @intCast(u8, 0x80 | ((code >> 6) & 63))
+            into[length + 2] = @intCast(u8, 0x80 | (code & 63))
+        } else {
+            into[length] = @intCast(u8, 0xF0 | (code >> 18))
+            into[length + 1] = @intCast(u8, 0x80 | ((code >> 12) & 63))
+            into[length + 2] = @intCast(u8, 0x80 | ((code >> 6) & 63))
+            into[length + 3] = @intCast(u8, 0x80 | (code & 63))
+        }
+        length += need
+    }
+    return length
+}
+
+// The tagged blocks of a record from `at` to `end`.
+fn readBlocks(bytes: []const u8, at: usize, end: usize, record: *Record) -> void {
+    var place = at
+    while place + 12 <= end {
+        const signature = get32(bytes, place)
+        if signature != 0x3842494D && signature != 0x38423634 { return }
+        const key = get32(bytes, place + 4)
+        const length = get32(bytes, place + 8)
+        const data = place + 12
+        if length > end - data { return }
+        if key == 0x6C756E69 && length >= 4 {
+            const units = get32(bytes, data)
+            if units <= (length - 4) / 2 {
+                record.*.unicodeAt = data + 4
+                record.*.unicodeLength = units
+            }
+        } else if (key == 0x6C736374 || key == 0x6C736476) && length >= 4 {
+            record.*.section = get32(bytes, data)
+            if length >= 12 && get32(bytes, data + 4) == 0x3842494D { record.*.sectionKey = @intCast(u32, get32(bytes, data + 8)) }
+        }
+        place = data + length
+    }
+}
+
+// The layer records from `at` (after the count) and where each
+// channel's data is; false when they do not fit in `end`.
+fn readRecords(r: *Reading, at: usize, end: usize, count: usize) -> bool {
+    const bytes = r.*.bytes
+    var place = at
+    var index: usize = 0
+    while index < count {
+        if place + 18 > end { return false }
+        var record: Record = undefined
+        record.top = getSigned32(bytes, place)
+        record.left = getSigned32(bytes, place + 4)
+        record.bottom = getSigned32(bytes, place + 8)
+        record.right = getSigned32(bytes, place + 12)
+        const channels = get16(bytes, place + 16)
+        place += 18
+        if channels > 56 || place + channels * 6 + 16 > end { return false }
+        record.first = r.*.channels.count()
+        record.count = channels
+        var channel: usize = 0
+        while channel < channels {
+            const id = @intCast(i64, @bitCast(i16, std.mem.readU16Big(bytes.pointer, place)))
+            if !r.*.channels.append(Channel.{ .id = id, .at = 0, .length = get32(bytes, place + 2) }) { return false }
+            place += 6
+            channel += 1
+        }
+        if get32(bytes, place) != 0x3842494D { return false }
+        record.key = @intCast(u32, get32(bytes, place + 4))
+        record.opacity = bytes[place + 8]
+        record.clipping = bytes[place + 9]
+        record.flags = bytes[place + 10]
+        const extra = get32(bytes, place + 12)
+        place += 16
+        if extra > end - place { return false }
+        const extra_end = place + extra
+        record.nameAt = 0
+        record.nameLength = 0
+        record.unicodeAt = 0
+        record.unicodeLength = 0
+        record.section = 0
+        record.sectionKey = 0
+        // The mask data and the blending ranges, each with its length.
+        var inner = place
+        var part: usize = 0
+        while part < 2 {
+            if inner + 4 > extra_end { return false }
+            const length = get32(bytes, inner)
+            if length > extra_end - inner - 4 { return false }
+            inner += 4 + length
+            part += 1
+        }
+        if inner < extra_end {
+            const length = @intCast(usize, bytes[inner])
+            if inner + 1 + length > extra_end { return false }
+            record.nameAt = inner + 1
+            record.nameLength = length
+            inner += (1 + length + 3) / 4 * 4
+            if inner < extra_end { readBlocks(bytes, inner, extra_end, &record) }
+        }
+        if !r.*.records.append(record) { return false }
+        place = extra_end
+        index += 1
+    }
+    // The channels' data after the records, in their order.
+    for *channel in r.*.channels.items() {
+        if channel.*.length > end - place { return false }
+        channel.*.at = place
+        place += channel.*.length
+    }
+    return true
+}
+
+// Where a channel of `id` goes in a pixel (false: it is passed over).
+fn shiftOf(id: i64, grey: bool, shift: *u32) -> bool {
+    if id == -1 {
+        shift.* = 24
+    } else if grey && id == 0 {
+        shift.* = 32
+    } else if !grey && id >= 0 && id <= 2 {
+        shift.* = 16 - @intCast(u32, id) * 8
+    } else {
+        return false
+    }
+    return true
+}
+
+// One row of a channel (`width` samples) into `row`; false when its data
+// is damaged.
+fn channelRow(r: *Reading, cursor: *Cursor, width: usize, row: [*]u8) -> bool {
+    const bytes = r.*.bytes
+    const size = width * (r.*.depth / 8)
+    if cursor.*.compression == 0 {
+        if size > cursor.*.end - cursor.*.at { return false }
+        std.mem.copy(row, bytes.pointer + cursor.*.at, size)
+        cursor.*.at += size
+    } else {
+        if cursor.*.countAt + 2 > bytes.length { return false }
+        const length = get16(bytes, cursor.*.countAt)
+        cursor.*.countAt += 2
+        if length > cursor.*.end - cursor.*.at { return false }
+        var at = cursor.*.at
+        if !unpackBits(bytes[0..cursor.*.at + length], &at, row, size) { return false }
+        cursor.*.at += length
+    }
+    return true
+}
+
+// The samples of `row` into the band's pixels at the cursor's place.
+fn mergeRow(row: [*]const u8, width: usize, depth: usize, shift: u32, into: [*]u32) -> void {
+    var x: usize = 0
+    while x < width {
+        var value: u32 = 0
+        if depth == 16 {
+            const wide = (@intCast(u32, row[x * 2]) << 8) | @intCast(u32, row[x * 2 + 1])
+            value = (wide * 255 + 32767) / 65535
+        } else {
+            value = @intCast(u32, row[x])
+        }
+        if shift == 32 {
+            into[x] = (into[x] & 0xFF000000) | (value << 16) | (value << 8) | value
+        } else {
+            into[x] = (into[x] & ~(@intCast(u32, 255) << @intCast(u5, shift))) | (value << @intCast(u5, shift))
+        }
+        x += 1
+    }
+}
+
+// The pixels the cursors read, `width` x `height`, into `device` at
+// (left, top), a band of 64 rows at a time. damaged for data that is.
+fn readPixels(r: *Reading, cursors: [*]Cursor, count: usize, width: usize, height: usize, left: i32, top: i32, device: *device_module.Device) -> formats.Status {
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const band = scratch.words(pool, width * 64)
+    const row = scratch.bytes(pool, width * 2)
+    var status = formats.Status.ok
+    if band == null || row == null { status = formats.Status.noMemory }
+    var y: usize = 0
+    while status == formats.Status.ok && y < height {
+        const rows = if height - y < 64 { height - y } else { 64 }
+        device_module.fillWords(band.?, width * rows, 0xFF000000)
+        var index: usize = 0
+        while status == formats.Status.ok && index < count {
+            var line: usize = 0
+            while line < rows {
+                if !channelRow(r, &cursors[index], width, row.?) {
+                    status = formats.Status.damaged
+                    break
+                }
+                mergeRow(row.?, width, r.*.depth, cursors[index].shift, band.? + line * width)
+                line += 1
+            }
+            index += 1
+        }
+        if status == formats.Status.ok {
+            var picture: png.Picture = undefined
+            picture.pixels = band.?
+            picture.width = width
+            picture.height = rows
+            picture.resolution = 0.0
+            picture.allocator = r.*.allocator
+            if !formats.writePicture(device, &picture, left, top + @intCast(i32, y)) { status = formats.Status.noMemory }
+        }
+        y += rows
+    }
+    scratch.release(pool, mark)
+    return status
+}
+
+// A layer's channels into its device. A channel in ZIP is passed over.
+fn readLayerPixels(r: *Reading, record: *const Record, device: *device_module.Device, report: *Report) -> formats.Status {
+    const width = record.*.right - record.*.left
+    const height = record.*.bottom - record.*.top
+    if width <= 0 || height <= 0 { return formats.Status.ok }
+    if width > LARGEST || height > LARGEST { return formats.Status.tooLarge }
+    if record.*.left < 0 - ora.FARTHEST || record.*.left > ora.FARTHEST || record.*.top < 0 - ora.FARTHEST || record.*.top > ora.FARTHEST { return formats.Status.tooLarge }
+    var cursors: [5]Cursor = undefined
+    var count: usize = 0
+    var index: usize = 0
+    const bytes = r.*.bytes
+    while index < record.*.count && count < 5 {
+        const channel = r.*.channels.items()[record.*.first + index]
+        index += 1
+        var shift: u32 = 0
+        if !shiftOf(channel.id, r.*.grey, &shift) || channel.length < 2 { continue }
+        const compression = get16(bytes, channel.at)
+        if compression > 1 {
+            report.*.skipped = true
+            continue
+        }
+        var at = channel.at + 2
+        const count_at = at
+        if compression == 1 {
+            at += @intCast(usize, height) * 2
+            if at > channel.at + channel.length { return formats.Status.damaged }
+        }
+        cursors[count] = Cursor.{ .shift = shift, .compression = compression, .at = at, .countAt = count_at, .end = channel.at + channel.length }
+        count += 1
+    }
+    // Without an alpha channel the layer is opaque in its rectangle.
+    return readPixels(r, &cursors, count, @intCast(usize, width), @intCast(usize, height), @intCast(i32, record.*.left), @intCast(i32, record.*.top), device)
+}
+
+// A record's name into the node.
+fn nameNode(r: *Reading, record: *const Record, node: *node_module.Node) -> void {
+    const buffer: [*]u8 = &r.*.name
+    var length: usize = 0
+    if record.*.unicodeLength > 0 {
+        length = fromUtf16(r.*.bytes, record.*.unicodeAt, record.*.unicodeLength, buffer, 512)
+    } else {
+        length = latin(r.*.bytes[record.*.nameAt..record.*.nameAt + record.*.nameLength], buffer, 512)
+    }
+    node_module.setName(node, buffer[0..length])
+}
+
+// A record's opacity, mode, flags and name into the node.
+fn propsOf(r: *Reading, record: *const Record, node: *node_module.Node, report: *Report) -> void {
+    nameNode(r, record, node)
+    node.*.opacity = record.*.opacity
+    node.*.inheritAlpha = record.*.clipping != 0
+    node.*.alphaLocked = record.*.flags & 1 != 0
+    node.*.visible = record.*.flags & 2 == 0
+    var key = record.*.key
+    if record.*.sectionKey != 0 { key = record.*.sectionKey }
+    if node.*.kind == node_module.GROUP && key == PASS {
+        node.*.passThrough = true
+        return
+    }
+    var known = false
+    node.*.blend = modeOf(key, &known)
+    if !known { report.*.skipped = true }
+}
+
+// The tree of the records into `image`.
+fn buildTree(r: *Reading, image: *image_module.Image, report: *Report) -> formats.Status {
+    if !r.*.groups.append(image.*.root) { return formats.Status.noMemory }
+    const records = r.*.records.items()
+    var index: usize = 0
+    while index < records.length {
+        const record = &records[index]
+        index += 1
+        const groups = r.*.groups.items()
+        const parent = groups[groups.length - 1]
+        if record.*.section == 3 {
+            const made = ora.newNode(image, node_module.GROUP, "Group")
+            if made == null { return formats.Status.noMemory }
+            if !r.*.groups.append(made.?) {
+                node_module.destroy(made.?)
+                return formats.Status.noMemory
+            }
+            continue
+        }
+        if record.*.section == 1 || record.*.section == 2 {
+            // The group whose divider came below (one without: an empty group).
+            var group: *node_module.Node = undefined
+            if groups.length > 1 {
+                group = r.*.groups.pop().?
+            } else {
+                const made = ora.newNode(image, node_module.GROUP, "Group")
+                if made == null { return formats.Status.noMemory }
+                group = made.?
+            }
+            propsOf(r, record, group, report)
+            group.*.collapsed = record.*.section == 2
+            const outer = r.*.groups.items()
+            if !node_module.insert(outer[outer.length - 1], group, node_module.childCount(outer[outer.length - 1])) {
+                node_module.destroy(group)
+                return formats.Status.noMemory
+            }
+            continue
+        }
+        const made = ora.newNode(image, node_module.PAINT, "Layer")
+        if made == null { return formats.Status.noMemory }
+        if !node_module.insert(parent, made.?, node_module.childCount(parent)) {
+            node_module.destroy(made.?)
+            return formats.Status.noMemory
+        }
+        propsOf(r, record, made.?, report)
+        const status = readLayerPixels(r, record, made.?.*.device.?, report)
+        if status != formats.Status.ok { return status }
+    }
+    // Groups whose own record is missing end where the layers end.
+    while r.*.groups.count() > 1 {
+        const group = r.*.groups.pop().?
+        const outer = r.*.groups.items()
+        if !node_module.insert(outer[outer.length - 1], group, node_module.childCount(outer[outer.length - 1])) {
+            node_module.destroy(group)
+            return formats.Status.noMemory
+        }
+    }
+    return formats.Status.ok
+}
+
+// The merged image (at `at`: its compression, then the channels) as one
+// layer "Background"; `alpha`: its fourth (grey: second) channel is alpha.
+fn readMerged(r: *Reading, image: *image_module.Image, at: usize, channels: usize, alpha: bool) -> formats.Status {
+    const bytes = r.*.bytes
+    if at + 2 > bytes.length { return formats.Status.damaged }
+    const compression = get16(bytes, at)
+    if compression > 1 { return formats.Status.unsupported }
+    const width = @intCast(usize, image.*.width)
+    const height = @intCast(usize, image.*.height)
+    const colours: usize = if r.*.grey { 1 } else { 3 }
+    var used = colours
+    if alpha && channels > colours { used += 1 }
+    var cursors: [4]Cursor = undefined
+    var place = at + 2
+    var count_at = place
+    if compression == 1 {
+        place += channels * height * 2
+        if place > bytes.length { return formats.Status.damaged }
+    }
+    const row_bytes = width * (r.*.depth / 8)
+    var index: usize = 0
+    while index < used {
+        var shift: u32 = if index == colours { 24 } else if r.*.grey { 32 } else { 16 - @intCast(u32, index) * 8 }
+        cursors[index] = Cursor.{ .shift = shift, .compression = compression, .at = place, .countAt = count_at, .end = bytes.length }
+        // The next channel begins where this one's rows end.
+        if compression == 0 {
+            place += row_bytes * height
+        } else {
+            var row: usize = 0
+            while row < height {
+                place += get16(bytes, count_at)
+                count_at += 2
+                row += 1
+            }
+        }
+        if place > bytes.length { return formats.Status.damaged }
+        index += 1
+    }
+    const made = ora.newNode(image, node_module.PAINT, "Background")
+    if made == null { return formats.Status.noMemory }
+    if !node_module.insert(image.*.root, made.?, 0) {
+        node_module.destroy(made.?)
+        return formats.Status.noMemory
+    }
+    return readPixels(r, &cursors, used, width, height, 0, 0, made.?.*.device.?)
+}
+
+// The name of a colour mode not read here.
+fn modeName(mode: usize) -> []const u8 {
+    if mode == 0 { return "Bitmap" }
+    if mode == 2 { return "Indexed" }
+    if mode == 4 { return "CMYK" }
+    if mode == 7 { return "Multichannel" }
+    if mode == 8 { return "Duotone" }
+    if mode == 9 { return "Lab" }
+    return "unknown"
+}
+
+// The resolution from the image resources at `at` (`length` bytes): the
+// horizontal one of 0x03ED, pixels an inch (0 when there is none).
+fn readResolution(bytes: []const u8, at: usize, length: usize) -> f64 {
+    var place = at
+    const end = at + length
+    while place + 12 <= end {
+        const id = get16(bytes, place + 4)
+        const name = @intCast(usize, bytes[place + 6])
+        // The name's length byte and its bytes, padded to an even count.
+        var data = place + 6 + (1 + name + 1) / 2 * 2
+        if data + 4 > end { return 0.0 }
+        const size = get32(bytes, data)
+        data += 4
+        if size > end - data { return 0.0 }
+        // (Pixels an inch whatever unit it names: that is only the one
+        // Photoshop shows.)
+        if id == 0x03ED && size >= 16 { return @floatFromInt(f64, get32(bytes, data)) / 65536.0 }
+        place = data + (size + 1) / 2 * 2
+    }
+    return 0.0
+}
+
+// The Photoshop document `bytes` as an image into `into` (the caller's
+// to destroy after Status.ok; null otherwise). unknownFormat without the
+// signature, unsupported for what is not read here (see the header; the
+// mode's name in `report.space`), damaged for what is cut short or does
+// not add up, tooLarge, noMemory; `report.skipped` for blend keys and
+// channels not read.
+pub fn read(allocator: Allocator, bytes: []const u8, into: *formats.LoadResult, report: *Report) -> formats.Status {
+    ora.clearReport(report)
+    into.*.image = null
+    if bytes.length < 26 || get32(bytes, 0) != 0x38425053 { return formats.Status.unknownFormat }
+    const version = get16(bytes, 4)
+    const channels = get16(bytes, 12)
+    const height = @intCast(i64, get32(bytes, 14))
+    const width = @intCast(i64, get32(bytes, 18))
+    const depth = get16(bytes, 22)
+    const mode = get16(bytes, 24)
+    if version == 2 {
+        ora.noteSpace(report, "PSB")
+        return formats.Status.unsupported
+    }
+    if version != 1 || channels == 0 || channels > 56 { return formats.Status.damaged }
+    if mode != 1 && mode != 3 {
+        ora.noteSpace(report, modeName(mode))
+        return formats.Status.unsupported
+    }
+    if depth != 8 && depth != 16 { return formats.Status.unsupported }
+    if (mode == 3 && channels < 3) || width < 1 || height < 1 { return formats.Status.damaged }
+    if width > LARGEST || height > LARGEST { return formats.Status.tooLarge }
+    // The colour mode data, the resources, the layers: each its length.
+    var at: usize = 26
+    if at + 4 > bytes.length || get32(bytes, at) > bytes.length - at - 4 { return formats.Status.damaged }
+    at += 4 + get32(bytes, at)
+    if at + 4 > bytes.length || get32(bytes, at) > bytes.length - at - 4 { return formats.Status.damaged }
+    var resolution = readResolution(bytes, at + 4, get32(bytes, at))
+    if !(resolution > 0.0) || resolution > 100000.0 { resolution = 72.0 }
+    at += 4 + get32(bytes, at)
+    if at + 4 > bytes.length || get32(bytes, at) > bytes.length - at - 4 { return formats.Status.damaged }
+    const layers_end = at + 4 + get32(bytes, at)
+    const made = image_module.create(allocator, @intCast(i32, width), @intCast(i32, height), resolution)
+    if made == null { return formats.Status.noMemory }
+    const memory = allocator.alloc(@sizeOf(Reading), 16)
+    if memory == null {
+        image_module.destroy(made.?)
+        return formats.Status.noMemory
+    }
+    const r: *Reading = unsafe { @ptrCast(*Reading, memory.?) }
+    r.*.allocator = allocator
+    r.*.bytes = bytes
+    r.*.depth = depth
+    r.*.grey = mode == 1
+    r.*.records = std.ArrayList(Record).init(allocator)
+    r.*.channels = std.ArrayList(Channel).init(allocator)
+    r.*.groups = std.ArrayList(*node_module.Node).init(allocator)
+    var status = formats.Status.ok
+    var layers: usize = 0
+    const colours: usize = if mode == 1 { 1 } else { 3 }
+    var merged_alpha = channels > colours
+    if layers_end - at >= 8 {
+        const info = get32(bytes, at + 4)
+        if info > layers_end - at - 8 {
+            status = formats.Status.damaged
+        } else if info >= 2 {
+            const signed = @intCast(i64, @bitCast(i16, std.mem.readU16Big(bytes.pointer, at + 8)))
+            layers = @intCast(usize, if signed < 0 { 0 - signed } else { signed })
+            merged_alpha = signed < 0 || (merged_alpha && layers == 0)
+            if !readRecords(r, at + 10, at + 8 + info, layers) { status = formats.Status.damaged }
+        }
+    }
+    if status == formats.Status.ok {
+        if layers > 0 {
+            status = buildTree(r, made.?, report)
+        } else {
+            status = readMerged(r, made.?, layers_end, channels, merged_alpha)
+        }
+    }
+    // Groups still open (a failure before their own record) are in no
+    // tree yet: they end here, with the layers in them.
+    while r.*.groups.count() > 1 {
+        const group = r.*.groups.pop().?
+        node_module.destroy(group)
+    }
+    r.*.records.deinit()
+    r.*.channels.deinit()
+    r.*.groups.deinit()
+    allocator.free(memory.?, @sizeOf(Reading), 16)
+    if status != formats.Status.ok {
+        image_module.destroy(made.?)
+        return status
+    }
+    ora.finish(made.?)
+    into.*.image = made
+    return formats.Status.ok
+}
+
+// read() as io/formats.mlx's list calls it.
+pub fn readImage(allocator: Allocator, bytes: []const u8, into: *formats.LoadResult) -> formats.Status {
+    var report: Report = undefined
+    return read(allocator, bytes, into, &report)
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+const Writing = struct {
+    image: *image_module.Image
+    // The records, and the channels' data after them.
+    records: std.ArrayList(u8)
+    data: std.ArrayList(u8)
+    count: usize
+    failed: bool
+    lossy: bool
+    // A name as Pascal text (see Reading's `name`).
+    ascii: [255]u8
+}
+
+fn put16(list: *std.ArrayList(u8), value: usize) -> bool {
+    return list.*.append(@intCast(u8, (value >> 8) & 255)) && list.*.append(@intCast(u8, value & 255))
+}
+
+fn put32(list: *std.ArrayList(u8), value: usize) -> bool {
+    return put16(list, (value >> 16) & 65535) && put16(list, value & 65535)
+}
+
+fn patch32(list: *std.ArrayList(u8), at: usize, value: usize) -> void {
+    std.mem.writeU32Big(list.*.items().pointer, at, @intCast(u32, value & 0xFFFFFFFF))
+}
+
+// The reading of a source for a channel: a device or the composite.
+const Source = struct {
+    device: ?*device_module.Device
+    image: *image_module.Image
+}
+
+fn readSource(source: *const Source, area: geom.Rect, into: [*]u32) -> void {
+    if source.*.device != null {
+        device_module.readRect(source.*.device.?, area, into, @intCast(usize, area.width))
+    } else {
+        render.read(source.*.image, area, into, @intCast(usize, area.width))
+    }
+}
+
+// One channel (the byte at `shift` of each pixel) of `area` of the
+// source, PackBits row by row, at the end of `data`: the rows' counts
+// into `counts` (2 bytes each at `counts_at`, which the caller reserved).
+fn packChannel(source: *const Source, area: geom.Rect, shift: u32, data: *std.ArrayList(u8), counts: *std.ArrayList(u8), counts_at: usize) -> bool {
+    const width = @intCast(usize, area.width)
+    const height = @intCast(usize, area.height)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const band = scratch.words(pool, width * 64)
+    const row = scratch.bytes(pool, width)
+    var ok = band != null && row != null
+    var y: usize = 0
+    while ok && y < height {
+        const rows = if height - y < 64 { height - y } else { 64 }
+        readSource(source, geom.rect(area.x, area.y + @intCast(i32, y), area.width, @intCast(i32, rows)), band.?)
+        var line: usize = 0
+        while ok && line < rows {
+            const from = band.? + line * width
+            var x: usize = 0
+            while x < width {
+                row.?[x] = @intCast(u8, (from[x] >> @intCast(u5, shift)) & 255)
+                x += 1
+            }
+            const before = data.*.count()
+            ok = packBits(row.?, width, data)
+            std.mem.writeU16Big(counts.*.items().pointer, counts_at + (y + line) * 2, @intCast(u16, data.*.count() - before))
+            line += 1
+        }
+        y += rows
+    }
+    scratch.release(pool, mark)
+    return ok
+}
+
+// A record of `name` with `area`, its four channels' lengths, key,
+// opacity, clipping, flags and section (0: none) at the end of records.
+fn putRecord(w: *Writing, name: []const u8, area: geom.Rect, lengths: *const [4]usize, key: u32, opacity: u8, clipping: bool, flags: u8, section: usize, section_key: u32) -> void {
+    const out = &w.*.records
+    // (The edges, signed, as their 32 bits.)
+    var ok = put32(out, @intCast(usize, @bitCast(u32, area.y))) && put32(out, @intCast(usize, @bitCast(u32, area.x)))
+    ok = ok && put32(out, @intCast(usize, @bitCast(u32, area.y + area.height))) && put32(out, @intCast(usize, @bitCast(u32, area.x + area.width)))
+    ok = ok && put16(out, 4)
+    ok = ok && put16(out, 0xFFFF) && put32(out, lengths.*[0]) && put16(out, 0) && put32(out, lengths.*[1]) && put16(out, 1) && put32(out, lengths.*[2]) && put16(out, 2) && put32(out, lengths.*[3])
+    ok = ok && put32(out, 0x3842494D) && put32(out, @intCast(usize, key)) && out.*.append(opacity) && out.*.append(if clipping { 1 } else { 0 }) && out.*.append(flags) && out.*.append(0)
+    // The extra data's length (filled in at the end), no mask data, no
+    // blending ranges.
+    const extra_at = out.*.count()
+    ok = ok && put32(out, 0) && put32(out, 0) && put32(out, 0)
+    // The Pascal name: ASCII, what is not "?", padded to four bytes.
+    const ascii: [*]u8 = &w.*.ascii
+    var length: usize = 0
+    var index: usize = 0
+    while index < name.length && length < 255 {
+        const byte = name[index]
+        if byte < 128 {
+            ascii[length] = byte
+            length += 1
+        } else if byte >= 0xC0 {
+            ascii[length] = 63
+            length += 1
+        }
+        index += 1
+    }
+    ok = ok && out.*.append(@intCast(u8, length)) && out.*.appendSlice(ascii[0..length])
+    var padding = (4 - (1 + length) % 4) % 4
+    while ok && padding > 0 {
+        ok = out.*.append(0)
+        padding -= 1
+    }
+    // luni: the name in UTF-16, padded to four bytes.
+    const luni_at = out.*.count()
+    ok = ok && put32(out, 0x3842494D) && put32(out, 0x6C756E69) && put32(out, 0) && put32(out, 0)
+    var units: usize = 0
+    index = 0
+    while ok && index < name.length {
+        var code = @intCast(usize, name[index])
+        var need: usize = 1
+        if code >= 0xF0 {
+            need = 4
+            code &= 7
+        } else if code >= 0xE0 {
+            need = 3
+            code &= 15
+        } else if code >= 0xC0 {
+            need = 2
+            code &= 31
+        } else if code >= 0x80 {
+            code = 0xFFFD
+        }
+        var follow: usize = 1
+        while follow < need {
+            if index + follow < name.length { code = (code << 6) | (@intCast(usize, name[index + follow]) & 63) }
+            follow += 1
+        }
+        index += need
+        if code >= 0x10000 && code < 0x110000 {
+            ok = put16(out, 0xD800 + ((code - 0x10000) >> 10)) && put16(out, 0xDC00 + ((code - 0x10000) & 1023))
+            units += 2
+        } else {
+            ok = put16(out, if code >= 0x110000 { 0xFFFD } else { code })
+            units += 1
+        }
+    }
+    while ok && (out.*.count() - luni_at - 12) % 4 != 0 { ok = out.*.append(0) }
+    if ok {
+        patch32(out, luni_at + 8, out.*.count() - luni_at - 12)
+        patch32(out, luni_at + 12, units)
+    }
+    if section != 0 {
+        ok = ok && put32(out, 0x3842494D) && put32(out, 0x6C736374) && put32(out, 12) && put32(out, section) && put32(out, 0x3842494D) && put32(out, @intCast(usize, section_key))
+    }
+    if ok { patch32(out, extra_at, out.*.count() - extra_at - 4) }
+    if !ok { w.*.failed = true }
+    w.*.count += 1
+}
+
+// The four channels of `area` of a device (alpha, red, green, blue) at
+// the end of the data; their lengths into `lengths`.
+fn putChannels(w: *Writing, source: *const Source, area: geom.Rect, lengths: *[4]usize) -> void {
+    const shifts = [4]u32{ 24, 16, 8, 0 }
+    var index: usize = 0
+    while index < 4 && !w.*.failed {
+        const start = w.*.data.count()
+        if geom.isEmpty(area) {
+            w.*.failed = !put16(&w.*.data, 0)
+        } else {
+            const counts_at = start + 2
+            w.*.failed = !put16(&w.*.data, 1) || !w.*.data.appendNTimes(0, @intCast(usize, area.height) * 2)
+            if !w.*.failed { w.*.failed = !packChannel(source, area, shifts[index], &w.*.data, &w.*.data, counts_at) }
+        }
+        lengths.*[index] = w.*.data.count() - start
+        index += 1
+    }
+}
+
+fn flagsOf(node: *node_module.Node, group: bool) -> u8 {
+    var flags: u8 = 0
+    if node.*.alphaLocked { flags |= 1 }
+    if !node.*.visible { flags |= 2 }
+    // Photoshop 5 on: bit 4 says whether the pixels count; a group's do not.
+    if group { flags |= 24 }
+    return flags
+}
+
+// What of a layer's `exact` bounds a record holds: all of it when read()
+// takes it (at most LARGEST on a side, its corner at most ora.FARTHEST
+// from the canvas), else what is on the canvas (and the file is lossy).
+fn keptArea(w: *Writing, exact: geom.Rect) -> geom.Rect {
+    const width = @intCast(i64, exact.width)
+    const height = @intCast(i64, exact.height)
+    const x = @intCast(i64, exact.x)
+    const y = @intCast(i64, exact.y)
+    if width <= LARGEST && height <= LARGEST && x >= 0 - ora.FARTHEST && x <= ora.FARTHEST && y >= 0 - ora.FARTHEST && y <= ora.FARTHEST { return exact }
+    w.*.lossy = true
+    return geom.intersect(exact, image_module.bounds(w.*.image))
+}
+
+fn writeLayers(w: *Writing, group: *node_module.Node) -> void {
+    for child in group.*.children.items() {
+        if w.*.failed { return }
+        if node_module.isMask(child.*.kind) { continue }
+        var empty_lengths = [4]usize{ 2, 2, 2, 2 }
+        const composite = Source.{ .device = null, .image = w.*.image }
+        if child.*.kind == node_module.GROUP && !ora.hasMasks(child) {
+            putChannels(w, &composite, geom.empty(), &empty_lengths)
+            putRecord(w, "</Layer group>", geom.empty(), &empty_lengths, NORM, 255, false, 24, 3, 0)
+            writeLayers(w, child)
+            var known = true
+            var key = PASS
+            if !child.*.passThrough { key = keyOf(child.*.blend, &known) }
+            if !known || child.*.locked { w.*.lossy = true }
+            putChannels(w, &composite, geom.empty(), &empty_lengths)
+            putRecord(w, node_module.nameOf(child), geom.empty(), &empty_lengths, key, child.*.opacity, child.*.inheritAlpha, flagsOf(child, true), if child.*.collapsed { 2 } else { 1 }, key)
+            continue
+        }
+        var flat: ora.Flat = undefined
+        if !ora.flatten(w.*.image, child, false, &flat) {
+            w.*.failed = true
+            return
+        }
+        if flat.lossy || child.*.locked { w.*.lossy = true }
+        var known = true
+        const key = keyOf(flat.blend, &known)
+        if !known { w.*.lossy = true }
+        const area = keptArea(w, device_module.exactBounds(flat.device.?))
+        var lengths = [4]usize{ 0, 0, 0, 0 }
+        const pixels = Source.{ .device = flat.device, .image = w.*.image }
+        putChannels(w, &pixels, area, &lengths)
+        putRecord(w, node_module.nameOf(child), area, &lengths, key, flat.opacity, child.*.inheritAlpha, flagsOf(child, false), 0, 0)
+        ora.endFlat(&flat)
+    }
+}
+
+// What `image` holds as a Photoshop document at the end of `into` (see
+// the header); `report.lossy` when something could not be kept. noMemory
+// when memory ran out (`into` is as it was then), tooLarge for an image
+// of more than LARGEST pixels on a side.
+pub fn write(image: *image_module.Image, options: *const formats.SaveOptions, into: *std.ArrayList(u8), report: *Report) -> formats.Status {
+    ora.clearReport(report)
+    if @intCast(i64, image.*.width) > LARGEST || @intCast(i64, image.*.height) > LARGEST { return formats.Status.tooLarge }
+    const allocator = image.*.allocator
+    const memory = allocator.alloc(@sizeOf(Writing), 16)
+    if memory == null { return formats.Status.noMemory }
+    const w: *Writing = unsafe { @ptrCast(*Writing, memory.?) }
+    w.*.image = image
+    w.*.records = std.ArrayList(u8).init(allocator)
+    w.*.data = std.ArrayList(u8).init(allocator)
+    w.*.count = 0
+    w.*.failed = false
+    w.*.lossy = false
+    writeLayers(w, image.*.root)
+    const begun = into.*.count()
+    const out = into
+    // (The count is an i16.)
+    const too_many = w.*.count > 32767
+    var ok = !w.*.failed && !too_many
+    // The header, no colour mode data, the resolution.
+    ok = ok && put32(out, 0x38425053) && put16(out, 1) && put32(out, 0) && put16(out, 0) && put16(out, 4)
+    ok = ok && put32(out, @intCast(usize, image.*.height)) && put32(out, @intCast(usize, image.*.width)) && put16(out, 8) && put16(out, 3) && put32(out, 0)
+    var fixed = image.*.resolution * 65536.0 + 0.5
+    if !(fixed > 0.0) || fixed > 4294967295.0 { fixed = 72.0 * 65536.0 }
+    const resolution = @intFromFloat(usize, fixed)
+    ok = ok && put32(out, 28) && put32(out, 0x3842494D) && put16(out, 0x03ED) && put16(out, 0) && put32(out, 16)
+    ok = ok && put32(out, resolution) && put16(out, 1) && put16(out, 1) && put32(out, resolution) && put16(out, 1) && put16(out, 1)
+    // The layers: their records and data, even in length, no global mask.
+    var info = 2 + w.*.records.count() + w.*.data.count()
+    const padding = info % 2
+    info += padding
+    ok = ok && put32(out, info + 8) && put32(out, info)
+    // A negative count: the first alpha channel is the merged image's.
+    ok = ok && put16(out, @intCast(usize, @bitCast(u16, @intCast(i16, 0 - @intCast(i64, w.*.count)))))
+    ok = ok && out.*.appendSlice(w.*.records.items()) && out.*.appendSlice(w.*.data.items())
+    if padding != 0 { ok = ok && out.*.append(0) }
+    ok = ok && put32(out, 0)
+    // The merged image: red, green, blue, alpha, PackBits.
+    if ok {
+        const height = @intCast(usize, image.*.height)
+        ok = put16(out, 1)
+        const counts_at = out.*.count()
+        ok = ok && out.*.appendNTimes(0, height * 8)
+        const shifts = [4]u32{ 16, 8, 0, 24 }
+        const composite = Source.{ .device = null, .image = image }
+        var channel: usize = 0
+        while ok && channel < 4 {
+            ok = packChannel(&composite, image_module.bounds(image), shifts[channel], out, out, counts_at + channel * height * 2)
+            channel += 1
+        }
+    }
+    report.*.lossy = w.*.lossy
+    w.*.records.deinit()
+    w.*.data.deinit()
+    allocator.free(memory.?, @sizeOf(Writing), 16)
+    if !ok {
+        _ = into.*.resize(begun)
+        return if too_many { formats.Status.tooLarge } else { formats.Status.noMemory }
+    }
+    return formats.Status.ok
+}
+
+// write() as io/formats.mlx's list calls it.
+pub fn writeImage(image: *image_module.Image, options: *const formats.SaveOptions, into: *std.ArrayList(u8)) -> formats.Status {
+    var report: Report = undefined
+    return write(image, options, into, &report)
+}

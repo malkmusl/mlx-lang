@@ -1,0 +1,668 @@
+// nebula ui: marks over the canvas: what a tool shows while it works (the
+// rectangle being dragged, a transform's handles, the brush's outline),
+// given in the IMAGE's coordinates and drawn onto the window, one window
+// pixel wide whatever the zoom, turned and mirrored as the view is, and
+// never outside the canvas area. A tool's overlay function (state.Tool's
+// `overlay`, called by ui/canvasview.mlx after the image is drawn) starts
+// with begin() and draws:
+//
+//     fn overlay(app: *App, canvas: *Canvas) -> void {
+//         const marks = overlay.begin(app, canvas)
+//         overlay.rect(&marks, 40.0, 30.0, 200.0, 120.0)
+//         overlay.handle(&marks, 40.0, 30.0, overlay.SQUARE, false)
+//         overlay.label(&marks, 240.0, 150.0, "200 x 120")
+//     }
+//
+// A mark must show on any picture, so a stroke is a light line with a
+// dark one beside it (below a level line, right of an upright one), and
+// the dashed ones are black and white in turn. Lines along the pixel grid
+// are drawn sharp, in the row or column their coordinate lies in; all
+// others are anti-aliased.
+//
+// Everything goes through one writer of pixels, which keeps to the
+// painter's clip, does nothing on a canvas without pixels (a layout pass,
+// a GPU's canvas) and adds what it drew to the painter's `bounds`: that
+// is how the canvas view knows what to paint over again when the marks
+// move (canvasview.refresh). The view draws its own decorations with it
+// too: the selection's marching ants, the grid, the guides
+// (antsLine, plainLine, painter).
+//
+// Lines stay one pixel of the device at every scale of the theme; the
+// sizes of handles, crosses, dashes and labels grow with it.
+const ui = @import("std.ui")
+const math = @import("std.math")
+const canvas_module = @import("std.ui.canvas")
+const text_module = @import("std.ui.text")
+const state = @import("../app/state.mlx")
+const viewport = @import("./viewport.mlx")
+const geom = @import("../core/geom.mlx")
+
+pub const App = state.App
+pub const Canvas = state.Canvas
+pub const Text = state.Text
+pub const View = viewport.View
+
+// Shapes of a handle.
+pub const SQUARE: u8 = 0
+pub const ROUND: u8 = 1
+pub const DIAMOND: u8 = 2
+
+// What a stroke is drawn with: the light line, the dark one beside it,
+// black and white dashes counted along the stroke, the same moved on by
+// the painter's phase (they march), one given colour.
+const INK_LIGHT: u8 = 0
+const INK_DARK: u8 = 1
+const INK_DASH: u8 = 2
+const INK_ANTS: u8 = 3
+const INK_PLAIN: u8 = 4
+
+const WHITE: u32 = 0xFFFFFFFF
+const BLACK: u32 = 0xFF000000
+// The dark line: black, a little of the picture still showing through
+// (premultiplied).
+const SHADE: u32 = 0xD2000000
+// A dash's length, a handle's reach from its middle, a cross's arm
+// (window pixels at scale 1).
+const DASH: i32 = 4
+const HANDLE: i32 = 3
+const ARM: i32 = 5
+// Coordinates beyond this are taken as this (a line may come from far
+// outside the window).
+const FAR: f64 = 10000000.0
+// A line that leaves its row or column by less than this is drawn in it.
+const STRAIGHT: f64 = 0.001
+// A coordinate this close below a pixel's edge counts as on it (points
+// that are whole numbers but for the arithmetic's last bit).
+const SNAP: f64 = 0.001
+
+// Where marks go: a canvas, how the view maps the image onto it, and the
+// rectangle they keep to. Made by begin() (a tool's) or painter().
+pub const Painter = struct {
+    canvas: *Canvas
+    // The view (ui/viewport.mlx's arithmetic): the image point in the
+    // middle, the zoom, the turn's cosine and sine, -1 for a mirrored
+    // view (else 1), and where on the canvas the middle is.
+    centerX: f64
+    centerY: f64
+    zoom: f64
+    cos: f64
+    sin: f64
+    side: f64
+    middleX: f64
+    middleY: f64
+    // The window pixel the canvas's first one is (0, 0 for the window's
+    // own canvas).
+    originX: i32
+    originY: i32
+    // Nothing is drawn outside these canvas pixels (left and top
+    // inclusive, right and bottom not).
+    left: i32
+    top: i32
+    right: i32
+    bottom: i32
+    // False: nothing is drawn at all.
+    live: bool
+    // What is drawn is added to this rectangle of window pixels.
+    bounds: ?*ui.Rect
+    // The marching ants' step.
+    phase: i32
+    scale: i32
+    // An active handle's colour, the labels' font.
+    accent: u32
+    font: ?*Text
+}
+
+// What the canvas view and the tools' painters share (the app's slot
+// SLOT_CANVAS): the rectangle of the window marks may go to now and what
+// they covered since the view last asked; and, for ui/canvasview.mlx
+// alone, the view record it showed last and the marks of a part that is
+// not a tool.
+pub const Shared = struct {
+    ready: bool
+    clip: ui.Rect
+    bounds: ui.Rect
+    front: usize
+    extra: ?state.ToolOverlay
+}
+
+// The shared record (null without memory).
+pub fn shared(app: *App) -> ?*Shared {
+    const memory = state.slot(app, state.SLOT_CANVAS, @sizeOf(Shared))
+    if memory == null { return null }
+    const record: *Shared = unsafe { @ptrCast(*Shared, memory.?) }
+    if !record.*.ready {
+        record.*.clip = ui.rect(0, 0, 0, 0)
+        record.*.bounds = ui.rect(0, 0, 0, 0)
+        record.*.front = 0
+        record.*.extra = null
+        record.*.ready = true
+    }
+    return record
+}
+
+fn usable(value: f64) -> bool { return value > -1.0e12 && value < 1.0e12 }
+
+fn held(value: f64) -> f64 {
+    return if value < -FAR { -FAR } else if value > FAR { FAR } else { value }
+}
+
+// The pixel row or column a coordinate lies in.
+fn pixelOf(value: f64) -> i32 {
+    return @intFromFloat(i32, @floor(held(value) + SNAP))
+}
+
+fn smaller(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+fn larger(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+fn distance(a: i32, b: i32) -> i32 { return if a > b { a - b } else { b - a } }
+
+// A painter onto `canvas`, whose pixel (0, 0) is the window's
+// (origin_x, origin_y), for `view`, keeping to `clip` (window pixels)
+// and adding what it draws to `bounds` (null: to nothing).
+pub fn painter(canvas: *Canvas, view: *const View, origin_x: i32, origin_y: i32, clip: ui.Rect, bounds: ?*ui.Rect) -> Painter {
+    const whole = ui.rect(origin_x, origin_y, @intCast(i32, canvas.*.width), @intCast(i32, canvas.*.height))
+    const kept = ui.intersect(clip, whole)
+    const zoom = view.*.zoom
+    return Painter.{
+        .canvas = canvas,
+        .centerX = view.*.centerX,
+        .centerY = view.*.centerY,
+        .zoom = zoom,
+        .cos = math.cos(view.*.rotation),
+        .sin = math.sin(view.*.rotation),
+        .side = if view.*.mirror { -1.0 } else { 1.0 },
+        .middleX = @floatFromInt(f64, view.*.area.x - origin_x) + @floatFromInt(f64, view.*.area.width) / 2.0,
+        .middleY = @floatFromInt(f64, view.*.area.y - origin_y) + @floatFromInt(f64, view.*.area.height) / 2.0,
+        .originX = origin_x,
+        .originY = origin_y,
+        .left = kept.x - origin_x,
+        .top = kept.y - origin_y,
+        .right = kept.x + kept.width - origin_x,
+        .bottom = kept.y + kept.height - origin_y,
+        .live = canvas.*.device == 0 && canvas.*.width > 0 && !ui.isEmpty(kept) && usable(zoom) && zoom > 0.0,
+        .bounds = bounds,
+        .phase = 0,
+        .scale = 1,
+        .accent = 0xFF5AA0FF,
+        .font = null,
+    }
+}
+
+// A painter for the marks of a tool over the document in front, on the
+// window's canvas: the first thing a tool's overlay function calls.
+// (Without a document, and on a canvas without pixels, it draws nothing.)
+pub fn begin(app: *App, canvas: *Canvas) -> Painter {
+    const record = shared(app)
+    var view: View = undefined
+    viewport.init(&view, 1, 1)
+    var clip = ui.rect(0, 0, 0, 0)
+    var bounds: ?*ui.Rect = null
+    if record != null && app.*.current < app.*.count && app.*.documents[app.*.current] != null {
+        view = app.*.documents[app.*.current].?.*.view
+        clip = record.?.*.clip
+        bounds = &record.?.*.bounds
+    }
+    var made = painter(canvas, &view, 0, 0, clip, bounds)
+    made.scale = if app.*.scale > 0 { app.*.scale } else { 1 }
+    made.accent = app.*.theme.accent | 0xFF000000
+    if app.*.fontsLoaded && app.*.small.loaded { made.font = state.smallOf(app) }
+    return made
+}
+
+// The marching ants step with `phase` (a pixel a step).
+pub fn setPhase(p: *Painter, phase: i32) -> void {
+    p.*.phase = phase
+}
+
+// Where image point (x, y) is on the painter's canvas.
+fn place(p: *const Painter, x: f64, y: f64, cx: *f64, cy: *f64) -> void {
+    const dx = (x - p.*.centerX) * p.*.side
+    const dy = y - p.*.centerY
+    cx.* = (dx * p.*.cos - dy * p.*.sin) * p.*.zoom + p.*.middleX
+    cy.* = (dx * p.*.sin + dy * p.*.cos) * p.*.zoom + p.*.middleY
+}
+
+// What was drawn in these canvas pixels counts for the bounds.
+fn note(p: *const Painter, x: i32, y: i32, width: i32, height: i32) -> void {
+    if p.*.bounds == null { return }
+    const x0 = larger(x, p.*.left)
+    const y0 = larger(y, p.*.top)
+    const x1 = smaller(x + width, p.*.right)
+    const y1 = smaller(y + height, p.*.bottom)
+    if x1 <= x0 || y1 <= y0 { return }
+    const target = p.*.bounds.?
+    target.* = geom.unite(target.*, ui.rect(x0 + p.*.originX, y0 + p.*.originY, x1 - x0, y1 - y0))
+}
+
+// One pixel: `color` (premultiplied) over it at `coverage`.
+inline fn put(p: *const Painter, i: i32, j: i32, color: u32, coverage: u32) -> void {
+    if i < p.*.left || j < p.*.top || i >= p.*.right || j >= p.*.bottom || coverage == 0 { return }
+    const at = @intCast(usize, j) * p.*.canvas.*.stride + @intCast(usize, i)
+    const pixels = p.*.canvas.*.pixels
+    if coverage >= 255 && color >> 24 == 255 {
+        pixels[at] = color
+    } else {
+        pixels[at] = canvas_module.over(pixels[at], color, if coverage > 255 { 255 } else { coverage })
+    }
+}
+
+// The colour of the `along`-th pixel of a stroke.
+inline fn inkAt(p: *const Painter, ink: u8, color: u32, along: i32) -> u32 {
+    if ink == INK_LIGHT { return WHITE }
+    if ink == INK_DARK { return SHADE }
+    if ink == INK_PLAIN { return color }
+    const dash = DASH * p.*.scale
+    var at = along
+    if ink == INK_ANTS { at -= p.*.phase }
+    var within = at % (dash * 2)
+    if within < 0 { within += dash * 2 }
+    return if within < dash { BLACK } else { WHITE }
+}
+
+// The pixels `first` to `last` of row `row` (`from`: where the stroke
+// began, for its dashes).
+fn levelRun(p: *const Painter, row: i32, first: i32, last: i32, ink: u8, color: u32, from: i32, at: i32) -> void {
+    note(p, first, row, last - first + 1, 1)
+    if row < p.*.top || row >= p.*.bottom { return }
+    const end = smaller(last, p.*.right - 1)
+    var i = larger(first, p.*.left)
+    const line = p.*.canvas.*.pixels + @intCast(usize, row) * p.*.canvas.*.stride
+    while i <= end {
+        const shown = inkAt(p, ink, color, distance(i, from) + at)
+        const index = @intCast(usize, i)
+        if shown >> 24 == 255 { line[index] = shown } else { line[index] = canvas_module.over(line[index], shown, 255) }
+        i += 1
+    }
+}
+
+// The pixels `first` to `last` of column `column`.
+fn uprightRun(p: *const Painter, column: i32, first: i32, last: i32, ink: u8, color: u32, from: i32, at: i32) -> void {
+    note(p, column, first, 1, last - first + 1)
+    if column < p.*.left || column >= p.*.right { return }
+    const end = smaller(last, p.*.bottom - 1)
+    var j = larger(first, p.*.top)
+    const stride = p.*.canvas.*.stride
+    const pixels = p.*.canvas.*.pixels
+    while j <= end {
+        const shown = inkAt(p, ink, color, distance(j, from) + at)
+        const index = @intCast(usize, j) * stride + @intCast(usize, column)
+        if shown >> 24 == 255 { pixels[index] = shown } else { pixels[index] = canvas_module.over(pixels[index], shown, 255) }
+        j += 1
+    }
+}
+
+// A stroke from (x0, y0) to (x1, y1) of the canvas (pixel (i, j) is the
+// square from (i, j) to (i + 1, j + 1)), one pixel wide. `at`: how many
+// pixels of a dashed stroke came before it.
+fn stroke(p: *const Painter, x0: f64, y0: f64, x1: f64, y1: f64, ink: u8, color: u32, at: i32) -> void {
+    if !p.*.live || !usable(x0) || !usable(y0) || !usable(x1) || !usable(y1) { return }
+    const dx = x1 - x0
+    const dy = y1 - y0
+    // The dark line lies one pixel beside the light one, across the
+    // stroke's main direction.
+    const shift: i32 = if ink == INK_DARK { 1 } else { 0 }
+    if math.abs(dy) < STRAIGHT {
+        levelRun(p, pixelOf(y0) + shift, pixelOf(math.min(x0, x1)), pixelOf(math.max(x0, x1)), ink, color, pixelOf(x0), at)
+        return
+    }
+    if math.abs(dx) < STRAIGHT {
+        uprightRun(p, pixelOf(x0) + shift, pixelOf(math.min(y0, y1)), pixelOf(math.max(y0, y1)), ink, color, pixelOf(y0), at)
+        return
+    }
+    const low_x = pixelOf(math.min(x0, x1))
+    const low_y = pixelOf(math.min(y0, y1))
+    note(p, low_x - 1, low_y - 1, pixelOf(math.max(x0, x1)) - low_x + 4, pixelOf(math.max(y0, y1)) - low_y + 4)
+    if math.abs(dx) >= math.abs(dy) {
+        // A column at a time: the pixels whose middle the stroke passes,
+        // the line's place between two rows shared out between them.
+        const slope = dy / dx
+        const first = math.max(@ceil(held(math.min(x0, x1)) - 0.5), @floatFromInt(f64, p.*.left))
+        const last = math.min(@ceil(held(math.max(x0, x1)) - 0.5) - 1.0, @floatFromInt(f64, p.*.right - 1))
+        if last < first { return }
+        const from = pixelOf(x0)
+        const end = @intFromFloat(i32, last)
+        var i = @intFromFloat(i32, first)
+        while i <= end {
+            const across = held(y0 + (@floatFromInt(f64, i) + 0.5 - x0) * slope - 0.5)
+            const base = @floor(across)
+            const j = @intFromFloat(i32, base) + shift
+            const second = @intFromFloat(u32, (across - base) * 255.0 + 0.5)
+            const shown = inkAt(p, ink, color, distance(i, from) + at)
+            put(p, i, j, shown, 255 - second)
+            put(p, i, j + 1, shown, second)
+            i += 1
+        }
+    } else {
+        const slope = dx / dy
+        const first = math.max(@ceil(held(math.min(y0, y1)) - 0.5), @floatFromInt(f64, p.*.top))
+        const last = math.min(@ceil(held(math.max(y0, y1)) - 0.5) - 1.0, @floatFromInt(f64, p.*.bottom - 1))
+        if last < first { return }
+        const from = pixelOf(y0)
+        const end = @intFromFloat(i32, last)
+        var j = @intFromFloat(i32, first)
+        while j <= end {
+            const across = held(x0 + (@floatFromInt(f64, j) + 0.5 - y0) * slope - 0.5)
+            const base = @floor(across)
+            const i = @intFromFloat(i32, base) + shift
+            const second = @intFromFloat(u32, (across - base) * 255.0 + 0.5)
+            const shown = inkAt(p, ink, color, distance(j, from) + at)
+            put(p, i, j, shown, 255 - second)
+            put(p, i + 1, j, shown, second)
+            j += 1
+        }
+    }
+}
+
+// A stroke between two image points (`at`: where in its dashes it
+// starts).
+fn edge(p: *const Painter, x0: f64, y0: f64, x1: f64, y1: f64, ink: u8, color: u32, at: i32) -> void {
+    var ax: f64 = 0.0
+    var ay: f64 = 0.0
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    place(p, x0, y0, &ax, &ay)
+    place(p, x1, y1, &bx, &by)
+    stroke(p, ax, ay, bx, by, ink, color, at)
+}
+
+// ---------------------------------------------------------------------------
+// Lines and shapes by the image's coordinates
+
+// A line from image point (x0, y0) to (x1, y1).
+pub fn line(p: *const Painter, x0: f64, y0: f64, x1: f64, y1: f64) -> void {
+    edge(p, x0, y0, x1, y1, INK_DARK, 0, 0)
+    edge(p, x0, y0, x1, y1, INK_LIGHT, 0, 0)
+}
+
+// The same in black and white dashes (what is being dragged out).
+pub fn dashedLine(p: *const Painter, x0: f64, y0: f64, x1: f64, y1: f64) -> void {
+    edge(p, x0, y0, x1, y1, INK_DASH, 0, 0)
+}
+
+fn box(p: *const Painter, x: f64, y: f64, width: f64, height: f64, ink: u8) -> void {
+    edge(p, x, y, x + width, y, ink, 0, 0)
+    edge(p, x + width, y, x + width, y + height, ink, 0, 0)
+    edge(p, x + width, y + height, x, y + height, ink, 0, 0)
+    edge(p, x, y + height, x, y, ink, 0, 0)
+}
+
+// The outline of the image's rectangle (x, y, width, height).
+pub fn rect(p: *const Painter, x: f64, y: f64, width: f64, height: f64) -> void {
+    box(p, x, y, width, height, INK_DARK)
+    box(p, x, y, width, height, INK_LIGHT)
+}
+
+pub fn dashedRect(p: *const Painter, x: f64, y: f64, width: f64, height: f64) -> void {
+    box(p, x, y, width, height, INK_DASH)
+}
+
+fn path(p: *const Painter, cx: f64, cy: f64, points: [*]const f64, count: usize, closed: bool, ink: u8) -> void {
+    var first_x: f64 = 0.0
+    var first_y: f64 = 0.0
+    place(p, cx + points[0], cy + points[1], &first_x, &first_y)
+    var before_x = first_x
+    var before_y = first_y
+    var index: usize = 1
+    while index < count {
+        var x: f64 = 0.0
+        var y: f64 = 0.0
+        place(p, cx + points[index * 2], cy + points[index * 2 + 1], &x, &y)
+        stroke(p, before_x, before_y, x, y, ink, 0, 0)
+        before_x = x
+        before_y = y
+        index += 1
+    }
+    if closed && count > 2 { stroke(p, before_x, before_y, first_x, first_y, ink, 0, 0) }
+}
+
+// The line through `count` image points (`points`: x and y of each in
+// turn), back to the first when `closed`.
+pub fn polyline(p: *const Painter, points: [*]const f64, count: usize, closed: bool) -> void {
+    if count < 2 || !p.*.live { return }
+    path(p, 0.0, 0.0, points, count, closed, INK_DARK)
+    path(p, 0.0, 0.0, points, count, closed, INK_LIGHT)
+}
+
+// The outline of a shape given around its middle: `count` points (x and
+// y in turn, image pixels from (cx, cy)), closed: a brush tip at the
+// pointer.
+pub fn outline(p: *const Painter, cx: f64, cy: f64, points: [*]const f64, count: usize) -> void {
+    if count < 2 || !p.*.live { return }
+    path(p, cx, cy, points, count, true, INK_DARK)
+    path(p, cx, cy, points, count, true, INK_LIGHT)
+}
+
+// The pixels of row `j` from column `first` to `last` of a ring `radius`
+// around (cx, cy): the light line on the radius, the dark one a pixel
+// further out, each as much as the pixel's middle is near it.
+fn ringSpan(p: *const Painter, j: i32, first: i32, last: i32, cx: f64, dy: f64, radius: f64) -> void {
+    const end = smaller(last, p.*.right - 1)
+    var i = larger(first, p.*.left)
+    while i <= end {
+        const dx = @floatFromInt(f64, i) + 0.5 - cx
+        const out = @sqrt(dx * dx + dy * dy) - radius
+        const dark = 1.0 - math.abs(out - 1.0)
+        const light = 1.0 - math.abs(out)
+        if dark > 0.0 { put(p, i, j, SHADE, @intFromFloat(u32, dark * 255.0 + 0.5)) }
+        if light > 0.0 { put(p, i, j, WHITE, @intFromFloat(u32, light * 255.0 + 0.5)) }
+        i += 1
+    }
+}
+
+// A circle of `radius` pixels around (cx, cy) of the canvas.
+fn ring(p: *const Painter, cx: f64, cy: f64, given: f64) -> void {
+    if !p.*.live || !usable(cx) || !usable(cy) || !usable(given) { return }
+    const radius = if given < 0.0 { 0.0 } else if given > FAR { FAR } else { given }
+    const outer = radius + 2.0
+    const inner = radius - 1.0
+    const left = pixelOf(cx - outer)
+    const top = pixelOf(cy - outer)
+    note(p, left, top, pixelOf(cx + outer) - left + 1, pixelOf(cy + outer) - top + 1)
+    const end = smaller(pixelOf(cy + outer), p.*.bottom - 1)
+    var j = larger(top, p.*.top)
+    while j <= end {
+        const dy = @floatFromInt(f64, j) + 0.5 - cy
+        const reach_squared = outer * outer - dy * dy
+        if reach_squared > 0.0 {
+            const reach = @sqrt(reach_squared)
+            // Inside the ring nothing is drawn: the row has two parts.
+            var hollow: f64 = 0.0
+            if inner > 0.0 && math.abs(dy) < inner { hollow = @sqrt(inner * inner - dy * dy) }
+            const first = pixelOf(cx - reach)
+            const last = pixelOf(cx + reach)
+            const left_end = pixelOf(cx - hollow)
+            const right_start = pixelOf(cx + hollow)
+            if hollow <= 0.0 || right_start <= left_end + 1 {
+                ringSpan(p, j, first, last, cx, dy, radius)
+            } else {
+                ringSpan(p, j, first, left_end, cx, dy, radius)
+                ringSpan(p, j, right_start, last, cx, dy, radius)
+            }
+        }
+        j += 1
+    }
+}
+
+// A circle of `radius` image pixels around image point (cx, cy): the
+// brush's size at the pointer.
+pub fn circle(p: *const Painter, cx: f64, cy: f64, radius: f64) -> void {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    place(p, cx, cy, &x, &y)
+    ring(p, x, y, radius * p.*.zoom)
+}
+
+fn oval(p: *const Painter, cx: f64, cy: f64, rx: f64, ry: f64, steps: usize, ink: u8) -> void {
+    // The points go round by turning one step at a time.
+    const turn = math.tau / @floatFromInt(f64, steps)
+    const c = math.cos(turn)
+    const s = math.sin(turn)
+    var ux: f64 = 1.0
+    var uy: f64 = 0.0
+    var before_x: f64 = 0.0
+    var before_y: f64 = 0.0
+    place(p, cx + rx, cy, &before_x, &before_y)
+    const first_x = before_x
+    const first_y = before_y
+    var index: usize = 1
+    while index < steps {
+        const nx = ux * c - uy * s
+        uy = ux * s + uy * c
+        ux = nx
+        var x: f64 = 0.0
+        var y: f64 = 0.0
+        place(p, cx + rx * ux, cy + ry * uy, &x, &y)
+        stroke(p, before_x, before_y, x, y, ink, 0, 0)
+        before_x = x
+        before_y = y
+        index += 1
+    }
+    stroke(p, before_x, before_y, first_x, first_y, ink, 0, 0)
+}
+
+// An ellipse around image point (cx, cy) with the half axes rx (level)
+// and ry.
+pub fn ellipse(p: *const Painter, cx: f64, cy: f64, rx: f64, ry: f64) -> void {
+    if !p.*.live || !usable(rx) || !usable(ry) { return }
+    const a = math.abs(rx)
+    const b = math.abs(ry)
+    if a == b {
+        circle(p, cx, cy, a)
+        return
+    }
+    // A corner about every three pixels of its way round, at most 720.
+    const around = (a + b) * p.*.zoom * 2.1
+    var steps: usize = 24
+    if around > 72.0 { steps = if around > 2160.0 { 720 } else { @intFromFloat(usize, around / 3.0) } }
+    oval(p, cx, cy, a, b, steps, INK_DARK)
+    oval(p, cx, cy, a, b, steps, INK_LIGHT)
+}
+
+// ---------------------------------------------------------------------------
+// Marks of a fixed size at an image point
+
+// A handle to drag at image point (x, y): 7 window pixels across (at
+// scale 1), white with a dark rim; an `active` one (under the pointer,
+// being dragged) is filled in the theme's accent.
+pub fn handle(p: *const Painter, x: f64, y: f64, kind: u8, active: bool) -> void {
+    if !p.*.live { return }
+    var fx: f64 = 0.0
+    var fy: f64 = 0.0
+    place(p, x, y, &fx, &fy)
+    if !usable(fx) || !usable(fy) { return }
+    const ci = pixelOf(fx)
+    const cj = pixelOf(fy)
+    const reach = HANDLE * p.*.scale
+    const rim = p.*.scale
+    const fill = if active { p.*.accent } else { WHITE }
+    note(p, ci - reach, cj - reach, reach * 2 + 1, reach * 2 + 1)
+    var dj = -reach
+    while dj <= reach {
+        var di = -reach
+        while di <= reach {
+            const ax = if di < 0 { -di } else { di }
+            const ay = if dj < 0 { -dj } else { dj }
+            if kind == ROUND {
+                const from = @sqrt(@floatFromInt(f64, di * di + dj * dj))
+                const whole = @floatFromInt(f64, reach) + 1.0 - from
+                const inside = @floatFromInt(f64, reach - rim) + 1.0 - from
+                if whole > 0.0 { put(p, ci + di, cj + dj, BLACK, if whole >= 1.0 { 255 } else { @intFromFloat(u32, whole * 255.0) }) }
+                if inside > 0.0 { put(p, ci + di, cj + dj, fill, if inside >= 1.0 { 255 } else { @intFromFloat(u32, inside * 255.0) }) }
+            } else if kind == DIAMOND {
+                if ax + ay <= reach { put(p, ci + di, cj + dj, if ax + ay > reach - rim { BLACK } else { fill }, 255) }
+            } else {
+                put(p, ci + di, cj + dj, if ax > reach - rim || ay > reach - rim { BLACK } else { fill }, 255)
+            }
+            di += 1
+        }
+        dj += 1
+    }
+}
+
+// A small upright cross at image point (x, y): a centre, a pivot.
+pub fn cross(p: *const Painter, x: f64, y: f64) -> void {
+    if !p.*.live { return }
+    var fx: f64 = 0.0
+    var fy: f64 = 0.0
+    place(p, x, y, &fx, &fy)
+    if !usable(fx) || !usable(fy) { return }
+    const ci = pixelOf(fx)
+    const cj = pixelOf(fy)
+    const arm = ARM * p.*.scale
+    levelRun(p, cj + 1, ci - arm, ci + arm, INK_DARK, 0, ci, 0)
+    uprightRun(p, ci + 1, cj - arm, cj + arm, INK_DARK, 0, cj, 0)
+    levelRun(p, cj, ci - arm, ci + arm, INK_LIGHT, 0, ci, 0)
+    uprightRun(p, ci, cj - arm, cj + arm, INK_LIGHT, 0, cj, 0)
+}
+
+// `text` on a dark backing beside image point (x, y), below and right of
+// it (moved to stay inside the canvas area): a size while it is dragged.
+// Nothing without a font, or where the area is too small for it.
+pub fn label(p: *const Painter, x: f64, y: f64, text: []const u8) -> void {
+    if !p.*.live || p.*.font == null || text.length == 0 { return }
+    var fx: f64 = 0.0
+    var fy: f64 = 0.0
+    place(p, x, y, &fx, &fy)
+    if !usable(fx) || !usable(fy) { return }
+    const font = p.*.font.?
+    const s = p.*.scale
+    const pad = 6 * s
+    const width = text_module.measure(font, text) + pad * 2
+    const height = font.*.ascent * 3 / 2 + 4 * s
+    if width > p.*.right - p.*.left || height > p.*.bottom - p.*.top { return }
+    var left = pixelOf(fx) + 12 * s
+    var top = pixelOf(fy) + 12 * s
+    if left + width > p.*.right { left = p.*.right - width }
+    if top + height > p.*.bottom { top = p.*.bottom - height }
+    if left < p.*.left { left = p.*.left }
+    if top < p.*.top { top = p.*.top }
+    note(p, left, top, width, height)
+    canvas_module.fillRoundedRect(p.*.canvas, left, top, width, height, 4 * s, canvas_module.color(214, 18, 19, 23))
+    text_module.drawText(p.*.canvas, font, text, left + pad, top + (height - font.*.ascent * 3 / 2) / 2, canvas_module.color(255, 240, 242, 246), width - pad * 2)
+}
+
+// ---------------------------------------------------------------------------
+// Marks by the window's coordinates
+
+// A line between two places of the window (pixel (i, j) is the square
+// from (i, j) to (i + 1, j + 1)).
+pub fn windowLine(p: *const Painter, x0: f64, y0: f64, x1: f64, y1: f64) -> void {
+    const ox = @floatFromInt(f64, p.*.originX)
+    const oy = @floatFromInt(f64, p.*.originY)
+    stroke(p, x0 - ox, y0 - oy, x1 - ox, y1 - oy, INK_DARK, 0, 0)
+    stroke(p, x0 - ox, y0 - oy, x1 - ox, y1 - oy, INK_LIGHT, 0, 0)
+}
+
+fn windowBox(p: *const Painter, x: f64, y: f64, width: f64, height: f64, ink: u8) -> void {
+    stroke(p, x, y, x + width, y, ink, 0, 0)
+    stroke(p, x + width, y, x + width, y + height, ink, 0, 0)
+    stroke(p, x + width, y + height, x, y + height, ink, 0, 0)
+    stroke(p, x, y + height, x, y, ink, 0, 0)
+}
+
+// The outline of a rectangle of the window.
+pub fn windowRect(p: *const Painter, x: f64, y: f64, width: f64, height: f64) -> void {
+    const left = x - @floatFromInt(f64, p.*.originX)
+    const top = y - @floatFromInt(f64, p.*.originY)
+    windowBox(p, left, top, width, height, INK_DARK)
+    windowBox(p, left, top, width, height, INK_LIGHT)
+}
+
+// ---------------------------------------------------------------------------
+// For the canvas view's own decorations
+
+// A piece of the selection's outline between two image points, level or
+// upright in the image and given from its upper or left end: black and
+// white dashes that march as the painter's phase goes on (setPhase). The
+// dashes are counted from the image's corner along x + y, so that the
+// pieces of a staircase go on from each other and every piece has
+// dashes, however the view is turned.
+pub fn antsLine(p: *const Painter, x0: f64, y0: f64, x1: f64, y1: f64) -> void {
+    const start = held((x0 + y0) * p.*.zoom)
+    edge(p, x0, y0, x1, y1, INK_ANTS, 0, @intFromFloat(i32, @floor(start + 0.5)))
+}
+
+// A line between two image points in one colour (premultiplied): a grid
+// line, a guide.
+pub fn plainLine(p: *const Painter, x0: f64, y0: f64, x1: f64, y1: f64, color: u32) -> void {
+    edge(p, x0, y0, x1, y1, INK_PLAIN, color, 0)
+}

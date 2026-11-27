@@ -8,6 +8,9 @@
 #                                       (FIPS 180-4's examples)
 #   tests/350_math_helpers_runtime.mlx  std.math's min, max, clamp,
 #                                       absolute, sqrt and smoothstep
+#   tests/447_math_inverse_runtime.mlx  std.math's sign, lerp, fmod,
+#                                       hypot, the arc and hyperbolic
+#                                       functions and powr
 #   tests/351_random_runtime.mlx        std.random (xoshiro256**'s and
 #                                       splitmix64's reference outputs)
 #   tests/352_terminal_tty_runtime.mlx  std.terminal.tty on a pty of its own
@@ -204,6 +207,7 @@ run 347_base64_runtime "base64, base64url, base32, base32hex, base16 and hex"
 run 348_md5_blake2_runtime "MD5 and BLAKE2b, plain, keyed and in pieces"
 run 349_sha2_runtime "SHA-224 and SHA-384 (and SHA-1, SHA-256, SHA-512)"
 run 350_math_helpers_runtime "min, max, clamp, absolute, sqrt and smoothstep"
+run 447_math_inverse_runtime "sign, lerp, fmod, hypot, atan, atan2, asin, acos, sinh, cosh, tanh and powr: signed zeros, infinities and NaN, values against the correctly rounded doubles, identities over sweeps, fmod against the integers' remainder"
 run 351_random_runtime "getrandom, xoshiro256**, splitmix64 and xorshift64*"
 run 352_terminal_tty_runtime "a pty's size, raw mode and process groups"
 run 353_fs_whole_files_runtime "files read and written whole, mkdir -p and the program's path"
@@ -266,6 +270,7 @@ run 451_kernel_bytes_runtime "the kernel's Bytes.fill and Bytes.copy (block move
 run 453_splash_squeeze_runtime "ignition's frame brought to a narrower display's width (a picture drawn for the screen's shape): means by hand and against whole numbers, parts as the whole, nothing outside their reach"
 run 470_canvas_loops_runtime "std.ui's pixel loops against the plain loops they replace, bit for bit: a colour over a pixel at every coverage and alpha, runs of pixels stored, clear, fills, rounded fills, outlines, scaled images and rows of coverage at chance (sizes 0 and 1, boxes off each edge, both byte orders), text against its glyphs' coverage, text a character to a cell against each character cut to its cell"
 run 471_terminal_cells_runtime "std.ui.terminal draws the cells that changed: after writes, scrolls, clears, the alternate screen, the history, selections, another cursor, resizes and colours at chance the picture is the one drawn whole, the cells drawn are exactly those that changed (after the rows it moved), a line more at the bottom moves the rows and draws that line, nothing changed draws nothing; dim text is the mean of its colour and its background, on white too"
+run 525_std_drawing_arena_runtime "what std runs every frame takes none of the value arena (std.turns) at a call and gives the old bytes and pixels: appendUnsigned, appendSigned and appendHex at every length cut at every capacity; drawText and drawCells on and off the canvas, a line wider than a row of coverage; drawImageRect across its parts; ui.next; a frame of widgets in a clip, a terminal's frames, the file chooser's; the look an app takes every frame (theme.at, std.ui.scheme.glass) with the desktop's colours and without, at every lightness"
 run 457_block_map_runtime "brixfs's map of the blocks in use (a bit a block by words, with the count) against a loop over single bits: runs marked and let go at chance, the first free block, what a second map keeps; the runs of a page"
 run 458_commit_frees_replaced_runtime "how brixfs's store finds its free blocks, on a model with the store's map: commits that let go what they replaced and mark the rewritten files again, snapshots kept, the disk run full: after each step the map is what a walk over every root marks"
 run 441_types_across_import_ring_runtime "records of three modules that import one another naming one another: pointers, records inside, a function type, sizes"

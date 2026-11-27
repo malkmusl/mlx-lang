@@ -1,0 +1,1495 @@
+// nebula core: the bucket. Which pixels belong to the region somebody
+// clicked, found by colour, as a mask (core/mask.mlx) of amounts: what the
+// fill tool then fills, what the contiguous selection tool ("magic wand")
+// makes the selection of, and what enclose-and-fill builds on.
+//
+//     var options = fill.defaults()
+//     options.threshold = 30
+//     const found = fill.region(layer.*.device.?, x, y, image_area, &options, region_mask)
+//     device.begin(layer.*.device.?)
+//     _ = fill.paint(layer.*.device.?, region_mask, found, color, blend.NORMAL, 255, 0, null)
+//     const change = device.commit(layer.*.device.?)
+//
+// `sample` is what the colours are read from: the layer itself, or the
+// image's projection for "sample merged"; the caller chooses. It is only
+// read, and `into`, the mask the caller made, must be another device. A
+// search never leaves `area` (the image's rectangle) and first makes the
+// mask nothing within it; what it returns is the rectangle around all it
+// found (empty: nothing, or no memory, and then the mask is nothing).
+//
+// A pixel belongs to a region by how far its colour is from the reference
+// (difference(): the largest difference of a channel, alpha among them;
+// what is fully transparent has no colour). Up to threshold * softness /
+// 100 away it counts whole (255), from there its amount falls evenly and
+// is nothing just past the threshold: softness 100 is a hard edge. With
+// REFERENCE_BOUNDARY the region is instead everything up to a line of the
+// colour `boundary`: a pixel counts by how far it is from being that.
+//
+// The search goes by rows of pixels (runs), keeps a bit a pixel for the
+// whole area and a list of the rows still to look at in memory that grows:
+// nothing recurses, nothing is limited. A tile of one colour (or none: the
+// device's default) is crossed 64 pixels a step.
+//
+// similar() takes every pixel in range wherever it is, enclosed() the
+// regions that lie inside a shape somebody drew (enclose and fill).
+// paint() and paintPattern() mix a colour or a pattern into a layer where
+// such a mask says, times a selection's.
+//
+// Growing or shrinking (round) and feathering are done afterwards on the
+// bytes of the found region's bounds: the time they take goes with the
+// length of the region's edge times the square of the radius (a feather
+// above 32 pixels: with the bounds' size alone). core/selection.mlx has
+// kernels of the same kind; the two were written at the same time and
+// could share them later.
+//
+// Not here: growing that stops at the darkest pixels (for line art), and
+// regions told apart by more than one device (layers by their colour
+// labels): the caller mixes what it wants looked at into one sample.
+const std = @import("std")
+const math = @import("std.math")
+const device_module = @import("./device.mlx")
+const geom = @import("./geom.mlx")
+const mask = @import("./mask.mlx")
+const pixel = @import("./pixel.mlx")
+const blend = @import("./blend.mlx")
+const scratch = @import("./scratch.mlx")
+
+pub const Device = device_module.Device
+pub const Rect = geom.Rect
+
+// What a pixel is compared with: the colour at the place clicked, or the
+// colour of the line to stop at (`boundary`).
+pub const REFERENCE_SEED: u8 = 0
+pub const REFERENCE_BOUNDARY: u8 = 1
+
+// Which of the regions inside a drawn shape enclosed() takes.
+pub const ALL_REGIONS: u8 = 0
+pub const REGIONS_OF_COLOR: u8 = 1
+pub const TRANSPARENT_REGIONS: u8 = 2
+pub const REGIONS_SURROUNDED_BY: u8 = 3
+
+// How many methods there are.
+pub const METHODS: u8 = 4
+
+// What people read for a method, in English or in German (a number that
+// is no method reads as REGIONS_OF_COLOR, which enclosed() takes it for).
+pub fn methodTitle(method: u8, german: bool) -> []const u8 {
+    if method == ALL_REGIONS { return if german { "Alle Bereiche" } else { "All regions" } }
+    if method == TRANSPARENT_REGIONS { return if german { "Transparente Bereiche" } else { "Transparent regions" } }
+    if method == REGIONS_SURROUNDED_BY { return if german { "Von einer Farbe umschlossene Bereiche" } else { "Regions enclosed by a colour" } }
+    return if german { "Bereiche einer Farbe" } else { "Regions of a colour" }
+}
+
+// The most pixels a region is grown or shrunk by and the largest feather.
+pub const MOST_GROW: i32 = 400
+pub const MOST_FEATHER: f64 = 400.0
+
+pub const Options = struct {
+    // How far a pixel's colour may be from the reference, 0-255.
+    threshold: u32
+    // 0-100: the part of the threshold within which a pixel counts whole
+    // (100: every pixel in the region does).
+    softness: u32
+    // false: every pixel of the area in range, wherever it is.
+    contiguous: bool
+    // Pixels that touch only at a corner are neighbours too.
+    diagonal: bool
+    // REFERENCE_SEED or REFERENCE_BOUNDARY.
+    reference: u8
+    // The colour REFERENCE_BOUNDARY stops at; the colour enclosed() asks
+    // for with REGIONS_OF_COLOR and REGIONS_SURROUNDED_BY.
+    boundary: u32
+    // Pixels the found region is grown (shrunk, below 0) by afterwards.
+    grow: i32
+    // The pixels to either side the found region's edge is blurred over
+    // afterwards (a Gaussian of a third of that as its deviation); 0: not
+    // at all.
+    feather: f64
+    // true: the area's edge is an edge of the region like any other
+    // (shrinking takes from it, feathering fades towards it); false: the
+    // region is taken to go on past the area.
+    stopAtImageEdge: bool
+}
+
+// What the fill tool starts with: a contiguous region of a hard edge
+// within a small threshold of the colour clicked.
+pub fn defaults() -> Options {
+    return Options.{
+        .threshold = 20,
+        .softness = 100,
+        .contiguous = true,
+        .diagonal = false,
+        .reference = REFERENCE_SEED,
+        .boundary = pixel.BLACK,
+        .grow = 0,
+        .feather = 0.0,
+        .stopAtImageEdge = false,
+    }
+}
+
+// How far two colours are apart, 0-255: the largest difference of a
+// channel, alpha among them. A pixel of alpha 0 has no colour: against it
+// only the alpha counts.
+pub inline fn difference(a: u32, b: u32) -> u32 {
+    const aa = a >> 24
+    const ba = b >> 24
+    var most = if aa > ba { aa - ba } else { ba - aa }
+    if aa == 0 || ba == 0 { return most }
+    const ar = (a >> 16) & 255
+    const br = (b >> 16) & 255
+    const red = if ar > br { ar - br } else { br - ar }
+    if red > most { most = red }
+    const ag = (a >> 8) & 255
+    const bg = (b >> 8) & 255
+    const green = if ag > bg { ag - bg } else { bg - ag }
+    if green > most { most = green }
+    const ab = a & 255
+    const bb = b & 255
+    const blue = if ab > bb { ab - bb } else { bb - ab }
+    if blue > most { most = blue }
+    return most
+}
+
+// ---------------------------------------------------------------------------
+// The search
+
+const EVERY: u64 = 0xFFFFFFFFFFFFFFFF
+// Rows to look at the list starts with room for (three numbers each).
+const FIRST_ROWS: usize = 4096
+
+// A search's working memory. Coordinates are the sample's own (the
+// image's less where the device sits), so that a tile is 64 columns from
+// a multiple of 64 and a word of bits is one tile's row.
+const Flood = struct {
+    sample: *Device
+    left: i32
+    top: i32
+    right: i32
+    bottom: i32
+    // The first tile the area touches and how many there are across.
+    tileLeft: i32
+    tileTop: i32
+    across: usize
+    // What is known of each tile: 0 not looked at, (colour << 1) | 1 one
+    // colour all over (no tile there: the default), else where its
+    // pixels are.
+    info: [*]usize
+    // A bit a pixel: taken. `across` words a row of the area.
+    bits: [*]u64
+    words: usize
+    reference: u32
+    // The amount a pixel counts with by its difference from the reference.
+    table: [*]u8
+    // The table holds nothing but 0 and 255.
+    hard: bool
+    // Columns to either side a row's neighbours reach (1: diagonal).
+    reach: i32
+    // The rows still to look at: row, first column, column after the last.
+    list: [*]i32
+    listed: usize
+    room: usize
+    failed: bool
+    // What was taken: how many and the pixels around them.
+    count: u64
+    minX: i32
+    minY: i32
+    maxX: i32
+    maxY: i32
+}
+
+// The bits `from` up to (not with) `to` of a word; 0 <= from < to <= 64.
+inline fn bitsBetween(from: i32, to: i32) -> u64 {
+    return (EVERY >> @intCast(u64, 64 - (to - from))) << @intCast(u64, from)
+}
+
+// Which is the lowest bit of a word that has one.
+inline fn lowest(word: u64) -> i32 {
+    return @intCast(i32, @popCount(~word & (word -% 1)))
+}
+
+inline fn wordOf(f: *Flood, lx: i32, ly: i32) -> usize {
+    return @intCast(usize, ly - f.*.top) * f.*.across + @intCast(usize, (lx >> 6) - f.*.tileLeft)
+}
+
+fn pixelsAt(known: usize) -> [*]const u32 { unsafe { return @ptrFromInt([*]const u32, known) } }
+
+// The amounts by difference: whole up to threshold * softness / 100,
+// falling evenly from there and nothing past the threshold; `stopping`
+// (a boundary colour) turns it over: nothing for the colour itself.
+fn fillTable(table: [*]u8, threshold: u32, softness: u32, stopping: bool) -> bool {
+    const limit = if threshold > 255 { 255 } else { threshold }
+    const whole = limit * (if softness > 100 { 100 } else { softness }) / 100
+    const steps = limit + 1 - whole
+    var hard = true
+    var distance: u32 = 0
+    while distance < 256 {
+        var amount: u32 = 0
+        if distance <= whole {
+            amount = 255
+        } else if distance <= limit {
+            amount = (255 * (limit + 1 - distance) + steps / 2) / steps
+            hard = false
+        }
+        if stopping { amount = 255 - amount }
+        table[@intCast(usize, distance)] = @intCast(u8, amount)
+        distance += 1
+    }
+    return hard
+}
+
+fn forget(f: *Flood) -> void {
+    f.*.count = 0
+    f.*.minX = f.*.right
+    f.*.minY = f.*.bottom
+    f.*.maxX = f.*.left - 1
+    f.*.maxY = f.*.top - 1
+}
+
+// The working memory of a search over `area` of `sample`, out of `pool`
+// (whose mark the caller took and releases; end() first). Null: no memory.
+fn prepare(pool: *scratch.Pool, sample: *Device, area: Rect, options: *const Options, reference: u32, stopping: bool) -> ?*Flood {
+    const memory = scratch.bytes(pool, @sizeOf(Flood))
+    if memory == null { return null }
+    const f: *Flood = unsafe { @ptrCast(*Flood, memory.?) }
+    f.*.sample = sample
+    f.*.left = area.x - sample.*.x
+    f.*.top = area.y - sample.*.y
+    f.*.right = f.*.left + area.width
+    f.*.bottom = f.*.top + area.height
+    f.*.tileLeft = f.*.left >> 6
+    f.*.tileTop = f.*.top >> 6
+    f.*.across = @intCast(usize, ((f.*.right - 1) >> 6) - f.*.tileLeft + 1)
+    const tiles = f.*.across * @intCast(usize, ((f.*.bottom - 1) >> 6) - f.*.tileTop + 1)
+    f.*.words = f.*.across * @intCast(usize, area.height)
+    const info = scratch.bytes(pool, tiles * 8)
+    const bits = scratch.bytes(pool, f.*.words * 8)
+    const table = scratch.bytes(pool, 256)
+    if info == null || bits == null || table == null { return null }
+    std.mem.zero(info.?, tiles * 8)
+    std.mem.zero(bits.?, f.*.words * 8)
+    unsafe {
+        f.*.info = @ptrCast([*]usize, info.?)
+        f.*.bits = @ptrCast([*]u64, bits.?)
+        f.*.list = @ptrFromInt([*]i32, 16)
+    }
+    f.*.table = table.?
+    f.*.reference = reference
+    f.*.hard = fillTable(f.*.table, options.*.threshold, options.*.softness, stopping)
+    f.*.reach = if options.*.diagonal { 1 } else { 0 }
+    f.*.listed = 0
+    f.*.room = 0
+    f.*.failed = false
+    forget(f)
+    return f
+}
+
+// Gives the list of rows back to the heap.
+fn end(f: *Flood) -> void {
+    if f.*.room == 0 { return }
+    unsafe { f.*.sample.*.allocator.free(@ptrCast([*]u8, f.*.list), f.*.room * 12, 16) }
+    f.*.room = 0
+    f.*.listed = 0
+}
+
+// What is known of the sample's tile (tx, ty), looked at when first asked.
+fn tileInfo(f: *Flood, tx: i32, ty: i32) -> usize {
+    const slot = @intCast(usize, ty - f.*.tileTop) * f.*.across + @intCast(usize, tx - f.*.tileLeft)
+    const known = f.*.info[slot]
+    if known != 0 { return known }
+    const pixels = device_module.tileRead(f.*.sample, tx, ty)
+    var found: usize = (@intCast(usize, f.*.sample.*.defaultPixel) << 1) | 1
+    if pixels != null {
+        const first = pixels.?[0]
+        var index: usize = 1
+        while index < device_module.TILE_PIXELS && pixels.?[index] == first { index += 1 }
+        found = if index == device_module.TILE_PIXELS { (@intCast(usize, first) << 1) | 1 } else { @intFromPtr(pixels.?) }
+    }
+    f.*.info[slot] = found
+    return found
+}
+
+fn pixelAt(f: *Flood, lx: i32, ly: i32) -> u32 {
+    const known = tileInfo(f, lx >> 6, ly >> 6)
+    if known & 1 != 0 { return @intCast(u32, known >> 1) }
+    return pixelsAt(known)[@intCast(usize, ((ly & 63) << 6) | (lx & 63))]
+}
+
+inline fn amountOf(f: *Flood, value: u32) -> u32 {
+    return @intCast(u32, f.*.table[@intCast(usize, difference(value, f.*.reference))])
+}
+
+// The column after the run of pixels to take that (lx, ly) is in (the
+// area's right edge at most). A pixel like the one before it is not
+// weighed again.
+fn runEnd(f: *Flood, lx: i32, ly: i32) -> i32 {
+    const reference = f.*.reference
+    const table = f.*.table
+    var same = reference
+    var taken = table[0] != 0
+    var x = lx
+    while x < f.*.right {
+        var stop = (x | 63) + 1
+        if stop > f.*.right { stop = f.*.right }
+        const known = tileInfo(f, x >> 6, ly >> 6)
+        if known & 1 != 0 {
+            if table[@intCast(usize, difference(@intCast(u32, known >> 1), reference))] == 0 { return x }
+        } else {
+            const row = pixelsAt(known) + @intCast(usize, (ly & 63) << 6)
+            var column = x & 63
+            const last = column + (stop - x)
+            while column < last {
+                const value = row[@intCast(usize, column)]
+                if value != same {
+                    same = value
+                    taken = table[@intCast(usize, difference(value, reference))] != 0
+                }
+                if !taken { return x - (x & 63) + column }
+                column += 1
+            }
+        }
+        x = stop
+    }
+    return f.*.right
+}
+
+// The first column of the run of pixels to take that (lx, ly) is in.
+fn runStart(f: *Flood, lx: i32, ly: i32) -> i32 {
+    const reference = f.*.reference
+    const table = f.*.table
+    var same = reference
+    var taken = table[0] != 0
+    var x = lx
+    while x > f.*.left {
+        // The tile of the column before, as far as the area has it.
+        const before = x - 1
+        const base = before - (before & 63)
+        const begin = if base < f.*.left { f.*.left } else { base }
+        const known = tileInfo(f, before >> 6, ly >> 6)
+        if known & 1 != 0 {
+            if table[@intCast(usize, difference(@intCast(u32, known >> 1), reference))] == 0 { return x }
+        } else {
+            const row = pixelsAt(known) + @intCast(usize, (ly & 63) << 6)
+            var column = before & 63
+            const first = begin - base
+            while column >= first {
+                const value = row[@intCast(usize, column)]
+                if value != same {
+                    same = value
+                    taken = table[@intCast(usize, difference(value, reference))] != 0
+                }
+                if !taken { return base + column + 1 }
+                column -= 1
+            }
+        }
+        x = begin
+    }
+    return f.*.left
+}
+
+// The first column from `from` up to `to` of row `ly` that is to take and
+// not taken yet (`to`: none).
+fn firstOpen(f: *Flood, ly: i32, from: i32, to: i32) -> i32 {
+    const reference = f.*.reference
+    const table = f.*.table
+    var same = reference
+    var taken = table[0] != 0
+    var x = from
+    while x < to {
+        var stop = (x | 63) + 1
+        if stop > to { stop = to }
+        const base = x - (x & 63)
+        var free = ~f.*.bits[wordOf(f, x, ly)] & bitsBetween(x & 63, stop - base)
+        if free != 0 {
+            const known = tileInfo(f, x >> 6, ly >> 6)
+            if known & 1 != 0 {
+                if table[@intCast(usize, difference(@intCast(u32, known >> 1), reference))] != 0 { return base + lowest(free) }
+            } else {
+                const row = pixelsAt(known) + @intCast(usize, (ly & 63) << 6)
+                while free != 0 {
+                    const column = lowest(free)
+                    const value = row[@intCast(usize, column)]
+                    if value != same {
+                        same = value
+                        taken = table[@intCast(usize, difference(value, reference))] != 0
+                    }
+                    if taken { return base + column }
+                    free &= free - 1
+                }
+            }
+        }
+        x = stop
+    }
+    return to
+}
+
+// Columns `from` up to `to` of row `ly` are taken.
+fn take(f: *Flood, ly: i32, from: i32, to: i32) -> void {
+    var x = from
+    while x < to {
+        var stop = (x | 63) + 1
+        if stop > to { stop = to }
+        const base = x - (x & 63)
+        f.*.bits[wordOf(f, x, ly)] |= bitsBetween(x & 63, stop - base)
+        x = stop
+    }
+    f.*.count += @intCast(u64, to - from)
+    if from < f.*.minX { f.*.minX = from }
+    if to - 1 > f.*.maxX { f.*.maxX = to - 1 }
+    if ly < f.*.minY { f.*.minY = ly }
+    if ly > f.*.maxY { f.*.maxY = ly }
+}
+
+// Row `ly` is to be looked at next to the columns `from` up to `to` of a
+// run just taken, from the first pixel there that is to take: when there
+// is none (the row the run was reached from, a wall) the row is not
+// listed, which keeps the list short.
+fn later(f: *Flood, ly: i32, from: i32, to: i32) -> void {
+    if ly < f.*.top || ly >= f.*.bottom { return }
+    const first = if from - f.*.reach < f.*.left { f.*.left } else { from - f.*.reach }
+    const last = if to + f.*.reach > f.*.right { f.*.right } else { to + f.*.reach }
+    const free = firstOpen(f, ly, first, last)
+    if free >= last { return }
+    if f.*.listed == f.*.room {
+        const allocator = f.*.sample.*.allocator
+        const more = if f.*.room == 0 { FIRST_ROWS } else { f.*.room * 2 }
+        const memory = allocator.alloc(more * 12, 16)
+        if memory == null {
+            f.*.failed = true
+            return
+        }
+        if f.*.room > 0 {
+            unsafe {
+                std.mem.copy(memory.?, @ptrCast([*]const u8, f.*.list), f.*.room * 12)
+                allocator.free(@ptrCast([*]u8, f.*.list), f.*.room * 12, 16)
+            }
+        }
+        unsafe { f.*.list = @ptrCast([*]i32, memory.?) }
+        f.*.room = more
+    }
+    const at = f.*.listed * 3
+    f.*.list[at] = ly
+    f.*.list[at + 1] = free
+    f.*.list[at + 2] = last
+    f.*.listed += 1
+}
+
+// Takes the run (lx, ly) is in, a pixel to take, and notes the rows above
+// and below it. The column after the run.
+fn takeRun(f: *Flood, lx: i32, ly: i32) -> i32 {
+    const from = runStart(f, lx, ly)
+    const to = runEnd(f, lx, ly)
+    take(f, ly, from, to)
+    later(f, ly - 1, from, to)
+    later(f, ly + 1, from, to)
+    return to
+}
+
+// Takes everything connected with (lx, ly), a place of the area: runs
+// whole, and of the rows next to each taken run what touches it, until no
+// row is left to look at. Nothing when the place itself is not to take.
+// (A run is taken whole or not at all, so one that is to take and has a
+// pixel not taken has none taken.)
+fn spread(f: *Flood, lx: i32, ly: i32) -> void {
+    if amountOf(f, pixelAt(f, lx, ly)) == 0 { return }
+    _ = takeRun(f, lx, ly)
+    while f.*.listed > 0 && !f.*.failed {
+        f.*.listed -= 1
+        const at = f.*.listed * 3
+        const row = f.*.list[at]
+        const to = f.*.list[at + 2]
+        var x = f.*.list[at + 1]
+        while true {
+            x = firstOpen(f, row, x, to)
+            if x >= to { break }
+            x = takeRun(f, x, row) + 1
+        }
+    }
+}
+
+// Takes every pixel of the area that is to take, wherever it is.
+fn everywhere(f: *Flood) -> void {
+    var ly = f.*.top
+    while ly < f.*.bottom {
+        var x = f.*.left
+        while true {
+            x = firstOpen(f, ly, x, f.*.right)
+            if x >= f.*.right { break }
+            const to = runEnd(f, x, ly)
+            take(f, ly, x, to)
+            x = to + 1
+        }
+        ly += 1
+    }
+}
+
+// The image's rectangle around what was taken (empty: nothing).
+fn taken(f: *Flood) -> Rect {
+    if f.*.count == 0 { return geom.empty() }
+    return geom.rect(f.*.minX + f.*.sample.*.x, f.*.minY + f.*.sample.*.y, f.*.maxX - f.*.minX + 1, f.*.maxY - f.*.minY + 1)
+}
+
+// `span` bits of row `ly` from column `lx` on, the first one lowest.
+fn rowBits(f: *Flood, lx: i32, ly: i32, span: i32) -> u64 {
+    const at = wordOf(f, lx, ly)
+    const shift = lx & 63
+    var found = f.*.bits[at] >> @intCast(u64, shift)
+    if shift + span > 64 { found |= f.*.bits[at + 1] << @intCast(u64, 64 - shift) }
+    if span < 64 { found &= bitsBetween(0, span) }
+    return found
+}
+
+fn larger(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+fn smaller(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+
+// The amounts of what was taken within `part` (of the image, inside the
+// area) into the mask, tile by tile of the mask's; a tile nothing was
+// taken in is not made. `merge`: an amount there already stays when it is
+// larger. False when memory ran out.
+fn write(f: *Flood, into: *Device, part: Rect, merge: bool) -> bool {
+    if geom.isEmpty(part) { return true }
+    const left = part.x - into.*.x
+    const top = part.y - into.*.y
+    const right = left + part.width
+    const bottom = top + part.height
+    // From the mask's own coordinates to the sample's.
+    const dx = into.*.x - f.*.sample.*.x
+    const dy = into.*.y - f.*.sample.*.y
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * 64)
+        const row1 = smaller(bottom, ty * 64 + 64)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * 64)
+            const span = smaller(right, tx * 64 + 64) - col0
+            var target: ?[*]u32 = null
+            var row = row0
+            while row < row1 {
+                var found = rowBits(f, col0 + dx, row + dy, span)
+                if found != 0 {
+                    if target == null {
+                        target = device_module.tileWrite(into, tx, ty)
+                        if target == null { return false }
+                    }
+                    const words = target.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63))
+                    if f.*.hard && found == bitsBetween(0, span) {
+                        device_module.fillWords(words, @intCast(usize, span), mask.ALL)
+                    } else {
+                        while found != 0 {
+                            const column = lowest(found)
+                            var amount: u32 = 255
+                            if !f.*.hard {
+                                amount = amountOf(f, pixelAt(f, col0 + dx + column, row + dy))
+                                if merge && words[@intCast(usize, column)] & 255 > amount { amount = words[@intCast(usize, column)] & 255 }
+                            }
+                            words[@intCast(usize, column)] = pixel.gray(amount)
+                            found &= found - 1
+                        }
+                    }
+                }
+                row += 1
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+    return true
+}
+
+// (From here on no rectangle is assigned under a condition, results are
+// returned where they are made: a rectangle assigned in a branch is taken
+// from the value arena at every call.)
+
+// A search with working memory out of `pool`, its amounts written: from
+// (x, y) when `contiguous`, else over all of the area. The rectangle
+// around what was found (empty, and the mask nothing: no memory).
+fn collect(pool: *scratch.Pool, sample: *Device, x: i32, y: i32, contiguous: bool, reference: u32, stopping: bool, area: Rect, options: *const Options, into: *Device) -> Rect {
+    const made = prepare(pool, sample, area, options, reference, stopping)
+    if made == null { return geom.empty() }
+    const f = made.?
+    if contiguous {
+        spread(f, x - sample.*.x, y - sample.*.y)
+    } else {
+        everywhere(f)
+    }
+    const found = taken(f)
+    const whole = !f.*.failed && write(f, into, found, false)
+    end(f)
+    if whole { return found }
+    _ = device_module.fill(into, area, mask.NOTHING)
+    return geom.empty()
+}
+
+// One search and what comes after it. The rectangle around what the mask
+// holds then.
+fn search(sample: *Device, x: i32, y: i32, contiguous: bool, reference: u32, stopping: bool, area: Rect, options: *const Options, into: *Device) -> Rect {
+    if !device_module.fill(into, area, mask.NOTHING) || geom.isEmpty(area) { return geom.empty() }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const found = collect(pool, sample, x, y, contiguous, reference, stopping, area, options, into)
+    scratch.release(pool, mark)
+    return refine(into, found, area, options)
+}
+
+// The region the pixel at (x, y) of `sample` belongs to, as amounts in
+// `into` (made nothing within `area` first): everything connected with it
+// by pixels in range (options.contiguous; else every pixel of the area in
+// range), never leaving `area`, then grown and feathered as the options
+// say. Returns the rectangle around it: empty when (x, y) is outside the
+// area, when the place itself is not to take (a boundary colour clicked)
+// or when memory ran out.
+pub fn region(sample: *Device, x: i32, y: i32, area: Rect, options: *const Options, into: *Device) -> Rect {
+    if !geom.contains(area, x, y) {
+        _ = device_module.fill(into, area, mask.NOTHING)
+        return geom.empty()
+    }
+    var reference = device_module.pixel(sample, x, y)
+    const stopping = options.*.reference == REFERENCE_BOUNDARY
+    if stopping { reference = options.*.boundary }
+    return search(sample, x, y, options.*.contiguous, reference, stopping, area, options, into)
+}
+
+// Every pixel of `area` within the threshold of `reference_color`,
+// wherever it is, as amounts in `into` (grown and feathered as the
+// options say; their contiguous, reference and boundary are not looked
+// at). Returns the rectangle around them (empty: none, or no memory).
+pub fn similar(sample: *Device, reference_color: u32, area: Rect, options: *const Options, into: *Device) -> Rect {
+    return search(sample, 0, 0, false, reference_color, false, area, options, into)
+}
+
+// ---------------------------------------------------------------------------
+// Regions inside a drawn shape
+
+// The part of the area a shape's mask can hold anything in.
+fn reachOf(enclosing: *Device, area: Rect) -> Rect {
+    if enclosing.*.defaultPixel & 255 >= 128 { return area }
+    return geom.intersect(area, device_module.extent(enclosing))
+}
+
+// Marks in `inside` (bits laid out as the search's) the pixels of the
+// area the shape's mask holds by half or more. The image's rectangle they
+// lie in (empty: none).
+fn shape(f: *Flood, pool: *scratch.Pool, enclosing: *Device, area: Rect, inside: [*]u64) -> Rect {
+    const part = reachOf(enclosing, area)
+    if geom.isEmpty(part) { return part }
+    const width = @intCast(usize, part.width)
+    const memory = scratch.bytes(pool, width)
+    if memory == null { return geom.empty() }
+    const line = memory.?
+    const first = part.x - f.*.sample.*.x
+    var y = part.y
+    while y < part.y + part.height {
+        mask.readBytes(enclosing, geom.rect(part.x, y, part.width, 1), line, width)
+        const base = @intCast(usize, y - f.*.sample.*.y - f.*.top) * f.*.across
+        var lx = first
+        var index: usize = 0
+        while index < width {
+            if line[index] >= 128 {
+                inside[base + @intCast(usize, (lx >> 6) - f.*.tileLeft)] |= bitsBetween(lx & 63, (lx & 63) + 1)
+            }
+            lx += 1
+            index += 1
+        }
+        y += 1
+    }
+    return part
+}
+
+// What a search just took: noted in `seen`, its amounts written into the
+// mask when all of it lies inside the shape, and the bits made free for
+// the next search. The image's rectangle written (empty: nothing).
+fn settle(f: *Flood, into: *Device, inside: [*]const u64, seen: [*]u64) -> Rect {
+    if f.*.count == 0 { return geom.empty() }
+    const first = @intCast(usize, (f.*.minX >> 6) - f.*.tileLeft)
+    const last = @intCast(usize, (f.*.maxX >> 6) - f.*.tileLeft)
+    var within = true
+    var ly = f.*.minY
+    while ly <= f.*.maxY {
+        const base = @intCast(usize, ly - f.*.top) * f.*.across
+        var word = first
+        while word <= last {
+            const got = f.*.bits[base + word]
+            if got & ~inside[base + word] != 0 { within = false }
+            seen[base + word] |= got
+            word += 1
+        }
+        ly += 1
+    }
+    var written = false
+    if within {
+        written = write(f, into, taken(f), true)
+        if !written { f.*.failed = true }
+    }
+    ly = f.*.minY
+    while ly <= f.*.maxY {
+        const base = @intCast(usize, ly - f.*.top) * f.*.across
+        var word = first
+        while word <= last {
+            f.*.bits[base + word] = 0
+            word += 1
+        }
+        ly += 1
+    }
+    if written { return taken(f) }
+    return geom.empty()
+}
+
+// A search from every pixel inside the shape that none reached yet (and
+// that is to take; `each`: every one is, compared with its own colour),
+// each kept when it stayed inside. The image's rectangle around what was
+// kept.
+fn gather(f: *Flood, pool: *scratch.Pool, enclosing: *Device, area: Rect, into: *Device, inside: [*]u64, seen: [*]u64, each: bool) -> Rect {
+    const part = shape(f, pool, enclosing, area, inside)
+    if geom.isEmpty(part) { return part }
+    // Around what was kept so far (nothing: the right is left of the left).
+    var x0 = area.x + area.width
+    var y0 = area.y + area.height
+    var x1 = area.x - 1
+    var y1 = area.y - 1
+    const first = (part.x - f.*.sample.*.x) >> 6
+    const last = (part.x + part.width - 1 - f.*.sample.*.x) >> 6
+    const bottom = part.y + part.height - f.*.sample.*.y
+    var ly = part.y - f.*.sample.*.y
+    while ly < bottom && !f.*.failed {
+        var tx = first
+        while tx <= last && !f.*.failed {
+            const at = @intCast(usize, ly - f.*.top) * f.*.across + @intCast(usize, tx - f.*.tileLeft)
+            var waiting = inside[at] & ~seen[at]
+            while waiting != 0 && !f.*.failed {
+                const column = lowest(waiting)
+                waiting &= waiting - 1
+                // (a search since may have reached it)
+                if seen[at] & bitsBetween(column, column + 1) == 0 {
+                    const value = pixelAt(f, tx * 64 + column, ly)
+                    if each { f.*.reference = value }
+                    if amountOf(f, value) != 0 {
+                        forget(f)
+                        spread(f, tx * 64 + column, ly)
+                        if !f.*.failed {
+                            const kept = settle(f, into, inside, seen)
+                            if !geom.isEmpty(kept) {
+                                x0 = smaller(x0, kept.x)
+                                y0 = smaller(y0, kept.y)
+                                x1 = larger(x1, kept.x + kept.width - 1)
+                                y1 = larger(y1, kept.y + kept.height - 1)
+                            }
+                        }
+                    }
+                }
+            }
+            tx += 1
+        }
+        ly += 1
+    }
+    if x1 < x0 { return geom.empty() }
+    return geom.rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+}
+
+// The searches of enclosed() with working memory out of `pool`. The
+// rectangle around what was kept (empty, and the mask nothing: no memory).
+fn insideShape(pool: *scratch.Pool, sample: *Device, enclosing: *Device, area: Rect, options: *const Options, into: *Device, method: u8) -> Rect {
+    var reference = options.*.boundary
+    if method == TRANSPARENT_REGIONS { reference = pixel.TRANSPARENT }
+    const made = prepare(pool, sample, area, options, reference, method == REGIONS_SURROUNDED_BY)
+    if made == null { return geom.empty() }
+    const f = made.?
+    const inside = scratch.bytes(pool, f.*.words * 8)
+    const seen = scratch.bytes(pool, f.*.words * 8)
+    if inside == null || seen == null { return geom.empty() }
+    std.mem.zero(inside.?, f.*.words * 8)
+    std.mem.zero(seen.?, f.*.words * 8)
+    var inside_bits: [*]u64 = undefined
+    var seen_bits: [*]u64 = undefined
+    unsafe {
+        inside_bits = @ptrCast([*]u64, inside.?)
+        seen_bits = @ptrCast([*]u64, seen.?)
+    }
+    const found = gather(f, pool, enclosing, area, into, inside_bits, seen_bits, method == ALL_REGIONS)
+    const whole = !f.*.failed
+    end(f)
+    if whole { return found }
+    _ = device_module.fill(into, area, mask.NOTHING)
+    return geom.empty()
+}
+
+// The regions of `sample` that lie wholly inside a shape somebody drew
+// (`enclosing`: a mask of it; inside is where it holds half or more), as
+// amounts in `into` (made nothing within `area` first), for the
+// enclose-and-fill tool. A region is what region() finds from one of its
+// pixels with the same threshold, softness and diagonal; one that reaches
+// a pixel outside the shape is left out (the area's edge does not count
+// as outside). `method` says which regions (one not known is taken as
+// REGIONS_OF_COLOR):
+//
+//     ALL_REGIONS             every one
+//     REGIONS_OF_COLOR        those of the colour options.boundary
+//     TRANSPARENT_REGIONS     the transparent ones
+//     REGIONS_SURROUNDED_BY   what lines of the colour options.boundary
+//                             close off from the shape's outside (the
+//                             lines themselves not)
+//
+// Then grown and feathered as the options say. Returns the rectangle
+// around what was found (empty: nothing, or no memory).
+pub fn enclosed(sample: *Device, enclosing: *Device, area: Rect, options: *const Options, into: *Device, method: u8) -> Rect {
+    if !device_module.fill(into, area, mask.NOTHING) || geom.isEmpty(area) { return geom.empty() }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const found = insideShape(pool, sample, enclosing, area, options, into, method)
+    scratch.release(pool, mark)
+    return refine(into, found, area, options)
+}
+
+// ---------------------------------------------------------------------------
+// Afterwards: grown, shrunk, feathered. All on bytes, a buffer of `width`
+// columns and `height` rows, a row after the other.
+
+// What a blur's weights add up to.
+const ONE: f64 = 16777216.0
+const HALF: u64 = 8388608
+// Up to this feather the blur is the Gaussian itself; above it three
+// means one after the other, which come within six levels (of 255) of it
+// and take the same time whatever the radius.
+const EXACT_FEATHER: f64 = 32.0
+
+// How far a disc of `radius` reaches sideways, by the rows from its middle.
+fn chordsOf(chords: [*]i32, radius: i32) -> void {
+    var reach = radius
+    var distance: i32 = 0
+    while distance <= radius {
+        while reach * reach + distance * distance > radius * radius { reach -= 1 }
+        chords[@intCast(usize, distance)] = reach
+        distance += 1
+    }
+}
+
+// into[i], for i below `count`, becomes the larger of itself and the
+// largest of `row` within `reach` columns of column from + i (columns
+// outside the row hold nothing). The largest of the window is kept from
+// one column to the next and looked for again only when it left.
+fn spreadMax(row: [*]const u8, width: i32, from: i32, count: i32, reach: i32, into: [*]u8) -> void {
+    var best: u8 = 0
+    var at: i32 = -1
+    var k = if from - reach < 0 { 0 } else { from - reach }
+    var stop = if from + reach > width { width } else { from + reach }
+    while k < stop {
+        const value = row[@intCast(usize, k)]
+        if value >= best {
+            best = value
+            at = k
+        }
+        k += 1
+    }
+    var index: i32 = 0
+    while index < count {
+        const x = from + index
+        if x + reach < width {
+            const value = row[@intCast(usize, x + reach)]
+            if value >= best {
+                best = value
+                at = x + reach
+            }
+        }
+        if best != 0 && at < x - reach {
+            best = 0
+            k = x - reach
+            stop = if x + reach + 1 > width { width } else { x + reach + 1 }
+            while k < stop {
+                const value = row[@intCast(usize, k)]
+                if value >= best {
+                    best = value
+                    at = k
+                }
+                k += 1
+            }
+        }
+        if best > into[@intCast(usize, index)] { into[@intCast(usize, index)] = best }
+        index += 1
+    }
+}
+
+// Counts in `quiet`, a number a column, the rows on end, this one the
+// last, that hold nothing within `radius` columns of the column.
+fn countQuiet(row: [*]const u8, width: i32, radius: i32, quiet: [*]u32) -> void {
+    var near: i32 = 0
+    var k: i32 = 0
+    while k < radius && k < width {
+        if row[@intCast(usize, k)] != 0 { near += 1 }
+        k += 1
+    }
+    var x: i32 = 0
+    while x < width {
+        if x + radius < width && row[@intCast(usize, x + radius)] != 0 { near += 1 }
+        if near == 0 {
+            quiet[@intCast(usize, x)] += 1
+        } else {
+            quiet[@intCast(usize, x)] = 0
+        }
+        if x - radius >= 0 && row[@intCast(usize, x - radius)] != 0 { near -= 1 }
+        x += 1
+    }
+}
+
+// `out` is `src` with every byte the largest within `radius` of it (a
+// disc); outside the buffer is nothing. Only stretches that can change
+// are looked at: not what is whole already, and not what has nothing in
+// the square around it (`quiet`, room for a number a column, counts the
+// rows for that as they come).
+fn dilate(src: [*]const u8, out: [*]u8, width: i32, height: i32, radius: i32, chords: [*]const i32, quiet: [*]u32) -> void {
+    const stride = @intCast(usize, width)
+    device_module.fillWords(quiet, stride, 0)
+    var counted: i32 = 0
+    var y: i32 = 0
+    while y < height {
+        const last = if y + radius + 1 > height { height } else { y + radius + 1 }
+        while counted < last {
+            countQuiet(src + @intCast(usize, counted) * stride, width, radius, quiet)
+            counted += 1
+        }
+        // The rows of the square around this one that the buffer has.
+        const rows = @intCast(u32, last - (if y - radius < 0 { 0 } else { y - radius }))
+        const row = src + @intCast(usize, y) * stride
+        const target = out + @intCast(usize, y) * stride
+        std.mem.copy(target, row, stride)
+        var x: i32 = 0
+        while x < width {
+            while x < width && (row[@intCast(usize, x)] == 255 || quiet[@intCast(usize, x)] >= rows) { x += 1 }
+            const from = x
+            while x < width && row[@intCast(usize, x)] != 255 && quiet[@intCast(usize, x)] < rows { x += 1 }
+            if x > from {
+                var distance = -radius
+                while distance <= radius {
+                    const other = y + distance
+                    if other >= 0 && other < height {
+                        const reach = chords[@intCast(usize, if distance < 0 { -distance } else { distance })]
+                        spreadMax(src + @intCast(usize, other) * stride, width, from, x - from, reach, target + @intCast(usize, from))
+                    }
+                    distance += 1
+                }
+            }
+        }
+        y += 1
+    }
+}
+
+// Every byte turned over (255 - it): the smallest within a radius is the
+// largest of what is turned over, turned back.
+fn invert(bytes: [*]u8, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        bytes[index] = 255 - bytes[index]
+        index += 1
+    }
+}
+
+// The weights of a blur over `reach` columns to either side: a Gaussian
+// of a third of the feather as its deviation, adding up to ONE exactly.
+fn gaussian(weights: [*]u32, reach: i32, feather: f64) -> void {
+    const deviation = if feather < 0.15 { 0.05 } else { feather / 3.0 }
+    const scale = -1.0 / (2.0 * deviation * deviation)
+    var total: f64 = 0.0
+    var index = -reach
+    while index <= reach {
+        total += math.exp(@floatFromInt(f64, index * index) * scale)
+        index += 1
+    }
+    var sum: i64 = 0
+    index = -reach
+    while index <= reach {
+        // (each a part of the total, at most all of it: 0.5 to ONE + 0.5)
+        const weight = @intFromFloat(i64, math.exp(@floatFromInt(f64, index * index) * scale) / total * ONE + 0.5)
+        weights[@intCast(usize, index + reach)] = @intCast(u32, weight)
+        sum += weight
+        index += 1
+    }
+    // What rounding left over goes to the middle, the largest.
+    const middle = @intCast(i64, weights[@intCast(usize, reach)]) + 16777216 - sum
+    weights[@intCast(usize, reach)] = @intCast(u32, middle)
+}
+
+// The width of the narrower of the three means that stand for a Gaussian
+// of `deviation` (odd), and how many of the three are that narrow (the
+// others are 2 wider): the widths whose variances add up to its.
+fn meanWidth(deviation: f64) -> i32 {
+    // (the deviation is at most MOST_FEATHER / 3: the width 267 at most)
+    const width = @intFromFloat(i32, @floor(@sqrt(4.0 * deviation * deviation + 1.0)))
+    return if width & 1 == 0 { width - 1 } else { width }
+}
+
+fn meanNarrow(deviation: f64, width: i32) -> i32 {
+    const w = @floatFromInt(f64, width)
+    const ideal = (12.0 * deviation * deviation - 3.0 * w * w - 12.0 * w - 9.0) / (-4.0 * w - 4.0)
+    // (0 to 3 for the width meanWidth gives; held there before it is
+    // made a whole number all the same)
+    return @intFromFloat(i32, math.round(math.clamp(ideal, 0.0, 3.0)))
+}
+
+// `out` is `src` blurred along its rows over `reach` columns to either
+// side (outside the buffer is nothing): by `weights`, 2 * reach + 1 of
+// them, or the plain mean when there are none. The sum of the window
+// moves along with it: where it says all nothing or all whole there is
+// nothing to weigh.
+fn blurRows(src: [*]const u8, out: [*]u8, width: i32, height: i32, weights: ?[*]const u32, reach: i32) -> void {
+    const stride = @intCast(usize, width)
+    const taps = @intCast(u32, 2 * reach + 1)
+    const whole = 255 * taps
+    var y: i32 = 0
+    while y < height {
+        const row = src + @intCast(usize, y) * stride
+        const target = out + @intCast(usize, y) * stride
+        var sum: u32 = 0
+        var k: i32 = 0
+        while k <= reach && k < width {
+            sum += @intCast(u32, row[@intCast(usize, k)])
+            k += 1
+        }
+        var x: i32 = 0
+        while x < width {
+            if sum == 0 {
+                target[@intCast(usize, x)] = 0
+            } else if sum == whole {
+                target[@intCast(usize, x)] = 255
+            } else if weights == null {
+                target[@intCast(usize, x)] = @intCast(u8, (sum + taps / 2) / taps)
+            } else {
+                k = if x - reach < 0 { 0 } else { x - reach }
+                const stop = if x + reach + 1 > width { width } else { x + reach + 1 }
+                var total: u64 = HALF
+                while k < stop {
+                    total += @intCast(u64, weights.?[@intCast(usize, k - x + reach)]) * @intCast(u64, row[@intCast(usize, k)])
+                    k += 1
+                }
+                target[@intCast(usize, x)] = @intCast(u8, total >> 24)
+            }
+            if x + reach + 1 < width { sum += @intCast(u32, row[@intCast(usize, x + reach + 1)]) }
+            if x - reach >= 0 { sum -= @intCast(u32, row[@intCast(usize, x - reach)]) }
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// The same along the columns; `sums`: room for a number a column.
+fn blurColumns(src: [*]const u8, out: [*]u8, width: i32, height: i32, weights: ?[*]const u32, reach: i32, sums: [*]u32) -> void {
+    const stride = @intCast(usize, width)
+    const taps = @intCast(u32, 2 * reach + 1)
+    const whole = 255 * taps
+    device_module.fillWords(sums, stride, 0)
+    var k: i32 = 0
+    while k <= reach && k < height {
+        const row = src + @intCast(usize, k) * stride
+        var x: usize = 0
+        while x < stride {
+            sums[x] += @intCast(u32, row[x])
+            x += 1
+        }
+        k += 1
+    }
+    var y: i32 = 0
+    while y < height {
+        const target = out + @intCast(usize, y) * stride
+        const first = if y - reach < 0 { 0 } else { y - reach }
+        const stop = if y + reach + 1 > height { height } else { y + reach + 1 }
+        var x: usize = 0
+        while x < stride {
+            const sum = sums[x]
+            if sum == 0 {
+                target[x] = 0
+            } else if sum == whole {
+                target[x] = 255
+            } else if weights == null {
+                target[x] = @intCast(u8, (sum + taps / 2) / taps)
+            } else {
+                var total: u64 = HALF
+                k = first
+                while k < stop {
+                    total += @intCast(u64, weights.?[@intCast(usize, k - y + reach)]) * @intCast(u64, src[@intCast(usize, k) * stride + x])
+                    k += 1
+                }
+                target[x] = @intCast(u8, total >> 24)
+            }
+            x += 1
+        }
+        if y + reach + 1 < height {
+            const entering = src + @intCast(usize, y + reach + 1) * stride
+            x = 0
+            while x < stride {
+                sums[x] += @intCast(u32, entering[x])
+                x += 1
+            }
+        }
+        if y - reach >= 0 {
+            const leaving = src + @intCast(usize, y - reach) * stride
+            x = 0
+            while x < stride {
+                sums[x] -= @intCast(u32, leaving[x])
+                x += 1
+            }
+        }
+        y += 1
+    }
+}
+
+// What lies outside the area (`inside`: the area's part of the buffer)
+// holds what the area's edge next to it holds (`onward`: the region goes
+// on there) or nothing.
+fn pad(bytes: [*]u8, width: i32, height: i32, inside: Rect, onward: bool) -> void {
+    const stride = @intCast(usize, width)
+    const right = inside.x + inside.width
+    const bottom = inside.y + inside.height
+    var y = inside.y
+    while y < bottom {
+        const row = bytes + @intCast(usize, y) * stride
+        var before: u8 = 0
+        var after: u8 = 0
+        if onward {
+            before = row[@intCast(usize, inside.x)]
+            after = row[@intCast(usize, right - 1)]
+        }
+        if inside.x > 0 { std.mem.set(row, before, @intCast(usize, inside.x)) }
+        if right < width { std.mem.set(row + @intCast(usize, right), after, @intCast(usize, width - right)) }
+        y += 1
+    }
+    y = 0
+    while y < height {
+        if y < inside.y || y >= bottom {
+            const row = bytes + @intCast(usize, y) * stride
+            if onward {
+                const edge = if y < inside.y { inside.y } else { bottom - 1 }
+                std.mem.copy(row, bytes + @intCast(usize, edge) * stride, stride)
+            } else {
+                std.mem.zero(row, stride)
+            }
+        }
+        y += 1
+    }
+}
+
+// The image's rectangle around what is more than nothing in the bytes of
+// `part` (`stride` from a row to the next); empty: all is nothing.
+fn boundsOf(bytes: [*]const u8, stride: usize, part: Rect) -> Rect {
+    const width = @intCast(usize, part.width)
+    var x0 = width
+    var x1: usize = 0
+    var y0: i32 = -1
+    var y1: i32 = -1
+    var y: i32 = 0
+    while y < part.height {
+        const row = bytes + @intCast(usize, y) * stride
+        var first: usize = 0
+        while first < width && row[first] == 0 { first += 1 }
+        if first < width {
+            var last = width - 1
+            while row[last] == 0 { last -= 1 }
+            if first < x0 { x0 = first }
+            if last > x1 { x1 = last }
+            if y0 < 0 { y0 = y }
+            y1 = y
+        }
+        y += 1
+    }
+    if y0 < 0 { return geom.empty() }
+    return geom.rect(part.x + @intCast(i32, x0), part.y + y0, @intCast(i32, x1 - x0) + 1, y1 - y0 + 1)
+}
+
+// The amounts of `part` that are more than nothing, from bytes (`stride`
+// a row), into the mask; a tile with nothing for it is not made. False
+// when memory ran out.
+fn store(into: *Device, part: Rect, from: [*]const u8, stride: usize) -> bool {
+    if geom.isEmpty(part) { return true }
+    const left = part.x - into.*.x
+    const top = part.y - into.*.y
+    const right = left + part.width
+    const bottom = top + part.height
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * 64)
+        const row1 = smaller(bottom, ty * 64 + 64)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * 64)
+            const span = @intCast(usize, smaller(right, tx * 64 + 64) - col0)
+            var target: ?[*]u32 = null
+            var row = row0
+            while row < row1 {
+                const source = from + (@intCast(usize, row - top) * stride + @intCast(usize, col0 - left))
+                const at = @intCast(usize, ((row & 63) << 6) | (col0 & 63))
+                var index: usize = 0
+                while index < span {
+                    const amount = @intCast(u32, source[index])
+                    if amount != 0 {
+                        if target == null {
+                            target = device_module.tileWrite(into, tx, ty)
+                            if target == null { return false }
+                        }
+                        target.?[at + index] = pixel.gray(amount)
+                    }
+                    index += 1
+                }
+                row += 1
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+    return true
+}
+
+// What refine() does, with working memory out of `pool`: `grow` pixels
+// (`radius` without its sign), then a blur that reaches `reach` pixels:
+// the Gaussian of `feather`, or (`mean` not 0) three means, `narrow` of
+// them `mean` wide and the others 2 wider.
+fn reshape(pool: *scratch.Pool, into: *Device, found: Rect, area: Rect, onward: bool, grow: i32, radius: i32, feather: f64, reach: i32, mean: i32, narrow: i32) -> Rect {
+    // The bytes of the bounds and of as much around them as a change can
+    // reach, the area's outside among it: padded once, a blur's steps
+    // each need less of it than the one before.
+    const whole = geom.grown(found, radius + reach)
+    const inner = geom.intersect(whole, area)
+    const inside = geom.moved(inner, -whole.x, -whole.y)
+    const stride = @intCast(usize, whole.width)
+    const size = stride * @intCast(usize, whole.height)
+    const first = scratch.bytes(pool, size)
+    const second = scratch.bytes(pool, size)
+    const chords = scratch.ints(pool, @intCast(usize, radius) + 1)
+    const weights = scratch.words(pool, @intCast(usize, reach) * 2 + 1)
+    const sums = scratch.words(pool, stride)
+    if first == null || second == null || chords == null || weights == null || sums == null {
+        _ = device_module.fill(into, area, mask.NOTHING)
+        return geom.empty()
+    }
+    var bytes = first.?
+    var spare = second.?
+    const start = @intCast(usize, inside.y) * stride + @intCast(usize, inside.x)
+    std.mem.zero(bytes, size)
+    mask.readBytes(into, inner, bytes + start, stride)
+    if radius != 0 {
+        pad(bytes, whole.width, whole.height, inside, onward)
+        chordsOf(chords.?, radius)
+        if grow < 0 { invert(bytes, size) }
+        dilate(bytes, spare, whole.width, whole.height, radius, chords.?, sums.?)
+        if grow < 0 { invert(spare, size) }
+        const swapped = bytes
+        bytes = spare
+        spare = swapped
+    }
+    if reach > 0 {
+        pad(bytes, whole.width, whole.height, inside, onward)
+        if mean == 0 {
+            gaussian(weights.?, reach, feather)
+            const kernel: [*]const u32 = weights.?
+            blurRows(bytes, spare, whole.width, whole.height, kernel, reach)
+            blurColumns(spare, bytes, whole.width, whole.height, kernel, reach, sums.?)
+        } else {
+            const less = (mean - 1) / 2
+            const one = if narrow > 0 { less } else { less + 1 }
+            const two = if narrow > 1 { less } else { less + 1 }
+            const three = if narrow > 2 { less } else { less + 1 }
+            blurRows(bytes, spare, whole.width, whole.height, null, one)
+            blurRows(spare, bytes, whole.width, whole.height, null, two)
+            blurRows(bytes, spare, whole.width, whole.height, null, three)
+            blurColumns(spare, bytes, whole.width, whole.height, null, one, sums.?)
+            blurColumns(bytes, spare, whole.width, whole.height, null, two, sums.?)
+            blurColumns(spare, bytes, whole.width, whole.height, null, three, sums.?)
+        }
+    }
+    const result = boundsOf(bytes + start, stride, inner)
+    if device_module.fill(into, found, mask.NOTHING) && store(into, inner, bytes + start, stride) { return result }
+    _ = device_module.fill(into, area, mask.NOTHING)
+    return geom.empty()
+}
+
+// The mask's amounts within `found` grown or shrunk by options.grow and
+// feathered by options.feather, written back. The rectangle around what
+// the mask holds then (within `area`; empty also when memory ran out:
+// then the mask is nothing).
+fn refine(into: *Device, found: Rect, area: Rect, options: *const Options) -> Rect {
+    const grow = geom.clampInt(options.*.grow, -MOST_GROW, MOST_GROW)
+    const radius = if grow < 0 { -grow } else { grow }
+    // (a feather that is no number is none)
+    var feather: f64 = 0.0
+    if options.*.feather > 0.0 { feather = math.min(options.*.feather, MOST_FEATHER) }
+    if geom.isEmpty(found) || (radius == 0 && feather == 0.0) { return found }
+    // (0 to MOST_FEATHER)
+    var reach = @intFromFloat(i32, @ceil(feather))
+    var mean: i32 = 0
+    var narrow: i32 = 0
+    if feather > EXACT_FEATHER {
+        mean = meanWidth(feather / 3.0)
+        narrow = meanNarrow(feather / 3.0, mean)
+        reach = narrow * ((mean - 1) / 2) + (3 - narrow) * ((mean + 1) / 2)
+    }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const result = reshape(pool, into, found, area, !options.*.stopAtImageEdge, grow, radius, feather, reach, mean, narrow)
+    scratch.release(pool, mark)
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Filling
+
+// `place - offset` within 0..size, whatever their signs and sizes (in
+// i64: an offset near the ends of i32 does not wrap the difference).
+fn wrapped(place: i32, offset: i32, size: i32) -> i32 {
+    const rest = (@intCast(i64, place) - @intCast(i64, offset)) % @intCast(i64, size)
+    return @intCast(i32, if rest < 0 { rest + @intCast(i64, size) } else { rest })
+}
+
+// The part of `bounds` where a mask can be more than nothing: around its
+// tiles when its default is nothing, else all of it.
+fn holding(amounts: *Device, bounds: Rect) -> Rect {
+    if mask.reachesEverywhere(amounts) { return bounds }
+    return geom.intersect(bounds, device_module.extent(amounts))
+}
+
+// The part of `bounds` where the region's mask and the selection (when
+// there is one) can both be more than nothing: bounds far larger than
+// the region (the whole image, or more) cost no more than its own.
+fn reached(region_mask: *Device, selection: ?*Device, bounds: Rect) -> Rect {
+    if selection == null { return holding(region_mask, bounds) }
+    return holding(selection.?, holding(region_mask, bounds))
+}
+
+// Mixes the colour (`source` holds it in all its 64 places) or the
+// pattern (laid into `source` first) into the columns `first` up to `last`
+// of a tile's row: `under` its pixels from the column at image column `x`
+// on, `line` their amounts, `y` the row's in the image.
+fn mix(under: [*]u32, line: [*]const u8, first: i32, last: i32, x: i32, y: i32, source: [*]u32, pattern: ?[*]const u32, pattern_width: i32, pattern_height: i32, offset_x: i32, offset_y: i32, mode: u16, strength: u32, flags: u32) -> void {
+    if pattern != null {
+        const pattern_row = pattern.? + @intCast(usize, wrapped(y, offset_y, pattern_height)) * @intCast(usize, pattern_width)
+        var px = wrapped(x + first, offset_x, pattern_width)
+        var place = first
+        while place < last {
+            source[@intCast(usize, place)] = pattern_row[@intCast(usize, px)]
+            px += 1
+            if px == pattern_width { px = 0 }
+            place += 1
+        }
+    }
+    // A stretch that counts whole is mixed without its amounts (the same
+    // result, sooner).
+    var whole = true
+    var column = first
+    while column < last && whole {
+        whole = line[@intCast(usize, column)] == 255
+        column += 1
+    }
+    var weights: ?[*]const u8 = null
+    if !whole { weights = line + @intCast(usize, first) }
+    // (the seed of the stretch's place: a mode that goes by place,
+    // Dissolve, falls the same however the fill is cut into tiles)
+    const seed = blend.seedAt(x + first, y)
+    blend.compositeSpanAt(mode, under + @intCast(usize, first), source + @intCast(usize, first), @intCast(usize, last - first), strength, weights, flags, seed)
+}
+
+// What paint() and paintPattern() do: `pattern` null is the one colour.
+fn cover(target: *Device, region_mask: *Device, bounds: Rect, color: u32, pattern: ?[*]const u32, pattern_width: i32, pattern_height: i32, offset_x: i32, offset_y: i32, mode: u16, opacity: u32, flags: u32, selection: ?*Device) -> Rect {
+    if opacity == 0 { return geom.empty() }
+    const area = reached(region_mask, selection, bounds)
+    if geom.isEmpty(area) { return geom.empty() }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    // A tile's amounts, the selection's for it, and a row of what is mixed in.
+    const amounts = scratch.bytes(pool, 4096)
+    const chosen = scratch.bytes(pool, 4096)
+    const source = scratch.words(pool, 64)
+    var x0 = area.x + area.width
+    var x1 = area.x - 1
+    var y0 = area.y + area.height
+    var y1 = area.y - 1
+    if amounts != null && chosen != null && source != null {
+        if pattern == null { device_module.fillWords(source.?, 64, color) }
+        const strength = if opacity > 255 { 255 } else { opacity }
+        const sparse = !mask.reachesEverywhere(region_mask)
+        const left = area.x - target.*.x
+        const top = area.y - target.*.y
+        const right = left + area.width
+        const bottom = top + area.height
+        var ty = top >> 6
+        while ty <= (bottom - 1) >> 6 {
+            const row0 = larger(top, ty * 64)
+            const row1 = smaller(bottom, ty * 64 + 64)
+            var tx = left >> 6
+            while tx <= (right - 1) >> 6 {
+                const col0 = larger(left, tx * 64)
+                const span = smaller(right, tx * 64 + 64) - col0
+                const part = geom.rect(col0 + target.*.x, row0 + target.*.y, span, row1 - row0)
+                if !sparse || device_module.touches(region_mask, part) {
+                    mask.readBytes(region_mask, part, amounts.?, 64)
+                    if selection != null {
+                        mask.readBytes(selection.?, part, chosen.?, 64)
+                        weigh(amounts.?, chosen.?, span, row1 - row0)
+                    }
+                    var pixels: ?[*]u32 = null
+                    var lost = false
+                    var row = row0
+                    while row < row1 && !lost {
+                        const line = amounts.? + @intCast(usize, (row - row0) * 64)
+                        var first: i32 = 0
+                        while first < span && line[@intCast(usize, first)] == 0 { first += 1 }
+                        if first < span {
+                            var last = span
+                            while line[@intCast(usize, last - 1)] == 0 { last -= 1 }
+                            if pixels == null { pixels = device_module.tileWrite(target, tx, ty) }
+                            if pixels == null {
+                                lost = true
+                            } else {
+                                const under = pixels.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63))
+                                mix(under, line, first, last, col0 + target.*.x, row + target.*.y, source.?, pattern, pattern_width, pattern_height, offset_x, offset_y, mode, strength, flags)
+                                if col0 + first + target.*.x < x0 { x0 = col0 + first + target.*.x }
+                                if col0 + last - 1 + target.*.x > x1 { x1 = col0 + last - 1 + target.*.x }
+                                if row + target.*.y < y0 { y0 = row + target.*.y }
+                                if row + target.*.y > y1 { y1 = row + target.*.y }
+                            }
+                        }
+                        row += 1
+                    }
+                }
+                tx += 1
+            }
+            ty += 1
+        }
+    }
+    scratch.release(pool, mark)
+    if x1 < x0 { return geom.empty() }
+    return geom.rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+}
+
+// Each of a tile's amounts (`span` columns of `rows` rows, 64 from a row
+// to the next) times the selection's.
+fn weigh(amounts: [*]u8, chosen: [*]const u8, span: i32, rows: i32) -> void {
+    var row: i32 = 0
+    while row < rows {
+        var index = @intCast(usize, row * 64)
+        const stop = index + @intCast(usize, span)
+        while index < stop {
+            if amounts[index] != 0 { amounts[index] = @intCast(u8, pixel.mul(@intCast(u32, amounts[index]), @intCast(u32, chosen[index]))) }
+            index += 1
+        }
+        row += 1
+    }
+}
+
+// Mixes `color` into `target` within `bounds` where `region_mask` says
+// (what a search above found): each pixel by the mask's amount there,
+// times the selection's when one is given, times `opacity` (0-255), in
+// the blend mode `mode` with blend.mlx's `flags` (blend.compositeSpanAt,
+// seeded by the pixel's place in the image). The caller begins and
+// commits the target's change. Returns the rectangle around the pixels
+// with an amount (empty: none, or an opacity of 0). Bounds larger than
+// the region (the whole image) cost what the region's own do, unless
+// the mask and the selection are both more than nothing where they have
+// no tiles (then all of the bounds is painted). Without memory for a
+// tile of the target that tile is left as it was.
+pub fn paint(target: *Device, region_mask: *Device, bounds: Rect, color: u32, mode: u16, opacity: u32, flags: u32, selection: ?*Device) -> Rect {
+    return cover(target, region_mask, bounds, color, null, 1, 1, 0, 0, mode, opacity, flags, selection)
+}
+
+// The same with a pattern for the colour: `pattern_width` times
+// `pattern_height` straight pixels, a row after the other, laid side by
+// side from (offset_x, offset_y) of the image in every direction. Returns
+// the rectangle around the pixels with an amount (empty: none, or a
+// pattern of no size).
+pub fn paintPattern(target: *Device, region_mask: *Device, bounds: Rect, pattern: [*]const u32, pattern_width: i32, pattern_height: i32, offset_x: i32, offset_y: i32, mode: u16, opacity: u32, flags: u32, selection: ?*Device) -> Rect {
+    if pattern_width <= 0 || pattern_height <= 0 { return geom.empty() }
+    return cover(target, region_mask, bounds, 0, pattern, pattern_width, pattern_height, offset_x, offset_y, mode, opacity, flags, selection)
+}

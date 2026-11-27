@@ -1,0 +1,889 @@
+// nebula io: OpenRaster (.ora), the layered format MyPaint, GIMP and
+// Krita share, read and written; and what the layered formats
+// (io/kra.mlx, io/psd.mlx) share: a report of what a file could not
+// hold, the composite and its thumbnail as PNG, a node made into pixels
+// for a format that knows only paint layers, the tree built when reading.
+//
+//     var report: ora.Report = undefined
+//     var bytes = std.ArrayList(u8).init(allocator)
+//     const status = ora.write(image, &options, &bytes, &report)
+//     if status == formats.Status.ok && report.lossy { ... warn: not all was kept ... }
+//
+//     var result: formats.LoadResult = undefined
+//     _ = ora.read(allocator, file_bytes, &result, &report)
+//
+// An OpenRaster file is a ZIP: "mimetype" (stored, first) holding
+// "image/openraster", stack.xml (the tree), a PNG for every layer in
+// data/, mergedimage.png (the composite) and Thumbnails/thumbnail.png (the
+// composite at most 256 pixels on its longer side). stack.xml:
+//
+//     <image version="0.0.5" w="640" h="480" xres="72" yres="72">
+//       <stack>                                       (the image; topmost first)
+//         <stack name="Group" opacity="1" visibility="visible"
+//                composite-op="svg:src-over" isolation="auto" x="0" y="0">
+//           <layer name="Ink" src="data/layer1.png" x="-12" y="40" opacity="0.5"
+//                  visibility="hidden" composite-op="svg:multiply"
+//                  edit-locked="true" alpha-locked="true" selected="true"/>
+//
+// Writing: a paint layer is its device's PNG at the device's exact
+// bounds (a layer of nothing: one transparent pixel); a group is a
+// stack, "isolation" auto for a pass-through group and isolate for the
+// others; opacity 0 to 1, visibility, the mode as blend.oraName() says
+// (svg: names where SVG has the mode, krita: ones otherwise). Of the
+// extra attributes, "edit-locked" (locked) and "selected" (the active
+// node) are the ones Krita writes; "alpha-locked" (alpha lock) is ours:
+// no program known here writes alpha lock into a stack. A layer that
+// inherits alpha in Normal mode is written in svg:src-atop, which mixes
+// the same. What OpenRaster has no word for becomes pixels (flatten()):
+// a fill layer, a clone, a vector or file layer, a layer or group with
+// masks (its content with the masks applied), a paint layer whose device
+// has a colour where it has no tiles (a Krita layer filled whole), and a
+// filter layer (what its group shows with the filter applied, in
+// krita:copy mode at full opacity, so that it stands for all below it:
+// the composite stays the same here and in Krita; a program without
+// krita:copy mixes it as src-over, the same where what is below it is
+// opaque). Fill layers, clones, filter layers, groups with masks and
+// layers filled whole are made over the canvas: what they show beyond it
+// is not kept. Such a file loses something: write() says so in the
+// report's `lossy` (as it does for a group or a layer that inherits alpha
+// other than a layer in Normal mode), and lossOf() tells before saving.
+// Colour labels, folding and the channels shown are not kept and not
+// counted as lost.
+//
+// Reading: every <layer>'s PNG (any picture format formats.importPicture
+// reads) at its x and y, outside the canvas too; nested <stack>s as
+// groups ("isolation" auto: pass-through; a stack without it is
+// isolated); a missing attribute takes its default (visible, opaque,
+// src-over, 0), an element not known here is passed over (its <layer>s
+// and <stack>s still count), a layer whose picture is missing or
+// damaged stays empty and sets the report's `skipped`, as does what is
+// inside a <layer> (passed over).
+const std = @import("std")
+const xml = @import("std.xml")
+const zip = @import("./zip.mlx")
+const png = @import("./png.mlx")
+const text = @import("./text.mlx")
+const formats = @import("./formats.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const device_module = @import("../core/device.mlx")
+const node_module = @import("../core/node.mlx")
+const image_module = @import("../core/image.mlx")
+const history_module = @import("../core/history.mlx")
+const render = @import("../core/render.mlx")
+const blend = @import("../core/blend.mlx")
+const scratch = @import("../core/scratch.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Rect = geom.Rect
+
+pub const MIME: []const u8 = "image/openraster"
+// The longest side of a thumbnail.
+pub const THUMBNAIL: i32 = 256
+
+// ---------------------------------------------------------------------------
+// What a file could not hold (shared by the layered formats)
+
+pub const Report = struct {
+    // Reading: something in the file was not understood or could not be
+    // read and was left out (a layer of a kind not known here, a filter
+    // not known here, a layer's picture that is damaged).
+    skipped: bool
+    // Writing: the file does not keep everything the image has (a kind
+    // the format lacks written as pixels, a mask applied, a mode it has
+    // no name for).
+    lossy: bool
+    // Reading a document of a colour space not read here (Krita's
+    // colorspacename, Photoshop's colour mode): its name.
+    space: [32]u8
+    spaceLength: usize
+}
+
+pub fn clearReport(report: *Report) -> void {
+    report.*.skipped = false
+    report.*.lossy = false
+    report.*.spaceLength = 0
+}
+
+pub fn noteSpace(report: *Report, name: []const u8) -> void {
+    var length: usize = 0
+    while length < name.length && length < 32 {
+        report.*.space[length] = name[length]
+        length += 1
+    }
+    report.*.spaceLength = length
+}
+
+pub fn spaceOf(report: *const Report) -> []const u8 {
+    const bytes: [*]const u8 = &report.*.space
+    return bytes[0..report.*.spaceLength]
+}
+
+// ---------------------------------------------------------------------------
+// Building the tree while reading (shared)
+
+// A node of `kind` named `name` for `image` (in no tree yet). Null
+// without memory.
+pub fn newNode(image: *image_module.Image, kind: u8, name: []const u8) -> ?*node_module.Node {
+    return node_module.create(image.*.allocator, kind, image_module.newId(image), name)
+}
+
+// How many of `parent`'s children are layers (the masks come after them).
+pub fn layerCount(parent: *node_module.Node) -> usize {
+    var count: usize = 0
+    for child in parent.*.children.items() {
+        if !node_module.isMask(child.*.kind) { count += 1 }
+    }
+    return count
+}
+
+// `node` into `parent` for a file that lists the topmost first: a layer
+// below all layers read so far, a mask after the layers and before the
+// masks read so far (the first mask listed is applied last). False
+// without memory (the node is still the caller's).
+pub fn putTopFirst(parent: *node_module.Node, node: *node_module.Node) -> bool {
+    const at = if node_module.isMask(node.*.kind) { layerCount(parent) } else { 0 }
+    return node_module.insert(parent, node, at)
+}
+
+// The image just read as a file just opened: nothing to undo, all of it
+// to be drawn, not modified, an active layer when the file named none.
+pub fn finish(image: *image_module.Image) -> void {
+    history_module.clear(image.*.history)
+    image_module.damageAll(image)
+    image.*.modified = false
+    image_module.settleActive(image)
+}
+
+// The whole number a float attribute means (opacity times 255, rounded,
+// held to 0..255).
+pub fn opacityOf(value: f64) -> u8 {
+    const scaled = value * 255.0 + 0.5
+    if !(scaled > 0.0) { return 0 }
+    if scaled >= 255.0 { return 255 }
+    return @intCast(u8, @intFromFloat(i32, scaled))
+}
+
+// The farthest a place of a file may be from the canvas, each way: so
+// far that a place plus another one (a tile's in a device that is moved)
+// or plus a picture's side still is an i32.
+pub const FARTHEST: i64 = 536870912
+
+// An i64 of a file held to what a place in the image may be (FARTHEST).
+pub fn placeOf(value: i64) -> i32 {
+    if value < 0 - FARTHEST { return @intCast(i32, 0 - FARTHEST) }
+    if value > FARTHEST { return @intCast(i32, FARTHEST) }
+    return @intCast(i32, value)
+}
+
+// ---------------------------------------------------------------------------
+// The composite and its thumbnail (shared)
+
+fn readShown(context: *anyopaque, area: *const Rect, into: [*]u32, stride: usize) -> void {
+    const image: *image_module.Image = unsafe { @ptrCast(*image_module.Image, context) }
+    render.read(image, area.*, into, stride)
+}
+
+// What the image shows, as an RGBA PNG at the end of `into` (with its
+// resolution). False without memory.
+pub fn writeMerged(image: *image_module.Image, level: i32, into: *std.ArrayList(u8)) -> bool {
+    var settings = png.options(true)
+    settings.level = level
+    settings.resolution = image.*.resolution
+    return png.encodeFrom(readShown, image, image_module.bounds(image), &settings, into)
+}
+
+// The size of the image's thumbnail: `largest` on the longer side at
+// most, the sides in the image's proportion, at least 1.
+pub fn thumbnailSize(width: i32, height: i32, largest: i32, into_width: *i32, into_height: *i32) -> void {
+    into_width.* = width
+    into_height.* = height
+    if width <= largest && height <= largest { return }
+    const longer = if width > height { width } else { height }
+    into_width.* = @intCast(i32, @intCast(i64, width) * @intCast(i64, largest) / @intCast(i64, longer))
+    into_height.* = @intCast(i32, @intCast(i64, height) * @intCast(i64, largest) / @intCast(i64, longer))
+    if into_width.* < 1 { into_width.* = 1 }
+    if into_height.* < 1 { into_height.* = 1 }
+}
+
+// What the image shows made smaller (each pixel of the thumbnail the
+// mean of the image's pixels it stands for, the colours weighed by their
+// alpha) to at most `largest` on the longer side, as an RGBA PNG at the
+// end of `into`. False without memory.
+pub fn writeThumbnail(image: *image_module.Image, largest: i32, level: i32, into: *std.ArrayList(u8)) -> bool {
+    const width = @intCast(usize, image.*.width)
+    const height = @intCast(usize, image.*.height)
+    var small_width: i32 = 0
+    var small_height: i32 = 0
+    thumbnailSize(image.*.width, image.*.height, largest, &small_width, &small_height)
+    const columns = @intCast(usize, small_width)
+    const rows = @intCast(usize, small_height)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const band = scratch.words(pool, width * 64)
+    const column_of = scratch.words(pool, width)
+    const sums_memory = scratch.bytes(pool, columns * 5 * 8)
+    const small = scratch.words(pool, columns * rows)
+    var done = false
+    if band != null && column_of != null && sums_memory != null && small != null {
+        const sums: [*]u64 = unsafe { @ptrCast([*]u64, sums_memory.?) }
+        var x: usize = 0
+        while x < width {
+            column_of.?[x] = @intCast(u32, x * columns / width)
+            x += 1
+        }
+        std.mem.zero(sums_memory.?, columns * 5 * 8)
+        var current: usize = 0
+        var top: usize = 0
+        while top < height {
+            const count = if height - top < 64 { height - top } else { 64 }
+            render.read(image, geom.rect(0, @intCast(i32, top), image.*.width, @intCast(i32, count)), band.?, width)
+            var row: usize = 0
+            while row < count {
+                const target = (top + row) * rows / height
+                if target != current {
+                    meanRow(sums, columns, small.? + current * columns)
+                    current = target
+                }
+                const line = band.? + row * width
+                x = 0
+                while x < width {
+                    const value = line[x]
+                    const a = @intCast(u64, value >> 24)
+                    const at = @intCast(usize, column_of.?[x]) * 5
+                    sums[at] += a
+                    sums[at + 1] += a * @intCast(u64, pixel.red(value))
+                    sums[at + 2] += a * @intCast(u64, pixel.green(value))
+                    sums[at + 3] += a * @intCast(u64, pixel.blue(value))
+                    sums[at + 4] += 1
+                    x += 1
+                }
+                row += 1
+            }
+            top += count
+        }
+        meanRow(sums, columns, small.? + current * columns)
+        var settings = png.options(true)
+        settings.level = level
+        done = png.encodeWith(small.?, columns, rows, columns, &settings, into)
+    }
+    scratch.release(pool, mark)
+    return done
+}
+
+// The thumbnail's row from the sums of its columns (alpha, red, green,
+// blue weighed by alpha, how many), which start again from nothing.
+fn meanRow(sums: [*]u64, columns: usize, into: [*]u32) -> void {
+    var column: usize = 0
+    while column < columns {
+        const at = column * 5
+        const count = sums[at + 4]
+        var value: u32 = 0
+        if count > 0 && sums[at] > 0 {
+            const total = sums[at]
+            const a = (total + count / 2) / count
+            const r = (sums[at + 1] + total / 2) / total
+            const g = (sums[at + 2] + total / 2) / total
+            const b = (sums[at + 3] + total / 2) / total
+            value = pixel.pack(@intCast(u32, a), @intCast(u32, r), @intCast(u32, g), @intCast(u32, b))
+        }
+        into[column] = value
+        sums[at] = 0
+        sums[at + 1] = 0
+        sums[at + 2] = 0
+        sums[at + 3] = 0
+        sums[at + 4] = 0
+        column += 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A node as pixels (shared)
+
+// How a node goes into a file that knows only paint layers and groups.
+pub const Flat = struct {
+    // The pixels to write: the node's own device, or one made here
+    // (`owned`: endFlat() ends it). Null: none (no memory).
+    device: ?*device_module.Device
+    owned: bool
+    blend: u16
+    opacity: u8
+    // Something of the node is not kept.
+    lossy: bool
+}
+
+// Whether any of the node's children is a mask.
+pub fn hasMasks(node: *node_module.Node) -> bool {
+    for child in node.*.children.items() {
+        if node_module.isMask(child.*.kind) { return true }
+    }
+    return false
+}
+
+// Whether a node is written as a plain paint layer of its own device
+// (no pixels to make): a paint, vector or file layer without masks whose
+// device is transparent where it has no tiles (a picture of its pixels
+// holds all it shows).
+pub fn isPlain(node: *node_module.Node) -> bool {
+    const kind = node.*.kind
+    return (kind == node_module.PAINT || kind == node_module.VECTOR || kind == node_module.FILE) && node.*.device != null && node.*.device.?.*.defaultPixel == 0 && !hasMasks(node)
+}
+
+// What `node` (a layer, not a group without masks: that is a stack)
+// shows as the pixels of a paint layer, into `flat`: a plain one its own
+// device; any other its pixels made (a filter layer: what its group shows
+// up to it, in COPY mode at full opacity when `copy_filters`, else in
+// Normal). False without memory (`flat` holds nothing to end then).
+pub fn flatten(image: *image_module.Image, node: *node_module.Node, copy_filters: bool, flat: *Flat) -> bool {
+    flat.*.device = null
+    flat.*.owned = false
+    flat.*.blend = node.*.blend
+    flat.*.opacity = node.*.opacity
+    flat.*.lossy = node.*.kind != node_module.PAINT
+    if isPlain(node) {
+        flat.*.device = node.*.device
+        return true
+    }
+    flat.*.lossy = true
+    const made = device_module.create(image.*.allocator, 0)
+    if made == null { return false }
+    flat.*.device = made
+    flat.*.owned = true
+    var whole = true
+    if node.*.kind == node_module.FILTER {
+        flat.*.blend = if copy_filters { blend.COPY } else { blend.NORMAL }
+        flat.*.opacity = 255
+        whole = filtered(image, node, made.?)
+    } else {
+        whole = shownInto(image, node, shownArea(image, node), made.?)
+    }
+    if !whole { endFlat(flat) }
+    return whole
+}
+
+// Where flatten() makes the pixels of a node that is no filter layer: a
+// layer's tiles (and the canvas too when its device has a colour where it
+// has none), the canvas for the others. (A function's result: a local
+// Rect assigned anew would be a new value of the arena at every call.)
+fn shownArea(image: *image_module.Image, node: *node_module.Node) -> Rect {
+    const canvas = image_module.bounds(image)
+    const kind = node.*.kind
+    if node.*.device == null || (kind != node_module.PAINT && kind != node_module.VECTOR && kind != node_module.FILE) { return canvas }
+    const tiles = device_module.extent(node.*.device.?)
+    if node.*.device.?.*.defaultPixel == 0 { return tiles }
+    return geom.unite(tiles, canvas)
+}
+
+// Ends what flatten() made (the node's own device stays).
+pub fn endFlat(flat: *Flat) -> void {
+    if flat.*.owned && flat.*.device != null { device_module.destroy(flat.*.device.?) }
+    flat.*.device = null
+    flat.*.owned = false
+}
+
+// Whether `count` words are all 0.
+fn blank(from: [*]const u32, count: usize) -> bool {
+    var index: usize = 0
+    while index < count {
+        if from[index] != 0 { return false }
+        index += 1
+    }
+    return true
+}
+
+// What `node` alone shows in `area`, written into `target` a tile of 64
+// x 64 at a time (each made with the margin its filter masks read
+// around it); a tile of nothing is not made. False without memory.
+fn shownInto(image: *image_module.Image, node: *node_module.Node, area: Rect, target: *device_module.Device) -> bool {
+    if geom.isEmpty(area) { return true }
+    const reach = render.margin(node)
+    const side = 64 + reach * 2
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const buffer = scratch.words(pool, @intCast(usize, side) * @intCast(usize, side))
+    const tile = scratch.words(pool, 4096)
+    var whole = buffer != null && tile != null
+    var top = area.y
+    while whole && top < geom.bottom(area) {
+        const rows = if geom.bottom(area) - top < 64 { geom.bottom(area) - top } else { 64 }
+        var left = area.x
+        while whole && left < geom.right(area) {
+            const columns = if geom.right(area) - left < 64 { geom.right(area) - left } else { 64 }
+            const wide = geom.rect(left - reach, top - reach, columns + reach * 2, rows + reach * 2)
+            render.readNode(image, node, wide, buffer.?)
+            const stride = @intCast(usize, wide.width)
+            var row: usize = 0
+            while row < @intCast(usize, rows) {
+                device_module.copyWords(tile.? + row * @intCast(usize, columns), buffer.? + (row + @intCast(usize, reach)) * stride + @intCast(usize, reach), @intCast(usize, columns))
+                row += 1
+            }
+            const count = @intCast(usize, rows) * @intCast(usize, columns)
+            if !blank(tile.?, count) {
+                whole = device_module.writeRect(target, geom.rect(left, top, columns, rows), tile.?, @intCast(usize, columns))
+            }
+            left += columns
+        }
+        top += rows
+    }
+    scratch.release(pool, mark)
+    return whole
+}
+
+// What the group of a filter layer shows once the filter is applied:
+// the layers above it (up to the first group that is not pass-through,
+// or the image) hidden for a moment, the filter itself shown, that group
+// mixed over the canvas in blocks (with the margin all filters read),
+// into `target`. False without memory (the layers are as they were).
+fn filtered(image: *image_module.Image, node: *node_module.Node, target: *device_module.Device) -> bool {
+    var hidden = std.ArrayList(*node_module.Node).init(image.*.allocator)
+    defer hidden.deinit()
+    var whole = true
+    var scope = image.*.root
+    var at = node
+    while at.*.parent != null {
+        const parent = at.*.parent.?
+        const index = node_module.indexIn(parent, at)
+        if index != null {
+            var above = index.? + 1
+            while above < node_module.childCount(parent) {
+                const sibling = node_module.childAt(parent, above)
+                if sibling.*.visible && !node_module.isMask(sibling.*.kind) {
+                    if hidden.append(sibling) { sibling.*.visible = false } else { whole = false }
+                }
+                above += 1
+            }
+        }
+        scope = parent
+        if parent.*.parent == null || !parent.*.passThrough || hasMasks(parent) { break }
+        at = parent
+    }
+    const was_visible = node.*.visible
+    node.*.visible = true
+    if whole { whole = groupInto(image, scope, target) }
+    node.*.visible = was_visible
+    for sibling in hidden.items() { sibling.*.visible = true }
+    return whole
+}
+
+// The children of `group` mixed over the canvas into `target`, tile by
+// tile with the image's margin; a tile of nothing is not made.
+fn groupInto(image: *image_module.Image, group: *node_module.Node, target: *device_module.Device) -> bool {
+    const area = image_module.bounds(image)
+    const reach = render.margin(image.*.root)
+    const side = 64 + reach * 2
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const buffer = scratch.words(pool, @intCast(usize, side) * @intCast(usize, side))
+    const tile = scratch.words(pool, 4096)
+    var whole = buffer != null && tile != null
+    var top = area.y
+    while whole && top < geom.bottom(area) {
+        const rows = if geom.bottom(area) - top < 64 { geom.bottom(area) - top } else { 64 }
+        var left = area.x
+        while whole && left < geom.right(area) {
+            const columns = if geom.right(area) - left < 64 { geom.right(area) - left } else { 64 }
+            const wide = geom.rect(left - reach, top - reach, columns + reach * 2, rows + reach * 2)
+            const stride = @intCast(usize, wide.width)
+            device_module.fillWords(buffer.?, stride * @intCast(usize, wide.height), 0)
+            render.children(image, group, wide, buffer.?, pool, 0)
+            var row: usize = 0
+            while row < @intCast(usize, rows) {
+                device_module.copyWords(tile.? + row * @intCast(usize, columns), buffer.? + (row + @intCast(usize, reach)) * stride + @intCast(usize, reach), @intCast(usize, columns))
+                row += 1
+            }
+            const count = @intCast(usize, rows) * @intCast(usize, columns)
+            if !blank(tile.?, count) {
+                whole = device_module.writeRect(target, geom.rect(left, top, columns, rows), tile.?, @intCast(usize, columns))
+            }
+            left += columns
+        }
+        top += rows
+    }
+    scratch.release(pool, mark)
+    return whole
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+// Whether saving `image` as OpenRaster would lose something (write()
+// sets the report's `lossy` exactly then).
+pub fn lossOf(image: *image_module.Image) -> bool {
+    return lossUnder(image.*.root)
+}
+
+fn lossUnder(group: *node_module.Node) -> bool {
+    for child in group.*.children.items() {
+        if node_module.isMask(child.*.kind) { continue }
+        if child.*.kind == node_module.GROUP && !hasMasks(child) {
+            // (A stack has no word for inheriting alpha.)
+            if child.*.inheritAlpha || lossUnder(child) { return true }
+        } else if !(child.*.kind == node_module.PAINT && isPlain(child)) {
+            return true
+        }
+        if child.*.inheritAlpha && child.*.blend != blend.NORMAL { return true }
+    }
+    return false
+}
+
+const Writing = struct {
+    image: *image_module.Image
+    archive: zip.Writer
+    stack: std.ArrayList(u8)
+    xml: text.XmlWriter
+    // One layer's PNG at a time.
+    picture: std.ArrayList(u8)
+    level: i32
+    count: usize
+    failed: bool
+    lossy: bool
+    // The layer's file name. (Here, not as a local: a buffer whose slice
+    // is handed on is a new value of the arena at every call.)
+    path: [40]u8
+}
+
+// "data/layerN.png" into `into`; its length. (The number by
+// text.formatInt: std.text.appendUnsigned's digits are a new value of the
+// arena at every call.)
+fn layerPath(number: usize, into: [*]u8) -> usize {
+    var length = std.text.append(into, 0, 40, "data/layer")
+    length += text.formatInt(@intCast(i64, number), into + length, 40 - length)
+    return std.text.append(into, length, 40, ".png")
+}
+
+fn putCommon(w: *Writing, node: *node_module.Node, opacity: u8, mode: u16) -> void {
+    text.xmlAttribute(&w.*.xml, "name", node_module.nameOf(node))
+    text.xmlAttributeFloat(&w.*.xml, "opacity", @floatFromInt(f64, opacity) / 255.0, 6)
+    text.xmlAttribute(&w.*.xml, "visibility", if node.*.visible { "visible" } else { "hidden" })
+    text.xmlAttribute(&w.*.xml, "composite-op", blend.oraName(mode))
+    if node.*.locked { text.xmlAttribute(&w.*.xml, "edit-locked", "true") }
+    if node.*.alphaLocked { text.xmlAttribute(&w.*.xml, "alpha-locked", "true") }
+    if w.*.image.*.active != null && @intFromPtr(w.*.image.*.active.?) == @intFromPtr(node) { text.xmlAttribute(&w.*.xml, "selected", "true") }
+}
+
+// One layer: its pixels as data/layerN.png, its element.
+fn writeLayer(w: *Writing, node: *node_module.Node) -> void {
+    var flat: Flat = undefined
+    if !flatten(w.*.image, node, true, &flat) {
+        w.*.failed = true
+        return
+    }
+    if flat.lossy { w.*.lossy = true }
+    var mode = flat.blend
+    // Inheriting alpha in Normal mode mixes as Source Atop does.
+    if node.*.inheritAlpha {
+        if mode == blend.NORMAL { mode = blend.SOURCE_ATOP } else { w.*.lossy = true }
+    }
+    w.*.count += 1
+    const path: [*]u8 = &w.*.path
+    const length = layerPath(w.*.count, path)
+    var bounds = geom.empty()
+    w.*.picture.clearRetainingCapacity()
+    var ok = formats.exportDevice(flat.device.?, w.*.level, &w.*.picture, &bounds)
+    endFlat(&flat)
+    ok = ok && zip.add(&w.*.archive, path[0..length], w.*.picture.items(), zip.STORED, 0)
+    if !ok {
+        w.*.failed = true
+        return
+    }
+    text.xmlOpen(&w.*.xml, "layer")
+    putCommon(w, node, flat.opacity, mode)
+    text.xmlAttribute(&w.*.xml, "src", path[0..length])
+    text.xmlAttributeInt(&w.*.xml, "x", @intCast(i64, bounds.x))
+    text.xmlAttributeInt(&w.*.xml, "y", @intCast(i64, bounds.y))
+    text.xmlClose(&w.*.xml)
+}
+
+// The children of `group`, the topmost first.
+fn writeChildren(w: *Writing, group: *node_module.Node) -> void {
+    var index = node_module.childCount(group)
+    while index > 0 && !w.*.failed {
+        index -= 1
+        const child = node_module.childAt(group, index)
+        if node_module.isMask(child.*.kind) { continue }
+        if child.*.kind == node_module.GROUP && !hasMasks(child) {
+            text.xmlOpen(&w.*.xml, "stack")
+            putCommon(w, child, child.*.opacity, child.*.blend)
+            text.xmlAttribute(&w.*.xml, "isolation", if child.*.passThrough { "auto" } else { "isolate" })
+            text.xmlAttributeInt(&w.*.xml, "x", 0)
+            text.xmlAttributeInt(&w.*.xml, "y", 0)
+            if child.*.inheritAlpha { w.*.lossy = true }
+            writeChildren(w, child)
+            text.xmlClose(&w.*.xml)
+        } else {
+            writeLayer(w, child)
+        }
+    }
+}
+
+// What `image` holds as an OpenRaster file at the end of `into`, the
+// archive's entries compressed at `options.level` (the PNGs as made:
+// stored); `report.lossy` set when it does not keep everything (see the
+// header). noMemory when memory ran out (`into` is as it was then).
+pub fn write(image: *image_module.Image, options: *const formats.SaveOptions, into: *std.ArrayList(u8), report: *Report) -> formats.Status {
+    clearReport(report)
+    const allocator = image.*.allocator
+    const memory = allocator.alloc(@sizeOf(Writing), 16)
+    if memory == null { return formats.Status.noMemory }
+    const w: *Writing = unsafe { @ptrCast(*Writing, memory.?) }
+    const begun = into.*.count()
+    w.*.image = image
+    w.*.stack = std.ArrayList(u8).init(allocator)
+    w.*.picture = std.ArrayList(u8).init(allocator)
+    w.*.level = options.*.level
+    w.*.count = 0
+    w.*.failed = false
+    w.*.lossy = false
+    zip.begin(&w.*.archive, into, allocator)
+    w.*.failed = !zip.add(&w.*.archive, "mimetype", MIME, zip.STORED, 0)
+    text.xmlBegin(&w.*.xml, &w.*.stack, 2)
+    text.xmlDeclaration(&w.*.xml)
+    text.xmlOpen(&w.*.xml, "image")
+    text.xmlAttribute(&w.*.xml, "version", "0.0.5")
+    text.xmlAttributeInt(&w.*.xml, "w", @intCast(i64, image.*.width))
+    text.xmlAttributeInt(&w.*.xml, "h", @intCast(i64, image.*.height))
+    text.xmlAttributeFloat(&w.*.xml, "xres", image.*.resolution, 6)
+    text.xmlAttributeFloat(&w.*.xml, "yres", image.*.resolution, 6)
+    text.xmlOpen(&w.*.xml, "stack")
+    if !w.*.failed { writeChildren(w, image.*.root) }
+    if !text.xmlEnd(&w.*.xml) { w.*.failed = true }
+    if !w.*.failed { w.*.failed = !zip.add(&w.*.archive, "stack.xml", w.*.stack.items(), zip.DEFLATED, options.*.level) }
+    if !w.*.failed {
+        w.*.picture.clearRetainingCapacity()
+        w.*.failed = !writeMerged(image, options.*.level, &w.*.picture) || !zip.add(&w.*.archive, "mergedimage.png", w.*.picture.items(), zip.STORED, 0)
+    }
+    if !w.*.failed {
+        w.*.picture.clearRetainingCapacity()
+        w.*.failed = !writeThumbnail(image, THUMBNAIL, options.*.level, &w.*.picture) || !zip.add(&w.*.archive, "Thumbnails/thumbnail.png", w.*.picture.items(), zip.STORED, 0)
+    }
+    if !w.*.failed { w.*.failed = !zip.finish(&w.*.archive) }
+    report.*.lossy = w.*.lossy
+    const failed = w.*.failed
+    w.*.stack.deinit()
+    w.*.picture.deinit()
+    allocator.free(memory.?, @sizeOf(Writing), 16)
+    if failed {
+        _ = into.*.resize(begun)
+        return formats.Status.noMemory
+    }
+    return formats.Status.ok
+}
+
+// write() as io/formats.mlx's list calls it (the report is left out:
+// lossOf() tells it before saving).
+pub fn writeImage(image: *image_module.Image, options: *const formats.SaveOptions, into: *std.ArrayList(u8)) -> formats.Status {
+    var report: Report = undefined
+    return write(image, options, into, &report)
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+// What reading keeps on the heap (the tokenizer is 2 KiB).
+const Reading = struct {
+    tokenizer: xml.Tokenizer
+    token: xml.Token
+    reader: zip.Reader
+    // The groups open now and the depth of their elements.
+    parents: [64]*node_module.Node
+    depths: [64]usize
+    open: usize
+    // An attribute's text (see Writing's `path`).
+    text: [512]u8
+}
+
+// The name of an element or attribute token as a slice.
+fn nameOf(token: *const xml.Token) -> []const u8 {
+    return token.*.name.pointer[0..token.*.name.length]
+}
+
+// A node's attributes from the element at `offset` of `document`.
+fn readCommon(r: *Reading, document: []const u8, offset: usize, node: *node_module.Node, image: *image_module.Image) -> void {
+    const buffer: [*]u8 = &r.*.text
+    const name = text.attributeText(document, offset, "name", buffer, 512)
+    if name != null { node_module.setName(node, name.?) }
+    node.*.opacity = opacityOf(text.attributeFloatOr(document, offset, "opacity", 1.0))
+    const visibility = text.attributeOf(document, offset, "visibility")
+    node.*.visible = visibility == null || !std.text.same(visibility.?, "hidden")
+    const mode = text.attributeText(document, offset, "composite-op", buffer, 512)
+    if mode != null { node.*.blend = blend.byName(mode.?) }
+    const locked = text.attributeOf(document, offset, "edit-locked")
+    node.*.locked = locked != null && std.text.same(locked.?, "true")
+    const alpha = text.attributeOf(document, offset, "alpha-locked")
+    node.*.alphaLocked = alpha != null && std.text.same(alpha.?, "true")
+    const selected = text.attributeOf(document, offset, "selected")
+    if selected != null && std.text.same(selected.?, "true") { image.*.active = node }
+}
+
+// A place attribute as a whole number (a float rounded; 0 when none).
+fn placeAttribute(document: []const u8, offset: usize, name: []const u8) -> i32 {
+    var whole: i64 = 0
+    if text.attributeInt(document, offset, name, &whole) { return placeOf(whole) }
+    var value: f64 = 0.0
+    if text.attributeFloat(document, offset, name, &value) && value > -536870912.0 && value < 536870912.0 {
+        return placeOf(@intFromFloat(i64, @floor(value + 0.5)))
+    }
+    return 0
+}
+
+// The picture the layer element names, into its device at its place.
+fn readLayerPicture(allocator: Allocator, r: *Reading, document: []const u8, offset: usize, node: *node_module.Node, report: *Report) -> formats.Status {
+    const buffer: [*]u8 = &r.*.text
+    const source = text.attributeText(document, offset, "src", buffer, 512)
+    if source == null {
+        report.*.skipped = true
+        return formats.Status.ok
+    }
+    const index = zip.find(&r.*.reader, source.?)
+    if index == null {
+        report.*.skipped = true
+        return formats.Status.ok
+    }
+    const size = zip.size(&r.*.reader, index.?)
+    const block = zip.read(&r.*.reader, index.?, allocator)
+    if block == null {
+        report.*.skipped = true
+        return formats.Status.ok
+    }
+    const x = placeAttribute(document, offset, "x")
+    const y = placeAttribute(document, offset, "y")
+    var status = formats.importPicture(allocator, block.?[0..size], node.*.device.?, x, y)
+    zip.free(allocator, block.?, size)
+    if status == formats.Status.noMemory { return status }
+    if status != formats.Status.ok {
+        report.*.skipped = true
+        status = formats.Status.ok
+    }
+    return status
+}
+
+// The tree of stack.xml (`document`) into `image`.
+fn readStack(allocator: Allocator, r: *Reading, document: []const u8, image: *image_module.Image, report: *Report) -> formats.Status {
+    xml.initAt(&r.*.tokenizer, document.pointer, document.length)
+    r.*.open = 0
+    var seen_root = false
+    var status = formats.Status.ok
+    while status == formats.Status.ok && xml.next(&r.*.tokenizer, &r.*.token) {
+        const kind = r.*.token.kind
+        if kind == xml.TokenKind.elementEnd {
+            if r.*.open > 0 && xml.depth(&r.*.tokenizer) < r.*.depths[r.*.open - 1] { r.*.open -= 1 }
+            continue
+        }
+        if kind != xml.TokenKind.elementStart { continue }
+        const element = nameOf(&r.*.token)
+        const offset = r.*.token.offset
+        const is_stack = std.text.same(element, "stack")
+        if !is_stack && !std.text.same(element, "layer") { continue }
+        if r.*.open >= 64 { return formats.Status.damaged }
+        if is_stack && !seen_root {
+            // The image's own stack.
+            seen_root = true
+            r.*.parents[0] = image.*.root
+            r.*.depths[0] = xml.depth(&r.*.tokenizer)
+            r.*.open = 1
+            continue
+        }
+        // A layer or stack outside the image's stack, or inside a layer,
+        // has no place.
+        if r.*.open == 0 { continue }
+        const parent = r.*.parents[r.*.open - 1]
+        if parent.*.kind != node_module.GROUP {
+            report.*.skipped = true
+            continue
+        }
+        const made = newNode(image, if is_stack { node_module.GROUP } else { node_module.PAINT }, if is_stack { "Group" } else { "Layer" })
+        if made == null { return formats.Status.noMemory }
+        const node = made.?
+        if !putTopFirst(parent, node) {
+            node_module.destroy(node)
+            return formats.Status.noMemory
+        }
+        readCommon(r, document, offset, node, image)
+        if is_stack {
+            const isolation = text.attributeOf(document, offset, "isolation")
+            node.*.passThrough = isolation != null && std.text.same(isolation.?, "auto")
+        } else {
+            status = readLayerPicture(allocator, r, document, offset, node, report)
+        }
+        r.*.parents[r.*.open] = node
+        r.*.depths[r.*.open] = xml.depth(&r.*.tokenizer)
+        r.*.open += 1
+    }
+    if status != formats.Status.ok { return status }
+    if xml.failed(&r.*.tokenizer) || !seen_root { return formats.Status.damaged }
+    return formats.Status.ok
+}
+
+// The image element's size and resolution; damaged without a size.
+fn readImageElement(r: *Reading, document: []const u8, width: *i64, height: *i64, resolution: *f64) -> bool {
+    xml.initAt(&r.*.tokenizer, document.pointer, document.length)
+    while xml.next(&r.*.tokenizer, &r.*.token) {
+        if r.*.token.kind == xml.TokenKind.elementStart {
+            if !std.text.same(nameOf(&r.*.token), "image") { return false }
+            const offset = r.*.token.offset
+            resolution.* = text.attributeFloatOr(document, offset, "xres", 72.0)
+            return text.attributeInt(document, offset, "w", width) && text.attributeInt(document, offset, "h", height)
+        }
+    }
+    return false
+}
+
+// The OpenRaster file `bytes` as an image into `into` (the caller's to
+// destroy after Status.ok; null otherwise). unknownFormat for what is no
+// ZIP with a stack.xml, damaged for a stack.xml that is not well formed
+// or has no size, tooLarge for a size of more than image.LARGEST,
+// noMemory when memory ran out; `report.skipped` when a layer's picture
+// could not be read.
+pub fn read(allocator: Allocator, bytes: []const u8, into: *formats.LoadResult, report: *Report) -> formats.Status {
+    clearReport(report)
+    into.*.image = null
+    const memory = allocator.alloc(@sizeOf(Reading), 16)
+    if memory == null { return formats.Status.noMemory }
+    const r: *Reading = unsafe { @ptrCast(*Reading, memory.?) }
+    var status = formats.Status.unknownFormat
+    if zip.open(&r.*.reader, bytes, allocator) {
+        const index = zip.find(&r.*.reader, "stack.xml")
+        if index != null {
+            status = readArchive(allocator, r, index.?, into, report)
+        }
+        zip.close(&r.*.reader)
+    }
+    allocator.free(memory.?, @sizeOf(Reading), 16)
+    return status
+}
+
+fn readArchive(allocator: Allocator, r: *Reading, index: usize, into: *formats.LoadResult, report: *Report) -> formats.Status {
+    const size = zip.size(&r.*.reader, index)
+    const block = zip.read(&r.*.reader, index, allocator)
+    if block == null { return formats.Status.damaged }
+    const document = block.?[0..size]
+    var status = formats.Status.damaged
+    var width: i64 = 0
+    var height: i64 = 0
+    var resolution: f64 = 72.0
+    if readImageElement(r, document, &width, &height, &resolution) {
+        status = formats.Status.tooLarge
+        if width >= 1 && height >= 1 && width <= @intCast(i64, image_module.LARGEST) && height <= @intCast(i64, image_module.LARGEST) {
+            if !(resolution > 0.0) || resolution > 100000.0 { resolution = 72.0 }
+            const made = image_module.create(allocator, @intCast(i32, width), @intCast(i32, height), resolution)
+            status = formats.Status.noMemory
+            if made != null {
+                status = readStack(allocator, r, document, made.?, report)
+                if status == formats.Status.ok {
+                    finish(made.?)
+                    into.*.image = made
+                } else {
+                    image_module.destroy(made.?)
+                }
+            }
+        }
+    }
+    zip.free(allocator, block.?, size)
+    return status
+}
+
+// read() as io/formats.mlx's list calls it.
+pub fn readImage(allocator: Allocator, bytes: []const u8, into: *formats.LoadResult) -> formats.Status {
+    var report: Report = undefined
+    return read(allocator, bytes, into, &report)
+}

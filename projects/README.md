@@ -32,6 +32,10 @@ projects/.../main.mlx -o ...`) and is checked by a script under `tools/`.
 - [`filemanager-shared/`](filemanager-shared/README.md): the file
   manager's responsive layout and chrome, shared by `desktop/files` and
   `android/files`.
+- [`nebula/`](nebula/README.md): Nebula, the painting program (layers,
+  brushes, selections, filters, transforms, its own file dialog; one
+  executable for Linux and for brixOS); `projects/nebula/test.sh`,
+  `tools/check_nebula.sh`.
 - [`observatory/`](observatory/README.md): MLX Observatory, an IDE around
   a 3D map of the code (`tools/codemap` is its index, shared with
   `tools/mlx-lsp`); `tools/check_observatory.sh`.

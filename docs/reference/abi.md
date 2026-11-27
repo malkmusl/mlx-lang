@@ -125,6 +125,15 @@ fn mixed(integer_a: u8, float_a: f64, integer_b: u16, float_b: f32) -> u8 {
 argument interleaved in source order while still drawing from separate
 integer/SSE register banks)
 
+What decides the bank is the value's type, not its operands': a comparison
+of two floats (`x < y` with `x: f64`) is a `bool` and goes in an integer
+register like any other `bool`, also when it is passed straight as an
+argument (`check(x < y, ...)`). On both backends the call's argument
+classification asks `State.isFloatValue`, which counts `icmp`/`fcmp`
+results as integers even though the LIR types an `fcmp` by its operands
+(`tests/456_float_comparison_values_runtime.mlx`; on aarch64 the same rule
+picks `w`/`x` registers over `d`/`s` ones).
+
 `178_float_cast_abi_runtime.mlx` pushes both banks to their limits in one
 call — seven `u8` integer arguments (filling all six integer registers plus
 one stack slot) and nine `f64` arguments (filling all eight `xmm` registers
@@ -202,17 +211,39 @@ none) and an optional slice was one word, so its length was lost on the way
 generated Wayland requests (`wl_data_offer.accept`) are such optional
 slices.
 
-An optional of anything but a pointer, a function, a slice or a float is
-tagged: the payload and then a tag, 1 when a value is present. In
-registers the tag is the word after the payload's (`?u32` and `?usize`
-are two words, returned in `rax` and `rdx`); in memory it is the byte
-after the payload's bytes (`@sizeOf(?u32)` is 5, `@sizeOf(?u8)` 2, at the
-payload's alignment), so a `?usize` holding 0 is not null and zeroed
-memory is null. An optional struct, union or array is a memory value like
-its payload: its address, the payload at offset 0 and the tag byte after
-it. `null` becomes the absent value wherever one is wanted, `== null`
-reads the tag, `.?` the payload (`tests/404_optional_zero_runtime.mlx`).
-An optional pointer stays the pointer, null being 0.
+An optional of anything but a pointer, a function or a slice is tagged:
+the payload and then a tag, 1 when a value is present. In registers the
+tag is the word after the payload's (`?u32`, `?usize` and `?f64` are two
+words, returned in `rax` and `rdx`: a `?f64` is not in `xmm0`, its
+payload's bits are the first word); in memory it is the byte after the
+payload's bytes (`@sizeOf(?u32)` is 5, `@sizeOf(?u8)` 2, `@sizeOf(?f64)`
+9, at the payload's alignment), so a `?usize` holding 0 is not null, nor
+a `?f64` holding 0.0 or -0.0 (which keeps its sign), a `?bool` holding
+false or an optional struct whose fields are all zero, and zeroed memory
+is null. An optional struct, union or array is a memory value like its
+payload: its address, the payload at offset 0 and the tag byte after it.
+`null` becomes the absent value wherever one is wanted, `== null` reads
+the tag, `.?` the payload (`tests/404_optional_zero_runtime.mlx`). That
+includes an inline function's result, a generic function's `?T`
+argument after its `T`, and the branches of an `if` or a `match` of
+which one is a `T` and another a `?T`, which makes the whole a `?T`.
+An optional pointer stays the pointer, null being 0; an optional slice
+is null when its pointer is 0, so a slice of length 0 that points
+somewhere (`""`, `buffer[2..2]`) is present. Before, an optional float
+was its payload alone, null being the word 0: `fn give() -> ?f64 {
+return 0.0 }` compared equal to null. And an inline function's `return
+0` as a `?u8` was not made one (the caller read a tag word it did not
+have), `if c { value } else { maybe }` was typed as its first branch,
+`T`, so the else branch's null read as present, and `null` for a
+generic `?T` after `T` was passed as one word
+(`tests/526_optional_zero_values_runtime.mlx`, for each of `?u8`,
+`?i64`, `?bool`, `?f32`, `?f64` 0.0 and -0.0, an optional struct and
+`?[]const u8`: returned, passed, inlined, in locals, `if`s, `match`es,
+fields, array elements and through pointers). A module-level optional
+given a value is written into the data with its tag, a float's bits or a
+struct literal's bytes too (refused before, MLX-E9001); one given `null`
+or `undefined` stays zeroed, absent
+(`tests/527_optional_zero_globals_runtime.mlx`).
 
 A local of several words (a slice, an optional slice, an error union)
 normally lives in one frame slot per word, which the optimizer forwards
@@ -224,7 +255,15 @@ word the local reads back; and `pointer.*` of a pointer to such a type
 loads every word, so `into.*.length` is the length. Before, the words
 were kept apart and the store reached the pointer alone, while the load
 took one word (`tests/303_slice_address_runtime.mlx`, run by
-`tests/run_literals.sh`).
+`tests/run_literals.sh`). The block is laid out as memory has the type:
+a tagged optional's tag is the byte after its payload's bytes (at 1 for a
+`?u8`, at 4 for a `?f32`), stored and loaded as that byte by the local as
+by the pointer; it was the word 8 bytes after the payload, so `at.*` of
+`&local` read no tag and `at.* = null` left the local present. A local
+optional struct, union or array is held by its storage's address as the
+struct itself is, and `&local` is that address; it was the slot holding
+the address, so `at.*` read past it and `at.* = null` overwrote the frame
+(`tests/526_optional_zero_values_runtime.mlx`).
 
 ## Aggregate (struct/array) argument and return classification
 
@@ -303,7 +342,15 @@ reachable when the next pass reuses the bytes. The limits are 1 KiB an
 allocation and 8 KiB a frame (a thread may run on a small stack). A
 struct literal handed to a reading callee, or a `var` made in every pass
 of a loop, then no longer grows the arena
-(`tests/328_aggregates_in_frame_runtime.mlx`). A `const` local's copy is a region of the function's frame
+(`tests/328_aggregates_in_frame_runtime.mlx`). Larger than the limit,
+or handed to a callee as a slice (`digits[0..count]`, even to one that
+only reads it), an array stays in the arena, and so does a struct
+`var` given another value or a struct an `if` expression chooses: what
+std runs every frame (text, images, widgets, a terminal's frame, an
+app's look) and
+`std.text`'s numbers keep clear of these, with their working memory in
+the records they serve and digits written straight into the caller's
+line (`tests/525_std_drawing_arena_runtime.mlx`). A `const` local's copy is a region of the function's frame
 instead (the same `alloca` with `arg1 == 1`): the frame-size estimate adds
 its bytes, and nothing of it may be handed back by address. A struct,
 union or array result is copied into its caller's storage anyway (below),
@@ -668,32 +715,59 @@ own copy of such a variable (`R_X86_64_COPY`, as gcc does for `optind` or
 `stdout`), the dynamic linker binds the symbol to that copy, and the slot
 makes the Mlx code read and write the copy too.
 
-A module-level `const` that is a table has such a slot too (`ir/lower.mlx`,
+A module-level `const` that is a table has an image too (`ir/lower.mlx`,
 `constantImageFor`): an array or struct literal, every element given, of
-values known at compile time and no address among them (those would wait
-for `__mlx_init_globals`, which a constant must not). It is made the
-first time the constant is used. `TABLE[i]`, `TABLE.field`, an element of
-an element, `&TABLE[i]` (a pointer to a constant) and `TABLE.length` work
-on the slot's address; nothing the compiler emits writes there. Any other
-use of the constant is its value: an `alloca` of the type and one
-`mem_copy` from the slot, so a callee that is handed it writes into
-storage of that use's own, as when the value was built there element by
-element. A slice of it and a pointer capture over it work on such a copy
-too. Nothing that sema checks writes through them any more: they are a
-`[]const T` and a `*const T` (`sema/declarations.mlx`, the slice
-expression; `tests/443_constant_slices_runtime.mlx`). But the body of a
+values known at compile time. It is made the first time the constant is
+used, as a read-only global (`lir.Global.readOnly`): its bytes are not in
+the data area but in the code, after the functions and before the string
+literals, each at its alignment under its label (`.__mlx_global_N`),
+reached RIP-relative on x86_64 and by `adrp`/`add` on aarch64 as a
+string literal is; the executable's symbol table names the block
+`__mlx_constant_tables`. `TABLE[i]`, `TABLE.field`, an element of an
+element, `&TABLE[i]` (a pointer to a constant), `TABLE.length`, a slice
+`TABLE[a..b]` (a `[]const T`) and the elements `for` walks work on the
+image's address: two slices of it are the same storage, and none of these
+builds the table. Any other use of the constant is its value: an `alloca`
+of the type and one `mem_copy` from the image, so a callee that is handed
+it by value writes into storage of that use's own, as when the value was
+built there element by element. Nothing that sema checks writes through
+a slice of the table or a pointer to it (`sema/declarations.mlx`, the
+slice expression; `tests/443_constant_slices_runtime.mlx`); the body of a
 generic function (an `anytype` or `comptime` parameter) is not checked,
-and one handed such a slice can still store through it: into the copy,
-which is why the copy stays until instantiated bodies are checked (the
-slot's address there would let that store change the table for
-everyone). A constant with addresses
-in it, one whose initializer is no literal, and a member of an aggregate
-are lowered as before: their initializer, where they are used
-(`tests/442_constant_table_static_runtime.mlx`,
+and a store there through such a slice faults (the code is not writable),
+as a store into a string literal's bytes does, where a copy used to take
+it and the table could not change (`ir/lower.mlx`, `lowerSlice`).
+
+The image holds addresses too where the program is loaded at the
+addresses it is linked for (`lower.setStaticAddresses`: an executable for
+x86_64-linux, x86_64-brixos or aarch64-linux, static or dynamically
+linked): a `[]const u8` that is a string literal or a constant whose value
+is one (its pointer and length), a function or an optional one (`null`
+the zero word), and a slice of another constant table that has an image,
+with bounds known at compile time (`A[0..]`, `B[1..3]`,
+`module.TABLE[2..]`: that image's address plus the lower bound's offset,
+and the length), in nested structs and arrays. Each such word is a
+`lir.GlobalAddress` (a string literal, a function's symbol or another
+global, and an addend); the backend notes its place in the code
+(`Emitter.emitReadOnlyGlobals`, `encoder.addCodeAddress`) and the image
+writer puts the address there once it knows where code and data are
+loaded (`encoder.fillCodeAddresses`: `elf64` at `TEXT_VADDR`,
+`elf64_dynamic`'s executable at its base, `elf64_aarch64`). A function
+named only by an image is kept by `ir/function_dce.mlx`. A shared object
+(`--shared`, `--plugin`, aarch64-android's `libmain.so`) is loaded
+anywhere and its writers emit no relocation the loader would apply to
+such a word; a kernel (`x86_64-freestanding`: brixOS's is linked at
+0x400000 and runs in the higher half) runs elsewhere than it is linked.
+There, as for a table holding a pointer (`&x`), a function of a C library
+(an `extern` one, bound when the program is loaded), or a value not known
+until the program runs, and for a member of an aggregate or a constant
+whose initializer is no literal, the constant is lowered as before: its
+initializer, where it is used (`tests/442_constant_table_static_runtime.mlx`,
+`tests/523_constant_table_addresses_runtime.mlx`,
 `tests/333_module_slices_runtime.mlx`).
 
 The address of a module-level constant, `&NAME` (a pointer to a
-constant), is the slot's for a table that has one, so `&TABLE` and
+constant), is the image's for a table that has one, so `&TABLE` and
 `&TABLE[0]` are the same address and stay it (`lowerAddressOf`,
 `tests/444_constant_address_runtime.mlx`); for every other constant it
 is the address of a copy of its value in a slot of the function

@@ -1,0 +1,833 @@
+// nebula tools: the tools that change how the image is looked at, never
+// the image itself: Zoom (a click zooms in about the point, with Alt out;
+// a rectangle dragged out is zoomed to fill the canvas, with Alt the
+// canvas shrinks into it), Pan (a drag moves the view), Measure (a drag
+// shows its length in pixels and its angle in degrees, Shift in steps of
+// 15 degrees; it stays shown until the next one) and Rotate View (a drag
+// around the middle of the canvas turns it, Shift in steps of 15 degrees,
+// a double click sets it upright). Each has its options: what it does
+// as buttons and numbers, for there may be no wheel (brixOS has none).
+//
+// And the hand every tool has: canvasGesture() takes the drags the
+// window's loop keeps for itself (the space bar held with the left
+// button, or the middle button): with Control such a drag zooms (up: in,
+// about where it began), with Shift it turns the canvas about its
+// middle, else it moves the view, as Krita has it.
+//
+// None of them records anything in the image's history: they change the
+// document's view (state.Document.view, ui/viewport.mlx's arithmetic),
+// held sane by the canvas view (ui/canvasview.mlx) at the next frame, and
+// ask for a whole frame.
+const std = @import("std")
+const math = @import("std.math")
+const ui = @import("std.ui")
+const view_module = @import("std.ui.view")
+const popup = @import("std.ui.popup")
+const ui_app = @import("std.ui.app")
+const canvas_module = @import("std.ui.canvas")
+const state = @import("../app/state.mlx")
+const api = @import("../app/api.mlx")
+const keys = @import("../app/keys.mlx")
+const shell_module = @import("../app/shell.mlx")
+const viewport = @import("../ui/viewport.mlx")
+const canvasview = @import("../ui/canvasview.mlx")
+const overlay = @import("../ui/overlay.mlx")
+const kit_module = @import("../ui/kit.mlx")
+const icons = @import("../ui/icons.mlx")
+const geom = @import("../core/geom.mlx")
+const table = @import("../core/table.mlx")
+
+pub const App = state.App
+pub const Input = state.Input
+pub const Canvas = state.Canvas
+
+pub const ZOOM: u8 = 50
+pub const PAN: u8 = 51
+pub const MEASURE: u8 = 52
+pub const ROTATE: u8 = 53
+
+// The phases of a gesture as the loop hands them to canvasGesture().
+pub const GESTURE_PRESS: u8 = 0
+pub const GESTURE_MOVE: u8 = 1
+pub const GESTURE_RELEASE: u8 = 2
+
+// What a gesture does (chosen by the modifiers held at its press).
+const DOING_NOTHING: u8 = 0
+const DOING_PAN: u8 = 1
+const DOING_ZOOM: u8 = 2
+const DOING_TURN: u8 = 3
+
+// A press and release closer than this many window pixels (times the
+// scale) are a click, not a drag.
+const CLICK_REACH: i32 = 4
+// A drag of this many window pixels up doubles the zoom (Control and the
+// space bar).
+const ZOOM_PIXELS: f64 = 120.0
+// The pointer must be this far from the middle of the canvas before the
+// angle it makes there counts (nearer, it swings wildly).
+const TURN_REACH: f64 = 6.0
+// Steps of an angle with Shift held: 15 degrees.
+const NOTCH: f64 = math.pi / 12.0
+// The reference line of the measure, in window pixels.
+const LEVEL_LENGTH: f64 = 48.0
+
+// ---------------------------------------------------------------------------
+// What the tools keep (each in its tool's slot)
+
+const Zoomer = struct {
+    dragging: bool
+    out: bool
+    startX: i32
+    startY: i32
+    nowX: i32
+    nowY: i32
+    // The zoom the options' slider shows, as a percentage.
+    percent: f64
+}
+
+const Hand = struct {
+    // The Pan tool's drag, and the view's middle when it began (Escape
+    // goes back to it).
+    dragging: bool
+    lastX: i32
+    lastY: i32
+    beforeX: f64
+    beforeY: f64
+    // A gesture (canvasGesture) and where it started.
+    doing: u8
+    gestureX: i32
+    gestureY: i32
+    startZoom: f64
+    turn: Turn
+}
+
+// Turning the view by the pointer's angle about the middle of the canvas.
+const Turn = struct {
+    // The angle is known (the pointer was far enough from the middle).
+    started: bool
+    startRotation: f64
+    startAngle: f64
+}
+
+const Ruler = struct {
+    dragging: bool
+    shown: bool
+    // The two ends, in the image's pixels.
+    x0: f64
+    y0: f64
+    x1: f64
+    y1: f64
+}
+
+const Turner = struct {
+    dragging: bool
+    turn: Turn
+    // The view as the drag found it (Escape goes back to it).
+    beforeX: f64
+    beforeY: f64
+    beforeRotation: f64
+    // The options' slider: the angle in degrees.
+    degrees: f64
+    pointerX: i32
+    pointerY: i32
+}
+
+fn zoomerOf(app: *App) -> ?*Zoomer {
+    const memory = state.slot(app, state.SLOT_TOOL + @intCast(usize, ZOOM), @sizeOf(Zoomer))
+    if memory == null { return null }
+    unsafe { return @ptrCast(*Zoomer, memory.?) }
+}
+
+fn handOf(app: *App) -> ?*Hand {
+    const memory = state.slot(app, state.SLOT_TOOL + @intCast(usize, PAN), @sizeOf(Hand))
+    if memory == null { return null }
+    unsafe { return @ptrCast(*Hand, memory.?) }
+}
+
+fn rulerOf(app: *App) -> ?*Ruler {
+    const memory = state.slot(app, state.SLOT_TOOL + @intCast(usize, MEASURE), @sizeOf(Ruler))
+    if memory == null { return null }
+    unsafe { return @ptrCast(*Ruler, memory.?) }
+}
+
+fn turnerOf(app: *App) -> ?*Turner {
+    const memory = state.slot(app, state.SLOT_TOOL + @intCast(usize, ROTATE), @sizeOf(Turner))
+    if memory == null { return null }
+    unsafe { return @ptrCast(*Turner, memory.?) }
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic shared by the tools
+
+fn scaleOf(app: *App) -> i32 { return if app.*.scale > 0 { app.*.scale } else { 1 } }
+
+// The modifiers held at an input. (app/loop.mlx keeps those of the last
+// key event, and the release of a modifier still carries it: only what
+// the shell says is held now counts.)
+fn heldAt(app: *App, input: *const Input) -> u32 {
+    return input.*.modifiers & shell_module.modifiers(app.*.shell)
+}
+
+fn distance(x0: i32, y0: i32, x1: i32, y1: i32) -> i32 {
+    const dx = if x1 > x0 { x1 - x0 } else { x0 - x1 }
+    const dy = if y1 > y0 { y1 - y0 } else { y0 - y1 }
+    return if dx > dy { dx } else { dy }
+}
+
+// The window place of the middle of the view's area.
+fn middleOf(view: *const viewport.View, x: *f64, y: *f64) -> void {
+    x.* = @floatFromInt(f64, view.*.area.x) + @floatFromInt(f64, view.*.area.width) / 2.0
+    y.* = @floatFromInt(f64, view.*.area.y) + @floatFromInt(f64, view.*.area.height) / 2.0
+}
+
+// The pointer's angle about the middle of the area (radians, clockwise
+// on the screen from the right); false when it is too near the middle.
+fn angleAt(view: *const viewport.View, wx: f64, wy: f64, scale: i32, angle: *f64) -> bool {
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    middleOf(view, &cx, &cy)
+    const dx = wx - cx
+    const dy = wy - cy
+    const reach = TURN_REACH * @floatFromInt(f64, scale)
+    if dx * dx + dy * dy < reach * reach { return false }
+    angle.* = math.atan2(dy, dx)
+    return true
+}
+
+fn beginTurn(turn: *Turn, view: *const viewport.View, wx: f64, wy: f64, scale: i32) -> void {
+    turn.*.startRotation = view.*.rotation
+    turn.*.started = angleAt(view, wx, wy, scale, &turn.*.startAngle)
+}
+
+// Turns the view by the angle the pointer swept about the middle since
+// the turn began (in steps of 15 degrees when `notched`); the image
+// point in the middle stays there. False while the angle is not known.
+fn turnTo(turn: *Turn, view: *viewport.View, wx: f64, wy: f64, scale: i32, notched: bool) -> bool {
+    if !turn.*.started {
+        turn.*.startRotation = view.*.rotation
+        turn.*.started = angleAt(view, wx, wy, scale, &turn.*.startAngle)
+        return false
+    }
+    var angle: f64 = 0.0
+    if !angleAt(view, wx, wy, scale, &angle) { return false }
+    var rotation = turn.*.startRotation + angle - turn.*.startAngle
+    if notched { rotation = math.round(rotation / NOTCH) * NOTCH }
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    middleOf(view, &cx, &cy)
+    viewport.rotateAt(view, cx, cy, rotation)
+    return true
+}
+
+// Appends `value` with one digit after the point (a comma in German);
+// what is no number, or beyond a trillion, as 0.
+fn appendTenths(into: [*]u8, at: usize, capacity: usize, value: f64, german: bool) -> usize {
+    const usable = if value > -1.0e12 && value < 1.0e12 { value } else { 0.0 }
+    var tenths = @intFromFloat(i64, math.round(usable * 10.0))
+    var length = at
+    if tenths < 0 {
+        length = std.text.appendByte(into, length, capacity, 45)
+        tenths = -tenths
+    }
+    length = std.text.appendUnsigned(into, length, capacity, @intCast(usize, tenths / 10))
+    length = std.text.appendByte(into, length, capacity, if german { 44 } else { 46 })
+    return std.text.appendUnsigned(into, length, capacity, @intCast(usize, tenths % 10))
+}
+
+fn degreesOf(radians: f64) -> f64 { return radians * 180.0 / math.pi }
+
+// ---------------------------------------------------------------------------
+// The options' rows
+
+// Rows laid out down `area`: ROW high, a little room between them.
+const Rows = struct {
+    area: ui.Rect
+    y: i32
+    s: i32
+}
+
+fn rowsIn(app: *App, area: ui.Rect) -> Rows {
+    return Rows.{ .area = area, .y = area.y, .s = scaleOf(app) }
+}
+
+// The next row, `height` logical pixels high, the width of the area.
+fn take(rows: *Rows, height: i32) -> ui.Rect {
+    const made = ui.rect(rows.*.area.x, rows.*.y, rows.*.area.width, height * rows.*.s)
+    rows.*.y += (height + 4) * rows.*.s
+    return made
+}
+
+fn gap(rows: *Rows) -> void {
+    rows.*.y += 6 * rows.*.s
+}
+
+// How tall what was laid out is.
+fn used(rows: *Rows) -> i32 { return rows.*.y - rows.*.area.y }
+
+// A name at the left of a row and its value at the right.
+fn valueRow(kit: *kit_module.Kit, area: ui.Rect, title: []const u8, value: []const u8) -> void {
+    kit_module.label(kit, ui.rect(area.x, area.y, area.width * 3 / 5, area.height), title, kit_module.TEXT_DIM, kit_module.ALIGN_LEFT)
+    kit_module.label(kit, ui.rect(area.x + area.width * 2 / 5, area.y, area.width * 3 / 5, area.height), value, kit_module.TEXT_NORMAL, kit_module.ALIGN_RIGHT)
+}
+
+// A few words on how the tool is used, wrapped to the rows' width, dim.
+fn hint(app: *App, rows: *Rows, text: []const u8) -> void {
+    const font = state.smallOf(app)
+    if !font.*.loaded { return }
+    const line = font.*.ascent * 3 / 2 + 2 * rows.*.s
+    const kit = api.kit(app)
+    const lines = popup.wrapped(kit.*.ui, font, text, rows.*.area.x, rows.*.y, rows.*.area.width, line, 6, app.*.theme.dim)
+    rows.*.y += @intCast(i32, lines) * line + 4 * rows.*.s
+}
+
+// A row of `count` square buttons with icons (`which`, their tooltips
+// `tips`; the one numbered `active` lit), their ids made from `base`.
+// The one clicked (`count` when none).
+fn iconRow(app: *App, rows: *Rows, base: u64, count: usize, which: *const [4]u16, tips: *const [4][]const u8, active: usize) -> usize {
+    const kit = api.kit(app)
+    const s = rows.*.s
+    const row = take(rows, kit_module.ROW + 4)
+    const side = row.height
+    var clicked = count
+    var index: usize = 0
+    while index < count {
+        const area = ui.rect(row.x + @intCast(i32, index) * (side + 4 * s), row.y, side, side)
+        if kit_module.toolButton(kit, view_module.idOf(base, index), area, icons.drawFor, @intCast(usize, which.*[index]), index == active, tips.*[index]) { clicked = index }
+        index += 1
+    }
+    return clicked
+}
+
+// ---------------------------------------------------------------------------
+// Zoom
+
+fn zoomPress(app: *App, input: *const Input) -> void {
+    const zoomer = zoomerOf(app)
+    if zoomer == null || input.*.button != ui_app.BUTTON_LEFT { return }
+    zoomer.?.*.dragging = true
+    zoomer.?.*.out = heldAt(app, input) & keys.ALT != 0
+    zoomer.?.*.startX = input.*.windowX
+    zoomer.?.*.startY = input.*.windowY
+    zoomer.?.*.nowX = input.*.windowX
+    zoomer.?.*.nowY = input.*.windowY
+}
+
+fn zoomMove(app: *App, input: *const Input) -> void {
+    const zoomer = zoomerOf(app)
+    if zoomer == null || !zoomer.?.*.dragging { return }
+    zoomer.?.*.nowX = input.*.windowX
+    zoomer.?.*.nowY = input.*.windowY
+    api.canvasChanged(app)
+}
+
+// Zooms so that the window rectangle from (x0, y0) to (x1, y1) (its
+// pixels inclusive) fills the canvas, its middle in the middle; `out`:
+// what the canvas shows now shrinks into the rectangle instead, the
+// canvas's middle to the rectangle's.
+fn zoomToRect(view: *viewport.View, x0: i32, y0: i32, x1: i32, y1: i32, out: bool) -> void {
+    const left = @floatFromInt(f64, if x0 < x1 { x0 } else { x1 })
+    const top = @floatFromInt(f64, if y0 < y1 { y0 } else { y1 })
+    const width = @floatFromInt(f64, distanceOf(x0, x1) + 1)
+    const height = @floatFromInt(f64, distanceOf(y0, y1) + 1)
+    const room_x = @floatFromInt(f64, view.*.area.width)
+    const room_y = @floatFromInt(f64, view.*.area.height)
+    if room_x < 1.0 || room_y < 1.0 { return }
+    const rx = left + width / 2.0
+    const ry = top + height / 2.0
+    var mx: f64 = 0.0
+    var my: f64 = 0.0
+    middleOf(view, &mx, &my)
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    viewport.toImage(view, if out { mx } else { rx }, if out { my } else { ry }, &cx, &cy)
+    const factor = if out { math.min(width / room_x, height / room_y) } else { math.min(room_x / width, room_y / height) }
+    view.*.zoom = viewport.clampZoom(view.*.zoom * factor)
+    view.*.centerX = cx
+    view.*.centerY = cy
+    if out { viewport.panBy(view, rx - mx, ry - my) }
+}
+
+fn distanceOf(a: i32, b: i32) -> i32 { return if a > b { a - b } else { b - a } }
+
+fn zoomRelease(app: *App, input: *const Input) -> void {
+    const zoomer = zoomerOf(app)
+    if zoomer == null || !zoomer.?.*.dragging { return }
+    zoomer.?.*.dragging = false
+    const doc = api.document(app)
+    if doc == null { return }
+    const view = &doc.?.*.view
+    const z = zoomer.?
+    if distance(z.*.startX, z.*.startY, input.*.windowX, input.*.windowY) > CLICK_REACH * scaleOf(app) {
+        zoomToRect(view, z.*.startX, z.*.startY, input.*.windowX, input.*.windowY, z.*.out)
+    } else {
+        // A click: twice (half) the zoom, the image point under the
+        // pointer staying under it.
+        const factor: f64 = if z.*.out { 0.5 } else { 2.0 }
+        viewport.zoomAt(view, @floatFromInt(f64, z.*.startX) + 0.5, @floatFromInt(f64, z.*.startY) + 0.5, view.*.zoom * factor)
+    }
+    api.redraw(app)
+}
+
+fn zoomCancel(app: *App) -> void {
+    const zoomer = zoomerOf(app)
+    if zoomer == null || !zoomer.?.*.dragging { return }
+    zoomer.?.*.dragging = false
+    api.canvasChanged(app)
+}
+
+fn zoomBusy(app: *App) -> bool {
+    const zoomer = zoomerOf(app)
+    return zoomer != null && zoomer.?.*.dragging
+}
+
+// The edges of window rectangle `area`, one pixel wide, in `color`
+// (premultiplied), as far as they are in the marks' clip; what they cover
+// is noted for the canvas view to restore.
+fn frameEdges(marks: *const overlay.Painter, area: ui.Rect, color: u32) -> void {
+    const clip = ui.rect(marks.*.left + marks.*.originX, marks.*.top + marks.*.originY, marks.*.right - marks.*.left, marks.*.bottom - marks.*.top)
+    var side: usize = 0
+    while side < 4 {
+        var edge = ui.rect(area.x, area.y, area.width, 1)
+        if side == 1 { edge = ui.rect(area.x, area.y + area.height - 1, area.width, 1) }
+        if side == 2 { edge = ui.rect(area.x, area.y + 1, 1, area.height - 2) }
+        if side == 3 { edge = ui.rect(area.x + area.width - 1, area.y + 1, 1, area.height - 2) }
+        const shown = ui.intersect(edge, clip)
+        if !ui.isEmpty(shown) {
+            canvas_module.fillRect(marks.*.canvas, shown.x - marks.*.originX, shown.y - marks.*.originY, shown.width, shown.height, color)
+            if marks.*.bounds != null { marks.*.bounds.?.* = geom.unite(marks.*.bounds.?.*, shown) }
+        }
+        side += 1
+    }
+}
+
+// The rectangle being dragged: a light line with a dark one around it,
+// seen on any picture, its corners closed.
+fn zoomOverlay(app: *App, canvas: *Canvas) -> void {
+    const zoomer = zoomerOf(app)
+    if zoomer == null || !zoomer.?.*.dragging { return }
+    const z = zoomer.?
+    if distance(z.*.startX, z.*.startY, z.*.nowX, z.*.nowY) <= CLICK_REACH * scaleOf(app) { return }
+    const marks = overlay.begin(app, canvas)
+    if !marks.live { return }
+    const left = if z.*.startX < z.*.nowX { z.*.startX } else { z.*.nowX }
+    const top = if z.*.startY < z.*.nowY { z.*.startY } else { z.*.nowY }
+    const area = ui.rect(left, top, distanceOf(z.*.startX, z.*.nowX) + 1, distanceOf(z.*.startY, z.*.nowY) + 1)
+    frameEdges(&marks, ui.rect(area.x - 1, area.y - 1, area.width + 2, area.height + 2), canvas_module.color(210, 0, 0, 0))
+    frameEdges(&marks, area, canvas_module.color(255, 255, 255, 255))
+}
+
+const ZOOM_ICONS = [4]u16{ icons.ZOOM_OUT, icons.ZOOM_IN, icons.ZOOM_ACTUAL, icons.ZOOM_FIT }
+
+fn zoomOptions(app: *App, area: ui.Rect) -> i32 {
+    const kit = api.kit(app)
+    const zoomer = zoomerOf(app)
+    var rows = rowsIn(app, area)
+    const doc = api.document(app)
+    if zoomer != null && doc != null {
+        zoomer.?.*.percent = doc.?.*.view.zoom * 100.0
+        var options = kit_module.sliderOptions(1.0, viewport.LARGEST * 100.0, 10.0, 0)
+        options.exponent = 3.0
+        options.softLow = 1.0
+        options.softHigh = 3200.0
+        options.suffix = " %"
+        if kit_module.slider(kit, view_module.id("nebula.zoom.percent"), take(&rows, kit_module.ROW), state.tr(app, "Zoom", "Zoom"), &zoomer.?.*.percent, &options) {
+            canvasview.zoomTo(app, zoomer.?.*.percent / 100.0)
+        }
+        const tips = [4][]const u8{ state.tr(app, "Zoom out", "Verkleinern"), state.tr(app, "Zoom in", "Vergrößern"), state.tr(app, "Actual pixels (100 %)", "Originalgröße (100 %)"), state.tr(app, "Fit the image", "Ganzes Bild") }
+        const clicked = iconRow(app, &rows, view_module.id("nebula.zoom.buttons"), 4, &ZOOM_ICONS, &tips, 4)
+        if clicked == 0 { canvasview.zoomOut(app) }
+        if clicked == 1 { canvasview.zoomIn(app) }
+        if clicked == 2 { canvasview.actualSize(app) }
+        if clicked == 3 { canvasview.fitPage(app) }
+        gap(&rows)
+    }
+    hint(app, &rows, state.tr(app, "Click to zoom in, Alt and click to zoom out. Drag a rectangle to fill the canvas with it.", "Klicken vergrößert, mit Alt verkleinert es. Ein aufgezogenes Rechteck füllt danach die Leinwand."))
+    return used(&rows)
+}
+
+// ---------------------------------------------------------------------------
+// Pan, and the hand of every tool
+
+fn panPress(app: *App, input: *const Input) -> void {
+    const hand = handOf(app)
+    const doc = api.document(app)
+    if hand == null || doc == null || input.*.button != ui_app.BUTTON_LEFT { return }
+    hand.?.*.dragging = true
+    hand.?.*.beforeX = doc.?.*.view.centerX
+    hand.?.*.beforeY = doc.?.*.view.centerY
+    hand.?.*.lastX = input.*.windowX
+    hand.?.*.lastY = input.*.windowY
+}
+
+fn panMove(app: *App, input: *const Input) -> void {
+    const hand = handOf(app)
+    if hand == null || !hand.?.*.dragging { return }
+    const doc = api.document(app)
+    if doc == null { return }
+    viewport.panBy(&doc.?.*.view, @floatFromInt(f64, input.*.windowX - hand.?.*.lastX), @floatFromInt(f64, input.*.windowY - hand.?.*.lastY))
+    hand.?.*.lastX = input.*.windowX
+    hand.?.*.lastY = input.*.windowY
+    api.redraw(app)
+}
+
+fn panRelease(app: *App, input: *const Input) -> void {
+    panMove(app, input)
+    const hand = handOf(app)
+    if hand != null { hand.?.*.dragging = false }
+}
+
+// Escape in the middle of a drag: the view goes back to where it was.
+fn panCancel(app: *App) -> void {
+    const hand = handOf(app)
+    const doc = api.document(app)
+    if hand == null || !hand.?.*.dragging { return }
+    hand.?.*.dragging = false
+    if doc != null {
+        doc.?.*.view.centerX = hand.?.*.beforeX
+        doc.?.*.view.centerY = hand.?.*.beforeY
+    }
+    api.redraw(app)
+}
+
+fn panBusy(app: *App) -> bool {
+    const hand = handOf(app)
+    return hand != null && hand.?.*.dragging
+}
+
+fn panOptions(app: *App, area: ui.Rect) -> i32 {
+    const kit = api.kit(app)
+    var rows = rowsIn(app, area)
+    if api.document(app) != null {
+        if kit_module.button(kit, view_module.id("nebula.pan.page"), take(&rows, kit_module.ROW), state.tr(app, "Fit the image", "Ganzes Bild"), kit_module.BUTTON_NORMAL) { canvasview.fitPage(app) }
+        if kit_module.button(kit, view_module.id("nebula.pan.width"), take(&rows, kit_module.ROW), state.tr(app, "Fit the width", "Ganze Breite"), kit_module.BUTTON_NORMAL) { canvasview.fitWidth(app) }
+        if kit_module.button(kit, view_module.id("nebula.pan.actual"), take(&rows, kit_module.ROW), state.tr(app, "Actual pixels (100 %)", "Originalgröße (100 %)"), kit_module.BUTTON_NORMAL) { canvasview.actualSize(app) }
+        gap(&rows)
+    }
+    hint(app, &rows, state.tr(app, "Drag to move the view. With any tool: the space bar or the middle button; with Control as well it zooms, with Shift it turns.", "Ziehen verschiebt die Ansicht. Mit jedem Werkzeug: Leertaste oder mittlere Taste; dazu Strg zoomt, Umschalt dreht."))
+    return used(&rows)
+}
+
+// A drag the window's loop keeps for itself (the space bar held with the
+// left button, or the middle button), in its phases: at GESTURE_PRESS
+// what it does is chosen by the modifiers held (Control: it zooms, up in
+// and down out, about the place it began; Shift: it turns the canvas
+// about the middle of the area by the angle the pointer sweeps there;
+// else it moves the view with the pointer), at GESTURE_MOVE it does it
+// (and asks for a frame), GESTURE_RELEASE ends it. `input` is the
+// pointer as a tool gets it (its window place and modifiers count).
+// False when there is no document (the drag is not taken) or, for a move
+// or a release, no gesture is going on.
+pub fn canvasGesture(app: *App, input: *const Input, phase: u8) -> bool {
+    const doc = api.document(app)
+    const found = handOf(app)
+    if doc == null || found == null { return false }
+    const hand = found.?
+    const view = &doc.?.*.view
+    const wx = @floatFromInt(f64, input.*.windowX) + 0.5
+    const wy = @floatFromInt(f64, input.*.windowY) + 0.5
+    if phase == GESTURE_PRESS {
+        hand.*.doing = DOING_PAN
+        const held = heldAt(app, input)
+        if held & keys.CONTROL != 0 {
+            hand.*.doing = DOING_ZOOM
+        } else if held & keys.SHIFT != 0 {
+            hand.*.doing = DOING_TURN
+        }
+        hand.*.gestureX = input.*.windowX
+        hand.*.gestureY = input.*.windowY
+        hand.*.startZoom = view.*.zoom
+        beginTurn(&hand.*.turn, view, wx, wy, scaleOf(app))
+        return true
+    }
+    if hand.*.doing == DOING_NOTHING { return false }
+    if hand.*.doing == DOING_PAN {
+        viewport.panBy(view, @floatFromInt(f64, input.*.windowX - hand.*.gestureX), @floatFromInt(f64, input.*.windowY - hand.*.gestureY))
+        hand.*.gestureX = input.*.windowX
+        hand.*.gestureY = input.*.windowY
+    } else if hand.*.doing == DOING_ZOOM {
+        const up = @floatFromInt(f64, hand.*.gestureY - input.*.windowY) / (ZOOM_PIXELS * @floatFromInt(f64, scaleOf(app)))
+        const factor = math.exp(math.clamp(up, -30.0, 30.0) * math.ln2)
+        // (About the place the drag began: the gesture's place is not
+        // moved on while it zooms.)
+        viewport.zoomAt(view, @floatFromInt(f64, hand.*.gestureX) + 0.5, @floatFromInt(f64, hand.*.gestureY) + 0.5, hand.*.startZoom * factor)
+    } else {
+        _ = turnTo(&hand.*.turn, view, wx, wy, scaleOf(app), false)
+    }
+    if phase == GESTURE_RELEASE { hand.*.doing = DOING_NOTHING }
+    api.redraw(app)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Measure
+
+// The end the pointer holds, in steps of 15 degrees about the start when
+// `notched` (the length kept).
+fn rulerEnd(ruler: *Ruler, x: f64, y: f64, notched: bool) -> void {
+    ruler.*.x1 = x
+    ruler.*.y1 = y
+    if !notched { return }
+    const dx = x - ruler.*.x0
+    const dy = y - ruler.*.y0
+    const length = math.sqrt(dx * dx + dy * dy)
+    const angle = math.round(math.atan2(dy, dx) / NOTCH) * NOTCH
+    ruler.*.x1 = ruler.*.x0 + length * math.cos(angle)
+    ruler.*.y1 = ruler.*.y0 + length * math.sin(angle)
+}
+
+fn measurePress(app: *App, input: *const Input) -> void {
+    const ruler = rulerOf(app)
+    if ruler == null || input.*.button != ui_app.BUTTON_LEFT { return }
+    ruler.?.*.dragging = true
+    ruler.?.*.shown = true
+    ruler.?.*.x0 = input.*.x
+    ruler.?.*.y0 = input.*.y
+    ruler.?.*.x1 = input.*.x
+    ruler.?.*.y1 = input.*.y
+    api.redraw(app)
+}
+
+fn measureMove(app: *App, input: *const Input) -> void {
+    const ruler = rulerOf(app)
+    if ruler == null || !ruler.?.*.dragging { return }
+    rulerEnd(ruler.?, input.*.x, input.*.y, heldAt(app, input) & keys.SHIFT != 0)
+    // (The options show the numbers too.)
+    api.redraw(app)
+}
+
+fn measureRelease(app: *App, input: *const Input) -> void {
+    const ruler = rulerOf(app)
+    if ruler == null || !ruler.?.*.dragging { return }
+    rulerEnd(ruler.?, input.*.x, input.*.y, heldAt(app, input) & keys.SHIFT != 0)
+    ruler.?.*.dragging = false
+    api.redraw(app)
+}
+
+fn measureCancel(app: *App) -> void {
+    const ruler = rulerOf(app)
+    if ruler == null || !ruler.?.*.shown { return }
+    ruler.?.*.dragging = false
+    ruler.?.*.shown = false
+    api.redraw(app)
+}
+
+// Another tool: the measure stays, to be seen when the tool is back.
+fn measureStop(app: *App) -> void {
+    const ruler = rulerOf(app)
+    if ruler != null { ruler.?.*.dragging = false }
+}
+
+fn measureBusy(app: *App) -> bool {
+    const ruler = rulerOf(app)
+    return ruler != null && ruler.?.*.dragging
+}
+
+// The last measure: its length in the image's pixels and its angle in
+// degrees, counter-clockwise from the right as on a protractor (the
+// image's y grows downwards), -180 to 180. False when none is shown.
+pub fn measured(app: *App, length: *f64, angle: *f64) -> bool {
+    const ruler = rulerOf(app)
+    if ruler == null || !ruler.?.*.shown { return false }
+    const dx = ruler.?.*.x1 - ruler.?.*.x0
+    const dy = ruler.?.*.y1 - ruler.?.*.y0
+    length.* = math.sqrt(dx * dx + dy * dy)
+    angle.* = if length.* > 0.0 { degreesOf(math.atan2(-dy, dx)) } else { 0.0 }
+    // (A level line drawn from right to left is 180, not -180.)
+    if angle.* <= -179.95 { angle.* = 180.0 }
+    return true
+}
+
+// "300.0 px  0.0°" for the measure shown.
+fn measureText(app: *App, into: [*]u8, capacity: usize) -> usize {
+    var length: f64 = 0.0
+    var angle: f64 = 0.0
+    if !measured(app, &length, &angle) { return 0 }
+    var at = appendTenths(into, 0, capacity, length, app.*.german)
+    at = std.text.append(into, at, capacity, " px   ")
+    at = appendTenths(into, at, capacity, angle, app.*.german)
+    return std.text.append(into, at, capacity, "\xC2\xB0")
+}
+
+fn measureOverlay(app: *App, canvas: *Canvas) -> void {
+    const ruler = rulerOf(app)
+    if ruler == null || !ruler.?.*.shown { return }
+    const r = ruler.?
+    const marks = overlay.begin(app, canvas)
+    // The level line the angle is measured from, then the measure.
+    if marks.zoom > 0.0 {
+        overlay.dashedLine(&marks, r.*.x0, r.*.y0, r.*.x0 + LEVEL_LENGTH * @floatFromInt(f64, marks.scale) / marks.zoom, r.*.y0)
+    }
+    overlay.line(&marks, r.*.x0, r.*.y0, r.*.x1, r.*.y1)
+    overlay.handle(&marks, r.*.x0, r.*.y0, overlay.ROUND, false)
+    overlay.handle(&marks, r.*.x1, r.*.y1, overlay.ROUND, r.*.dragging)
+    var text: [64]u8 = undefined
+    const bytes: [*]u8 = &text
+    const length = measureText(app, bytes, 64)
+    overlay.label(&marks, r.*.x1, r.*.y1, bytes[0..length])
+}
+
+fn measureOptions(app: *App, area: ui.Rect) -> i32 {
+    const kit = api.kit(app)
+    var rows = rowsIn(app, area)
+    var length: f64 = 0.0
+    var angle: f64 = 0.0
+    var text: [48]u8 = undefined
+    const bytes: [*]u8 = &text
+    const shown = measured(app, &length, &angle)
+    const ruler = rulerOf(app)
+    var at: usize = 0
+    if shown {
+        at = std.text.append(bytes, appendTenths(bytes, 0, 48, length, app.*.german), 48, " px")
+    }
+    valueRow(kit, take(&rows, kit_module.ROW), state.tr(app, "Distance", "Abstand"), bytes[0..at])
+    at = 0
+    if shown { at = std.text.append(bytes, appendTenths(bytes, 0, 48, angle, app.*.german), 48, "\xC2\xB0") }
+    valueRow(kit, take(&rows, kit_module.ROW), state.tr(app, "Angle", "Winkel"), bytes[0..at])
+    at = 0
+    if shown && ruler != null { at = std.text.append(bytes, appendTenths(bytes, 0, 48, ruler.?.*.x1 - ruler.?.*.x0, app.*.german), 48, " px") }
+    valueRow(kit, take(&rows, kit_module.ROW), state.tr(app, "Across", "Waagrecht"), bytes[0..at])
+    at = 0
+    if shown && ruler != null { at = std.text.append(bytes, appendTenths(bytes, 0, 48, ruler.?.*.y1 - ruler.?.*.y0, app.*.german), 48, " px") }
+    valueRow(kit, take(&rows, kit_module.ROW), state.tr(app, "Down", "Senkrecht"), bytes[0..at])
+    gap(&rows)
+    hint(app, &rows, state.tr(app, "Drag to measure a distance and its angle; Shift keeps the angle to steps of 15\xC2\xB0. Escape takes the measure away.", "Ziehen misst Abstand und Winkel; Umschalt hält den Winkel in Schritten von 15\xC2\xB0. Escape nimmt das Maß weg."))
+    return used(&rows)
+}
+
+// ---------------------------------------------------------------------------
+// Rotate View
+
+fn rotatePress(app: *App, input: *const Input) -> void {
+    const turner = turnerOf(app)
+    const doc = api.document(app)
+    if turner == null || doc == null || input.*.button != ui_app.BUTTON_LEFT { return }
+    const view = &doc.?.*.view
+    if input.*.clicks == 2 {
+        // Upright again, what is in the middle staying there.
+        var cx: f64 = 0.0
+        var cy: f64 = 0.0
+        middleOf(view, &cx, &cy)
+        viewport.rotateAt(view, cx, cy, 0.0)
+        turner.?.*.dragging = false
+        api.redraw(app)
+        return
+    }
+    turner.?.*.dragging = true
+    turner.?.*.beforeX = view.*.centerX
+    turner.?.*.beforeY = view.*.centerY
+    turner.?.*.beforeRotation = view.*.rotation
+    turner.?.*.pointerX = input.*.windowX
+    turner.?.*.pointerY = input.*.windowY
+    beginTurn(&turner.?.*.turn, view, @floatFromInt(f64, input.*.windowX) + 0.5, @floatFromInt(f64, input.*.windowY) + 0.5, scaleOf(app))
+    api.canvasChanged(app)
+}
+
+fn rotateMove(app: *App, input: *const Input) -> void {
+    const turner = turnerOf(app)
+    const doc = api.document(app)
+    if turner == null || doc == null || !turner.?.*.dragging { return }
+    turner.?.*.pointerX = input.*.windowX
+    turner.?.*.pointerY = input.*.windowY
+    _ = turnTo(&turner.?.*.turn, &doc.?.*.view, @floatFromInt(f64, input.*.windowX) + 0.5, @floatFromInt(f64, input.*.windowY) + 0.5, scaleOf(app), heldAt(app, input) & keys.SHIFT != 0)
+    api.redraw(app)
+}
+
+fn rotateRelease(app: *App, input: *const Input) -> void {
+    rotateMove(app, input)
+    const turner = turnerOf(app)
+    if turner != null { turner.?.*.dragging = false }
+}
+
+// Escape in the middle of a drag: the view goes back to how it was.
+fn rotateCancel(app: *App) -> void {
+    const turner = turnerOf(app)
+    const doc = api.document(app)
+    if turner == null || !turner.?.*.dragging { return }
+    turner.?.*.dragging = false
+    if doc != null {
+        doc.?.*.view.centerX = turner.?.*.beforeX
+        doc.?.*.view.centerY = turner.?.*.beforeY
+        doc.?.*.view.rotation = turner.?.*.beforeRotation
+    }
+    api.redraw(app)
+}
+
+fn rotateStop(app: *App) -> void {
+    const turner = turnerOf(app)
+    if turner != null { turner.?.*.dragging = false }
+}
+
+fn rotateBusy(app: *App) -> bool {
+    const turner = turnerOf(app)
+    return turner != null && turner.?.*.dragging
+}
+
+// While a turn is dragged: the middle it turns about, a line out to the
+// pointer and the angle the view is turned to.
+fn rotateOverlay(app: *App, canvas: *Canvas) -> void {
+    const turner = turnerOf(app)
+    const doc = api.document(app)
+    if turner == null || doc == null || !turner.?.*.dragging { return }
+    const view = &doc.?.*.view
+    const marks = overlay.begin(app, canvas)
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    middleOf(view, &cx, &cy)
+    overlay.windowLine(&marks, cx, cy, @floatFromInt(f64, turner.?.*.pointerX) + 0.5, @floatFromInt(f64, turner.?.*.pointerY) + 0.5)
+    overlay.cross(&marks, view.*.centerX, view.*.centerY)
+    var text: [32]u8 = undefined
+    const bytes: [*]u8 = &text
+    const length = std.text.append(bytes, appendTenths(bytes, 0, 32, degreesOf(view.*.rotation), app.*.german), 32, "\xC2\xB0")
+    overlay.label(&marks, view.*.centerX, view.*.centerY, bytes[0..length])
+}
+
+const ROTATE_ICONS = [4]u16{ icons.ROTATE_LEFT, icons.ROTATE_RIGHT, icons.ROTATE_RESET, icons.MIRROR_VIEW }
+
+fn rotateOptions(app: *App, area: ui.Rect) -> i32 {
+    const kit = api.kit(app)
+    const turner = turnerOf(app)
+    var rows = rowsIn(app, area)
+    const doc = api.document(app)
+    if turner != null && doc != null {
+        const view = &doc.?.*.view
+        turner.?.*.degrees = degreesOf(view.*.rotation)
+        var options = kit_module.sliderOptions(-180.0, 180.0, 15.0, 1)
+        options.suffix = "\xC2\xB0"
+        if kit_module.slider(kit, view_module.id("nebula.rotate.angle"), take(&rows, kit_module.ROW), state.tr(app, "Angle", "Winkel"), &turner.?.*.degrees, &options) {
+            canvasview.rotateBy(app, turner.?.*.degrees * math.pi / 180.0 - view.*.rotation)
+        }
+        const tips = [4][]const u8{ state.tr(app, "Turn left by 15\xC2\xB0", "15\xC2\xB0 nach links drehen"), state.tr(app, "Turn right by 15\xC2\xB0", "15\xC2\xB0 nach rechts drehen"), state.tr(app, "Upright", "Gerade stellen"), state.tr(app, "Mirror the view", "Ansicht spiegeln") }
+        const clicked = iconRow(app, &rows, view_module.id("nebula.rotate.buttons"), 4, &ROTATE_ICONS, &tips, if view.*.mirror { 3 } else { 4 })
+        if clicked == 0 { canvasview.rotateBy(app, -NOTCH) }
+        if clicked == 1 { canvasview.rotateBy(app, NOTCH) }
+        if clicked == 2 { canvasview.resetRotation(app) }
+        if clicked == 3 { canvasview.toggleMirror(app) }
+        gap(&rows)
+    }
+    hint(app, &rows, state.tr(app, "Drag around the middle of the canvas to turn it; Shift turns in steps of 15\xC2\xB0. A double click sets it upright.", "Um die Mitte der Leinwand ziehen dreht sie; mit Umschalt in Schritten von 15\xC2\xB0. Ein Doppelklick stellt sie gerade."))
+    return used(&rows)
+}
+
+// ---------------------------------------------------------------------------
+// The table
+
+fn panDeactivate(app: *App) -> void {
+    const hand = handOf(app)
+    if hand != null { hand.?.*.dragging = false }
+}
+
+const TOOLS = [4]state.Tool{
+    state.Tool.{ .id = ZOOM, .key = "zoom", .name = "Zoom", .german = "Zoom", .shortcut = "Z", .icon = icons.TOOL_ZOOM, .group = state.GROUP_VIEW, .cursor = state.CURSOR_ARROW, .activate = null, .deactivate = zoomCancel, .press = zoomPress, .move = zoomMove, .release = zoomRelease, .keyPress = null, .tick = null, .overlay = zoomOverlay, .options = zoomOptions, .cancel = zoomCancel, .finish = null, .busy = zoomBusy },
+    state.Tool.{ .id = PAN, .key = "pan", .name = "Pan", .german = "Ansicht verschieben", .shortcut = "H", .icon = icons.TOOL_PAN, .group = state.GROUP_VIEW, .cursor = state.CURSOR_ARROW, .activate = null, .deactivate = panDeactivate, .press = panPress, .move = panMove, .release = panRelease, .keyPress = null, .tick = null, .overlay = null, .options = panOptions, .cancel = panCancel, .finish = null, .busy = panBusy },
+    state.Tool.{ .id = MEASURE, .key = "measure", .name = "Measure", .german = "Messen", .shortcut = "", .icon = icons.TOOL_MEASURE, .group = state.GROUP_VIEW, .cursor = state.CURSOR_CROSS, .activate = null, .deactivate = measureStop, .press = measurePress, .move = measureMove, .release = measureRelease, .keyPress = null, .tick = null, .overlay = measureOverlay, .options = measureOptions, .cancel = measureCancel, .finish = null, .busy = measureBusy },
+    state.Tool.{ .id = ROTATE, .key = "rotateview", .name = "Rotate View", .german = "Ansicht drehen", .shortcut = "", .icon = icons.ROTATE_RIGHT, .group = state.GROUP_VIEW, .cursor = state.CURSOR_ARROW, .activate = null, .deactivate = rotateStop, .press = rotatePress, .move = rotateMove, .release = rotateRelease, .keyPress = null, .tick = null, .overlay = rotateOverlay, .options = rotateOptions, .cancel = rotateCancel, .finish = null, .busy = rotateBusy },
+}
+
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's tools, as tools/registry.mlx puts them together (a copy of
+// the table in heap memory, made at the first call: core/table.mlx).
+pub fn list() -> []const state.Tool {
+    if kept.address != 0 { return table.rows(state.Tool, &kept) }
+    return table.keep(state.Tool, &kept, TOOLS[0..])
+}

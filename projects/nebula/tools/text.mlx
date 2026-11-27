@@ -1,0 +1,928 @@
+// nebula tools: the text tool. A click on the canvas places a text box,
+// a drag draws one as wide as its lines may grow (they wrap at it); then
+// the tool takes the keys: what is typed goes in at the caret, Enter
+// starts a new line, Backspace and Delete take a character away, the
+// arrows, Home and End move the caret (Up and Down by the lines as they
+// are set), Control and V puts the clipboard's text in, and a click in
+// the box moves the caret there. The text shows over the canvas as it
+// will be, in the foreground colour (core/textrender.mlx sets it, the
+// same for the preview as for the result). Control and Enter, a click
+// beside the box, Apply in the options or another tool puts it on the
+// image: a new paint layer above the active one, named after the text's
+// first words, with the text in it (only where the selection is when
+// there is one), one step "Text" of the history. Escape, or Cancel in
+// the options, drops what was typed.
+//
+// Its options: the font (those core/textrender.mlx finds), the size in
+// pixels, the alignment (left, centred, right: a box placed by a click
+// is aligned to the place clicked), the line spacing, the room between
+// letters and whether edges are smooth; they are kept in the settings
+// (app/settings.mlx) when a change of them is complete.
+//
+// While a text is typed the tool is busy (undo waits; app/loop.mlx gives
+// it Enter through finish(), which starts a new line unless Control is
+// held). Not done: choosing a part of the text (to replace or delete it
+// at once), editing a text once it is on the image (it is pixels then),
+// a caret that blinks.
+const std = @import("std")
+const ui = @import("std.ui")
+const view_module = @import("std.ui.view")
+const popup = @import("std.ui.popup")
+const ui_app = @import("std.ui.app")
+const canvas_module = @import("std.ui.canvas")
+const state = @import("../app/state.mlx")
+const api = @import("../app/api.mlx")
+const keys = @import("../app/keys.mlx")
+const shell_module = @import("../app/shell.mlx")
+const settings = @import("../app/settings.mlx")
+const viewport = @import("../ui/viewport.mlx")
+const overlay = @import("../ui/overlay.mlx")
+const kit_module = @import("../ui/kit.mlx")
+const icons = @import("../ui/icons.mlx")
+const textrender = @import("../core/textrender.mlx")
+const device_module = @import("../core/device.mlx")
+const mask_module = @import("../core/mask.mlx")
+const node_module = @import("../core/node.mlx")
+const history_module = @import("../core/history.mlx")
+const ops = @import("../core/ops.mlx")
+const geom = @import("../core/geom.mlx")
+const pixel = @import("../core/pixel.mlx")
+const blend = @import("../core/blend.mlx")
+const scratch = @import("../core/scratch.mlx")
+const table = @import("../core/table.mlx")
+
+pub const App = state.App
+pub const Input = state.Input
+pub const Canvas = state.Canvas
+pub const Style = textrender.Style
+pub const Fonts = textrender.Fonts
+
+pub const TEXT: u8 = 60
+
+// The most bytes a text holds.
+pub const CAPACITY: usize = 4096
+// A press and release closer than this many window pixels (times the
+// scale) place a box at a point; farther, they draw one.
+const CLICK_REACH: i32 = 4
+// A click this many window pixels around the box still counts as in it.
+const BOX_MARGIN: f64 = 6.0
+// The live text is not drawn over more of the image than this many
+// pixels at once (a huge text far zoomed out shows its box alone).
+const MOST_SHOWN: i32 = 16777216
+// A layer's name: about so many bytes of the text's first words.
+const TITLE: usize = 32
+
+// What the tool keeps (its slot).
+const Writer = struct {
+    ready: bool
+    // A press on the canvas is going on: a box is being placed.
+    pressing: bool
+    pressX: f64
+    pressY: f64
+    pressWindowX: i32
+    pressWindowY: i32
+    nowX: f64
+    nowY: f64
+    nowWindowX: i32
+    nowWindowY: i32
+    // A text is being typed: where it is anchored (textrender's x, y),
+    // the width its lines wrap at (0: none), its bytes and the caret.
+    editing: bool
+    // The image it is for (its address): another one in front drops it.
+    image: usize
+    x: f64
+    y: f64
+    wrap: f64
+    text: [4096]u8
+    length: usize
+    caret: usize
+    style: Style
+    // The text's coverage as the overlay shows it (a mask; null until it
+    // is first needed) and whether it must be set again.
+    coverage: ?*device_module.Device
+    stale: bool
+    covered: geom.Rect
+    fonts: ?*Fonts
+    fontsTried: bool
+    // The options' sliders: the line spacing in per cent.
+    linePercent: f64
+}
+
+fn writerOf(app: *App) -> ?*Writer {
+    const memory = state.slot(app, state.SLOT_TOOL + @intCast(usize, TEXT), @sizeOf(Writer))
+    if memory == null { return null }
+    const writer: *Writer = unsafe { @ptrCast(*Writer, memory.?) }
+    if !writer.*.ready {
+        writer.*.ready = true
+        writer.*.style = textrender.defaultStyle()
+        writer.*.coverage = null
+        writer.*.fonts = null
+        writer.*.fontsTried = false
+        readSettings(app, writer)
+    }
+    return writer
+}
+
+fn fontsOfWriter(app: *App, writer: *Writer) -> ?*Fonts {
+    if writer.*.fonts == null && !writer.*.fontsTried {
+        writer.*.fontsTried = true
+        writer.*.fonts = textrender.create(app.*.allocator)
+    }
+    return writer.*.fonts
+}
+
+fn textOf(writer: *Writer) -> []const u8 {
+    const bytes: [*]const u8 = &writer.*.text
+    return bytes[0..writer.*.length]
+}
+
+// The style the text in the box is set in (the options' and the box's
+// width).
+fn styleNow(writer: *Writer) -> Style {
+    var style = writer.*.style
+    style.wrap = writer.*.wrap
+    return style
+}
+
+// ---------------------------------------------------------------------------
+// What other parts and tests ask
+
+// The tool's style (its options; the box's width is not in it): changes
+// apply to the text being typed from the next frame on. Null without
+// memory.
+pub fn styleOf(app: *App) -> ?*Style {
+    const writer = writerOf(app)
+    if writer == null { return null }
+    writer.?.*.stale = true
+    return &writer.?.*.style
+}
+
+// The fonts the tool sets text in (null: none could be listed).
+pub fn fontsOf(app: *App) -> ?*Fonts {
+    const writer = writerOf(app)
+    if writer == null { return null }
+    return fontsOfWriter(app, writer.?)
+}
+
+// Whether a text is being typed for the image in front, and what has been
+// typed so far ("" when none is).
+pub fn editing(app: *App) -> bool {
+    const writer = writerOf(app)
+    return writer != null && typing(app, writer.?)
+}
+
+pub fn typedText(app: *App) -> []const u8 {
+    const writer = writerOf(app)
+    if writer == null || !typing(app, writer.?) { return "" }
+    return textOf(writer.?)
+}
+
+// ---------------------------------------------------------------------------
+// The settings kept between runs
+
+fn held(value: f64, low: f64, high: f64) -> f64 {
+    // (Not a number is the low end.)
+    if !(value > low) { return low }
+    return if value > high { high } else { value }
+}
+
+fn readNumber(text: []const u8, into: *i64) -> bool {
+    if text.length == 0 || text.length > 12 { return false }
+    var index: usize = 0
+    var negative = false
+    if text[0] == 45 {
+        negative = true
+        index = 1
+    }
+    if index >= text.length { return false }
+    var value: i64 = 0
+    while index < text.length {
+        if text[index] < 48 || text[index] > 57 { return false }
+        value = value * 10 + @intCast(i64, text[index] - 48)
+        index += 1
+    }
+    into.* = if negative { -value } else { value }
+    return true
+}
+
+fn readSettings(app: *App, writer: *Writer) -> void {
+    var number: i64 = 0
+    if readNumber(settings.text(app, "tool.text.size"), &number) { writer.*.style.size = @floatFromInt(f64, number) / 10.0 }
+    if readNumber(settings.text(app, "tool.text.align"), &number) && number >= 0 && number <= 2 { writer.*.style.alignment = @intCast(u8, number) }
+    if readNumber(settings.text(app, "tool.text.lines"), &number) { writer.*.style.lineSpacing = @floatFromInt(f64, number) / 100.0 }
+    if readNumber(settings.text(app, "tool.text.letters"), &number) { writer.*.style.letterSpacing = @floatFromInt(f64, number) / 10.0 }
+    if readNumber(settings.text(app, "tool.text.smooth"), &number) { writer.*.style.antialias = number != 0 }
+    // The font by its name (the list may differ from run to run); the
+    // list is made when it is needed, so the name waits for it.
+    const face = settings.text(app, "tool.text.font")
+    if face.length > 0 {
+        const fonts = fontsOfWriter(app, writer)
+        if fonts != null {
+            const found = textrender.find(fonts.?, face)
+            if found < textrender.count(fonts.?) { writer.*.style.face = found }
+        }
+    }
+}
+
+fn keepNumber(app: *App, key: []const u8, value: f64, factor: f64) -> void {
+    var text: [24]u8 = undefined
+    const bytes: [*]u8 = &text
+    const scaled = @intFromFloat(i64, @floor(held(value * factor, -1000000.0, 1000000.0) + 0.5))
+    const length = std.text.appendSigned(bytes, 0, 24, @intCast(isize, scaled))
+    _ = settings.setText(app, key, bytes[0..length])
+}
+
+fn keepSettings(app: *App, writer: *Writer) -> void {
+    keepNumber(app, "tool.text.size", writer.*.style.size, 10.0)
+    keepNumber(app, "tool.text.align", @floatFromInt(f64, writer.*.style.alignment), 1.0)
+    keepNumber(app, "tool.text.lines", writer.*.style.lineSpacing, 100.0)
+    keepNumber(app, "tool.text.letters", writer.*.style.letterSpacing, 10.0)
+    keepNumber(app, "tool.text.smooth", if writer.*.style.antialias { 1.0 } else { 0.0 }, 1.0)
+    const fonts = fontsOfWriter(app, writer)
+    if fonts != null && writer.*.style.face < textrender.count(fonts.?) {
+        _ = settings.setText(app, "tool.text.font", textrender.name(fonts.?, writer.*.style.face))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Editing the text
+
+fn previousBoundary(text: []const u8, at: usize) -> usize {
+    if at == 0 { return 0 }
+    var index = at - 1
+    while index > 0 && text[index] & 192 == 128 { index -= 1 }
+    return index
+}
+
+fn nextBoundary(text: []const u8, at: usize) -> usize {
+    if at >= text.length { return text.length }
+    var index = at + 1
+    while index < text.length && text[index] & 192 == 128 { index += 1 }
+    return index
+}
+
+// Puts `bytes` in at the caret, a character at a time: line feeds stay, a
+// tab is a blank, other control characters are left out. False when the
+// text is full (the characters that fitted whole are in).
+fn insert(writer: *Writer, bytes: []const u8) -> bool {
+    writer.*.stale = true
+    var at: usize = 0
+    while at < bytes.length {
+        const byte = bytes[at]
+        // A character: its lead byte and the ones that continue it.
+        var end = at + 1
+        if byte >= 192 {
+            while end < bytes.length && bytes[end] & 192 == 128 { end += 1 }
+        }
+        const count = end - at
+        if byte == 13 || (byte < 32 && byte != 10 && byte != 9) || byte == 127 {
+            at = end
+            continue
+        }
+        if writer.*.length + count > CAPACITY { return false }
+        var index = writer.*.length
+        while index > writer.*.caret {
+            writer.*.text[index + count - 1] = writer.*.text[index - 1]
+            index -= 1
+        }
+        var put: usize = 0
+        while put < count {
+            const value = bytes[at + put]
+            writer.*.text[writer.*.caret + put] = if value == 9 { 32 } else { value }
+            put += 1
+        }
+        writer.*.length += count
+        writer.*.caret += count
+        at = end
+    }
+    return true
+}
+
+// Takes the bytes from .. to away (the caret goes to `from`).
+fn remove(writer: *Writer, from: usize, to: usize) -> void {
+    if to <= from || to > writer.*.length { return }
+    const gone = to - from
+    var index = from
+    while index + gone < writer.*.length {
+        writer.*.text[index] = writer.*.text[index + gone]
+        index += 1
+    }
+    writer.*.length -= gone
+    writer.*.caret = from
+    writer.*.stale = true
+}
+
+// The overlay's coverage of a text that is no longer typed is let go.
+fn forget(writer: *Writer) -> void {
+    if writer.*.coverage != null { device_module.clear(writer.*.coverage.?) }
+    writer.*.covered = geom.empty()
+    writer.*.stale = true
+}
+
+// Whether a text is being typed for the image in front. One typed for
+// another image (another document came to the front) is dropped here, so
+// that the keys and undo are that image's again.
+fn typing(app: *App, writer: *Writer) -> bool {
+    if !writer.*.editing { return false }
+    const image = api.image(app)
+    if image != null && @intFromPtr(image.?) == writer.*.image { return true }
+    writer.*.editing = false
+    writer.*.length = 0
+    writer.*.caret = 0
+    forget(writer)
+    return false
+}
+
+fn startEditing(app: *App, writer: *Writer, x: f64, y: f64, wrap: f64) -> void {
+    const image = api.image(app)
+    if image == null { return }
+    writer.*.editing = true
+    writer.*.image = @intFromPtr(image.?)
+    writer.*.x = x
+    writer.*.y = y
+    writer.*.wrap = wrap
+    writer.*.length = 0
+    writer.*.caret = 0
+    writer.*.stale = true
+    _ = fontsOfWriter(app, writer)
+    api.canvasChanged(app)
+}
+
+// The caret on the line above or below (by the lines as they are set):
+// where it comes nearest to where it is across. From the first line up
+// it goes to the start, from the last down to the end.
+fn caretVertically(app: *App, writer: *Writer, up: bool) -> void {
+    const fonts = fontsOfWriter(app, writer)
+    if fonts == null { return }
+    var style = styleNow(writer)
+    const text = textOf(writer)
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var height: f64 = 0.0
+    if !textrender.caretAt(fonts.?, &style, text, writer.*.x, writer.*.y, writer.*.caret, &cx, &cy, &height) { return }
+    const extent = textrender.measure(fonts.?, &style, text)
+    if extent.pitch <= 0.0 { return }
+    const line = nearest((cy - writer.*.y) / extent.pitch)
+    if up && line <= 0.0 {
+        writer.*.caret = 0
+        return
+    }
+    if !up && line >= @floatFromInt(f64, extent.lines) - 1.0 {
+        writer.*.caret = writer.*.length
+        return
+    }
+    const target = if up { cy - extent.pitch } else { cy + extent.pitch }
+    writer.*.caret = textrender.offsetAt(fonts.?, &style, text, writer.*.x, writer.*.y, cx, target + height / 2.0)
+}
+
+fn nearest(value: f64) -> f64 { return @floor(value + 0.5) }
+
+// The caret to the start (or the end) of its line as the lines are set;
+// without a font, of its line between line feeds.
+fn caretToLineEdge(app: *App, writer: *Writer, end: bool) -> void {
+    const text = textOf(writer)
+    const fonts = fontsOfWriter(app, writer)
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var height: f64 = 0.0
+    var style = styleNow(writer)
+    if fonts != null && textrender.caretAt(fonts.?, &style, text, writer.*.x, writer.*.y, writer.*.caret, &cx, &cy, &height) {
+        writer.*.caret = textrender.offsetAt(fonts.?, &style, text, writer.*.x, writer.*.y, if end { 1.0e9 } else { -1.0e9 }, cy + height / 2.0)
+        return
+    }
+    var at = writer.*.caret
+    if end {
+        while at < text.length && text[at] != 10 { at += 1 }
+    } else {
+        while at > 0 && text[at - 1] != 10 { at -= 1 }
+    }
+    writer.*.caret = at
+}
+
+fn paste(app: *App, writer: *Writer) -> void {
+    var text = shell_module.clipboard(app.*.shell, "text/plain;charset=utf-8")
+    if text.length == 0 { text = shell_module.clipboard(app.*.shell, "text/plain") }
+    if !insert(writer, text) { api.say(app, state.tr(app, "The text cannot be longer", "Der Text kann nicht länger werden"), true) }
+}
+
+// A key while the tool is in use: while a text is typed every key is
+// the text's (true), else none is.
+fn keyPress(app: *App, code: u32, modifiers: u32, down: bool) -> bool {
+    const found = writerOf(app)
+    if found == null || !typing(app, found.?) { return false }
+    const writer = found.?
+    if !down || keys.isModifier(code) { return true }
+    const text = textOf(writer)
+    if code == keys.BACKSPACE {
+        if writer.*.caret > 0 { remove(writer, previousBoundary(text, writer.*.caret), writer.*.caret) }
+    } else if code == keys.DELETE {
+        if writer.*.caret < writer.*.length { remove(writer, writer.*.caret, nextBoundary(text, writer.*.caret)) }
+    } else if code == keys.LEFT {
+        writer.*.caret = previousBoundary(text, writer.*.caret)
+    } else if code == keys.RIGHT {
+        writer.*.caret = nextBoundary(text, writer.*.caret)
+    } else if code == keys.HOME {
+        caretToLineEdge(app, writer, false)
+    } else if code == keys.END {
+        caretToLineEdge(app, writer, true)
+    } else if code == keys.UP || code == keys.DOWN {
+        caretVertically(app, writer, code == keys.UP)
+    } else if modifiers & keys.CONTROL != 0 {
+        const plain = shell_module.plainTyped(app.*.shell)
+        if plain.length == 1 && (plain[0] == 118 || plain[0] == 86) { paste(app, writer) }
+    } else if modifiers & keys.ALT == 0 {
+        if !insert(writer, shell_module.typed(app.*.shell)) { api.say(app, state.tr(app, "The text cannot be longer", "Der Text kann nicht länger werden"), true) }
+    }
+    api.canvasChanged(app)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Putting it on the image
+
+fn isBlankText(text: []const u8) -> bool {
+    for byte in text {
+        if byte != 32 && byte != 10 && byte != 9 { return false }
+    }
+    return true
+}
+
+// The layer's name: the text's first words, about TITLE bytes of them
+// (lines run together, a word cut only when the first is that long).
+fn titleOf(text: []const u8, into: [*]u8) -> usize {
+    var length: usize = 0
+    var at: usize = 0
+    while at < text.length {
+        while at < text.length && (text[at] == 32 || text[at] == 10 || text[at] == 9) { at += 1 }
+        var end = at
+        while end < text.length && text[end] != 32 && text[end] != 10 && text[end] != 9 { end += 1 }
+        if end == at { break }
+        const room = if length == 0 { 0 } else { 1 }
+        if length > 0 && length + room + (end - at) > TITLE { break }
+        if length > 0 {
+            into[length] = 32
+            length += 1
+        }
+        var index = at
+        while index < end && length < TITLE {
+            into[length] = text[index]
+            length += 1
+            index += 1
+        }
+        // (A word cut in the middle of a character loses the character.)
+        if index < end {
+            if text[index] & 192 == 128 {
+                while length > 0 && into[length - 1] & 192 == 128 { length -= 1 }
+                if length > 0 { length -= 1 }
+            }
+            break
+        }
+        at = end
+    }
+    return length
+}
+
+// The text typed becomes a new layer of the image (or nothing, when it
+// is only blanks). The box is closed either way.
+fn commit(app: *App) -> void {
+    const found = writerOf(app)
+    if found == null || !typing(app, found.?) { return }
+    const writer = found.?
+    writer.*.editing = false
+    forget(writer)
+    api.canvasChanged(app)
+    const text = textOf(writer)
+    const image = api.image(app)
+    if isBlankText(text) || image == null { return }
+    const fonts = fontsOfWriter(app, writer)
+    if fonts == null || textrender.usable(fonts.?, writer.*.style.face) >= textrender.count(fonts.?) {
+        api.say(app, state.tr(app, "No font could be read: the text was not set", "Keine Schrift ließ sich lesen: der Text wurde nicht gesetzt"), true)
+        return
+    }
+    const name = state.tr(app, "Text", "Text")
+    var title: [32]u8 = undefined
+    const bytes: [*]u8 = &title
+    const title_length = titleOf(text, bytes)
+    history_module.begin(image.?.*.history, name)
+    const layer = ops.newLayer(image.?, node_module.PAINT, bytes[0..title_length], name)
+    var area = geom.empty()
+    if layer != null && ops.beginPixels(image.?, layer.?) {
+        var style = styleNow(writer)
+        var selection: ?*device_module.Device = null
+        if image.?.*.selected { selection = image.?.*.selection }
+        _ = textrender.paint(fonts.?, &style, text, writer.*.x, writer.*.y, layer.?.*.device.?, app.*.foreground, blend.NORMAL, 255, 0, selection)
+        area = ops.endPixels(image.?, layer.?, name)
+    }
+    history_module.end(image.?.*.history)
+    if layer == null { api.say(app, state.tr(app, "There is no memory for a new layer", "Für eine neue Ebene fehlt der Speicher"), true) }
+    api.layersChanged(app)
+    api.imageChanged(app, area)
+}
+
+// The text typed is dropped.
+fn drop(app: *App) -> void {
+    const found = writerOf(app)
+    if found == null { return }
+    found.?.*.pressing = false
+    if found.?.*.editing {
+        found.?.*.editing = false
+        found.?.*.length = 0
+        found.?.*.caret = 0
+        forget(found.?)
+    }
+    api.canvasChanged(app)
+}
+
+// ---------------------------------------------------------------------------
+// The pointer
+
+// The box of the text being typed, in the image's pixels.
+fn boxOf(app: *App, writer: *Writer, left: *f64, top: *f64, width: *f64, height: *f64) -> bool {
+    const fonts = fontsOfWriter(app, writer)
+    if fonts == null { return false }
+    var style = styleNow(writer)
+    const extent = textrender.measure(fonts.?, &style, textOf(writer))
+    if extent.lines == 0 { return false }
+    left.* = writer.*.x + extent.left
+    top.* = writer.*.y
+    width.* = extent.width
+    height.* = extent.height
+    return true
+}
+
+fn press(app: *App, input: *const Input) -> void {
+    const found = writerOf(app)
+    if found == null || input.*.button != ui_app.BUTTON_LEFT { return }
+    const writer = found.?
+    if typing(app, writer) {
+        // In the box the caret goes where it was clicked; beside it the
+        // text is done.
+        var left: f64 = 0.0
+        var top: f64 = 0.0
+        var width: f64 = 0.0
+        var height: f64 = 0.0
+        const doc = api.document(app)
+        const zoom = if doc != null && doc.?.*.view.zoom > 0.0 { doc.?.*.view.zoom } else { 1.0 }
+        const margin = BOX_MARGIN * @floatFromInt(f64, if app.*.scale > 0 { app.*.scale } else { 1 }) / zoom
+        if boxOf(app, writer, &left, &top, &width, &height) && input.*.x >= left - margin && input.*.x <= left + width + margin && input.*.y >= top - margin && input.*.y <= top + height + margin {
+            var style = styleNow(writer)
+            writer.*.caret = textrender.offsetAt(writer.*.fonts.?, &style, textOf(writer), writer.*.x, writer.*.y, input.*.x, input.*.y)
+            api.canvasChanged(app)
+            return
+        }
+        commit(app)
+        return
+    }
+    if api.document(app) == null { return }
+    writer.*.pressing = true
+    writer.*.pressX = input.*.x
+    writer.*.pressY = input.*.y
+    writer.*.pressWindowX = input.*.windowX
+    writer.*.pressWindowY = input.*.windowY
+    writer.*.nowX = input.*.x
+    writer.*.nowY = input.*.y
+    writer.*.nowWindowX = input.*.windowX
+    writer.*.nowWindowY = input.*.windowY
+}
+
+fn move(app: *App, input: *const Input) -> void {
+    const found = writerOf(app)
+    if found == null || !found.?.*.pressing { return }
+    found.?.*.nowX = input.*.x
+    found.?.*.nowY = input.*.y
+    found.?.*.nowWindowX = input.*.windowX
+    found.?.*.nowWindowY = input.*.windowY
+    api.canvasChanged(app)
+}
+
+fn dragged(app: *App, writer: *Writer) -> bool {
+    const dx = writer.*.nowWindowX - writer.*.pressWindowX
+    const dy = writer.*.nowWindowY - writer.*.pressWindowY
+    const reach = CLICK_REACH * (if app.*.scale > 0 { app.*.scale } else { 1 })
+    return dx > reach || dx < -reach || dy > reach || dy < -reach
+}
+
+fn release(app: *App, input: *const Input) -> void {
+    const found = writerOf(app)
+    if found == null || !found.?.*.pressing { return }
+    const writer = found.?
+    move(app, input)
+    writer.*.pressing = false
+    if dragged(app, writer) {
+        const left = if writer.*.pressX < writer.*.nowX { writer.*.pressX } else { writer.*.nowX }
+        const top = if writer.*.pressY < writer.*.nowY { writer.*.pressY } else { writer.*.nowY }
+        const width = if writer.*.pressX < writer.*.nowX { writer.*.nowX - writer.*.pressX } else { writer.*.pressX - writer.*.nowX }
+        startEditing(app, writer, left, top, if width < 1.0 { 1.0 } else { width })
+    } else {
+        startEditing(app, writer, writer.*.pressX, writer.*.pressY, 0.0)
+    }
+}
+
+// Enter while a text is typed: a new line; with Control, the text is
+// done.
+fn finish(app: *App) -> void {
+    const found = writerOf(app)
+    if found == null || !typing(app, found.?) { return }
+    if app.*.modifiers & keys.CONTROL != 0 {
+        commit(app)
+        return
+    }
+    _ = insert(found.?, "\n")
+    api.canvasChanged(app)
+}
+
+fn cancel(app: *App) -> void {
+    drop(app)
+}
+
+// Another tool: what was typed goes on the image.
+fn deactivate(app: *App) -> void {
+    const found = writerOf(app)
+    if found == null { return }
+    found.?.*.pressing = false
+    commit(app)
+}
+
+fn busy(app: *App) -> bool {
+    const found = writerOf(app)
+    return found != null && (found.?.*.pressing || typing(app, found.?))
+}
+
+// ---------------------------------------------------------------------------
+// What is drawn over the canvas
+
+// The coverage of the text as it is now, set again when it changed.
+fn refresh(app: *App, writer: *Writer) -> void {
+    if !writer.*.stale && writer.*.coverage != null { return }
+    if writer.*.coverage == null { writer.*.coverage = mask_module.create(app.*.allocator, false) }
+    if writer.*.coverage == null { return }
+    device_module.clear(writer.*.coverage.?)
+    writer.*.covered = geom.empty()
+    writer.*.stale = false
+    const fonts = fontsOfWriter(app, writer)
+    if fonts == null { return }
+    var style = styleNow(writer)
+    writer.*.covered = textrender.coverage(fonts.?, &style, textOf(writer), writer.*.x, writer.*.y, writer.*.coverage.?)
+}
+
+// The text as it will be, over the canvas: its coverage in the
+// foreground colour, window pixel by window pixel through the view
+// (sharp blocks of the image's pixels from zoom 1 on, mixed from the
+// four nearest below).
+fn showText(app: *App, marks: *const overlay.Painter, writer: *Writer) -> void {
+    if !marks.*.live || writer.*.coverage == null || geom.isEmpty(writer.*.covered) { return }
+    const doc = api.document(app)
+    if doc == null { return }
+    const view = &doc.?.*.view
+    const clip = ui.rect(marks.*.left + marks.*.originX, marks.*.top + marks.*.originY, marks.*.right - marks.*.left, marks.*.bottom - marks.*.top)
+    const area = geom.intersect(writer.*.covered, geom.grown(viewport.imageRectOf(view, clip), 1))
+    if geom.isEmpty(area) || @intCast(i64, area.width) * @intCast(i64, area.height) > @intCast(i64, MOST_SHOWN) { return }
+    const shown = ui.intersect(viewport.windowRectOf(view, area), clip)
+    if ui.isEmpty(shown) { return }
+    const width = @intCast(usize, area.width)
+    const height = @intCast(usize, area.height)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const amounts = scratch.bytes(pool, width * height)
+    if amounts == null {
+        scratch.release(pool, mark)
+        return
+    }
+    mask_module.readBytes(writer.*.coverage.?, area, amounts.?, width)
+    const color = pixel.premultiplied(app.*.foreground)
+    const zoom = marks.*.zoom
+    const sharp = zoom >= 1.0
+    // The image place of a canvas place goes linearly with it: these are
+    // its steps along a row (each row starts from its own place).
+    const across_x = marks.*.cos * marks.*.side / zoom
+    const across_y = -marks.*.sin / zoom
+    const columns = @floatFromInt(f64, area.width)
+    const rows = @floatFromInt(f64, area.height)
+    const canvas = marks.*.canvas
+    const first = shown.x - marks.*.originX
+    const last = first + shown.width
+    var j = shown.y - marks.*.originY
+    const bottom = j + shown.height
+    while j < bottom {
+        const u = (@floatFromInt(f64, first) + 0.5 - marks.*.middleX) / zoom
+        const v = (@floatFromInt(f64, j) + 0.5 - marks.*.middleY) / zoom
+        var ix = (u * marks.*.cos + v * marks.*.sin) * marks.*.side + marks.*.centerX - @floatFromInt(f64, area.x)
+        var iy = -u * marks.*.sin + v * marks.*.cos + marks.*.centerY - @floatFromInt(f64, area.y)
+        const line = canvas.*.pixels + @intCast(usize, j) * canvas.*.stride
+        var i = first
+        while i < last {
+            var cover: u32 = 0
+            if sharp {
+                if ix >= 0.0 && iy >= 0.0 && ix < columns && iy < rows { cover = @intCast(u32, amounts.?[@intFromFloat(usize, iy) * width + @intFromFloat(usize, ix)]) }
+            } else {
+                // Between the four nearest pixels' middles.
+                const fx = ix - 0.5
+                const fy = iy - 0.5
+                if fx > -1.0 && fy > -1.0 && fx < columns && fy < rows {
+                    const x0 = @floor(fx)
+                    const y0 = @floor(fy)
+                    const tx = fx - x0
+                    const ty = fy - y0
+                    const cx = @intFromFloat(i32, x0)
+                    const cy = @intFromFloat(i32, y0)
+                    const a = amountAt(amounts.?, area.width, area.height, cx, cy)
+                    const b = amountAt(amounts.?, area.width, area.height, cx + 1, cy)
+                    const c = amountAt(amounts.?, area.width, area.height, cx, cy + 1)
+                    const d = amountAt(amounts.?, area.width, area.height, cx + 1, cy + 1)
+                    const mixed = (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty
+                    cover = @intFromFloat(u32, mixed + 0.5)
+                }
+            }
+            if cover != 0 {
+                const at = @intCast(usize, i)
+                line[at] = canvas_module.over(line[at], color, if cover > 255 { 255 } else { cover })
+            }
+            ix += across_x
+            iy += across_y
+            i += 1
+        }
+        j += 1
+    }
+    if marks.*.bounds != null { marks.*.bounds.?.* = geom.unite(marks.*.bounds.?.*, shown) }
+    scratch.release(pool, mark)
+}
+
+inline fn amountAt(amounts: [*]const u8, width: i32, height: i32, x: i32, y: i32) -> f64 {
+    if x < 0 || y < 0 || x >= width || y >= height { return 0.0 }
+    return @floatFromInt(f64, amounts[@intCast(usize, y * width + x)])
+}
+
+fn drawOverlay(app: *App, canvas: *Canvas) -> void {
+    const found = writerOf(app)
+    if found == null { return }
+    const writer = found.?
+    const marks = overlay.begin(app, canvas)
+    if !marks.live { return }
+    const scale = @floatFromInt(f64, marks.scale)
+    if writer.*.pressing && dragged(app, writer) {
+        const left = if writer.*.pressX < writer.*.nowX { writer.*.pressX } else { writer.*.nowX }
+        const top = if writer.*.pressY < writer.*.nowY { writer.*.pressY } else { writer.*.nowY }
+        const width = if writer.*.pressX < writer.*.nowX { writer.*.nowX - writer.*.pressX } else { writer.*.pressX - writer.*.nowX }
+        const height = if writer.*.pressY < writer.*.nowY { writer.*.nowY - writer.*.pressY } else { writer.*.pressY - writer.*.nowY }
+        overlay.dashedRect(&marks, left, top, width, height)
+        return
+    }
+    if !typing(app, writer) { return }
+    refresh(app, writer)
+    showText(app, &marks, writer)
+    // The box around it, a little away from the glyphs, and the caret.
+    var left: f64 = 0.0
+    var top: f64 = 0.0
+    var width: f64 = 0.0
+    var height: f64 = 0.0
+    if !boxOf(app, writer, &left, &top, &width, &height) {
+        // Without a font there is no text to show: the place at least.
+        overlay.cross(&marks, writer.*.x, writer.*.y)
+        return
+    }
+    const room = 4.0 * scale / marks.zoom
+    overlay.dashedRect(&marks, left - room, top - room, width + room * 2.0, height + room * 2.0)
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var tall: f64 = 0.0
+    var style = styleNow(writer)
+    if textrender.caretAt(writer.*.fonts.?, &style, textOf(writer), writer.*.x, writer.*.y, writer.*.caret, &cx, &cy, &tall) {
+        overlay.line(&marks, cx, cy, cx, cy + tall)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The options
+
+fn fontName(context: usize, index: usize) -> []const u8 {
+    const fonts: *Fonts = unsafe { @ptrFromInt(*Fonts, context) }
+    return textrender.name(fonts, index)
+}
+
+const ALIGN_ICONS = [3]u16{ icons.ALIGN_LEFT, icons.ALIGN_CENTER, icons.ALIGN_RIGHT }
+
+// What changed in the options shows in the text being typed and is kept
+// once it is complete.
+fn changedOption(app: *App, writer: *Writer, complete: bool) -> void {
+    writer.*.stale = true
+    if writer.*.editing { api.canvasChanged(app) }
+    if complete { keepSettings(app, writer) }
+}
+
+fn options(app: *App, area: ui.Rect) -> i32 {
+    const found = writerOf(app)
+    if found == null { return 0 }
+    const writer = found.?
+    const kit = api.kit(app)
+    const s = if app.*.scale > 0 { app.*.scale } else { 1 }
+    const row = kit_module.ROW * s
+    const step = row + 4 * s
+    const named = if area.width * 2 / 5 < 84 * s { area.width * 2 / 5 } else { 84 * s }
+    var y = area.y
+
+    // The font: a list of those there are.
+    kit_module.label(kit, ui.rect(area.x, y, named, row), state.tr(app, "Font", "Schrift"), kit_module.TEXT_DIM, kit_module.ALIGN_LEFT)
+    const fonts = fontsOfWriter(app, writer)
+    const field = ui.rect(area.x + named, y, area.width - named, row)
+    if fonts != null && textrender.count(fonts.?) > 0 {
+        var face = if writer.*.style.face < textrender.count(fonts.?) { writer.*.style.face } else { 0 }
+        if kit_module.comboBoxWith(kit, view_module.id("nebula.text.font"), field, textrender.count(fonts.?), fontName, @intFromPtr(fonts.?), &face) {
+            writer.*.style.face = face
+            changedOption(app, writer, true)
+        }
+    } else {
+        kit_module.label(kit, field, state.tr(app, "None found", "Keine gefunden"), kit_module.TEXT_DANGER, kit_module.ALIGN_LEFT)
+    }
+    y += step
+
+    var size = kit_module.sliderOptions(textrender.SMALLEST, textrender.LARGEST, 1.0, 0)
+    size.exponent = 2.5
+    size.softLow = textrender.SMALLEST
+    size.softHigh = 300.0
+    size.suffix = " px"
+    const size_id = view_module.id("nebula.text.size")
+    if kit_module.slider(kit, size_id, ui.rect(area.x, y, area.width, row), state.tr(app, "Size", "Größe"), &writer.*.style.size, &size) { changedOption(app, writer, false) }
+    if kit_module.released(kit, size_id) { changedOption(app, writer, true) }
+    y += step
+
+    kit_module.label(kit, ui.rect(area.x, y, named, row), state.tr(app, "Alignment", "Ausrichtung"), kit_module.TEXT_DIM, kit_module.ALIGN_LEFT)
+    const align_tips = [3][]const u8{ state.tr(app, "Left", "Links"), state.tr(app, "Centred", "Mittig"), state.tr(app, "Right", "Rechts") }
+    var index: usize = 0
+    while index < 3 {
+        const button = ui.rect(area.x + named + @intCast(i32, index) * (row + 2 * s), y, row, row)
+        if kit_module.toolButton(kit, view_module.idOf(view_module.id("nebula.text.align"), index), button, icons.drawFor, @intCast(usize, ALIGN_ICONS[index]), @intCast(usize, writer.*.style.alignment) == index, align_tips[index]) {
+            writer.*.style.alignment = @intCast(u8, index)
+            changedOption(app, writer, true)
+        }
+        index += 1
+    }
+    y += step
+
+    writer.*.linePercent = writer.*.style.lineSpacing * 100.0
+    var lines = kit_module.sliderOptions(25.0, 400.0, 5.0, 0)
+    lines.suffix = " %"
+    const lines_id = view_module.id("nebula.text.lines")
+    if kit_module.slider(kit, lines_id, ui.rect(area.x, y, area.width, row), state.tr(app, "Line spacing", "Zeilenabstand"), &writer.*.linePercent, &lines) {
+        writer.*.style.lineSpacing = writer.*.linePercent / 100.0
+        changedOption(app, writer, false)
+    }
+    if kit_module.released(kit, lines_id) { changedOption(app, writer, true) }
+    y += step
+
+    var letters = kit_module.sliderOptions(-50.0, 200.0, 0.5, 1)
+    letters.softLow = -20.0
+    letters.softHigh = 50.0
+    letters.suffix = " px"
+    const letters_id = view_module.id("nebula.text.letters")
+    if kit_module.slider(kit, letters_id, ui.rect(area.x, y, area.width, row), state.tr(app, "Letter spacing", "Zeichenabstand"), &writer.*.style.letterSpacing, &letters) { changedOption(app, writer, false) }
+    if kit_module.released(kit, letters_id) { changedOption(app, writer, true) }
+    y += step
+
+    if kit_module.checkBox(kit, view_module.id("nebula.text.smooth"), ui.rect(area.x, y, area.width, row), state.tr(app, "Smooth edges", "Glatte Kanten"), &writer.*.style.antialias) { changedOption(app, writer, true) }
+    y += step
+
+    // The colour is the foreground's: shown here (over squares where it is
+    // translucent), chosen elsewhere.
+    kit_module.label(kit, ui.rect(area.x, y, named, row), state.tr(app, "Colour", "Farbe"), kit_module.TEXT_DIM, kit_module.ALIGN_LEFT)
+    const swatch = ui.rect(area.x + named, y + 3 * s, row - 6 * s, row - 6 * s)
+    const canvas = kit_module.canvasOf(kit)
+    if app.*.foreground >> 24 != 255 { kit_module.checker(canvas, swatch, 3 * s) }
+    kit_module.fillStraight(canvas, swatch, app.*.foreground)
+    kit_module.frame(canvas, swatch, app.*.theme.border)
+    kit_module.label(kit, ui.rect(swatch.x + swatch.width + 8 * s, y, area.x + area.width - swatch.x - swatch.width - 8 * s, row), state.tr(app, "The foreground", "Die Vordergrundfarbe"), kit_module.TEXT_NORMAL, kit_module.ALIGN_LEFT)
+    y += step
+
+    if typing(app, writer) {
+        y += 4 * s
+        const half = (area.width - 6 * s) / 2
+        if kit_module.button(kit, view_module.id("nebula.text.apply"), ui.rect(area.x, y, half, row), state.tr(app, "Apply", "Übernehmen"), kit_module.BUTTON_PRIMARY) { commit(app) }
+        if kit_module.button(kit, view_module.id("nebula.text.cancel"), ui.rect(area.x + area.width - half, y, half, row), state.tr(app, "Cancel", "Abbrechen"), kit_module.BUTTON_NORMAL) { drop(app) }
+        y += step
+    }
+
+    y += 6 * s
+    const font = state.smallOf(app)
+    if font.*.loaded {
+        const line = font.*.ascent * 3 / 2 + 2 * s
+        const words = state.tr(app, "Click to place a text, or drag a box for its lines to wrap in. Control and Enter puts it on the image as a new layer, Escape drops it.", "Klicken setzt einen Text, ein aufgezogener Rahmen bricht seine Zeilen um. Strg und Eingabe setzt ihn als neue Ebene ins Bild, Escape verwirft ihn.")
+        const count = popup.wrapped(kit.*.ui, font, words, area.x, y, area.width, line, 8, app.*.theme.dim)
+        y += @intCast(i32, count) * line
+    }
+    return y - area.y
+}
+
+// ---------------------------------------------------------------------------
+// The table
+
+const TOOLS = [1]state.Tool{
+    state.Tool.{ .id = TEXT, .key = "text", .name = "Text", .german = "Text", .shortcut = "", .icon = icons.TOOL_TEXT, .group = state.GROUP_OTHER, .cursor = state.CURSOR_CROSS, .activate = null, .deactivate = deactivate, .press = press, .move = move, .release = release, .keyPress = keyPress, .tick = null, .overlay = drawOverlay, .options = options, .cancel = cancel, .finish = finish, .busy = busy },
+}
+
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's tools, as tools/registry.mlx puts them together (a copy of
+// the table in heap memory, made at the first call: core/table.mlx).
+pub fn list() -> []const state.Tool {
+    if kept.address != 0 { return table.rows(state.Tool, &kept) }
+    return table.keep(state.Tool, &kept, TOOLS[0..])
+}

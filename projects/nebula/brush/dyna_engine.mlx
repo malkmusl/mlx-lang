@@ -1,0 +1,267 @@
+// nebula brush: the dyna engine ("dyna"), Krita's dyna brush after Paul
+// Haeberli's DynaDraw: the pen drags a nib that has mass and meets drag,
+// and the nib draws a ribbon. The ribbon's width is the dab's diameter
+// (times the width number) where the nib moves slowly and thins the
+// faster it goes; it lies across the nib's motion, or at a fixed angle
+// like a calligraphy pen's. Heavy nibs swing out at corners, light ones
+// follow the pen closely; drag calms them.
+//
+// Its numbers in Settings.values (values() lists them with their ranges
+// and defaults; defaults() makes a dyna brush):
+//
+//   0  mass        0..1: how slowly the nib takes up the pen's pull (0.5)
+//   1  drag        0..1: the part of its speed the nib loses every step
+//                  (0.15)
+//   2  width       the ribbon's width at rest in dab diameters (0.01 to
+//                  10; 1)
+//   3  thinning    0..1: how much speed thins the ribbon (0.5): at v
+//                  pixels a millisecond it is 1 / (1 + 4 thinning v)
+//                  as wide as at rest, a tenth at least
+//   4  fixed angle 1: the ribbon lies at the angle below (turned with
+//                  the dab) instead of across the motion (0)
+//   5  angle       degrees, clockwise on the screen (-360 to 360; 30)
+//   6  steps       the nib's steps every dab (1 to 16; 1)
+//
+// Every step, the pen's pull (the way from the nib to the pen, which
+// moves from the dab before to this one over the steps) divided by
+// 1 + 49 mass^2 is added to the nib's speed, which then loses the drag,
+// and the nib moves by it; its speed in pixels a millisecond (by the
+// times of the pen's points; where no time passed, the width stays what
+// it was) sets the width. The ribbon from the nib's place two steps ago
+// through the last one to this one is filled at once (so that the
+// pieces of a ribbon overlap and no seam shows where they meet). The nib
+// starts at the first dab, at rest: a tap paints nothing. Each copy of a
+// dab (mirrored) has its own nib. Not done: Krita's shapes other than
+// the ribbon (circles, lines, wire, polygons).
+const math = @import("std.math")
+const types = @import("./types.mlx")
+const geom = @import("../core/geom.mlx")
+const raster = @import("../core/raster.mlx")
+const table = @import("../core/table.mlx")
+// (The ink the procedural engines share lives in the sketch engine's
+// module.)
+const ink_module = @import("./sketch_engine.mlx")
+
+pub const Rect = geom.Rect
+const Value = ink_module.Value
+const SLOTS = ink_module.SLOTS
+
+// The engine's number (Settings.engine): types.mlx has no name for it yet.
+pub const ENGINE_DYNA: u16 = 16
+
+const MASS: usize = 0
+const DRAG: usize = 1
+const WIDTH: usize = 2
+const THINNING: usize = 3
+const FIXED: usize = 4
+const ANGLE: usize = 5
+const STEPS: usize = 6
+
+const VALUES = [7]Value{
+    Value.{ .key = "mass", .name = "Mass", .german = "Masse", .low = 0.0, .high = 1.0, .initial = 0.5 },
+    Value.{ .key = "drag", .name = "Drag", .german = "Widerstand", .low = 0.0, .high = 1.0, .initial = 0.15 },
+    Value.{ .key = "width", .name = "Width", .german = "Breite", .low = 0.01, .high = 10.0, .initial = 1.0 },
+    Value.{ .key = "thinning", .name = "Thinning by speed", .german = "Verjüngung durch Tempo", .low = 0.0, .high = 1.0, .initial = 0.5 },
+    Value.{ .key = "fixed_angle", .name = "Fixed angle", .german = "Fester Winkel", .low = 0.0, .high = 1.0, .initial = 0.0 },
+    Value.{ .key = "angle", .name = "Angle", .german = "Winkel", .low = -360.0, .high = 360.0, .initial = 30.0 },
+    Value.{ .key = "steps", .name = "Steps", .german = "Schritte", .low = 1.0, .high = 16.0, .initial = 1.0 },
+}
+
+var keptValues: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The engine's numbers (row N is Settings.values[N]).
+pub fn values() -> []const Value {
+    if keptValues.address != 0 { return table.rows(Value, &keptValues) }
+    return table.keep(Value, &keptValues, VALUES[0..])
+}
+
+// A dyna brush: types.defaults() with this engine, 16 pixels, dabs a
+// fifth of the diameter apart, the size not by pressure, and the
+// numbers' defaults.
+pub fn defaults(settings: *types.Settings) -> void {
+    types.defaults(settings)
+    types.setName(settings, "Dyna pen")
+    settings.*.engine = ENGINE_DYNA
+    settings.*.size = 16.0
+    settings.*.tip.spacing = 0.2
+    settings.*.options[types.OPTION_SIZE].on = false
+    ink_module.applyValues(settings, values())
+}
+
+// One nib: its place and speed, the way the ribbon lies across it, where
+// the pen was at its last dab, and the ribbon's last two cross-sections
+// (left x, y, right x, y each; `sections` of them are there).
+const Nib = struct {
+    x: f64
+    y: f64
+    vx: f64
+    vy: f64
+    acrossX: f64
+    acrossY: f64
+    penX: f64
+    penY: f64
+    time: f64
+    // The part of the width at rest it had last.
+    narrowing: f64
+    sections: usize
+    older: [4]f64
+    newer: [4]f64
+}
+
+const Own = struct {
+    ink: *ink_module.Ink
+    nibs: [8]Nib
+    started: [8]bool
+}
+
+fn ownOf(stroke: *types.Stroke) -> *Own {
+    unsafe { return @ptrFromInt(*Own, stroke.*.engineState) }
+}
+
+fn begin(stroke: *types.Stroke) -> bool {
+    const allocator = stroke.*.allocator
+    const memory = allocator.alloc(@sizeOf(Own), 16)
+    const ink = ink_module.inkCreate(allocator)
+    if memory == null || ink == null {
+        if memory != null { allocator.free(memory.?, @sizeOf(Own), 16) }
+        if ink != null { ink_module.inkDestroy(ink.?, allocator) }
+        return false
+    }
+    const own: *Own = unsafe { @ptrCast(*Own, memory.?) }
+    own.*.ink = ink.?
+    var slot: usize = 0
+    while slot < SLOTS {
+        own.*.started[slot] = false
+        slot += 1
+    }
+    stroke.*.engineState = @intFromPtr(own)
+    return true
+}
+
+fn free(stroke: *types.Stroke) -> void {
+    if stroke.*.engineState == 0 { return }
+    const own = ownOf(stroke)
+    const allocator = stroke.*.allocator
+    ink_module.inkDestroy(own.*.ink, allocator)
+    unsafe { allocator.free(@ptrCast([*]u8, own), @sizeOf(Own), 16) }
+    stroke.*.engineState = 0
+}
+
+fn paint(stroke: *types.Stroke, dab: *const types.Dab) -> Rect {
+    const own = ownOf(stroke)
+    const ink = own.*.ink
+    ink_module.inkFor(ink, stroke, dab)
+    const slot = @intCast(usize, dab.*.copy)
+    // (A copy that has no nib of its own paints nothing.)
+    if slot >= SLOTS { return geom.empty() }
+    const nib = &own.*.nibs[slot]
+    if !own.*.started[slot] {
+        nib.*.x = dab.*.x
+        nib.*.y = dab.*.y
+        nib.*.vx = 0.0
+        nib.*.vy = 0.0
+        nib.*.acrossX = 0.0
+        nib.*.acrossY = 1.0
+        nib.*.penX = dab.*.x
+        nib.*.penY = dab.*.y
+        nib.*.time = dab.*.point.time
+        nib.*.narrowing = 1.0
+        nib.*.sections = 0
+        own.*.started[slot] = true
+        return geom.empty()
+    }
+    const list = values()
+    const mass = ink_module.number(stroke, list, MASS)
+    const keep = 1.0 - ink_module.number(stroke, list, DRAG)
+    const diameter = dab.*.diameter
+    const rest_width = diameter * ink_module.number(stroke, list, WIDTH)
+    const thinning = ink_module.number(stroke, list, THINNING)
+    const fixed = ink_module.isSet(stroke, list, FIXED)
+    const angle = ink_module.number(stroke, list, ANGLE) * math.pi / 180.0 + dab.*.angle
+    const steps = ink_module.count(stroke, list, STEPS)
+    const heaviness = 1.0 + 49.0 * mass * mass
+    const from_x = nib.*.penX
+    const from_y = nib.*.penY
+    // Milliseconds a step.
+    const lapse = (dab.*.point.time - nib.*.time) / @floatFromInt(f64, steps)
+    const path = ink.*.path
+    var step: usize = 0
+    while step < steps {
+        const along = @floatFromInt(f64, step + 1) / @floatFromInt(f64, steps)
+        const pen_x = from_x + (dab.*.x - from_x) * along
+        const pen_y = from_y + (dab.*.y - from_y) * along
+        nib.*.vx = (nib.*.vx + (pen_x - nib.*.x) / heaviness) * keep
+        nib.*.vy = (nib.*.vy + (pen_y - nib.*.y) / heaviness) * keep
+        nib.*.x += nib.*.vx
+        nib.*.y += nib.*.vy
+        const speed = math.hypot(nib.*.vx, nib.*.vy)
+        if lapse > 0.001 { nib.*.narrowing = math.max(0.1, 1.0 / (1.0 + 4.0 * thinning * speed / lapse)) }
+        const half = rest_width * nib.*.narrowing * 0.5
+        if fixed {
+            nib.*.acrossX = math.cos(angle)
+            nib.*.acrossY = math.sin(angle)
+        } else if speed > 0.000001 {
+            var ax = 0.0 - nib.*.vy / speed
+            var ay = nib.*.vx / speed
+            // (Kept on the side it was: a ribbon that turns back does not
+            // twist.)
+            if ax * nib.*.acrossX + ay * nib.*.acrossY < 0.0 {
+                ax = 0.0 - ax
+                ay = 0.0 - ay
+            }
+            nib.*.acrossX = ax
+            nib.*.acrossY = ay
+        }
+        // A nib that flew off (or is no number) starts again at the pen.
+        if !(math.abs(nib.*.x - pen_x) < diameter * 100.0 + 10000.0) || !(math.abs(nib.*.y - pen_y) < diameter * 100.0 + 10000.0) {
+            nib.*.x = pen_x
+            nib.*.y = pen_y
+            nib.*.vx = 0.0
+            nib.*.vy = 0.0
+            nib.*.sections = 0
+        }
+        const lx = nib.*.x + nib.*.acrossX * half
+        const ly = nib.*.y + nib.*.acrossY * half
+        const rx = nib.*.x - nib.*.acrossX * half
+        const ry = nib.*.y - nib.*.acrossY * half
+        if nib.*.sections >= 1 {
+            // Left side forward, right side back: one shape over the last
+            // two pieces.
+            if nib.*.sections >= 2 {
+                raster.moveTo(path, nib.*.older[0], nib.*.older[1])
+                raster.lineTo(path, nib.*.newer[0], nib.*.newer[1])
+            } else {
+                raster.moveTo(path, nib.*.newer[0], nib.*.newer[1])
+            }
+            raster.lineTo(path, lx, ly)
+            raster.lineTo(path, rx, ry)
+            raster.lineTo(path, nib.*.newer[2], nib.*.newer[3])
+            if nib.*.sections >= 2 { raster.lineTo(path, nib.*.older[2], nib.*.older[3]) }
+            raster.close(path)
+            ink_module.inkFill(ink, path, raster.NONZERO)
+        }
+        nib.*.older = nib.*.newer
+        nib.*.newer[0] = lx
+        nib.*.newer[1] = ly
+        nib.*.newer[2] = rx
+        nib.*.newer[3] = ry
+        if nib.*.sections < 2 { nib.*.sections += 1 }
+        step += 1
+    }
+    nib.*.penX = dab.*.x
+    nib.*.penY = dab.*.y
+    nib.*.time = dab.*.point.time
+    return ink_module.inkBox(ink)
+}
+
+const ENGINES = [1]types.Engine{
+    types.Engine.{ .id = ENGINE_DYNA, .key = "dyna", .name = "Dyna brush", .german = "Dynamikpinsel", .flags = 0, .begin = begin, .dab = paint, .end = null, .free = free },
+}
+
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's engine, "dyna" (brush/engines.mlx lists it).
+pub fn list() -> []const types.Engine {
+    if kept.address != 0 { return table.rows(types.Engine, &kept) }
+    return table.keep(types.Engine, &kept, ENGINES[0..])
+}

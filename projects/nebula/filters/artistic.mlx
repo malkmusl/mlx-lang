@@ -1,0 +1,904 @@
+// nebula filters: the Artistic group of the Filter menu: Oilpaint,
+// Pixelize, Raindrops, Halftone and Posterize (ids 250-299).
+//
+//     var params: types.Params = undefined
+//     registry.defaults(artistic.OILPAINT, &params)
+//     params.values[0] = 3.0                       // brush size
+//     _ = registry.apply(&params, pixels, width, height, stride)
+//
+// Each works in place on straight pixels and reads its numbers held in
+// their ranges (NaN: the initial value). What is said of a place is said
+// of the place in the rectangle handed in, so three of them are not for
+// a caller that filters a picture block by block as it comes:
+//
+//   Pixelize   its cells start at the rectangle's first pixel, so it is
+//              not separable into blocks in general: the caller filters
+//              the layer whole, or lines its blocks up with the cell grid.
+//              margin() says the larger side of a cell: a block on the
+//              grid grown by it holds every cell it shows a part of, and
+//              the grown block is on the grid too when both sides divide
+//              that margin (square cells, 8 x 16) or it stops at the
+//              layer's first row and column.
+//   Halftone   its grid of dots starts there too (a pixel is made from
+//              itself alone, so there is no margin): filter whole, or
+//              blocks that start on the grid (possible at angle 0 only).
+//   Raindrops  places its drops by the rectangle's size: it is about the
+//              whole layer; margin() is the drop size, as far as a pixel
+//              of a drop is from what it shows.
+//
+// Oilpaint reads its brush size around a pixel and Posterize nothing: both
+// give the same pixels whole or in blocks with the margin.
+//
+// Alpha: Oilpaint, Halftone and Posterize keep each pixel's alpha (Halftone
+// times its two colours' alpha), Pixelize and Raindrops mix it as they mix
+// colour, colour weighed by alpha; a pixel that ends transparent is 0.
+const math = @import("std.math")
+const types = @import("./types.mlx")
+const pixel = @import("../core/pixel.mlx")
+const scratch = @import("../core/scratch.mlx")
+const table = @import("../core/table.mlx")
+
+pub const Params = types.Params
+
+pub const OILPAINT: u16 = 250
+pub const PIXELIZE: u16 = 251
+pub const RAINDROPS: u16 = 252
+pub const HALFTONE: u16 = 253
+pub const POSTERIZE: u16 = 254
+
+// Where each filter is in FILTERS.
+const OILPAINT_PLACE: usize = 0
+const PIXELIZE_PLACE: usize = 1
+const RAINDROPS_PLACE: usize = 2
+const HALFTONE_PLACE: usize = 3
+const POSTERIZE_PLACE: usize = 4
+
+// The number at `index` of a filter's `rows`, held in its range (files
+// and scripts hand in anything; NaN counts as the initial value).
+fn number(params: *const Params, rows: []const types.Param, index: usize) -> f64 {
+    const value = params.*.values[index]
+    if value != value { return rows[index].initial }
+    if value < rows[index].low { return rows[index].low }
+    if value > rows[index].high { return rows[index].high }
+    return value
+}
+
+// The same as a whole number (the nearest).
+fn whole(params: *const Params, rows: []const types.Param, index: usize) -> i32 {
+    return @intFromFloat(i32, math.round(number(params, rows, index)))
+}
+
+fn switched(params: *const Params, rows: []const types.Param, index: usize) -> bool {
+    return number(params, rows, index) >= 0.5
+}
+
+// A colour parameter's 0xAARRGGBB.
+fn colorOf(params: *const Params, rows: []const types.Param, index: usize) -> u32 {
+    return @intCast(u32, @intFromFloat(i64, math.round(number(params, rows, index))))
+}
+
+// The rectangle's pixels as rows without gaps between them, for a filter
+// that reads around the pixel it writes. Null without memory.
+fn copied(pool: *scratch.Pool, pixels: [*]const u32, width: usize, height: usize, stride: usize) -> ?[*]u32 {
+    const source = scratch.words(pool, width * height)
+    if source == null { return null }
+    var y: usize = 0
+    while y < height {
+        const from = pixels + y * stride
+        const into = source.? + y * width
+        var x: usize = 0
+        while x < width {
+            into[x] = from[x]
+            x += 1
+        }
+        y += 1
+    }
+    return source
+}
+
+// A number scrambled into 64 even bits (the last step of splitmix64, in
+// three expressions the compiler puts in place of their calls): what
+// Raindrops draws its drops from. Nothing of std.random: the same seed
+// has to give the same picture on every run and every system.
+const GOLDEN: u64 = 0x9E3779B97F4A7C15
+inline fn stirred(bits: u64) -> u64 { return (bits ^ (bits >> 30)) *% 0xBF58476D1CE4E5B9 }
+inline fn stirredAgain(bits: u64) -> u64 { return (bits ^ (bits >> 27)) *% 0x94D049BB133111EB }
+inline fn settled(bits: u64) -> u64 { return bits ^ (bits >> 31) }
+inline fn scramble(value: u64) -> u64 { return settled(stirredAgain(stirred(value))) }
+
+// a * b / 255 rounded (pixel.mul as one expression, so that no call is
+// left in a loop).
+inline fn rounded(sum: u32) -> u32 { return (sum + (sum >> 8)) >> 8 }
+inline fn scaled(a: u32, b: u32) -> u32 { return rounded(a * b + 128) }
+
+// ---- Oilpaint ----
+//
+// Each pixel becomes the mean colour of the intensity level most of its
+// neighbourhood has: the square of `brush size` pixels to every side, its
+// pixels sorted by how light they are into `smoothness` levels, each
+// counting as much as its alpha (so what is transparent has no say and
+// gives no colour); of two levels with the same count the darker one.
+// The pixel's own alpha stays.
+//
+// A row is done with one histogram of the levels (count and colour sums)
+// that slides along it: a step takes out the column that leaves and puts
+// in the one that comes, 2 * size + 1 pixels each, so the work for a pixel
+// grows with the size, not its square. The fullest level is followed
+// along: as long as it did not lose count in the step, only it and the
+// levels that gained can be the fullest now; when it did, all levels are
+// looked through.
+//
+// A picture without any transparency (most are) takes a shorter way to
+// the same pixels: every pixel counts 1, so a level's count and sums fit
+// one word and a pixel is one addition.
+
+const OILPAINT_PARAMS = [2]types.Param{
+    types.Param.{ .name = "Brush size", .german = "Pinselgröße", .kind = types.INT, .low = 1.0, .high = 5.0, .initial = 1.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Smoothness", .german = "Glättung", .kind = types.INT, .low = 10.0, .high = 255.0, .initial = 30.0, .choices = "", .choicesGerman = "" },
+}
+
+fn oilpaintMargin(params: *const Params) -> i32 {
+    return whole(params, described(OILPAINT_PLACE), 0)
+}
+
+// Where in the copy each row of the window around row `y` starts, the
+// rows past the edge being the edge's.
+fn oilpaintRows(rows: [*]usize, y: usize, radius: usize, width: usize, height: usize) -> void {
+    var index: usize = 0
+    while index < radius * 2 + 1 {
+        var row = y + index
+        row = if row < radius { 0 } else { row - radius }
+        if row >= height { row = height - 1 }
+        rows[index] = row * width
+        index += 1
+    }
+}
+
+// The fullest of the histogram's levels (four words each: the count,
+// then the sums of red, green and blue), the first of equals.
+fn oilpaintFullest(bins: [*]const u32, levels: usize) -> usize {
+    var best: usize = 0
+    var most: u32 = 0
+    var bin: usize = 0
+    while bin < levels {
+        if bins[bin * 4] > most {
+            most = bins[bin * 4]
+            best = bin
+        }
+        bin += 1
+    }
+    return best
+}
+
+// Pixels of any alpha: a pixel counts its alpha, its colours times it.
+fn oilpaintMixed(pixels: [*]u32, width: usize, height: usize, stride: usize, source: [*]const u32, level: [*]const u8, rows: [*]usize, bins: [*]u32, radius: usize, levels: usize) -> void {
+    const window = radius * 2 + 1
+    // The colour worked out last and what it was worked out from: where
+    // the picture is even, the next pixel's is the same.
+    var known_most: u32 = 0
+    var known_red: u32 = 0
+    var known_green: u32 = 0
+    var known_blue: u32 = 0
+    var known: u32 = 0
+    var y: usize = 0
+    while y < height {
+        oilpaintRows(rows, y, radius, width, height)
+        var index: usize = 0
+        while index < levels * 4 {
+            bins[index] = 0
+            index += 1
+        }
+        index = 0
+        while index < window {
+            var column: usize = if index < radius { 0 } else { index - radius }
+            if column >= width { column = width - 1 }
+            var k: usize = 0
+            while k < window {
+                const at = rows[k] + column
+                const p = source[at]
+                const a = p >> 24
+                if a != 0 {
+                    const bin = @intCast(usize, level[at]) * 4
+                    bins[bin] += a
+                    bins[bin + 1] += ((p >> 16) & 255) * a
+                    bins[bin + 2] += ((p >> 8) & 255) * a
+                    bins[bin + 3] += (p & 255) * a
+                }
+                k += 1
+            }
+            index += 1
+        }
+        var best = oilpaintFullest(bins, levels)
+        var most = bins[best * 4]
+        const out = pixels + y * stride
+        const own = source + y * width
+        var x: usize = 0
+        while true {
+            const a = own[x] >> 24
+            if a == 0 {
+                out[x] = 0
+            } else {
+                // The pixel itself is in the window, so `most` is not 0.
+                const red = bins[best * 4 + 1]
+                const green = bins[best * 4 + 2]
+                const blue = bins[best * 4 + 3]
+                if most != known_most || red != known_red || green != known_green || blue != known_blue {
+                    const half = most / 2
+                    known = (((red + half) / most) << 16) | (((green + half) / most) << 8) | ((blue + half) / most)
+                    known_most = most
+                    known_red = red
+                    known_green = green
+                    known_blue = blue
+                }
+                out[x] = (a << 24) | known
+            }
+            x += 1
+            if x >= width { break }
+            const leaving: usize = if x - 1 < radius { 0 } else { x - 1 - radius }
+            var coming = x + radius
+            if coming >= width { coming = width - 1 }
+            if leaving == coming { continue }
+            const before = most
+            const fullest = best
+            var k: usize = 0
+            while k < window {
+                const at = rows[k] + leaving
+                const p = source[at]
+                const taken = p >> 24
+                if taken != 0 {
+                    const bin = @intCast(usize, level[at]) * 4
+                    bins[bin] -= taken
+                    bins[bin + 1] -= ((p >> 16) & 255) * taken
+                    bins[bin + 2] -= ((p >> 8) & 255) * taken
+                    bins[bin + 3] -= (p & 255) * taken
+                }
+                k += 1
+            }
+            most = bins[best * 4]
+            k = 0
+            while k < window {
+                const at = rows[k] + coming
+                const p = source[at]
+                const added = p >> 24
+                if added != 0 {
+                    const bin = @intCast(usize, level[at])
+                    const count = bins[bin * 4] + added
+                    bins[bin * 4] = count
+                    bins[bin * 4 + 1] += ((p >> 16) & 255) * added
+                    bins[bin * 4 + 2] += ((p >> 8) & 255) * added
+                    bins[bin * 4 + 3] += (p & 255) * added
+                    if count > most || (count == most && bin < best) {
+                        most = count
+                        best = bin
+                    }
+                }
+                k += 1
+            }
+            // A level nothing was put into has at most the count it had,
+            // which was at most `before` (and the same only behind the
+            // fullest): it can be the fullest now only if the one that
+            // was lost count and none that gained went past `before`.
+            if bins[fullest * 4] < before && most <= before {
+                best = oilpaintFullest(bins, levels)
+                most = bins[best * 4]
+            }
+        }
+        y += 1
+    }
+}
+
+// An opaque pixel as the histogram of an opaque picture takes it: a count
+// of one above bit 48, and red, green and blue in 16 bits each (the 121
+// pixels of the largest window, at 255, add up to less than 2^16).
+inline fn oilpaintPacked(p: u32) -> u64 {
+    return 0x0001000000000000 | (@intCast(u64, p & 0xFF0000) << 16) | (@intCast(u64, p & 0xFF00) << 8) | @intCast(u64, p & 0xFF)
+}
+
+fn oilpaintFullestPacked(bins: [*]const u64, levels: usize) -> usize {
+    var best: usize = 0
+    var most: u64 = 0
+    var bin: usize = 0
+    while bin < levels {
+        if bins[bin] >> 48 > most {
+            most = bins[bin] >> 48
+            best = bin
+        }
+        bin += 1
+    }
+    return best
+}
+
+// Opaque pixels only: the same steps as oilpaintMixed with every pixel
+// counting 1 instead of 255. That gives the same pixels: the fullest
+// level is the same, and its sums over the count, rounded, are the sums
+// times 255 over the count times 255, rounded.
+fn oilpaintOpaque(pixels: [*]u32, width: usize, height: usize, stride: usize, source: [*]const u32, level: [*]const u8, rows: [*]usize, bins: [*]u64, radius: usize, levels: usize) -> void {
+    const window = radius * 2 + 1
+    var known_from: u64 = 0
+    var known: u32 = 0
+    var y: usize = 0
+    while y < height {
+        oilpaintRows(rows, y, radius, width, height)
+        var index: usize = 0
+        while index < levels {
+            bins[index] = 0
+            index += 1
+        }
+        index = 0
+        while index < window {
+            var column: usize = if index < radius { 0 } else { index - radius }
+            if column >= width { column = width - 1 }
+            var k: usize = 0
+            while k < window {
+                const at = rows[k] + column
+                bins[@intCast(usize, level[at])] += oilpaintPacked(source[at])
+                k += 1
+            }
+            index += 1
+        }
+        var best = oilpaintFullestPacked(bins, levels)
+        var most = bins[best] >> 48
+        const out = pixels + y * stride
+        var x: usize = 0
+        while true {
+            const sums = bins[best]
+            if sums != known_from {
+                const half = most / 2
+                known = 0xFF000000 | (@intCast(u32, (((sums >> 32) & 0xFFFF) + half) / most) << 16) | (@intCast(u32, (((sums >> 16) & 0xFFFF) + half) / most) << 8) | @intCast(u32, ((sums & 0xFFFF) + half) / most)
+                known_from = sums
+            }
+            out[x] = known
+            x += 1
+            if x >= width { break }
+            const leaving: usize = if x - 1 < radius { 0 } else { x - 1 - radius }
+            var coming = x + radius
+            if coming >= width { coming = width - 1 }
+            if leaving == coming { continue }
+            const before = most
+            const fullest = best
+            var k: usize = 0
+            while k < window {
+                const at = rows[k] + leaving
+                bins[@intCast(usize, level[at])] -= oilpaintPacked(source[at])
+                k += 1
+            }
+            most = bins[best] >> 48
+            k = 0
+            while k < window {
+                const at = rows[k] + coming
+                const bin = @intCast(usize, level[at])
+                const sums_now = bins[bin] + oilpaintPacked(source[at])
+                bins[bin] = sums_now
+                if sums_now >> 48 > most || (sums_now >> 48 == most && bin < best) {
+                    most = sums_now >> 48
+                    best = bin
+                }
+                k += 1
+            }
+            // As in oilpaintMixed.
+            if bins[fullest] >> 48 < before && most <= before {
+                best = oilpaintFullestPacked(bins, levels)
+                most = bins[best] >> 48
+            }
+        }
+        y += 1
+    }
+}
+
+fn oilpaint(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    const radius = @intCast(usize, whole(params, described(OILPAINT_PLACE), 0))
+    const levels = @intCast(usize, whole(params, described(OILPAINT_PLACE), 1))
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const copy = copied(pool, pixels, width, height, stride)
+    const planes = scratch.bytes(pool, width * height)
+    // Four u32 a level for pixels of any alpha, a u64 for opaque ones.
+    const histogram = scratch.bytes(pool, levels * 16)
+    const starts = scratch.bytes(pool, (radius * 2 + 1) * 8)
+    if copy == null || planes == null || histogram == null || starts == null {
+        scratch.release(pool, mark)
+        return
+    }
+    const source = copy.?
+    const level = planes.?
+    const rows: [*]usize = unsafe { @ptrCast([*]usize, starts.?) }
+    // Each pixel's level, and whether every pixel is opaque.
+    const scale = @intCast(u32, levels)
+    var every: u32 = 0xFF000000
+    var index: usize = 0
+    while index < width * height {
+        const p = source[index]
+        every &= p
+        level[index] = @intCast(u8, (pixel.luma(p) * scale) >> 8)
+        index += 1
+    }
+    if every == 0xFF000000 {
+        const bins: [*]u64 = unsafe { @ptrCast([*]u64, histogram.?) }
+        oilpaintOpaque(pixels, width, height, stride, source, level, rows, bins, radius, levels)
+    } else {
+        const bins: [*]u32 = unsafe { @ptrCast([*]u32, histogram.?) }
+        oilpaintMixed(pixels, width, height, stride, source, level, rows, bins, radius, levels)
+    }
+    scratch.release(pool, mark)
+}
+
+// ---- Pixelize ----
+//
+// The rectangle cut into cells of `pixel width` x `pixel height` from its
+// first pixel on (the last ones of a row and a column as large as what is
+// left); each cell gets the mean of its pixels: the alpha's mean, the
+// colour's mean weighed by alpha. Cells of one pixel change nothing.
+
+const PIXELIZE_PARAMS = [2]types.Param{
+    types.Param.{ .name = "Pixel width", .german = "Pixelbreite", .kind = types.INT, .low = 1.0, .high = 1024.0, .initial = 10.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Pixel height", .german = "Pixelhöhe", .kind = types.INT, .low = 1.0, .high = 1024.0, .initial = 10.0, .choices = "", .choicesGerman = "" },
+}
+
+// The larger side of a cell: a block that starts on the cell grid and is
+// grown by this holds every cell it shows a part of.
+fn pixelizeMargin(params: *const Params) -> i32 {
+    const cell_width = whole(params, described(PIXELIZE_PLACE), 0)
+    const cell_height = whole(params, described(PIXELIZE_PLACE), 1)
+    const larger = if cell_width > cell_height { cell_width } else { cell_height }
+    return if larger <= 1 { 0 } else { larger }
+}
+
+fn pixelize(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    const cell_width = @intCast(usize, whole(params, described(PIXELIZE_PLACE), 0))
+    const cell_height = @intCast(usize, whole(params, described(PIXELIZE_PLACE), 1))
+    if cell_width == 1 && cell_height == 1 { return }
+    var top: usize = 0
+    while top < height {
+        const bottom = if height - top < cell_height { height } else { top + cell_height }
+        var left: usize = 0
+        while left < width {
+            const right = if width - left < cell_width { width } else { left + cell_width }
+            // A cell is up to a million pixels: its sums need 64 bits.
+            var alpha: u64 = 0
+            var red: u64 = 0
+            var green: u64 = 0
+            var blue: u64 = 0
+            var y = top
+            while y < bottom {
+                const row = pixels + y * stride
+                var x = left
+                while x < right {
+                    const p = row[x]
+                    const a = p >> 24
+                    if a != 0 {
+                        alpha += @intCast(u64, a)
+                        red += @intCast(u64, ((p >> 16) & 255) * a)
+                        green += @intCast(u64, ((p >> 8) & 255) * a)
+                        blue += @intCast(u64, (p & 255) * a)
+                    }
+                    x += 1
+                }
+                y += 1
+            }
+            const count = @intCast(u64, (right - left) * (bottom - top))
+            const a = (alpha + count / 2) / count
+            var mean: u32 = 0
+            if a != 0 {
+                const half = alpha / 2
+                mean = (@intCast(u32, a) << 24) | (@intCast(u32, (red + half) / alpha) << 16) | (@intCast(u32, (green + half) / alpha) << 8) | @intCast(u32, (blue + half) / alpha)
+            }
+            y = top
+            while y < bottom {
+                const row = pixels + y * stride
+                var x = left
+                while x < right {
+                    row[x] = mean
+                    x += 1
+                }
+                y += 1
+            }
+            left = right
+        }
+        top = bottom
+    }
+}
+
+// ---- Raindrops ----
+//
+// `number` round drops, each between half the `drop size` and all of it
+// across, at places drawn from the seed where no other drop is (a place
+// is tried a few times, then the drop is left out). A drop shows what is
+// under it enlarged, as a lens does: the pixel at the distance d from its
+// centre shows the picture at d * (m + (1 - m) (d / radius)^2), which is
+// d at the rim, so the picture goes on without a break there; m is how
+// much smaller the middle's view is, and `fish eyes` percent of the drops
+// have a much smaller one. On that comes the light: the upper rim in
+// shadow, a glow below it inside, and a small highlight at the lower left.
+
+const RAINDROPS_PARAMS = [4]types.Param{
+    types.Param.{ .name = "Drop size", .german = "Tropfengröße", .kind = types.INT, .low = 1.0, .high = 200.0, .initial = 80.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Number of drops", .german = "Anzahl der Tropfen", .kind = types.INT, .low = 1.0, .high = 500.0, .initial = 80.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Fish eyes", .german = "Fischaugen", .kind = types.INT, .low = 0.0, .high = 100.0, .initial = 30.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Seed", .german = "Startwert", .kind = types.INT, .low = 0.0, .high = 2147483647.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+}
+
+// How often a place for a drop is drawn before the drop is given up.
+const RAINDROPS_TRIES: usize = 16
+// The view's size at a drop's middle, and at a fish eye's.
+const RAINDROPS_LENS: f64 = 0.55
+const RAINDROPS_FISH_EYE: f64 = 0.25
+
+fn raindropsMargin(params: *const Params) -> i32 {
+    return whole(params, described(RAINDROPS_PLACE), 0)
+}
+
+// One drop of `radius` around (cx, cy) drawn over the pixels; `tile` has
+// room for the drop's square.
+fn raindrop(pixels: [*]u32, width: usize, height: usize, stride: usize, tile: [*]u32, cx: usize, cy: usize, radius: usize, lens: f64) -> void {
+    const left = if cx < radius { 0 } else { cx - radius }
+    const top = if cy < radius { 0 } else { cy - radius }
+    const right = if cx + radius >= width { width - 1 } else { cx + radius }
+    const bottom = if cy + radius >= height { height - 1 } else { cy + radius }
+    const across = right - left + 1
+    const down = bottom - top + 1
+    // What is under the drop, kept: the drop is drawn over it.
+    var y: usize = 0
+    while y < down {
+        const from = pixels + ((top + y) * stride + left)
+        const into = tile + y * across
+        var x: usize = 0
+        while x < across {
+            into[x] = from[x]
+            x += 1
+        }
+        y += 1
+    }
+    const reach = @floatFromInt(f64, radius)
+    const middle_x = @floatFromInt(f64, cx - left)
+    const middle_y = @floatFromInt(f64, cy - top)
+    // The highlight: a spot towards the lower left.
+    const spot_x = middle_x - 0.41 * reach
+    const spot_y = middle_y + 0.57 * reach
+    const spot_size = 0.18 * reach
+    y = 0
+    while y < down {
+        const out = pixels + ((top + y) * stride + left)
+        const dy = @floatFromInt(f64, y) - middle_y
+        var x: usize = 0
+        while x < across {
+            const dx = @floatFromInt(f64, x) - middle_x
+            const squared = dx * dx + dy * dy
+            if squared < reach * reach {
+                const distance = @sqrt(squared)
+                const part = distance / reach
+                const shrink = lens + (1.0 - lens) * part * part
+                // Inside the drop's square, as the pixel itself is and
+                // what it shows is nearer the middle.
+                const sx = middle_x + dx * shrink
+                const sy = middle_y + dy * shrink
+                const x0 = @intFromFloat(usize, sx)
+                const y0 = @intFromFloat(usize, sy)
+                const x1 = if x0 + 1 < across { x0 + 1 } else { x0 }
+                const y1 = if y0 + 1 < down { y0 + 1 } else { y0 }
+                const wx = @intFromFloat(u32, (sx - @floatFromInt(f64, x0)) * 256.0 + 0.5)
+                const wy = @intFromFloat(u32, (sy - @floatFromInt(f64, y0)) * 256.0 + 0.5)
+                // The four around the place, each at its share (of
+                // 65536) times its alpha, so that colour counts as far
+                // as it shows. The sums stay in a u32: alpha times share
+                // adds up to at most 255 * 65536, a colour times that to
+                // 255 * 255 * 65536, which with the half for rounding is
+                // below 2^32.
+                const p00 = tile[y0 * across + x0]
+                const p10 = tile[y0 * across + x1]
+                const p01 = tile[y1 * across + x0]
+                const p11 = tile[y1 * across + x1]
+                const a00 = (p00 >> 24) * (256 - wx) * (256 - wy)
+                const a10 = (p10 >> 24) * wx * (256 - wy)
+                const a01 = (p01 >> 24) * (256 - wx) * wy
+                const a11 = (p11 >> 24) * wx * wy
+                const total = a00 + a10 + a01 + a11
+                const alpha = (total + 32768) >> 16
+                var shown: u32 = 0
+                if alpha != 0 {
+                    const half = total / 2
+                    const r = (((p00 >> 16) & 255) * a00 + ((p10 >> 16) & 255) * a10 + ((p01 >> 16) & 255) * a01 + ((p11 >> 16) & 255) * a11 + half) / total
+                    const g = (((p00 >> 8) & 255) * a00 + ((p10 >> 8) & 255) * a10 + ((p01 >> 8) & 255) * a01 + ((p11 >> 8) & 255) * a11 + half) / total
+                    const b = ((p00 & 255) * a00 + (p10 & 255) * a10 + (p01 & 255) * a01 + (p11 & 255) * a11 + half) / total
+                    shown = (alpha << 24) | (r << 16) | (g << 8) | b
+                    // How much the place looks up (1 at the top, 0 from
+                    // the sides down): where the rim's shadow and the
+                    // glow are.
+                    var up: f64 = 0.0
+                    if distance > 0.0 && dy < 0.0 { up = 0.0 - dy / distance }
+                    var rim = (part - 0.7) / 0.3
+                    if rim < 0.0 { rim = 0.0 }
+                    rim = rim * rim * (3.0 - 2.0 * rim)
+                    const ring = (part - 0.35) / 0.2
+                    var glow = 1.0 - ring * ring
+                    if glow < 0.0 { glow = 0.0 }
+                    const spot_dx = (@floatFromInt(f64, x) - spot_x) / spot_size
+                    const spot_dy = (@floatFromInt(f64, y) - spot_y) / spot_size
+                    var spot = 1.0 - (spot_dx * spot_dx + spot_dy * spot_dy)
+                    if spot < 0.0 { spot = 0.0 }
+                    // The light fades out over the rim's last pixel, so
+                    // the drop has no hard outline.
+                    var edge = reach - distance
+                    if edge > 1.0 { edge = 1.0 }
+                    const light = ((40.0 * glow - 80.0 * rim) * up + 60.0 * spot) * edge
+                    const shift = @intFromFloat(i32, if light < 0.0 { light - 0.5 } else { light + 0.5 })
+                    if shift != 0 {
+                        const r = pixel.clamp(@intCast(i32, (shown >> 16) & 255) + shift)
+                        const g = pixel.clamp(@intCast(i32, (shown >> 8) & 255) + shift)
+                        const b = pixel.clamp(@intCast(i32, shown & 255) + shift)
+                        shown = (shown & 0xFF000000) | (r << 16) | (g << 8) | b
+                    }
+                }
+                out[x] = shown
+            }
+            x += 1
+        }
+        y += 1
+    }
+}
+
+fn raindrops(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    const size = @intCast(u64, whole(params, described(RAINDROPS_PLACE), 0))
+    const number = @intCast(usize, whole(params, described(RAINDROPS_PLACE), 1))
+    const fish_eyes = @intCast(u64, whole(params, described(RAINDROPS_PLACE), 2))
+    const seed = @intCast(u64, whole(params, described(RAINDROPS_PLACE), 3))
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    // A drop is at most the size across and at least three pixels.
+    const side = @intCast(usize, size) + 3
+    const places = scratch.ints(pool, number * 3)
+    const room = scratch.words(pool, side * side)
+    if places == null || room == null {
+        scratch.release(pool, mark)
+        return
+    }
+    const drops = places.?
+    var placed: usize = 0
+    var draw = scramble(seed)
+    var drop: usize = 0
+    while drop < number {
+        var attempt: usize = 0
+        while attempt < RAINDROPS_TRIES {
+            draw +%= GOLDEN
+            const across = size / 2 + scramble(draw) % (size - size / 2 + 1)
+            draw +%= GOLDEN
+            const cx = scramble(draw) % @intCast(u64, width)
+            draw +%= GOLDEN
+            const cy = scramble(draw) % @intCast(u64, height)
+            const radius: u64 = if across < 2 { 1 } else { across / 2 }
+            var free = true
+            var other: usize = 0
+            while other < placed {
+                const dx = @intCast(i64, cx) - @intCast(i64, drops[other * 3])
+                const dy = @intCast(i64, cy) - @intCast(i64, drops[other * 3 + 1])
+                const apart = @intCast(i64, radius) + @intCast(i64, drops[other * 3 + 2])
+                if dx * dx + dy * dy < apart * apart {
+                    free = false
+                    break
+                }
+                other += 1
+            }
+            if free {
+                drops[placed * 3] = @intCast(i32, cx)
+                drops[placed * 3 + 1] = @intCast(i32, cy)
+                drops[placed * 3 + 2] = @intCast(i32, radius)
+                placed += 1
+                draw +%= GOLDEN
+                const lens = if scramble(draw) % 100 < fish_eyes { RAINDROPS_FISH_EYE } else { RAINDROPS_LENS }
+                raindrop(pixels, width, height, stride, room.?, @intCast(usize, cx), @intCast(usize, cy), @intCast(usize, radius), lens)
+                break
+            }
+            attempt += 1
+        }
+        drop += 1
+    }
+    scratch.release(pool, mark)
+}
+
+// ---- Halftone ----
+//
+// The picture as dots of the foreground colour on the background colour.
+// A square grid of cells, turned by the angle, lies over the rectangle
+// (its first pixel's corner is a corner of a cell); in each cell's middle
+// sits a round dot, and a pixel is in it when it is nearer the middle
+// than the radius its own lightness asks for: the one at which the dot
+// covers as much of its cell as the pixel is short of white, so that an
+// even grey keeps its lightness seen from afar. White is all background,
+// black all foreground. With anti-aliasing the dot's edge is one pixel
+// of in-between. `Invert` swaps the two colours. The pixel's alpha stays,
+// times the colour's.
+
+const HALFTONE_PARAMS = [6]types.Param{
+    types.Param.{ .name = "Cell size", .german = "Zellengröße", .kind = types.FLOAT, .low = 2.0, .high = 256.0, .initial = 8.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Angle", .german = "Winkel", .kind = types.ANGLE, .low = 0.0, .high = 360.0, .initial = 45.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Invert", .german = "Invertieren", .kind = types.BOOL, .low = 0.0, .high = 1.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Anti-aliasing", .german = "Kantenglättung", .kind = types.BOOL, .low = 0.0, .high = 1.0, .initial = 1.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Foreground color", .german = "Vordergrundfarbe", .kind = types.COLOR, .low = 0.0, .high = 4294967295.0, .initial = 4278190080.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Background color", .german = "Hintergrundfarbe", .kind = types.COLOR, .low = 0.0, .high = 4294967295.0, .initial = 4294967295.0, .choices = "", .choicesGerman = "" },
+}
+
+// The dot's radius for each lightness 0-255, in cells: worked out at the
+// first asking, the same for every cell size. Black's is beyond the
+// cell's corners and white's below nothing, so that the edge's
+// in-between pixel shows on neither.
+var halftone_sizes: [256]f64 = undefined
+var halftone_sized: bool = false
+
+// How much of a cell (its side 1) a dot of `radius` in its middle covers:
+// four times the area under the circle from the middle to the side, the
+// circle held at the cell's upper side.
+fn halftoneCover(radius: f64) -> f64 {
+    var area: f64 = 0.0
+    var step: usize = 0
+    while step < 64 {
+        const x = (@floatFromInt(f64, step) + 0.5) / 128.0
+        if x < radius {
+            const height = @sqrt(radius * radius - x * x)
+            area += if height > 0.5 { 0.5 } else { height }
+        }
+        step += 1
+    }
+    return area / 32.0
+}
+
+fn halftoneSizes() -> [*]const f64 {
+    if !halftone_sized {
+        var level: usize = 1
+        while level < 255 {
+            const wanted = 1.0 - @floatFromInt(f64, level) / 255.0
+            // A dot inside its cell covers pi r^2 of it; a larger one is
+            // cut by the cell's sides, and its radius is searched for
+            // between touching them and reaching the corners.
+            var size = math.sqrt(wanted / math.pi)
+            if size > 0.5 {
+                var low: f64 = 0.5
+                var high: f64 = 0.7071067811865476
+                var round: usize = 0
+                while round < 20 {
+                    size = (low + high) / 2.0
+                    if halftoneCover(size) < wanted { low = size } else { high = size }
+                    round += 1
+                }
+            }
+            halftone_sizes[level] = size
+            level += 1
+        }
+        halftone_sizes[0] = 2.0
+        halftone_sizes[255] = -1.0
+        halftone_sized = true
+    }
+    return &halftone_sizes
+}
+
+fn halftone(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    const rows = described(HALFTONE_PLACE)
+    const cell = number(params, rows, 0)
+    const angle = number(params, rows, 1) * math.pi / 180.0
+    const smooth = switched(params, rows, 3)
+    var ink = colorOf(params, rows, 4)
+    var paper = colorOf(params, rows, 5)
+    if switched(params, rows, 2) {
+        const swapped = ink
+        ink = paper
+        paper = swapped
+    }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const shades = scratch.words(pool, 256)
+    if shades == null {
+        scratch.release(pool, mark)
+        return
+    }
+    // The colour for each share of ink, from paper (0) to ink (255).
+    const mixes = shades.?
+    var index: usize = 0
+    while index < 256 {
+        mixes[index] = pixel.mix(paper, ink, @intCast(u32, index))
+        index += 1
+    }
+    const sizes = halftoneSizes()
+    const across = math.cos(angle) / cell
+    const along = math.sin(angle) / cell
+    var y: usize = 0
+    while y < height {
+        const row = pixels + y * stride
+        const py = @floatFromInt(f64, y) + 0.5
+        var x: usize = 0
+        while x < width {
+            const p = row[x]
+            const a = p >> 24
+            if a != 0 {
+                const px = @floatFromInt(f64, x) + 0.5
+                // The place in cells of the turned grid, then from the
+                // middle of the cell it is in; how far inside the dot it
+                // is in pixels.
+                const u = px * across + py * along
+                const v = py * across - px * along
+                const du = u - @floor(u) - 0.5
+                const dv = v - @floor(v) - 0.5
+                const inside = (sizes[@intCast(usize, pixel.luma(p))] - @sqrt(du * du + dv * dv)) * cell
+                var cover: u32 = 0
+                if smooth {
+                    if inside >= 0.5 {
+                        cover = 255
+                    } else if inside > -0.5 {
+                        cover = @intFromFloat(u32, (inside + 0.5) * 255.0 + 0.5)
+                    }
+                } else if inside > 0.0 {
+                    cover = 255
+                }
+                const mixed = mixes[@intCast(usize, cover)]
+                const alpha = scaled(a, mixed >> 24)
+                row[x] = if alpha == 0 { 0 } else { (alpha << 24) | (mixed & 0x00FFFFFF) }
+            }
+            x += 1
+        }
+        y += 1
+    }
+    scratch.release(pool, mark)
+}
+
+// ---- Posterize ----
+//
+// Each of red, green and blue held to `steps` values spread evenly from
+// 0 to 255 (2: nothing or all), the nearest one. Alpha stays.
+
+const POSTERIZE_PARAMS = [1]types.Param{
+    types.Param.{ .name = "Steps", .german = "Stufen", .kind = types.INT, .low = 2.0, .high = 255.0, .initial = 16.0, .choices = "", .choicesGerman = "" },
+}
+
+fn posterize(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    const last = @intCast(u32, whole(params, described(POSTERIZE_PLACE), 0)) - 1
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const values = scratch.words(pool, 256)
+    if values == null {
+        scratch.release(pool, mark)
+        return
+    }
+    const steps = values.?
+    var channel: u32 = 0
+    while channel < 256 {
+        const step = (channel * last + 127) / 255
+        steps[@intCast(usize, channel)] = (step * 255 + last / 2) / last
+        channel += 1
+    }
+    var y: usize = 0
+    while y < height {
+        const row = pixels + y * stride
+        var x: usize = 0
+        while x < width {
+            const p = row[x]
+            row[x] = (p & 0xFF000000) | (steps[@intCast(usize, (p >> 16) & 255)] << 16) | (steps[@intCast(usize, (p >> 8) & 255)] << 8) | steps[@intCast(usize, p & 255)]
+            x += 1
+        }
+        y += 1
+    }
+    scratch.release(pool, mark)
+}
+
+const FILTERS = [5]types.Info{
+    types.Info.{ .id = OILPAINT, .key = "oilpaint", .name = "Oilpaint", .german = "Ölgemälde", .category = types.ARTISTIC, .params = OILPAINT_PARAMS[0..], .margin = oilpaintMargin, .apply = oilpaint },
+    types.Info.{ .id = PIXELIZE, .key = "pixelize", .name = "Pixelize", .german = "Verpixeln", .category = types.ARTISTIC, .params = PIXELIZE_PARAMS[0..], .margin = pixelizeMargin, .apply = pixelize },
+    types.Info.{ .id = RAINDROPS, .key = "raindrops", .name = "Raindrops", .german = "Regentropfen", .category = types.ARTISTIC, .params = RAINDROPS_PARAMS[0..], .margin = raindropsMargin, .apply = raindrops },
+    types.Info.{ .id = HALFTONE, .key = "halftone", .name = "Halftone", .german = "Halbton", .category = types.ARTISTIC, .params = HALFTONE_PARAMS[0..], .margin = null, .apply = halftone },
+    types.Info.{ .id = POSTERIZE, .key = "posterize", .name = "Posterize", .german = "Posterisieren", .category = types.ARTISTIC, .params = POSTERIZE_PARAMS[0..], .margin = null, .apply = posterize },
+}
+
+// The list in heap memory that stays, once it was asked for (a slice of
+// the constant table itself would be a copy of all of it in the value
+// arena at every asking: core/table.mlx).
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's filters. What it gives stays valid and where it is (only
+// without memory at the first asking is it the table itself, good until
+// the window's loop turns; the next asking tries again).
+pub fn list() -> []const types.Info {
+    if kept.address != 0 { return table.rows(types.Info, &kept) }
+    return types.keepList(&kept, FILTERS[0..])
+}
+
+// What the filter at `place` of the list says of its numbers (the rows'
+// own slices point at the parameter tables in the program's data).
+fn described(place: usize) -> []const types.Param {
+    return list()[place].params
+}

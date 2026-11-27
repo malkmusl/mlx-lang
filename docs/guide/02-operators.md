@@ -6,7 +6,7 @@
 `89_checked_overflow_comptime.mlx`, `91_wrapping_saturating_runtime.mlx`,
 `92_saturating_shift_runtime.mlx`, `93_checked_overflow_runtime.mlx`,
 `94_wrapping_shift_count_runtime.mlx`, `113_signed_integer_runtime.mlx`,
-`359_signed_wrapping_runtime.mlx`,
+`359_signed_wrapping_runtime.mlx`, `524_narrow_overflow_runtime.mlx`,
 `114_unsigned_comparison_runtime.mlx`, `183_float_exponent_runtime.mlx`,
 `184_signed_right_shift_runtime.mlx`, `203_immediate_alu_gep_runtime.mlx`,
 `207_popcount_runtime.mlx`, `322_float_literal_arithmetic_runtime.mlx`,
@@ -354,9 +354,37 @@ fn main() u8 {
 
 (`tests/93_checked_overflow_runtime.mlx`)
 
+The bounds are the type's own at every width and sign: an `i8`, `i16`,
+`i32`, `u8`, `u16` or `u32` traps where its range ends, not where the
+64-bit register holding it would. The same holds for the compound forms
+(`+=`, `-=`, `*=`), for unary `-` (the smallest value of a signed type,
+and anything but 0 of an unsigned one: `0 -% x` is the wrapping
+negation) and for `/` of a signed type (its smallest value divided by
+-1). So every integer result is a value of its type, whatever compares,
+widens, stores or passes it next.
+
+```mlx
+fn add(a: i32, b: i32) i32 {
+    return a + b
+}
+
+fn main() u8 {
+    const sum = add(2147483647, 201)   // traps: the sum is past the i32 maximum
+    if sum > 2147483647 { return 1 }   // (it used to come back as 2147483848)
+    return 13
+}
+```
+
+(`tests/524_narrow_overflow_runtime.mlx`, every type and operator on both
+backends with `tests/run_narrow_overflow.sh`: the overflowing cases end
+the process with SIGILL, the values in range and the wrapping and
+saturating forms of each type exit 13.)
+
 For explicit wraparound or clamping semantics, use the `%`- and `|`-prefixed
 compound operators: `+%=`/`-%=`/`*%=` wrap, and `+|=`/`-|=`/`*|=` saturate at
 the type's bounds. `<<|` saturates a left shift instead of trapping/wrapping.
+Both keep to the type's width: `i8` `127 +% 1` is -128, `100 +| 100` is
+127 and `-100 -| 100` is -128 (`tests/524_narrow_overflow_runtime.mlx`).
 
 ```mlx
 fn main() u8 {

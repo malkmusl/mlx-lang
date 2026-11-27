@@ -1,0 +1,1499 @@
+// nebula's selections (core/selection.mlx): two masks joined in each mode,
+// hard and soft, also where a mask's default is all; select all, invert,
+// clip; shapes from a rectangle, a layer's alpha and lightness, a colour;
+// feather (the sum stays, the mirror image exactly, the same wherever the
+// tiles lie, a straight edge keeps its place), grow and shrink (exact
+// discs, a square grown and shrunk again is itself, the image's edge),
+// border, smooth, sharpen; bounds, isEmpty, isRectangle; nothing selected
+// and the largest radius; the outline's segments (a rectangle, an L, two
+// pixels touching at a corner, cut by the area); a selection applied to
+// pixels (clear, copy, fill); that only tiles that differ are written and
+// that changes are undone; an image's selection through ops and the
+// history; every function against a second, plain implementation of its
+// definition in this file (pixel by pixel, on random soft amounts across
+// tile borders left of and above the origin, on masks moved off the tile
+// grid, whose default is all, in bands of 64 rows, inside open changes,
+// with empty and out-of-range inputs); that nothing of it takes memory of
+// the value arena or keeps heap memory; and how long a feather, a grow
+// and a shrink of 20 pixels take on 2048 x 2048 (printed). Exits 13.
+const std = @import("std")
+const crash = @import("std.crash")
+const math = @import("std.math")
+const turns = @import("std.turns")
+const device = @import("../core/device.mlx")
+const geom = @import("../core/geom.mlx")
+const mask = @import("../core/mask.mlx")
+const pixel = @import("../core/pixel.mlx")
+const blend = @import("../core/blend.mlx")
+const image_module = @import("../core/image.mlx")
+const history = @import("../core/history.mlx")
+const ops = @import("../core/ops.mlx")
+const selection = @import("../core/selection.mlx")
+
+const Device = device.Device
+const Rect = geom.Rect
+const Segment = selection.Segment
+
+// Room for the amounts of 700 x 700 pixels.
+const ROOM: usize = 490000
+
+fn gray(target: *Device, area: Rect, amount: u32) -> void {
+    _ = device.fill(target, area, pixel.gray(amount))
+}
+
+fn sameRect(a: Rect, x: i32, y: i32, width: i32, height: i32) -> bool {
+    return a.x == x && a.y == y && a.width == width && a.height == height
+}
+
+// The sum of the amounts in `area`.
+fn total(target: *Device, area: Rect, room: [*]u8) -> u64 {
+    const width = @intCast(usize, area.width)
+    const count = width * @intCast(usize, area.height)
+    mask.readBytes(target, area, room, width)
+    var sum: u64 = 0
+    var index: usize = 0
+    while index < count {
+        sum += @intCast(u64, room[index])
+        index += 1
+    }
+    return sum
+}
+
+// Whether `a` in `area` holds what `b` holds in the rectangle of the same
+// size at (bx, by).
+fn alike(a: *Device, area: Rect, b: *Device, bx: i32, by: i32, room_a: [*]u8, room_b: [*]u8) -> bool {
+    const width = @intCast(usize, area.width)
+    const count = width * @intCast(usize, area.height)
+    mask.readBytes(a, area, room_a, width)
+    mask.readBytes(b, geom.rect(bx, by, area.width, area.height), room_b, width)
+    return std.mem.eql(room_a, room_b, count)
+}
+
+// Whether two amounts are the same or one level apart.
+fn near(a: u8, b: u8) -> bool {
+    return a == b || (a < b && b - a == 1) || (a > b && a - b == 1)
+}
+
+fn isSegment(segment: Segment, x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
+    return segment.x0 == x0 && segment.y0 == y0 && segment.x1 == x1 && segment.y1 == y1
+}
+
+// One pixel grown by `radius` is the disc of all pixels whose centres are
+// that near, and nothing else.
+fn discGrown(allocator: std.allocator.Allocator, radius: i32, room: [*]u8) -> bool {
+    const made = mask.create(allocator, false).?
+    const cx: i32 = -3
+    const cy: i32 = 70
+    mask.set(made, cx, cy, 255)
+    if !selection.grow(made, radius) { return false }
+    const side = radius * 2 + 5
+    const area = geom.rect(cx - radius - 2, cy - radius - 2, side, side)
+    mask.readBytes(made, area, room, @intCast(usize, side))
+    var count: u32 = 0
+    var dy = -radius - 2
+    while dy <= radius + 2 {
+        var dx = -radius - 2
+        while dx <= radius + 2 {
+            const amount = room[@intCast(usize, (dy + radius + 2) * side + dx + radius + 2)]
+            const inside = dx * dx + dy * dy <= radius * radius
+            if inside && amount != 255 { return false }
+            if !inside && amount != 0 { return false }
+            if inside { count += 1 }
+            dx += 1
+        }
+        dy += 1
+    }
+    // Its area is that of the circle, within 6 % (a disc of a few
+    // pixels is too coarse to say).
+    const circle = math.pi * @floatFromInt(f64, radius * radius)
+    if radius >= 5 && math.abs(@floatFromInt(f64, count) - circle) > circle * 0.06 { return false }
+    if !sameRect(selection.bounds(made), cx - radius, cy - radius, radius * 2 + 1, radius * 2 + 1) { return false }
+    // Shrunk by as much, the one pixel is left.
+    if !selection.shrink(made, radius, geom.empty(), true) { return false }
+    if !sameRect(selection.bounds(made), cx, cy, 1, 1) || mask.at(made, cx, cy) != 255 { return false }
+    device.destroy(made)
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// A second, plain implementation of what the module is said to do, pixel
+// by pixel from the definitions, to hold its results against.
+
+// A number that looks random, the same in every run (0 to 32767).
+fn random(state: *u32) -> u32 {
+    state.* = state.* *% 1103515245 +% 12345
+    return (state.* >> 16) & 32767
+}
+
+// Amounts in `area` drawn at random in squares of `block` pixels: about
+// a third nothing, a third all, a third anything.
+fn scatter(target: *Device, area: Rect, block: i32, state: *u32) -> void {
+    var by = area.y
+    while by < area.y + area.height {
+        var bx = area.x
+        while bx < area.x + area.width {
+            const pick = random(state) % 3
+            var amount: u32 = 0
+            if pick == 1 { amount = 255 }
+            if pick == 2 { amount = random(state) & 255 }
+            var y = by
+            while y < by + block && y < area.y + area.height {
+                var x = bx
+                while x < bx + block && x < area.x + area.width {
+                    mask.set(target, x, y, amount)
+                    x += 1
+                }
+                y += 1
+            }
+            bx += block
+        }
+        by += block
+    }
+}
+
+// Pixels of any colour and alpha (a quarter of them transparent with a
+// colour, a quarter opaque) in `area` of a layer.
+fn paintRandom(layer: *Device, area: Rect, state: *u32) -> void {
+    var y = area.y
+    while y < area.y + area.height {
+        var x = area.x
+        while x < area.x + area.width {
+            const pick = random(state) % 4
+            var value = (random(state) << 17) ^ (random(state) << 2) ^ random(state)
+            if pick == 0 { value = value & 0x00FFFFFF }
+            if pick == 1 { value = value | 0xFF000000 }
+            device.setPixel(layer, x, y, value)
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// The amounts of `area` read one at a time (mask.at), row after row.
+fn snapshot(target: *Device, area: Rect, into: [*]u8) -> void {
+    var y: i32 = 0
+    while y < area.height {
+        var x: i32 = 0
+        while x < area.width {
+            into[@intCast(usize, y * area.width + x)] = @intCast(u8, mask.at(target, area.x + x, area.y + y))
+            x += 1
+        }
+        y += 1
+    }
+}
+
+// The amount at (x, y) of a snapshot of `area`; `blank` outside it.
+fn amountIn(shot: [*]const u8, area: Rect, blank: u32, x: i32, y: i32) -> u32 {
+    if !geom.contains(area, x, y) { return blank }
+    return @intCast(u32, shot[@intCast(usize, (y - area.y) * area.width + (x - area.x))])
+}
+
+// Whether `target` holds over `check` what the snapshot of `area` holds.
+fn holdsShot(target: *Device, shot: [*]const u8, area: Rect, blank: u32, check: Rect) -> bool {
+    var y = check.y
+    while y < check.y + check.height {
+        var x = check.x
+        while x < check.x + check.width {
+            if mask.at(target, x, y) != amountIn(shot, area, blank, x, y) { return false }
+            x += 1
+        }
+        y += 1
+    }
+    return true
+}
+
+// The five modes as the work package says them, on two amounts.
+fn combinedAs(mode: u8, held: u32, given: u32) -> u32 {
+    if mode == selection.ADD { return if held > given { held } else { given } }
+    if mode == selection.SUBTRACT { return (held * (255 - given) + 127) / 255 }
+    if mode == selection.INTERSECT { return if held < given { held } else { given } }
+    if mode == selection.SYMMETRIC_DIFFERENCE { return if held > given { held - given } else { given - held } }
+    return given
+}
+
+// Whether grow() (`selecting`) or shrink() by `radius` left `target` as
+// defined, over `check`, against the snapshot of `area` from before
+// (`blank` outside it): a pixel with a seed within `radius` (centre to
+// centre) becomes all (nothing); a seed is a pixel selected from half on
+// (for shrink: selected less than half, and inside `inside`); every
+// other pixel keeps its amount.
+fn spreadAsSaid(target: *Device, shot: [*]const u8, area: Rect, blank: u32, radius: i32, selecting: bool, inside: Rect, check: Rect) -> bool {
+    var y = check.y
+    while y < check.y + check.height {
+        var x = check.x
+        while x < check.x + check.width {
+            var seeded = false
+            var dy = -radius
+            while dy <= radius && !seeded {
+                var dx = -radius
+                while dx <= radius && !seeded {
+                    if dx * dx + dy * dy <= radius * radius {
+                        const held = amountIn(shot, area, blank, x + dx, y + dy)
+                        if selecting {
+                            seeded = held >= 128
+                        } else {
+                            seeded = held < 128 && geom.contains(inside, x + dx, y + dy)
+                        }
+                    }
+                    dx += 1
+                }
+                dy += 1
+            }
+            var wanted = amountIn(shot, area, blank, x, y)
+            if seeded { wanted = if selecting { 255 } else { 0 } }
+            if mask.at(target, x, y) != wanted { return false }
+            x += 1
+        }
+        y += 1
+    }
+    return true
+}
+
+// A mask with random amounts in `area` (default all or nothing), grown
+// (shrunk) by `radius` as defined: checked against spreadAsSaid, and
+// inside a change that, undone, gives back what was there.
+fn spreadCase(allocator: std.allocator.Allocator, area: Rect, all: bool, radius: i32, selecting: bool, inside: Rect, from_border: bool, state: *u32, room: [*]u8) -> bool {
+    const made = mask.create(allocator, all).?
+    const blank: u32 = if all { 255 } else { 0 }
+    scatter(made, area, 3, state)
+    snapshot(made, area, room)
+    device.begin(made)
+    var done = false
+    if selecting {
+        done = selection.grow(made, radius)
+    } else {
+        done = selection.shrink(made, radius, inside, from_border)
+    }
+    const change = device.commit(made)
+    var fine = done && spreadAsSaid(made, room, area, blank, radius, selecting, if from_border || selecting { geom.rect(-100000, -100000, 200000, 200000) } else { inside }, geom.grown(area, radius + 2))
+    if change != null {
+        _ = device.apply(made, change.?, true)
+        if !holdsShot(made, room, area, blank, geom.grown(area, radius + 2)) { fine = false }
+        device.destroyChange(change.?)
+    }
+    device.destroy(made)
+    return fine
+}
+
+// Whether border() by `width` left `target` as defined over `check`
+// (against the snapshot of `area` from before): grown less shrunk, of the
+// mask made all or nothing at half, is all exactly where both a selected
+// and an unselected pixel lie within `width` (centre to centre).
+fn borderAsSaid(target: *Device, shot: [*]const u8, area: Rect, blank: u32, width: i32, check: Rect) -> bool {
+    var y = check.y
+    while y < check.y + check.height {
+        var x = check.x
+        while x < check.x + check.width {
+            var selected = false
+            var unselected = false
+            var dy = -width
+            while dy <= width {
+                var dx = -width
+                while dx <= width {
+                    if dx * dx + dy * dy <= width * width {
+                        if amountIn(shot, area, blank, x + dx, y + dy) >= 128 { selected = true } else { unselected = true }
+                    }
+                    dx += 1
+                }
+                dy += 1
+            }
+            const wanted: u32 = if selected && unselected { 255 } else { 0 }
+            if mask.at(target, x, y) != wanted { return false }
+            x += 1
+        }
+        y += 1
+    }
+    return true
+}
+
+// Whether smooth() left `target` as defined over `check`: each amount the
+// mean of the nine around it (itself too), rounded.
+fn smoothAsSaid(target: *Device, shot: [*]const u8, area: Rect, blank: u32, check: Rect) -> bool {
+    var y = check.y
+    while y < check.y + check.height {
+        var x = check.x
+        while x < check.x + check.width {
+            var sum: u32 = 0
+            var dy: i32 = -1
+            while dy <= 1 {
+                var dx: i32 = -1
+                while dx <= 1 {
+                    sum += amountIn(shot, area, blank, x + dx, y + dy)
+                    dx += 1
+                }
+                dy += 1
+            }
+            // (sum / 9 is never half way between two levels.)
+            if mask.at(target, x, y) != (sum + 4) / 9 { return false }
+            x += 1
+        }
+        y += 1
+    }
+    return true
+}
+
+// Whether bounds() is the rectangle around every amount above nothing
+// in the snapshot of `area` (of a mask whose default is nothing).
+fn boundsAsSaid(target: *Device, shot: [*]const u8, area: Rect) -> bool {
+    var any = false
+    var x0: i32 = 0
+    var y0: i32 = 0
+    var x1: i32 = 0
+    var y1: i32 = 0
+    var y = area.y
+    while y < area.y + area.height {
+        var x = area.x
+        while x < area.x + area.width {
+            if amountIn(shot, area, 0, x, y) != 0 {
+                if !any || x < x0 { x0 = x }
+                if !any || x > x1 { x1 = x }
+                if !any || y < y0 { y0 = y }
+                if !any || y > y1 { y1 = y }
+                any = true
+            }
+            x += 1
+        }
+        y += 1
+    }
+    const got = selection.bounds(target)
+    if !any { return geom.isEmpty(got) && selection.isEmpty(target) }
+    return sameRect(got, x0, y0, x1 - x0 + 1, y1 - y0 + 1) && !selection.isEmpty(target)
+}
+
+// One axis of feather()'s kernel at `offset`: three boxes of radii
+// (radius + 2) / 3, (radius + 1) / 3 and radius / 3 one after the other
+// (the ways three steps, one within each box, add up to `offset`, over
+// all ways there are).
+fn weight(radius: i32, offset: i32) -> f64 {
+    const b0 = (radius + 2) / 3
+    const b1 = (radius + 1) / 3
+    const b2 = radius / 3
+    var ways: i32 = 0
+    var j0 = -b0
+    while j0 <= b0 {
+        var j1 = -b1
+        while j1 <= b1 {
+            const j2 = offset - j0 - j1
+            if j2 >= -b2 && j2 <= b2 { ways += 1 }
+            j1 += 1
+        }
+        j0 += 1
+    }
+    return @floatFromInt(f64, ways) / @floatFromInt(f64, (b0 * 2 + 1) * (b1 * 2 + 1) * (b2 * 2 + 1))
+}
+
+// Whether feather() by `radius` left `target` within a level of the
+// exact convolution (in doubles) of the snapshot of `area` from before,
+// and exactly the default where the kernel does not reach.
+fn featherAsSaid(allocator: std.allocator.Allocator, target: *Device, shot: [*]const u8, area: Rect, blank: u32, radius: i32) -> bool {
+    const out = geom.grown(area, radius)
+    const taps = @intCast(usize, radius * 2 + 1)
+    const tall = out.height + radius * 2
+    const cells = @intCast(usize, out.width) * @intCast(usize, tall)
+    const weights_memory = allocator.alloc(taps * 8, 16).?
+    const rows_memory = allocator.alloc(cells * 8, 16).?
+    var weights: [*]f64 = undefined
+    var rows: [*]f64 = undefined
+    unsafe { weights = @ptrCast([*]f64, weights_memory) }
+    unsafe { rows = @ptrCast([*]f64, rows_memory) }
+    var tap = -radius
+    while tap <= radius {
+        weights[@intCast(usize, tap + radius)] = weight(radius, tap)
+        tap += 1
+    }
+    var row: i32 = 0
+    while row < tall {
+        const y = out.y - radius + row
+        var column: i32 = 0
+        while column < out.width {
+            var sum: f64 = 0.0
+            tap = -radius
+            while tap <= radius {
+                sum += weights[@intCast(usize, tap + radius)] * @floatFromInt(f64, amountIn(shot, area, blank, out.x + column + tap, y))
+                tap += 1
+            }
+            rows[@intCast(usize, row * out.width + column)] = sum
+            column += 1
+        }
+        row += 1
+    }
+    var fine = true
+    var y = out.y - 2
+    while y < out.y + out.height + 2 && fine {
+        var x = out.x - 2
+        while x < out.x + out.width + 2 && fine {
+            const got = @intCast(i32, mask.at(target, x, y))
+            if geom.contains(out, x, y) {
+                var sum: f64 = 0.0
+                tap = -radius
+                while tap <= radius {
+                    sum += weights[@intCast(usize, tap + radius)] * rows[@intCast(usize, (y - out.y + radius + tap) * out.width + x - out.x)]
+                    tap += 1
+                }
+                // (sum is a mean of amounts: 0 to 255.)
+                const wanted = @intFromFloat(i32, sum + 0.5)
+                if got - wanted > 1 || wanted - got > 1 { fine = false }
+            } else if got != @intCast(i32, blank) {
+                fine = false
+            }
+            x += 1
+        }
+        y += 1
+    }
+    allocator.free(rows_memory, cells * 8, 16)
+    allocator.free(weights_memory, taps * 8, 16)
+    return fine
+}
+
+// Whether the edge between pixels (x, y - 1) and (x, y) is part of the
+// outline: 0 no, 1 with the inside below, 2 above.
+fn levelEdge(target: *Device, x: i32, y: i32) -> u32 {
+    const below = mask.at(target, x, y) >= 128
+    if below == (mask.at(target, x, y - 1) >= 128) { return 0 }
+    return if below { 1 } else { 2 }
+}
+
+// The same for the edge between (x - 1, y) and (x, y): 1 with the inside
+// right of it, 2 left.
+fn uprightEdge(target: *Device, x: i32, y: i32) -> u32 {
+    const right = mask.at(target, x, y) >= 128
+    if right == (mask.at(target, x - 1, y) >= 128) { return 0 }
+    return if right { 1 } else { 2 }
+}
+
+// Whether `list` is the outline of `target` inside `area` as defined:
+// each maximal run of edges with the inside on one side, from the corner
+// it starts at, by row, then column, a level one before an upright one.
+fn outlineAsSaid(target: *Device, area: Rect, list: []const Segment) -> bool {
+    var at: usize = 0
+    const right = area.x + area.width
+    const bottom = area.y + area.height
+    var y = area.y
+    while y <= bottom {
+        var x = area.x
+        while x <= right {
+            if x < right {
+                const side = levelEdge(target, x, y)
+                if side != 0 && (x == area.x || levelEdge(target, x - 1, y) != side) {
+                    var end = x + 1
+                    while end < right && levelEdge(target, end, y) == side { end += 1 }
+                    if at >= list.length || !isSegment(list[at], x, y, end, y) { return false }
+                    at += 1
+                }
+            }
+            if y < bottom {
+                const side = uprightEdge(target, x, y)
+                if side != 0 && (y == area.y || uprightEdge(target, x, y - 1) != side) {
+                    var end = y + 1
+                    while end < bottom && uprightEdge(target, x, end) == side { end += 1 }
+                    if at >= list.length || !isSegment(list[at], x, y, x, end) { return false }
+                    at += 1
+                }
+            }
+            x += 1
+        }
+        y += 1
+    }
+    return at == list.length
+}
+
+fn outlineCase(target: *Device, area: Rect, segments: *std.ArrayList(Segment)) -> bool {
+    segments.clearRetainingCapacity()
+    if !selection.outline(target, area, segments) { return false }
+    return outlineAsSaid(target, area, segments.items())
+}
+
+// What the selection's amount at a place is for the pixel functions:
+// all for no selection.
+fn amountOf(chosen: ?*Device, x: i32, y: i32) -> u32 {
+    if chosen == null { return 255 }
+    return mask.at(chosen.?, x, y)
+}
+
+fn alphaTimes(value: u32, amount: u32) -> u32 {
+    const alpha = ((value >> 24) * amount + 127) / 255
+    return if alpha == 0 { 0 } else { (value & 0x00FFFFFF) | (alpha << 24) }
+}
+
+// copySelected(), clearSelected() and fillSelected() of `layer` with
+// `chosen` inside `area`, each pixel of `check` held against the
+// definitions: copied, alpha times the amount (the pixel itself where
+// the amount is all), nothing outside the area; cleared, alpha times
+// what the amount leaves (untouched where it is nothing); filled,
+// blend.blendPixelAt of the colour at the opacity times the amount, with
+// the pixel's own Dissolve seed (seedAt). 0 when all hold.
+fn applyCase(layer: *Device, chosen: ?*Device, area: Rect, color: u32, mode: u16, opacity: u32, check: Rect) -> u8 {
+    const copied = selection.copySelected(layer, chosen, area)
+    const cleared = device.copy(layer).?
+    const filled = device.copy(layer).?
+    if copied == null || !selection.clearSelected(cleared, chosen, area) || !selection.fillSelected(filled, chosen, area, color, mode, opacity) { return 1 }
+    const strength = if opacity > 255 { 255 } else { opacity }
+    var failed: u8 = 0
+    var y = check.y
+    while y < check.y + check.height && failed == 0 {
+        var x = check.x
+        while x < check.x + check.width && failed == 0 {
+            const was = device.pixel(layer, x, y)
+            const inside = geom.contains(area, x, y)
+            const amount = if inside { amountOf(chosen, x, y) } else { 0 }
+            const kept = if amount == 255 { was } else { alphaTimes(was, amount) }
+            if device.pixel(copied.?, x, y) != (if inside { kept } else { 0 }) { failed = 2 }
+            if device.pixel(cleared, x, y) != (if amount == 0 { was } else { alphaTimes(was, 255 - amount) }) { failed = 3 }
+            if device.pixel(filled, x, y) != blend.blendPixelAt(mode, was, color, (strength * amount + 127) / 255, 0, blend.seedAt(x, y)) { failed = 4 }
+            x += 1
+        }
+        y += 1
+    }
+    if device.pixel(copied.?, 100000, -100000) != 0 { failed = 5 }
+    device.destroy(copied.?)
+    device.destroy(cleared)
+    device.destroy(filled)
+    return failed
+}
+
+// The checks of the second reading: each function against the plain
+// implementation above, at negative coordinates, across tile borders, on
+// moved masks and masks whose default is all, inside open changes, with
+// empty, one-pixel and out-of-range inputs. 0 when all hold, else the
+// number of the first that does not.
+fn attack(allocator: std.allocator.Allocator, room: [*]u8, other: [*]u8) -> u8 {
+    var state: u32 = 12345
+    const span = geom.rect(-70, -70, 140, 140)
+    const anywhere = geom.rect(-100000, -100000, 200000, 200000)
+    var found = geom.empty()
+
+    // Joining two masks moved off the tile grid, in every mode (and one
+    // that is none: it replaces), for the four pairs of defaults; joined
+    // once more, ADD, INTERSECT and REPLACE change nothing.
+    const view = geom.rect(-110, -110, 260, 260)
+    var mode: u8 = 0
+    while mode < 6 {
+        var pair: u32 = 0
+        while pair < 4 {
+            const a = mask.create(allocator, pair & 1 != 0).?
+            const b = mask.create(allocator, pair & 2 != 0).?
+            scatter(a, span, 4, &state)
+            scatter(b, geom.rect(-20, 10, 100, 90), 5, &state)
+            device.moveTo(a, -5, 7)
+            device.moveTo(b, 13, -29)
+            snapshot(a, view, room)
+            snapshot(b, view, other)
+            const used: u8 = if mode == 5 { 9 } else { mode }
+            if !selection.combine(a, b, used) { return 227 }
+            var index: usize = 0
+            while index < 67600 {
+                const x = view.x + @intCast(i32, index % 260)
+                const y = view.y + @intCast(i32, index / 260)
+                if mask.at(a, x, y) != combinedAs(used, @intCast(u32, room[index]), @intCast(u32, other[index])) { return 228 }
+                if mask.at(b, x, y) != @intCast(u32, other[index]) { return 229 }
+                index += 1
+            }
+            const far_a: u32 = if pair & 1 != 0 { 255 } else { 0 }
+            const far_b: u32 = if pair & 2 != 0 { 255 } else { 0 }
+            if mask.at(a, 4000, -4000) != combinedAs(used, far_a, far_b) || mask.at(a, -4000, 4000) != combinedAs(used, far_a, far_b) { return 230 }
+            if used == selection.ADD || used == selection.INTERSECT || used == 9 {
+                device.begin(a)
+                if !selection.combine(a, b, used) || device.commit(a) != null { return 231 }
+            }
+            device.destroy(a)
+            device.destroy(b)
+            pair += 1
+        }
+        mode += 1
+    }
+
+    // Grow and shrink against the definition: soft amounts across tile
+    // borders left of and above the origin, defaults nothing and all,
+    // radii small and larger, from the image's edge and not, inside a
+    // change that undoes.
+    if !spreadCase(allocator, span, false, 4, true, anywhere, true, &state, room) || !spreadCase(allocator, span, false, 11, true, anywhere, true, &state, room) { return 232 }
+    if !spreadCase(allocator, span, true, 6, true, anywhere, true, &state, room) { return 233 }
+    if !spreadCase(allocator, span, false, 5, false, anywhere, true, &state, room) || !spreadCase(allocator, span, true, 7, false, anywhere, true, &state, room) { return 234 }
+    const cut = geom.rect(-30, -50, 70, 200)
+    if !spreadCase(allocator, span, false, 6, false, cut, false, &state, room) || !spreadCase(allocator, span, true, 6, false, cut, false, &state, room) { return 235 }
+    // A selection that lies beside the image (60 pixels to its right):
+    // not from the image's edge, the image's own pixels still draw it
+    // back.
+    const beside = mask.create(allocator, false).?
+    gray(beside, geom.rect(150, 0, 10, 10), 255)
+    const beside_area = geom.rect(140, -10, 30, 30)
+    snapshot(beside, beside_area, room)
+    if !selection.shrink(beside, 60, geom.rect(0, 0, 100, 100), false) || !spreadAsSaid(beside, room, beside_area, 0, 60, false, geom.rect(0, 0, 100, 100), beside_area) || !selection.isEmpty(beside) { return 236 }
+    device.destroy(beside)
+    // Single pixels at the corners of tiles.
+    const corners = mask.create(allocator, false).?
+    mask.set(corners, 63, 63, 255)
+    mask.set(corners, 64, 0, 200)
+    mask.set(corners, -64, -64, 128)
+    mask.set(corners, -65, -1, 127)
+    const corner_area = geom.rect(-70, -70, 140, 140)
+    snapshot(corners, corner_area, room)
+    if !selection.grow(corners, 3) || !spreadAsSaid(corners, room, corner_area, 0, 3, true, anywhere, corner_area) { return 237 }
+    snapshot(corners, corner_area, room)
+    if !selection.shrink(corners, 1, anywhere, true) || !spreadAsSaid(corners, room, corner_area, 0, 1, false, anywhere, corner_area) { return 237 }
+    device.destroy(corners)
+    // Border against its definition, defaults nothing and all.
+    var all_around = false
+    while true {
+        const banded = mask.create(allocator, all_around).?
+        scatter(banded, span, 4, &state)
+        snapshot(banded, span, room)
+        if !selection.border(banded, 5) || !borderAsSaid(banded, room, span, if all_around { 255 } else { 0 }, 5, geom.grown(span, 8)) || mask.at(banded, 5000, 5000) != 0 { return 237 }
+        device.destroy(banded)
+        if all_around { break }
+        all_around = true
+    }
+
+    // Feather against the exact convolution: soft amounts across tile
+    // borders, defaults nothing and all, one pixel at a tile's corner;
+    // the same moved by an odd distance with device.moveTo; inside a
+    // change that undoes and redoes.
+    const soft_area = geom.rect(-75, -20, 100, 90)
+    const f = mask.create(allocator, false).?
+    scatter(f, soft_area, 3, &state)
+    snapshot(f, soft_area, room)
+    const shifted = device.copy(f).?
+    device.moveTo(shifted, 37, -91)
+    const twin = device.copy(f).?
+    if !selection.feather(f, 7.0) || !featherAsSaid(allocator, f, room, soft_area, 0, 7) { return 238 }
+    if !selection.feather(shifted, 7.0) || !alike(f, geom.grown(soft_area, 9), shifted, soft_area.x - 9 + 37, soft_area.y - 9 - 91, other, other + 200000) { return 239 }
+    device.begin(twin)
+    if !selection.feather(twin, 7.0) { return 240 }
+    const feathered = device.commit(twin)
+    if feathered == null || !alike(twin, geom.grown(soft_area, 9), f, soft_area.x - 9, soft_area.y - 9, other, other + 200000) { return 240 }
+    _ = device.apply(twin, feathered.?, true)
+    if !holdsShot(twin, room, soft_area, 0, geom.grown(soft_area, 9)) { return 240 }
+    _ = device.apply(twin, feathered.?, false)
+    if !alike(twin, geom.grown(soft_area, 9), f, soft_area.x - 9, soft_area.y - 9, other, other + 200000) { return 240 }
+    device.destroyChange(feathered.?)
+    device.destroy(twin)
+    device.destroy(shifted)
+    device.destroy(f)
+    const holed = mask.create(allocator, true).?
+    scatter(holed, soft_area, 4, &state)
+    snapshot(holed, soft_area, room)
+    if !selection.feather(holed, 4.0) || !featherAsSaid(allocator, holed, room, soft_area, 255, 4) { return 241 }
+    device.destroy(holed)
+    // A mask 60000 pixels wide goes in bands of 64 rows: feathered and
+    // grown, what is near the origin is still as defined.
+    const wide = mask.create(allocator, false).?
+    scatter(wide, soft_area, 3, &state)
+    mask.set(wide, 60000, 0, 255)
+    snapshot(wide, soft_area, room)
+    if !selection.feather(wide, 7.0) || !featherAsSaid(allocator, wide, room, soft_area, 0, 7) { return 213 }
+    selection.clear(wide)
+    scatter(wide, soft_area, 3, &state)
+    mask.set(wide, 60000, 0, 255)
+    snapshot(wide, soft_area, room)
+    if !selection.grow(wide, 9) || !spreadAsSaid(wide, room, soft_area, 0, 9, true, anywhere, geom.rect(-90, -35, 130, 120)) || mask.at(wide, 60000, 9) != 255 || mask.at(wide, 60000, 10) != 0 { return 213 }
+    device.destroy(wide)
+    const dot = mask.create(allocator, false).?
+    mask.set(dot, 63, 63, 255)
+    const dot_area = geom.rect(63, 63, 1, 1)
+    snapshot(dot, dot_area, room)
+    if !selection.feather(dot, 1.0) || !featherAsSaid(allocator, dot, room, dot_area, 0, 1) { return 241 }
+    device.destroy(dot)
+    // Smooth against its definition, defaults nothing and all, on a mask
+    // moved off the tile grid.
+    var smooth_all = false
+    while true {
+        const smoothed = mask.create(allocator, smooth_all).?
+        scatter(smoothed, span, 2, &state)
+        device.moveTo(smoothed, -3, 5)
+        const moved_span = geom.moved(span, -3, 5)
+        snapshot(smoothed, moved_span, room)
+        if !selection.smooth(smoothed) || !smoothAsSaid(smoothed, room, moved_span, if smooth_all { 255 } else { 0 }, geom.grown(moved_span, 3)) { return 241 }
+        device.destroy(smoothed)
+        if smooth_all { break }
+        smooth_all = true
+    }
+
+    // The outline against the definition: soft blocks across tile
+    // borders, over all of them, cut by areas on and off the tile grid,
+    // of a mask moved off the grid and of one whose default is all; of
+    // one pixel's area and of none; an area as large as can be is all
+    // there is.
+    var segments = std.ArrayList(Segment).init(allocator)
+    defer segments.deinit()
+    const lines = mask.create(allocator, false).?
+    scatter(lines, span, 3, &state)
+    if !outlineCase(lines, geom.rect(-80, -80, 160, 160), &segments) { return 242 }
+    const counted = segments.count()
+    if !outlineCase(lines, geom.rect(-33, -64, 70, 129), &segments) || !outlineCase(lines, geom.rect(0, 0, 1, 1), &segments) || !outlineCase(lines, geom.rect(-64, 63, 128, 2), &segments) { return 243 }
+    segments.clearRetainingCapacity()
+    if !selection.outline(lines, geom.rect(-2000000000, -2000000000, 2147483647, 2147483647), &segments) || segments.count() != counted { return 244 }
+    segments.clearRetainingCapacity()
+    if !selection.outline(lines, geom.rect(5, 5, 0, 9), &segments) || !selection.outline(lines, geom.rect(5, 5, 9, -1), &segments) || segments.count() != 0 { return 244 }
+    device.moveTo(lines, 17, -9)
+    if !outlineCase(lines, geom.rect(-60, -90, 150, 160), &segments) { return 245 }
+    // Two strips with tile rows of nothing between them: a band of
+    // lines without tiles ends no segment it should not.
+    selection.clear(lines)
+    device.moveTo(lines, 0, 0)
+    scatter(lines, geom.rect(-70, -70, 140, 10), 3, &state)
+    scatter(lines, geom.rect(-70, 130, 140, 10), 2, &state)
+    gray(lines, geom.rect(30, -70, 5, 210), 200)
+    if !outlineCase(lines, geom.rect(-80, -80, 160, 230), &segments) { return 245 }
+    device.destroy(lines)
+    const open_lines = mask.create(allocator, true).?
+    scatter(open_lines, span, 5, &state)
+    if !outlineCase(open_lines, geom.rect(-75, -75, 150, 150), &segments) || !outlineCase(open_lines, geom.rect(-200, -200, 300, 300), &segments) { return 245 }
+    device.destroy(open_lines)
+
+    // A selection applied to pixels against the definitions: a layer of
+    // every kind of pixel across tile borders, a soft selection moved off
+    // the grid, an area that ends inside both; no selection; a selection
+    // whose default is all; a layer whose default is opaque; opacity
+    // beyond 255 and colours without alpha; Dissolve.
+    const layer = device.create(allocator, 0).?
+    paintRandom(layer, geom.rect(-70, -30, 150, 100), &state)
+    const chosen = mask.create(allocator, false).?
+    scatter(chosen, geom.rect(-60, -40, 120, 90), 3, &state)
+    device.moveTo(chosen, 3, -5)
+    const area = geom.rect(-50, -20, 90, 75)
+    const check = geom.rect(-80, -50, 180, 130)
+    if applyCase(layer, chosen, area, 0xC08040A0, blend.NORMAL, 200, check) != 0 { return 246 }
+    if applyCase(layer, chosen, area, 0xFF20E040, blend.MULTIPLY, 1000, check) != 0 || applyCase(layer, chosen, area, 0xFF000000, blend.ERASE, 255, check) != 0 { return 247 }
+    if applyCase(layer, chosen, area, 0x00FFFFFF, blend.NORMAL, 255, check) != 0 || applyCase(layer, chosen, area, 0x80FF0000, blend.COPY, 255, check) != 0 { return 248 }
+    if applyCase(layer, chosen, area, 0x00FF0000, blend.COPY, 255, check) != 0 || applyCase(layer, chosen, area, 0x00FF0000, blend.DESTINATION_IN, 180, check) != 0 { return 248 }
+    if applyCase(layer, chosen, area, 0xFF00FF00, blend.DISSOLVE, 255, check) != 0 || applyCase(layer, null, area, 0xFF00FF00, blend.DISSOLVE, 140, check) != 0 { return 249 }
+    if applyCase(layer, null, area, 0xC08040A0, blend.NORMAL, 200, check) != 0 { return 250 }
+    const most = mask.create(allocator, true).?
+    scatter(most, geom.rect(-10, -10, 30, 30), 3, &state)
+    if applyCase(layer, most, area, 0xC08040A0, blend.NORMAL, 200, check) != 0 { return 250 }
+    const ground = device.create(allocator, 0xFF203040).?
+    paintRandom(ground, geom.rect(-20, -20, 40, 40), &state)
+    if applyCase(ground, chosen, area, 0xC08040A0, blend.NORMAL, 200, check) != 0 || applyCase(ground, most, area, 0xC08040A0, blend.MULTIPLY, 200, check) != 0 { return 251 }
+    const carried = device.copy(layer).?
+    device.moveTo(carried, 21, -13)
+    if applyCase(carried, chosen, area, 0xFF00FF00, blend.DISSOLVE, 255, check) != 0 || applyCase(carried, chosen, area, 0xC08040A0, blend.NORMAL, 90, check) != 0 { return 251 }
+    device.destroy(carried)
+    // A colour without alpha changes nothing in the modes that need the
+    // colour's alpha: no tile is written, not even where the layer's
+    // tiles are shared (as with what the history keeps).
+    const kept_tiles = device.copy(layer).?
+    device.begin(layer)
+    if !selection.fillSelected(layer, chosen, area, 0x00FFFFFF, blend.NORMAL, 255) || !selection.fillSelected(layer, null, area, 0x00102030, blend.MULTIPLY, 255) || device.commit(layer) != null { return 252 }
+    device.destroy(kept_tiles)
+    // Nothing of it where the area is empty.
+    device.begin(layer)
+    const none = selection.copySelected(layer, chosen, geom.empty())
+    if none == null || device.tileCount(none.?) != 0 || !selection.clearSelected(layer, chosen, geom.rect(0, 0, 0, 50)) || !selection.fillSelected(layer, null, geom.rect(0, 0, 50, -3), 0xFFFFFFFF, blend.NORMAL, 255) || device.commit(layer) != null { return 252 }
+    device.destroy(none.?)
+    device.destroy(ground)
+    device.destroy(most)
+    device.destroy(chosen)
+    device.destroy(layer)
+
+    // Asking a moved mask; one pixel short of all is no rectangle.
+    const boxed = mask.create(allocator, false).?
+    gray(boxed, geom.rect(10, 10, 50, 70), 255)
+    device.moveTo(boxed, -37, 5)
+    if !selection.isRectangle(boxed, &found) || !sameRect(found, -27, 15, 50, 70) || !sameRect(selection.bounds(boxed), -27, 15, 50, 70) { return 253 }
+    mask.set(boxed, 22, 84, 254)
+    if selection.isRectangle(boxed, &found) || selection.isEmpty(boxed) { return 253 }
+    // Bounds against a scan of every pixel: soft amounts, a mask moved
+    // off the grid, single amounts of 1 at its far ends.
+    const scanned = mask.create(allocator, false).?
+    scatter(scanned, geom.rect(-60, -50, 100, 90), 7, &state)
+    mask.set(scanned, -66, 3, 1)
+    mask.set(scanned, 3, 64, 1)
+    device.moveTo(scanned, 9, -2)
+    snapshot(scanned, view, room)
+    if !boundsAsSaid(scanned, room, view) { return 253 }
+    selection.clear(scanned)
+    snapshot(scanned, view, room)
+    if !boundsAsSaid(scanned, room, view) { return 253 }
+    device.destroy(scanned)
+    // Empty areas leave a mask as it was (select all of nothing: nothing
+    // is selected).
+    snapshot(boxed, view, room)
+    if !selection.invert(boxed, geom.empty()) || !selection.clip(boxed, geom.rect(-10000, -10000, 20000, 20000)) || !holdsShot(boxed, room, view, 0, view) { return 254 }
+    if !selection.selectAll(boxed, geom.rect(5, 5, -5, 5)) || !selection.isEmpty(boxed) || mask.reachesEverywhere(boxed) { return 254 }
+    device.destroy(boxed)
+
+    // Out of range: a threshold and a softness beyond 255 select all
+    // there is (transparent pixels too); a default between nothing and
+    // all is sharpened like any amount.
+    const shades = device.create(allocator, 0).?
+    device.setPixel(shades, 3, 3, 0xFF000000)
+    device.setPixel(shades, 4, 3, 0x00123456)
+    const odd = mask.create(allocator, false).?
+    if !selection.fromColor(odd, shades, 0xFFFFFFFF, 1000, 1000, geom.rect(0, 0, 10, 10), selection.REPLACE) || !selection.isRectangle(odd, &found) || !sameRect(found, 0, 0, 10, 10) { return 255 }
+    device.setDefault(odd, pixel.gray(128))
+    if !selection.sharpen(odd) || odd.*.defaultPixel != mask.ALL { return 255 }
+    device.setDefault(odd, pixel.gray(127))
+    if !selection.sharpen(odd) || odd.*.defaultPixel != mask.NOTHING || mask.at(odd, 5, 5) != 255 { return 255 }
+    device.destroy(odd)
+    device.destroy(shades)
+    return 0
+}
+
+fn printTime(what: []const u8, milliseconds: usize) -> void {
+    _ = std.io.print(what)
+    _ = std.io.writeUnsigned(std.io.stdout(), milliseconds)
+    _ = std.io.println(" ms")
+}
+
+pub fn main() -> u8 {
+    _ = crash.install()
+    const allocator = std.heap.allocator()
+    const room = allocator.alloc(ROOM, 16).?
+    const other = allocator.alloc(ROOM, 16).?
+    const image = geom.rect(0, 0, 200, 150)
+    const everywhere = geom.rect(-10000, -10000, 20000, 20000)
+
+    // Two hard squares that overlap, across tile borders and the origin,
+    // joined in each mode.
+    const a = mask.create(allocator, false).?
+    const b = mask.create(allocator, false).?
+    const first = geom.rect(-20, -20, 100, 100)
+    const second = geom.rect(40, 40, 100, 100)
+    gray(b, second, 255)
+
+    gray(a, first, 255)
+    if !selection.combine(a, b, selection.ADD) { return 1 }
+    if mask.at(a, -20, -20) != 255 || mask.at(a, 139, 139) != 255 || mask.at(a, 60, 60) != 255 || mask.at(a, 100, 0) != 0 || mask.at(a, -21, 0) != 0 { return 2 }
+    if !sameRect(selection.bounds(a), -20, -20, 160, 160) { return 3 }
+
+    selection.clear(a)
+    gray(a, first, 255)
+    if !selection.combine(a, b, selection.SUBTRACT) { return 4 }
+    if mask.at(a, 0, 0) != 255 || mask.at(a, 39, 79) != 255 || mask.at(a, 40, 40) != 0 || mask.at(a, 79, 79) != 0 || mask.at(a, 100, 100) != 0 { return 5 }
+    if !sameRect(selection.bounds(a), -20, -20, 100, 100) { return 6 }
+
+    selection.clear(a)
+    gray(a, first, 255)
+    if !selection.combine(a, b, selection.INTERSECT) { return 7 }
+    if mask.at(a, 40, 40) != 255 || mask.at(a, 79, 79) != 255 || mask.at(a, 39, 40) != 0 || mask.at(a, 80, 79) != 0 || mask.at(a, 0, 0) != 0 { return 8 }
+    if !sameRect(selection.bounds(a), 40, 40, 40, 40) { return 9 }
+
+    selection.clear(a)
+    gray(a, first, 255)
+    if !selection.combine(a, b, selection.SYMMETRIC_DIFFERENCE) { return 10 }
+    if mask.at(a, 0, 0) != 255 || mask.at(a, 50, 50) != 0 || mask.at(a, 100, 100) != 255 || mask.at(a, 139, 139) != 255 || mask.at(a, 140, 139) != 0 { return 11 }
+
+    selection.clear(a)
+    gray(a, first, 255)
+    if !selection.combine(a, b, selection.REPLACE) { return 12 }
+    if !sameRect(selection.bounds(a), 40, 40, 100, 100) || mask.at(a, 0, 0) != 0 || mask.at(a, 139, 40) != 255 { return 14 }
+    // The shape is not written when the mask that took its tiles is.
+    mask.set(a, 50, 50, 7)
+    if mask.at(b, 50, 50) != 255 || mask.at(a, 50, 50) != 7 { return 15 }
+
+    // A mask joined with itself.
+    selection.clear(a)
+    gray(a, first, 255)
+    if !selection.combine(a, a, selection.ADD) || !sameRect(selection.bounds(a), -20, -20, 100, 100) { return 16 }
+    if !selection.combine(a, a, selection.SYMMETRIC_DIFFERENCE) || !selection.isEmpty(a) { return 17 }
+
+    // Soft amounts: 200 on the left, 100 on the right, both in the middle.
+    const soft = mask.create(allocator, false).?
+    gray(soft, geom.rect(50, 0, 100, 50), 100)
+    selection.clear(a)
+    gray(a, geom.rect(0, 0, 100, 50), 200)
+    if !selection.combine(a, soft, selection.ADD) { return 18 }
+    if mask.at(a, 10, 10) != 200 || mask.at(a, 70, 10) != 200 || mask.at(a, 120, 10) != 100 || mask.at(a, 150, 10) != 0 { return 19 }
+    selection.clear(a)
+    gray(a, geom.rect(0, 0, 100, 50), 200)
+    if !selection.combine(a, soft, selection.SUBTRACT) { return 20 }
+    if mask.at(a, 10, 10) != 200 || mask.at(a, 70, 10) != 122 || mask.at(a, 120, 10) != 0 { return 21 }
+    selection.clear(a)
+    gray(a, geom.rect(0, 0, 100, 50), 200)
+    if !selection.combine(a, soft, selection.INTERSECT) { return 22 }
+    if mask.at(a, 10, 10) != 0 || mask.at(a, 70, 10) != 100 || mask.at(a, 120, 10) != 0 { return 23 }
+    selection.clear(a)
+    gray(a, geom.rect(0, 0, 100, 50), 200)
+    if !selection.combine(a, soft, selection.SYMMETRIC_DIFFERENCE) { return 24 }
+    if mask.at(a, 10, 10) != 200 || mask.at(a, 70, 10) != 100 || mask.at(a, 120, 10) != 100 || mask.at(a, 99, 49) != 100 || mask.at(a, 100, 50) != 0 { return 25 }
+    device.destroy(soft)
+
+    // Masks whose default is all. All and a square: the square, and the
+    // default is nothing again.
+    const all = mask.create(allocator, true).?
+    if !selection.combine(all, b, selection.INTERSECT) { return 26 }
+    if mask.reachesEverywhere(all) || !sameRect(selection.bounds(all), 40, 40, 100, 100) || mask.at(all, 1000, 1000) != 0 { return 27 }
+    // All less a square.
+    selection.clear(all)
+    device.setDefault(all, mask.ALL)
+    if !selection.combine(all, b, selection.SUBTRACT) { return 28 }
+    if !mask.reachesEverywhere(all) || mask.at(all, 1000, -1000) != 255 || mask.at(all, 50, 50) != 0 || mask.at(all, 39, 40) != 255 || mask.at(all, 140, 139) != 255 { return 29 }
+    // A square and all with a hole: all but what of the hole the square
+    // does not fill.
+    const holed = mask.create(allocator, true).?
+    gray(holed, geom.rect(0, 0, 300, 300), 0)
+    selection.clear(a)
+    gray(a, first, 255)
+    if !selection.combine(a, holed, selection.ADD) { return 30 }
+    if !mask.reachesEverywhere(a) || mask.at(a, 10, 10) != 255 || mask.at(a, 200, 200) != 0 || mask.at(a, 1000, 1000) != 255 || mask.at(a, 300, 0) != 255 || mask.at(a, 299, 299) != 0 || mask.at(a, -20, -20) != 255 { return 31 }
+    // What differs from all: everything but the square.
+    selection.clear(a)
+    gray(a, first, 255)
+    selection.clear(all)
+    device.setDefault(all, mask.ALL)
+    if !selection.combine(a, all, selection.SYMMETRIC_DIFFERENCE) { return 32 }
+    if !mask.reachesEverywhere(a) || mask.at(a, 0, 0) != 0 || mask.at(a, 500, 500) != 255 || mask.at(a, 80, 79) != 255 { return 33 }
+    // A square and all: the square.
+    selection.clear(a)
+    gray(a, first, 255)
+    if !selection.combine(a, all, selection.INTERSECT) || !sameRect(selection.bounds(a), -20, -20, 100, 100) || mask.reachesEverywhere(a) { return 34 }
+    device.destroy(holed)
+    device.destroy(all)
+
+    // Select all: the image's rectangle and nothing else, whatever was
+    // there.
+    const s = mask.create(allocator, false).?
+    gray(s, geom.rect(-50, -50, 30, 30), 255)
+    var found = geom.empty()
+    if !selection.selectAll(s, image) { return 35 }
+    if !sameRect(selection.bounds(s), 0, 0, 200, 150) || mask.at(s, -40, -40) != 0 || mask.at(s, 200, 149) != 0 || mask.at(s, 199, 149) != 255 { return 36 }
+    if !selection.isRectangle(s, &found) || !sameRect(found, 0, 0, 200, 150) { return 37 }
+
+    // Inverted inside the image, and twice is as never.
+    selection.clear(s)
+    gray(s, geom.rect(10, 10, 50, 50), 255)
+    gray(s, geom.rect(100, 20, 40, 40), 200)
+    const kept = device.copy(s).?
+    if !selection.invert(s, image) { return 38 }
+    if mask.at(s, 20, 20) != 0 || mask.at(s, 0, 0) != 255 || mask.at(s, 199, 149) != 255 || mask.at(s, 110, 30) != 55 || mask.at(s, 200, 10) != 0 || mask.at(s, -1, -1) != 0 { return 39 }
+    if !selection.invert(s, image) { return 40 }
+    if !alike(s, geom.rect(-10, -10, 230, 180), kept, -10, -10, room, other) { return 41 }
+    device.destroy(kept)
+    const inverted = mask.create(allocator, true).?
+    if !selection.invert(inverted, image) || mask.at(inverted, 5, 5) != 0 || mask.at(inverted, 199, 149) != 0 || mask.at(inverted, 300, 300) != 255 { return 42 }
+    device.destroy(inverted)
+
+    // Clipped to the image.
+    selection.clear(s)
+    gray(s, geom.rect(-30, -30, 100, 100), 255)
+    if !selection.clip(s, image) || !sameRect(selection.bounds(s), 0, 0, 70, 70) { return 43 }
+    // (Clipping to a rectangle as large as can be looks at the mask's
+    // own tiles, not at the rectangle's.)
+    if !selection.clip(s, geom.rect(-2000000000, -2000000000, 2147483647, 2147483647)) || !sameRect(selection.bounds(s), 0, 0, 70, 70) { return 194 }
+    if !selection.clip(s, geom.empty()) || !selection.isEmpty(s) || !geom.isEmpty(selection.bounds(s)) { return 44 }
+
+    // Rectangles, hard and soft.
+    if !selection.fromRect(s, geom.rect(10, 10, 30, 30), selection.REPLACE, 0.0) { return 45 }
+    if !selection.isRectangle(s, &found) || !sameRect(found, 10, 10, 30, 30) { return 46 }
+    if !selection.fromRect(s, geom.rect(40, 10, 30, 30), selection.ADD, 0.0) || !selection.isRectangle(s, &found) || !sameRect(found, 10, 10, 60, 30) { return 47 }
+    if !selection.fromRect(s, geom.rect(10, 10, 60, 10), selection.SUBTRACT, 0.0) || !selection.isRectangle(s, &found) || !sameRect(found, 10, 20, 60, 20) { return 48 }
+    if !selection.fromRect(s, geom.rect(60, 20, 50, 50), selection.ADD, 0.0) || selection.isRectangle(s, &found) { return 49 }
+    if !selection.fromRect(s, geom.rect(100, 100, 60, 60), selection.REPLACE, 6.0) { return 50 }
+    if mask.at(s, 130, 130) != 255 || mask.at(s, 93, 130) != 0 || mask.at(s, 94, 130) == 0 || !sameRect(selection.bounds(s), 94, 94, 72, 72) { return 51 }
+    if mask.at(s, 99, 130) + mask.at(s, 100, 130) < 254 || mask.at(s, 99, 130) + mask.at(s, 100, 130) > 256 { return 52 }
+    // A rectangle from anywhere does no harm.
+    if !selection.fromRect(s, geom.rect(2147483000, -2147483000, 2147483000, 2147483000), selection.SUBTRACT, 0.0) || mask.at(s, 130, 130) != 255 { return 53 }
+
+    // What is opaque in a layer, what is light.
+    const layer = device.create(allocator, 0).?
+    _ = device.fill(layer, geom.rect(-10, -10, 40, 40), 0x80FF0000)
+    _ = device.fill(layer, geom.rect(100, 100, 10, 10), 0xFF00FF00)
+    if !selection.fromAlpha(s, layer, selection.REPLACE) { return 54 }
+    if mask.at(s, 0, 0) != 128 || mask.at(s, -10, -10) != 128 || mask.at(s, 105, 105) != 255 || mask.at(s, 50, 50) != 0 || mask.at(s, 130, 130) != 0 { return 55 }
+    if !sameRect(selection.bounds(s), -10, -10, 120, 120) { return 56 }
+    gray(s, geom.rect(0, 0, 200, 5), 60)
+    if !selection.fromAlpha(s, layer, selection.INTERSECT) || mask.at(s, 0, 0) != 60 || mask.at(s, 0, 5) != 128 || mask.at(s, 50, 0) != 0 { return 57 }
+    _ = device.fill(layer, geom.rect(0, 200, 10, 10), 0xFFFFFFFF)
+    _ = device.fill(layer, geom.rect(10, 200, 10, 10), 0xFF808080)
+    _ = device.fill(layer, geom.rect(20, 200, 10, 10), 0x80FFFFFF)
+    _ = device.fill(layer, geom.rect(30, 200, 10, 10), 0xFF000000)
+    if !selection.fromLuma(s, layer, selection.REPLACE) { return 58 }
+    if mask.at(s, 5, 205) != 255 || mask.at(s, 15, 205) != 128 || mask.at(s, 25, 205) != 128 || mask.at(s, 35, 205) != 0 || mask.at(s, 105, 105) != 149 { return 59 }
+    device.destroy(layer)
+
+    // Pixels like a colour: exactly, within 20 levels, and with a soft
+    // end over 10 more.
+    const picture = device.create(allocator, 0).?
+    device.setPixel(picture, 0, 0, 0xFF6496C8)
+    device.setPixel(picture, 1, 0, 0xFF6E96C8)
+    device.setPixel(picture, 2, 0, 0xFF64AAC8)
+    device.setPixel(picture, 3, 0, 0xFF6496E1)
+    device.setPixel(picture, 4, 0, 0xFF8C96C8)
+    device.setPixel(picture, 5, 0, 0xFF6496DD)
+    device.setPixel(picture, 6, 0, 0xFF6496E6)
+    device.setPixel(picture, 70, 0, 0xFF6496C8)
+    device.setPixel(picture, -5, 0, 0xFF6496C8)
+    device.setPixel(picture, 10, 5, 0x80FF0000)
+    const strip = geom.rect(0, 0, 100, 10)
+    if !selection.fromColor(s, picture, 0xFF6496C8, 0, 0, strip, selection.REPLACE) { return 60 }
+    if mask.at(s, 0, 0) != 255 || mask.at(s, 1, 0) != 0 || mask.at(s, 2, 0) != 0 || mask.at(s, 70, 0) != 255 || mask.at(s, -5, 0) != 0 || mask.at(s, 50, 5) != 0 { return 61 }
+    if !sameRect(selection.bounds(s), 0, 0, 71, 1) { return 62 }
+    if !selection.fromColor(s, picture, 0xFF6496C8, 20, 0, strip, selection.REPLACE) { return 63 }
+    if mask.at(s, 0, 0) != 255 || mask.at(s, 1, 0) != 255 || mask.at(s, 2, 0) != 255 || mask.at(s, 3, 0) != 0 || mask.at(s, 4, 0) != 0 || mask.at(s, 5, 0) != 0 { return 64 }
+    if !selection.fromColor(s, picture, 0xFF6496C8, 20, 10, strip, selection.REPLACE) { return 65 }
+    if mask.at(s, 2, 0) != 255 || mask.at(s, 3, 0) != 128 || mask.at(s, 5, 0) != 230 || mask.at(s, 6, 0) != 0 || mask.at(s, 4, 0) != 0 { return 66 }
+    // What is transparent, whatever colour it is said in; where there is
+    // no tile too, but only inside the area.
+    if !selection.fromColor(s, picture, 0x00FF0000, 0, 0, strip, selection.REPLACE) { return 67 }
+    if mask.at(s, 50, 5) != 255 || mask.at(s, 0, 0) != 0 || mask.at(s, 99, 9) != 255 || mask.at(s, 100, 9) != 0 || mask.at(s, 50, 10) != 0 || mask.at(s, 10, 5) != 0 { return 68 }
+    // Half transparent red is itself, not opaque red, and 127 from it.
+    if !selection.fromColor(s, picture, 0x80FF0000, 0, 0, strip, selection.REPLACE) || mask.at(s, 10, 5) != 255 || mask.at(s, 11, 5) != 0 { return 69 }
+    if !selection.fromColor(s, picture, 0xFFFF0000, 126, 0, strip, selection.REPLACE) || mask.at(s, 10, 5) != 0 { return 70 }
+    if !selection.fromColor(s, picture, 0xFFFF0000, 127, 0, strip, selection.REPLACE) || mask.at(s, 10, 5) != 255 { return 71 }
+    device.destroy(picture)
+
+    // Feather: the sum of the amounts stays within half a percent.
+    const f = mask.create(allocator, false).?
+    gray(f, geom.rect(30, 30, 100, 100), 255)
+    const whole_area = geom.rect(20, 20, 120, 120)
+    const sum_before = total(f, whole_area, room)
+    if sum_before != 2550000 { return 72 }
+    // (No radius: nothing happens.)
+    const sharp = device.copy(f).?
+    if !selection.feather(f, 0.0) || !selection.feather(f, 0.3) || !selection.feather(f, -4.0) { return 73 }
+    if !alike(f, whole_area, sharp, 20, 20, room, other) { return 74 }
+    device.destroy(sharp)
+    if !selection.feather(f, 8.0) { return 75 }
+    const sum_after = total(f, whole_area, room)
+    const off = if sum_after > sum_before { sum_after - sum_before } else { sum_before - sum_after }
+    if off * 200 > sum_before { return 76 }
+    // It reaches 8 pixels and no farther.
+    if !sameRect(selection.bounds(f), 22, 22, 116, 116) { return 77 }
+    // The same seen from left and right and from above and below,
+    // exactly; across the diagonal within one level (rows and columns
+    // are rounded at different points).
+    var y: usize = 0
+    while y < 120 {
+        var x: usize = 0
+        while x < 120 {
+            const amount = room[y * 120 + x]
+            if amount != room[y * 120 + 119 - x] || amount != room[(119 - y) * 120 + x] { return 78 }
+            if !near(amount, room[x * 120 + y]) { return 224 }
+            x += 1
+        }
+        y += 1
+    }
+    // Across a straight edge (between x = 29 and x = 30) the amounts
+    // only rise, from nothing 9 pixels outside to all 8 pixels inside,
+    // through half at the edge.
+    var column: i32 = 20
+    while column < 45 {
+        if mask.at(f, column, 80) > mask.at(f, column + 1, 80) { return 79 }
+        column += 1
+    }
+    if mask.at(f, 21, 80) != 0 || mask.at(f, 22, 80) == 0 || mask.at(f, 37, 80) == 255 || mask.at(f, 38, 80) != 255 { return 80 }
+    const outside = mask.at(f, 29, 80)
+    const inside = mask.at(f, 30, 80)
+    if outside >= 128 || inside < 128 || outside + inside < 254 || outside + inside > 256 { return 81 }
+    // The same square elsewhere among the tiles (left of and above the
+    // origin) feathers to the same amounts.
+    const moved = mask.create(allocator, false).?
+    gray(moved, geom.rect(-131, -197, 100, 100), 255)
+    if !selection.feather(moved, 8.0) { return 82 }
+    if !alike(f, whole_area, moved, -141, -207, room, other) { return 83 }
+    device.destroy(moved)
+    // A hole in a mask of all: all stays all far away, the hole's edge
+    // is soft and where it was.
+    const hole = mask.create(allocator, true).?
+    gray(hole, geom.rect(0, 0, 40, 40), 0)
+    if !selection.feather(hole, 5.0) { return 84 }
+    if mask.at(hole, 1000, 1000) != 255 || mask.at(hole, 20, 20) != 0 || mask.at(hole, -6, 20) != 255 || mask.at(hole, -5, 20) != 252 || mask.at(hole, -1, 20) + mask.at(hole, 0, 20) != 255 { return 85 }
+    device.destroy(hole)
+    device.destroy(f)
+
+    // Grow: one pixel becomes the disc, for small and large radii.
+    if !discGrown(allocator, 5, room) { return 86 }
+    if !discGrown(allocator, 20, room) { return 87 }
+    if !discGrown(allocator, 50, room) { return 88 }
+    if !discGrown(allocator, 1, room) { return 89 }
+    // No radius: nothing happens. Soft amounts: from half on a pixel
+    // grows, below it stays what it is.
+    const g = mask.create(allocator, false).?
+    gray(g, geom.rect(0, 0, 10, 10), 255)
+    mask.set(g, 10, 5, 200)
+    mask.set(g, 30, 5, 100)
+    if !selection.grow(g, 0) || !selection.grow(g, -3) || mask.at(g, 10, 5) != 200 || mask.at(g, 11, 5) != 0 { return 90 }
+    if !selection.grow(g, 3) { return 91 }
+    if mask.at(g, 10, 5) != 255 || mask.at(g, 13, 5) != 255 || mask.at(g, 14, 5) != 0 || mask.at(g, 12, 0) != 255 || mask.at(g, 13, 4) != 0 || mask.at(g, 30, 5) != 100 || mask.at(g, 29, 5) != 0 { return 92 }
+    // And shrink: below half a pixel takes its neighbours with it, what
+    // stays keeps its amount.
+    selection.clear(g)
+    gray(g, geom.rect(0, 0, 40, 40), 200)
+    mask.set(g, 20, 20, 100)
+    if !selection.shrink(g, 2, everywhere, true) { return 93 }
+    if mask.at(g, 1, 20) != 0 || mask.at(g, 2, 20) != 200 || mask.at(g, 20, 20) != 0 || mask.at(g, 22, 20) != 0 || mask.at(g, 23, 20) != 200 || mask.at(g, 21, 21) != 0 || mask.at(g, 22, 21) != 200 { return 94 }
+
+    // A big square grown has round corners; shrunk again it is itself.
+    selection.clear(g)
+    gray(g, geom.rect(100, 100, 300, 300), 255)
+    const square = device.copy(g).?
+    if !selection.grow(g, 20) { return 95 }
+    if !sameRect(selection.bounds(g), 80, 80, 340, 340) || mask.at(g, 80, 250) != 255 || mask.at(g, 79, 250) != 0 || mask.at(g, 80, 80) != 0 || mask.at(g, 86, 86) != 255 || mask.at(g, 85, 86) != 0 { return 96 }
+    if !selection.shrink(g, 20, everywhere, true) { return 97 }
+    if !alike(g, geom.rect(60, 60, 380, 380), square, 60, 60, room, other) { return 98 }
+    device.destroy(square)
+
+    // Shrinking and the image's edge.
+    if !selection.selectAll(g, image) || !selection.shrink(g, 10, image, true) { return 99 }
+    if !selection.isRectangle(g, &found) || !sameRect(found, 10, 10, 180, 130) { return 100 }
+    if !selection.selectAll(g, image) || !selection.shrink(g, 10, image, false) { return 101 }
+    if !selection.isRectangle(g, &found) || !sameRect(found, 0, 0, 200, 150) { return 102 }
+    if !selection.fromRect(g, geom.rect(0, 40, 50, 50), selection.REPLACE, 0.0) || !selection.shrink(g, 5, image, false) { return 103 }
+    if !selection.isRectangle(g, &found) || !sameRect(found, 0, 45, 45, 40) { return 104 }
+    if !selection.shrink(g, 5, image, true) || !selection.isRectangle(g, &found) || !sameRect(found, 5, 50, 35, 30) { return 105 }
+
+    // In a mask of all a hole closes in when what is selected grows (it
+    // keeps its corners) and widens when it shrinks (round corners).
+    selection.clear(g)
+    device.setDefault(g, mask.ALL)
+    gray(g, geom.rect(0, 0, 40, 40), 0)
+    if !selection.grow(g, 5) { return 106 }
+    if mask.at(g, 4, 20) != 255 || mask.at(g, 5, 20) != 0 || mask.at(g, 5, 5) != 0 || mask.at(g, 34, 34) != 0 || mask.at(g, 35, 34) != 255 || mask.at(g, 1000, 0) != 255 { return 107 }
+    selection.clear(g)
+    device.setDefault(g, mask.ALL)
+    gray(g, geom.rect(0, 0, 40, 40), 0)
+    if !selection.shrink(g, 5, image, true) { return 108 }
+    if mask.at(g, -5, 20) != 0 || mask.at(g, -6, 20) != 255 || mask.at(g, -4, -4) != 255 || mask.at(g, -3, -4) != 0 || mask.at(g, 1000, 1000) != 255 || mask.at(g, 20, 20) != 0 { return 109 }
+
+    // Border: 10 pixels to each side of the outline, hard, whatever the
+    // amounts were.
+    selection.clear(g)
+    gray(g, geom.rect(100, 100, 300, 300), 255)
+    gray(g, geom.rect(400, 100, 3, 300), 90)
+    if !selection.border(g, 0) || mask.at(g, 250, 250) != 255 { return 110 }
+    if !selection.border(g, 10) { return 111 }
+    if mask.at(g, 90, 250) != 255 || mask.at(g, 89, 250) != 0 || mask.at(g, 109, 250) != 255 || mask.at(g, 110, 250) != 0 || mask.at(g, 250, 250) != 0 { return 112 }
+    if mask.at(g, 390, 250) != 255 || mask.at(g, 389, 250) != 0 || mask.at(g, 409, 250) != 255 || mask.at(g, 410, 250) != 0 { return 113 }
+    if !sameRect(selection.bounds(g), 90, 90, 320, 320) || total(g, geom.rect(80, 250, 40, 1), room) != 20 * 255 { return 114 }
+    // Around a hole in a mask of all: the band, and nothing far away.
+    selection.clear(g)
+    device.setDefault(g, mask.ALL)
+    gray(g, geom.rect(0, 0, 40, 40), 0)
+    if !selection.border(g, 3) { return 115 }
+    if mask.reachesEverywhere(g) || mask.at(g, 1000, 1000) != 0 || mask.at(g, 20, 20) != 0 || mask.at(g, -3, 20) != 255 || mask.at(g, -4, 20) != 0 || mask.at(g, 2, 20) != 255 || mask.at(g, 3, 20) != 0 { return 116 }
+
+    // Smooth: the mean of nine. A pixel sticking out of a straight edge
+    // falls out of the outline, the edge stays in.
+    selection.clear(g)
+    gray(g, geom.rect(10, 10, 50, 50), 255)
+    mask.set(g, 30, 9, 255)
+    if !selection.smooth(g) { return 117 }
+    if mask.at(g, 30, 9) != 113 || mask.at(g, 30, 10) != 198 || mask.at(g, 20, 9) != 85 || mask.at(g, 20, 10) != 170 || mask.at(g, 20, 11) != 255 { return 118 }
+    if mask.at(g, 29, 8) != 28 || mask.at(g, 10, 10) != 113 || mask.at(g, 9, 9) != 28 || mask.at(g, 8, 8) != 0 || mask.at(g, 30, 30) != 255 { return 119 }
+
+    // Sharpen: all or nothing at half.
+    selection.clear(g)
+    gray(g, geom.rect(0, 0, 10, 10), 127)
+    gray(g, geom.rect(10, 0, 10, 10), 128)
+    gray(g, geom.rect(20, 0, 10, 10), 200)
+    gray(g, geom.rect(30, 0, 10, 10), 255)
+    if !selection.sharpen(g) { return 120 }
+    if mask.at(g, 5, 5) != 0 || mask.at(g, 15, 5) != 255 || mask.at(g, 25, 5) != 255 || mask.at(g, 35, 5) != 255 || !selection.isRectangle(g, &found) || !sameRect(found, 10, 0, 30, 10) { return 121 }
+
+    // Asking: nothing, a soft rectangle, a mask of all.
+    selection.clear(g)
+    if !selection.isEmpty(g) || selection.isRectangle(g, &found) || !geom.isEmpty(selection.bounds(g)) { return 122 }
+    gray(g, geom.rect(-70, -70, 10, 10), 200)
+    if selection.isEmpty(g) || selection.isRectangle(g, &found) || !sameRect(selection.bounds(g), -70, -70, 10, 10) { return 123 }
+    mask.set(g, -61, -61, 0)
+    mask.set(g, -70, -70, 1)
+    if !sameRect(selection.bounds(g), -70, -70, 10, 10) { return 124 }
+    selection.clear(g)
+    device.setDefault(g, mask.ALL)
+    if selection.isEmpty(g) || selection.isRectangle(g, &found) { return 125 }
+    selection.clear(g)
+
+    // Nothing selected: everything works and nothing comes of it.
+    var segments = std.ArrayList(Segment).init(allocator)
+    defer segments.deinit()
+    if !selection.feather(g, 5.0) || !selection.grow(g, 5) || !selection.shrink(g, 5, image, false) || !selection.border(g, 5) || !selection.smooth(g) || !selection.sharpen(g) { return 216 }
+    if !selection.combine(g, g, selection.ADD) || !selection.clip(g, image) || !selection.outline(g, image, &segments) || segments.count() != 0 || !selection.isEmpty(g) || device.tileCount(g) != 0 { return 217 }
+    const nothing = selection.copySelected(g, g, image)
+    if nothing == null || device.tileCount(nothing.?) != 0 || !selection.clearSelected(nothing.?, g, image) || !selection.fillSelected(nothing.?, g, image, 0xFFFFFFFF, blend.NORMAL, 255) || device.tileCount(nothing.?) != 0 { return 218 }
+    device.destroy(nothing.?)
+    // One pixel, and a radius as large as a number can be: taken as the
+    // largest there is, a disc still.
+    mask.set(g, 10, 10, 255)
+    if !selection.grow(g, 2147483647) { return 219 }
+    const reach = selection.LARGEST_RADIUS
+    if !sameRect(selection.bounds(g), 10 - reach, 10 - reach, reach * 2 + 1, reach * 2 + 1) || mask.at(g, 10 + reach, 10) != 255 || mask.at(g, 10, 10 - reach) != 255 || mask.at(g, 10 + reach, 11) != 0 { return 220 }
+    if mask.at(g, 10 + 1448, 10 - 1448) != 255 || mask.at(g, 10 + 1449, 10 - 1449) != 0 || mask.at(g, 10 - 1200, 10 + 1659) != 255 || mask.at(g, 10 - 1200, 10 + 1660) != 0 { return 221 }
+    selection.clear(g)
+    gray(g, geom.rect(0, 0, 100, 100), 255)
+    if !selection.feather(g, 1.0e30) { return 222 }
+    const spread = selection.bounds(g)
+    if spread.x < -reach || spread.x >= 0 || spread.y < -reach || spread.y >= 0 || spread.width != 100 - spread.x * 2 || spread.height != 100 - spread.y * 2 { return 223 }
+    if mask.at(g, 50, 50) == 0 || mask.at(g, 50, 50) != mask.at(g, 49, 49) || mask.at(g, 50, 50) != mask.at(g, 49, 50) { return 225 }
+    selection.clear(g)
+
+    // The outline of a rectangle: its four sides, in order.
+    gray(g, geom.rect(5, 5, 20, 10), 255)
+    if !selection.outline(g, geom.rect(0, 0, 100, 100), &segments) || segments.count() != 4 { return 126 }
+    if !isSegment(segments.items()[0], 5, 5, 25, 5) || !isSegment(segments.items()[1], 5, 5, 5, 15) || !isSegment(segments.items()[2], 25, 5, 25, 15) || !isSegment(segments.items()[3], 5, 15, 25, 15) { return 127 }
+    // The same when the area is the rectangle itself; none inside it.
+    segments.clearRetainingCapacity()
+    if !selection.outline(g, geom.rect(5, 5, 20, 10), &segments) || segments.count() != 4 || !isSegment(segments.items()[3], 5, 15, 25, 15) { return 128 }
+    segments.clearRetainingCapacity()
+    if !selection.outline(g, geom.rect(8, 8, 5, 5), &segments) || segments.count() != 0 { return 129 }
+    // Cut by the area: only what lies in it, and not closed where it is
+    // cut.
+    if !selection.outline(g, geom.rect(10, 0, 10, 100), &segments) || segments.count() != 2 { return 130 }
+    if !isSegment(segments.items()[0], 10, 5, 20, 5) || !isSegment(segments.items()[1], 10, 15, 20, 15) { return 131 }
+    segments.clearRetainingCapacity()
+    if !selection.outline(g, geom.rect(0, 0, 15, 10), &segments) || segments.count() != 2 { return 132 }
+    if !isSegment(segments.items()[0], 5, 5, 15, 5) || !isSegment(segments.items()[1], 5, 5, 5, 10) { return 133 }
+    // (Added to what the list holds.)
+    if !selection.outline(g, geom.rect(0, 0, 15, 10), &segments) || segments.count() != 4 { return 134 }
+    segments.clearRetainingCapacity()
+
+    // An L across a tile border: six sides.
+    selection.clear(g)
+    gray(g, geom.rect(60, 60, 10, 20), 255)
+    gray(g, geom.rect(70, 70, 10, 10), 255)
+    if !selection.outline(g, geom.rect(-5, -5, 200, 200), &segments) || segments.count() != 6 { return 135 }
+    if !isSegment(segments.items()[0], 60, 60, 70, 60) || !isSegment(segments.items()[1], 60, 60, 60, 80) || !isSegment(segments.items()[2], 70, 60, 70, 70) { return 136 }
+    if !isSegment(segments.items()[3], 70, 70, 80, 70) || !isSegment(segments.items()[4], 80, 70, 80, 80) || !isSegment(segments.items()[5], 60, 80, 80, 80) { return 137 }
+    segments.clearRetainingCapacity()
+
+    // Two pixels that touch at a corner: eight sides of one pixel's
+    // length, none joined through the corner. The pixel beside them that
+    // is selected by just less than half is outside.
+    selection.clear(g)
+    mask.set(g, 3, 3, 255)
+    mask.set(g, 4, 4, 128)
+    mask.set(g, 5, 4, 127)
+    if !selection.outline(g, geom.rect(0, 0, 20, 20), &segments) || segments.count() != 8 { return 138 }
+    if !isSegment(segments.items()[0], 3, 3, 4, 3) || !isSegment(segments.items()[1], 3, 3, 3, 4) || !isSegment(segments.items()[2], 4, 3, 4, 4) || !isSegment(segments.items()[3], 3, 4, 4, 4) { return 139 }
+    if !isSegment(segments.items()[4], 4, 4, 5, 4) || !isSegment(segments.items()[5], 4, 4, 4, 5) || !isSegment(segments.items()[6], 5, 4, 5, 5) || !isSegment(segments.items()[7], 4, 5, 5, 5) { return 140 }
+    segments.clearRetainingCapacity()
+
+    // All of the image: its rim. A hole in a mask of all: the hole, and
+    // no rim. Left of and above the origin.
+    if !selection.selectAll(g, image) || !selection.outline(g, image, &segments) || segments.count() != 4 { return 141 }
+    if !isSegment(segments.items()[0], 0, 0, 200, 0) || !isSegment(segments.items()[1], 0, 0, 0, 150) || !isSegment(segments.items()[2], 200, 0, 200, 150) || !isSegment(segments.items()[3], 0, 150, 200, 150) { return 142 }
+    segments.clearRetainingCapacity()
+    selection.clear(g)
+    device.setDefault(g, mask.ALL)
+    gray(g, geom.rect(10, 10, 5, 5), 0)
+    if !selection.outline(g, geom.rect(0, 0, 50, 50), &segments) || segments.count() != 4 || !isSegment(segments.items()[0], 10, 10, 15, 10) || !isSegment(segments.items()[2], 15, 10, 15, 15) { return 143 }
+    segments.clearRetainingCapacity()
+    selection.clear(g)
+    gray(g, geom.rect(-70, -10, 10, 5), 255)
+    if !selection.outline(g, geom.rect(-100, -100, 200, 200), &segments) || segments.count() != 4 || !isSegment(segments.items()[1], -70, -10, -70, -5) || !isSegment(segments.items()[3], -70, -5, -60, -5) { return 144 }
+    segments.clearRetainingCapacity()
+    selection.clear(g)
+    if !selection.outline(g, image, &segments) || segments.count() != 0 { return 145 }
+
+    // A selection applied to pixels: all in one part, 100 of 255 in
+    // another, nothing elsewhere; the area ends inside the soft part.
+    const paint = device.create(allocator, 0).?
+    const tint: u32 = 0xC0336699
+    _ = device.fill(paint, geom.rect(-10, -10, 150, 100), tint)
+    selection.clear(g)
+    gray(g, geom.rect(0, 0, 30, 80), 255)
+    gray(g, geom.rect(30, 0, 30, 80), 100)
+    const part = geom.rect(0, 0, 50, 200)
+    const faint = (tint & 0x00FFFFFF) | (pixel.mul(0xC0, 100) << 24)
+    const copied = selection.copySelected(paint, g, part)
+    if copied == null { return 146 }
+    if device.pixel(copied.?, 10, 10) != tint || device.pixel(copied.?, 40, 10) != faint || device.pixel(copied.?, 49, 79) != faint { return 147 }
+    if device.pixel(copied.?, 50, 10) != 0 || device.pixel(copied.?, 10, 80) != 0 || device.pixel(copied.?, -5, 10) != 0 || device.pixel(copied.?, 100, 50) != 0 { return 148 }
+    if !sameRect(device.exactBounds(copied.?), 0, 0, 50, 80) || device.pixel(paint, 10, 10) != tint || device.pixel(paint, 100, 50) != tint { return 149 }
+    device.destroy(copied.?)
+    // No selection: all of the area; a whole tile is the source's own.
+    const most = selection.copySelected(paint, null, geom.rect(-2000000000, 20, 2147483647, 2147483647))
+    if most == null || !sameRect(device.exactBounds(most.?), -10, 20, 150, 70) || device.pixel(most.?, 139, 89) != tint || device.pixel(most.?, 0, 19) != 0 { return 195 }
+    device.destroy(most.?)
+    const patch = selection.copySelected(paint, null, geom.rect(60, 60, 10, 10))
+    if patch == null || !sameRect(device.exactBounds(patch.?), 60, 60, 10, 10) || device.pixel(patch.?, 60, 60) != tint || device.pixel(patch.?, 69, 69) != tint { return 150 }
+    device.destroy(patch.?)
+    const tile = selection.copySelected(paint, null, geom.rect(0, 0, 64, 64))
+    if tile == null || device.tileCount(tile.?) != 1 || device.pixel(tile.?, 63, 63) != tint || device.pixel(tile.?, 64, 63) != 0 { return 151 }
+    device.setPixel(tile.?, 5, 5, 0xFF000000)
+    if device.pixel(paint, 5, 5) != tint { return 152 }
+    device.destroy(tile.?)
+    // A source that is something everywhere (a mask): its default too.
+    const plane = mask.create(allocator, true).?
+    const cut = selection.copySelected(plane, g, geom.rect(20, 0, 20, 10))
+    if cut == null || device.pixel(cut.?, 25, 5) != 0xFFFFFFFF || device.pixel(cut.?, 35, 5) != 0x64FFFFFF || device.pixel(cut.?, 40, 5) != 0 || device.pixel(cut.?, 19, 5) != 0 || device.pixel(cut.?, 25, 10) != 0 { return 153 }
+    device.destroy(cut.?)
+    device.destroy(plane)
+
+    // Cleared: what was selected goes, as much as it was selected, and
+    // only inside the area.
+    if !selection.clearSelected(paint, g, part) { return 154 }
+    if device.pixel(paint, 10, 10) != 0 || device.pixel(paint, 40, 10) != ((tint & 0x00FFFFFF) | (pixel.mul(0xC0, 155) << 24)) { return 155 }
+    if device.pixel(paint, 50, 10) != tint || device.pixel(paint, 10, 80) != tint || device.pixel(paint, -1, 10) != tint { return 156 }
+    if !selection.clearSelected(paint, null, geom.rect(100, 0, 5, 5)) || device.pixel(paint, 100, 0) != 0 || device.pixel(paint, 104, 4) != 0 || device.pixel(paint, 105, 4) != tint || device.pixel(paint, 99, 0) != tint { return 157 }
+    // Clearing where nothing is selected writes no tile.
+    device.begin(paint)
+    if !selection.clearSelected(paint, g, geom.rect(0, 80, 200, 200)) || device.commit(paint) != null { return 158 }
+    device.destroy(paint)
+
+    // Filled: the colour at the opacity times the amount, over opaque
+    // and over translucent pixels, over nothing, and taken away (erase).
+    const canvas = device.create(allocator, 0).?
+    const under: u32 = 0xFF102030
+    const thin: u32 = 0x80405060
+    const ink: u32 = 0xFFFF8000
+    _ = device.fill(canvas, geom.rect(0, 0, 100, 50), under)
+    _ = device.fill(canvas, geom.rect(0, 50, 100, 50), thin)
+    if !selection.fillSelected(canvas, g, everywhere, ink, blend.NORMAL, 200) { return 159 }
+    if device.pixel(canvas, 10, 10) != blend.blendPixel(blend.NORMAL, under, ink, 200) || device.pixel(canvas, 40, 10) != blend.blendPixel(blend.NORMAL, under, ink, pixel.mul(200, 100)) || device.pixel(canvas, 70, 10) != under { return 160 }
+    if device.pixel(canvas, 10, 60) != blend.blendPixel(blend.NORMAL, thin, ink, 200) || device.pixel(canvas, 40, 60) != blend.blendPixel(blend.NORMAL, thin, ink, pixel.mul(200, 100)) || device.pixel(canvas, 10, 80) != thin { return 161 }
+    if device.pixel(canvas, 10, 10) == under || device.pixel(canvas, 40, 60) == thin { return 162 }
+    const was_all = device.pixel(canvas, 10, 10)
+    const was_part = device.pixel(canvas, 40, 10)
+    if !selection.fillSelected(canvas, g, everywhere, 0xFF000000, blend.ERASE, 255) { return 163 }
+    if device.pixel(canvas, 10, 10) != blend.blendPixel(blend.ERASE, was_all, 0xFF000000, 255) || device.pixel(canvas, 40, 10) != blend.blendPixel(blend.ERASE, was_part, 0xFF000000, 100) || device.pixel(canvas, 70, 10) != under { return 164 }
+    if device.pixel(canvas, 10, 10) >> 24 != 0 || device.pixel(canvas, 40, 10) >> 24 != pixel.mul(was_part >> 24, 155) { return 192 }
+    device.clear(canvas)
+    if !selection.fillSelected(canvas, g, everywhere, ink, blend.NORMAL, 255) { return 165 }
+    if device.pixel(canvas, 10, 10) != blend.blendPixel(blend.NORMAL, 0, ink, 255) || device.pixel(canvas, 40, 10) != blend.blendPixel(blend.NORMAL, 0, ink, 100) || device.pixel(canvas, 70, 10) != 0 || device.tileCount(canvas) != 2 { return 166 }
+    if device.pixel(canvas, 10, 10) >> 24 != 255 || device.pixel(canvas, 40, 10) >> 24 != 100 { return 193 }
+    device.clear(canvas)
+    if !selection.fillSelected(canvas, g, everywhere, ink, blend.NORMAL, 0) || device.tileCount(canvas) != 0 { return 167 }
+    if !selection.fillSelected(canvas, null, geom.rect(-5, -5, 10, 10), ink, blend.NORMAL, 255) { return 168 }
+    if !sameRect(device.exactBounds(canvas), -5, -5, 10, 10) || device.pixel(canvas, -5, -5) != blend.blendPixel(blend.NORMAL, 0, ink, 255) || device.pixel(canvas, 4, 4) != device.pixel(canvas, -5, -5) { return 169 }
+    device.destroy(canvas)
+
+    // Only what differs is written: adding what is selected already is
+    // no change, and growing a square of 25 tiles by a pixel makes the
+    // 20 tiles around it (not the corners) and touches no other.
+    selection.clear(g)
+    gray(g, geom.rect(0, 0, 320, 320), 255)
+    device.begin(g)
+    if !selection.fromRect(g, geom.rect(10, 10, 100, 100), selection.ADD, 0.0) || device.commit(g) != null { return 170 }
+    device.begin(g)
+    if !selection.grow(g, 1) { return 171 }
+    const change = device.commit(g)
+    if change == null || change.?.*.count != 20 || mask.at(g, -1, 100) != 255 || mask.at(g, -1, -1) != 0 { return 172 }
+    // Undone, the square is back.
+    _ = device.apply(g, change.?, true)
+    if !selection.isRectangle(g, &found) || !sameRect(found, 0, 0, 320, 320) { return 173 }
+    device.destroyChange(change.?)
+    // What replaces the mask's tiles (a border) is undone as well, and
+    // given up.
+    device.begin(g)
+    if !selection.feather(g, 3.0) || !selection.border(g, 4) || mask.at(g, 100, 100) != 0 || mask.at(g, 2, 100) != 255 { return 196 }
+    const banded = device.commit(g)
+    if banded == null { return 197 }
+    _ = device.apply(g, banded.?, true)
+    if !selection.isRectangle(g, &found) || !sameRect(found, 0, 0, 320, 320) { return 198 }
+    _ = device.apply(g, banded.?, false)
+    if mask.at(g, 100, 100) != 0 || mask.at(g, 2, 100) != 255 || mask.at(g, -4, 100) != 255 || mask.at(g, -5, 100) != 0 { return 199 }
+    device.destroyChange(banded.?)
+    device.begin(g)
+    if !selection.invert(g, image) || !selection.smooth(g) { return 200 }
+    _ = device.rollback(g)
+    if mask.at(g, 100, 100) != 0 || mask.at(g, 2, 100) != 255 || mask.at(g, 150, 100) != 0 { return 201 }
+
+    // An image's selection, changed as the Select menu does it: one step
+    // each, undone and redone; a change given up; nothing left selected
+    // is no selection.
+    const picture_made = image_module.create(allocator, 200, 150, 72.0)
+    if picture_made == null { return 202 }
+    const pic = picture_made.?
+    ops.beginSelection(pic)
+    if !selection.fromRect(pic.*.selection, geom.rect(150, 100, 100, 100), selection.ADD, 0.0) || !selection.grow(pic.*.selection, 4) || !selection.clip(pic.*.selection, image_module.bounds(pic)) { return 203 }
+    ops.endSelection(pic, true, "Select")
+    if !pic.*.selected || !sameRect(selection.bounds(pic.*.selection), 146, 96, 54, 54) || image_module.selectedAt(pic, 147, 97) != 0 || image_module.selectedAt(pic, 148, 97) != 255 { return 204 }
+    if image_module.selectedAt(pic, 199, 149) != 255 || image_module.selectedAt(pic, 145, 120) != 0 { return 205 }
+    ops.beginSelection(pic)
+    if !selection.invert(pic.*.selection, image_module.bounds(pic)) { return 206 }
+    ops.endSelection(pic, true, "Invert selection")
+    if image_module.selectedAt(pic, 199, 149) != 0 || image_module.selectedAt(pic, 0, 0) != 255 { return 207 }
+    _ = history.undo(pic.*.history, pic)
+    if !pic.*.selected || image_module.selectedAt(pic, 199, 149) != 255 || image_module.selectedAt(pic, 0, 0) != 0 { return 208 }
+    _ = history.undo(pic.*.history, pic)
+    if pic.*.selected || image_module.selectedAt(pic, 0, 0) != 255 { return 209 }
+    _ = history.redo(pic.*.history, pic)
+    _ = history.redo(pic.*.history, pic)
+    if !pic.*.selected || image_module.selectedAt(pic, 199, 149) != 0 || image_module.selectedAt(pic, 0, 0) != 255 { return 210 }
+    ops.beginSelection(pic)
+    if !selection.feather(pic.*.selection, 5.0) || image_module.selectedAt(pic, 146, 120) == 0 { return 211 }
+    ops.cancelSelection(pic)
+    if image_module.selectedAt(pic, 146, 120) != 0 || image_module.selectedAt(pic, 145, 120) != 255 { return 212 }
+    ops.beginSelection(pic)
+    if !selection.shrink(pic.*.selection, 100, image_module.bounds(pic), true) { return 214 }
+    ops.endSelection(pic, true, "Shrink selection")
+    if pic.*.selected || !selection.isEmpty(pic.*.selection) { return 215 }
+    image_module.destroy(pic)
+
+    // Every function against a plain implementation of its definition.
+    const attacked = attack(allocator, room, other)
+    if attacked != 0 { return attacked }
+
+    // Nothing of all this takes memory that stays taken, of the value
+    // arena or of the heap: a hundred rounds of everything (the heap is
+    // looked at after the first ten: working memory is kept for the next
+    // use).
+    const stage = device.create(allocator, 0).?
+    const arena = turns.locate()
+    const used = turns.used(arena)
+    var live: usize = 0
+    var round: u32 = 0
+    while round < 100 {
+        if round == 10 { live = std.heap.liveBytes() }
+        if !selection.fromRect(g, geom.rect(-10, 10, 150, 80), selection.REPLACE, 0.0) || !selection.feather(g, 4.0) { return 174 }
+        if !selection.grow(g, 3) || !selection.shrink(g, 3, image, false) || !selection.smooth(g) || !selection.combine(g, b, selection.SYMMETRIC_DIFFERENCE) { return 175 }
+        if !selection.invert(g, image) || !selection.clip(g, image) || !selection.border(g, 2) || !selection.sharpen(g) { return 176 }
+        segments.clearRetainingCapacity()
+        if !selection.outline(g, image, &segments) || segments.count() == 0 || selection.isEmpty(g) || selection.isRectangle(g, &found) { return 177 }
+        if !selection.fillSelected(stage, g, image, ink, blend.NORMAL, 128) || !selection.clearSelected(stage, g, image) { return 178 }
+        const lifted = selection.copySelected(stage, g, image)
+        if lifted == null { return 179 }
+        device.destroy(lifted.?)
+        _ = device.fill(stage, geom.rect(-20, 30, 100, 70), 0x80FF8040)
+        if !selection.fromAlpha(g, stage, selection.ADD) || !selection.fromLuma(g, stage, selection.SUBTRACT) || !selection.fromColor(g, stage, 0x80FF8040, 10, 20, image, selection.INTERSECT) { return 179 }
+        if !selection.fromRect(g, geom.rect(30, 30, 50, 50), selection.SYMMETRIC_DIFFERENCE, 3.0) || geom.isEmpty(selection.bounds(g)) { return 179 }
+        selection.clear(g)
+        if !selection.selectAll(g, image) || !selection.isRectangle(g, &found) { return 179 }
+        round += 1
+    }
+    if turns.used(arena) - used > 65536 { return 180 }
+    if std.heap.liveBytes() > live + 65536 { return 226 }
+    device.destroy(stage)
+
+    // 2048 x 2048, all selected, feathered and grown by 20 pixels: in
+    // several bands, which must not show. The time is printed.
+    const large = geom.rect(0, 0, 2048, 2048)
+    if !selection.selectAll(g, large) { return 181 }
+    var started = std.time.milliseconds()
+    if !selection.feather(g, 20.0) { return 182 }
+    printTime("feather 20 on 2048 x 2048: ", std.time.milliseconds() - started)
+    // (The last pixels of a wide feather are less than half a level:
+    // nothing.)
+    const feathered = selection.bounds(g)
+    if feathered.x < -20 || feathered.x > -17 || feathered.y < -20 || feathered.y > -17 || feathered.width != 2048 - feathered.x * 2 || feathered.height != 2048 - feathered.y * 2 { return 183 }
+    if mask.at(g, 1000, 1000) != 255 || mask.at(g, -1, 1000) + mask.at(g, 0, 1000) != 255 || mask.at(g, -21, 1000) != 0 || mask.at(g, 20, 1000) != 255 { return 191 }
+    // Down a column near the left edge and along the row near the top
+    // edge the amounts are the same (within a level), and each the same
+    // from both ends.
+    mask.readBytes(g, geom.rect(3, -24, 1, 2096), room, 1)
+    mask.readBytes(g, geom.rect(-24, 3, 2096, 1), other, 2096)
+    var index: usize = 0
+    while index < 2096 {
+        if !near(room[index], other[index]) || room[index] != room[2095 - index] || other[index] != other[2095 - index] { return 184 }
+        index += 1
+    }
+    if !selection.selectAll(g, large) { return 185 }
+    mask.set(g, 1000, 1000, 0)
+    started = std.time.milliseconds()
+    if !selection.grow(g, 20) { return 186 }
+    printTime("grow 20 on 2048 x 2048: ", std.time.milliseconds() - started)
+    if !sameRect(selection.bounds(g), -20, -20, 2088, 2088) || mask.at(g, 1000, 1000) != 255 || mask.at(g, -20, 1000) != 255 || mask.at(g, -20, -20) != 0 || mask.at(g, -14, -14) != 255 { return 187 }
+    // The round corners are the same at all four ends, whatever band
+    // they were in.
+    mask.readBytes(g, geom.rect(-24, -24, 2096, 30), room, 2096)
+    mask.readBytes(g, geom.rect(-24, 2042, 2096, 30), other, 2096)
+    index = 0
+    while index < 2096 * 30 {
+        const row = index / 2096
+        const at = index % 2096
+        if room[index] != other[(29 - row) * 2096 + at] || room[index] != room[row * 2096 + 2095 - at] { return 188 }
+        index += 1
+    }
+    started = std.time.milliseconds()
+    if !selection.shrink(g, 20, large, true) { return 189 }
+    printTime("shrink 20 on 2048 x 2048: ", std.time.milliseconds() - started)
+    if !selection.isRectangle(g, &found) || !sameRect(found, 0, 0, 2048, 2048) { return 190 }
+
+    device.destroy(g)
+    device.destroy(s)
+    device.destroy(a)
+    device.destroy(b)
+    allocator.free(room, ROOM, 16)
+    allocator.free(other, ROOM, 16)
+    return 13
+}

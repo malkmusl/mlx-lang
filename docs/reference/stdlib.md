@@ -1190,7 +1190,8 @@ pub fn main() -> u8 {
 
 **Implementation:** `std/src/math.mlx`
 **Source tests:** `325_standard_math_runtime.mlx`, `324_float_rounding_runtime.mlx`,
-`350_math_helpers_runtime.mlx`
+`350_math_helpers_runtime.mlx`, `447_math_inverse_runtime.mlx` (the last two
+run by `tests/run_std_modules.sh`)
 
 Floating-point math in Mlx on the doubles' bits, without libm. Import it as
 `@import("std.math")`; it imports nothing itself, so a `--plugin` library
@@ -1220,6 +1221,46 @@ can use it too.
   709.78 and underflows to 0 below -745.13.
 - `pow(x, y)` for `x > 0` (`exp(y ln x)`: a few ulps for results up to
   about 2^50), `cbrt(x)` for any sign.
+- `powr(x, y)` is `pow` with the whole exponents taken by squaring in
+  pairs of doubles: the nearest double as a rule (`powr(2.0, 3.0)` is 8,
+  `powr(10.0, -2.0)` is 0.01, which `exp(y ln x)` need not give; within
+  2 ulps below 1e-290), down among the subnormals and up to the largest
+  double, and for a negative base, whose power has its sign when `y` is
+  odd (`powr(-2.0, 3.0)` is -8). A negative base with a fractional `y`
+  is NaN; 1 and -1 to any whole power are 1 or -1, also to the infinite
+  ones (as in C: `pow`'s `exp(y ln x)` would make infinity times 0); a
+  fractional `y`, a `y` from 2^53 on and the powers of zero and the
+  infinities are `pow`'s, with the base's sign for an odd `y`.
+- `sign(x)` is -1, 0 or 1 (0 for either zero, NaN for NaN).
+  `lerp(a, b, t)` is the straight line from `a` at 0 to `b` at 1 and on
+  past both, the way C++'s `std::lerp` draws it: exactly `a` at 0 and
+  `b` at 1 (which `a + (b - a) t` alone can miss), exactly `a` wherever
+  the two are the same, between them for t in 0..1 and never turning
+  back as t grows; ends of opposite signs are weighted, `(1 - t) a + t b`,
+  so `lerp(-1e308, 1e308, 0.5)` is 0 where `b - a` would overflow.
+- `fmod(x, y)` is C's remainder: the sign of `x`, smaller than `|y|`,
+  and exact (the largest 2^k `|y|` that fits is taken away until less
+  than `|y|` is left, each step without rounding), so
+  `fmod(5.0 * 2^1000, 3.0)` is 2 and a zero remainder keeps `x`'s sign.
+  NaN for `y` = 0, an infinite `x` and NaN; `x` for an infinite `y`.
+- `hypot(x, y)` is the length sqrt(x² + y²) without the squares, so
+  1e200 does not overflow and 1e-200 is not lost; within 2 ulps;
+  infinite when either side is.
+- `atan(x)`, `atan2(y, x)`, `asin(x)`, `acos(x)`: the arc tangent from a
+  table of atan(k/8) in two parts and a short series, within 2 ulps;
+  `atan2` is the angle of the point (x, y) in -pi..pi with C's cases for
+  the axes, the two zeros (`atan2(0.0, -1.0)` is pi, `atan2(-0.0, -1.0)`
+  is -pi) and the infinities; `asin` and `acos` are `atan2` of the
+  triangle's sides, within 3 ulps, NaN outside -1..1.
+- `sinh(x)`, `cosh(x)`, `tanh(x)` on e^x: `cosh` within 2 ulps, `sinh`
+  within 3, `tanh` within 4; `sinh` and `cosh` reach infinity past
+  710.47, `tanh` is ±1 from 22 on; `sinh` and `tanh` return a zero or a
+  tiny `x` as it came.
+
+The functions from `fmod` on are those of the repository's C library
+(`compiler/libc/libm.mlx`: the same reductions, constants and bits), in
+std for the programs that have no C library under them. None of them
+takes from the value arena: they can be called for every pixel.
 
 ```mlx
 const math = @import("std.math")
@@ -1234,6 +1275,32 @@ pub fn main() -> u8 {
 ```
 
 (`tests/325_standard_math_runtime.mlx`)
+
+```mlx
+const math = @import("std.math")
+
+pub fn main() -> u8 {
+    if math.fmod(10.0, 3.0) != 1.0 || math.fmod(-10.0, 3.0) != -1.0 { return 20 }   // the sign of what is divided
+    if math.hypot(3.0, 4.0) != 5.0 || math.hypot(-3.0, 4.0) != 5.0 { return 50 }
+    if math.atan(1.0) != 0.7853981633974483 { return 62 }                           // pi/4, to the bit
+    if math.atan2(5.0, -5.0) != 2.356194490192345 { return 71 }                     // the second quadrant: 3 pi/4
+    if math.atan2(0.0, -5.0) != math.pi || math.atan2(-0.0, -5.0) != -math.pi { return 74 }
+    if math.asin(1.0) != 1.5707963267948966 || !math.isNan(math.asin(-1.5)) { return 101 }
+    if math.acos(1.0) != 0.0 || math.acos(-1.0) != math.pi { return 105 }
+    if math.tanh(22.0) != 1.0 || math.cosh(0.0) != 1.0 { return 131 }
+    if math.powr(-2.0, 3.0) != -8.0 || math.powr(10.0, -2.0) != 0.01 { return 140 }
+    if math.lerp(2.0, 10.0, 0.25) != 4.0 || math.sign(-0.25) != -1.0 { return 7 }
+    return 13
+}
+```
+
+(`tests/447_math_inverse_runtime.mlx`: these and the cases with signed
+zeros, infinities and NaN bit for bit, the functions against the
+correctly rounded doubles at over 160 arguments, the identities that
+tie them to `sin`, `cos`, `tan` and `exp` over sweeps of a few thousand,
+`fmod`, `lerp` and `powr` against integer arithmetic, `lerp`'s bounds
+and direction, and the rising functions across the seams of their
+pieces)
 
 ## Encodings (`std.base64`)
 
@@ -1687,6 +1754,16 @@ recognized as specifier characters but return
 `Error.UnsupportedSpecifier` — float formatting is not implemented. There is
 no `@hasDecl(T, "format")` custom-formatting hook yet; `{any}` always uses
 the built-in aggregate representation.
+
+`std.text` (`std/bootstrap/text.mlx`) builds a line in a fixed buffer
+without allocating: `append`, `appendByte`, `appendUnsigned`,
+`appendSigned` and `appendHex` each add after `at` and return the new
+length, leaving out what does not fit `capacity` (a number's leading
+digits are kept). A number's digits are written straight into the line,
+last first, so none of them takes the compiler's value arena either
+(an array of digits of their own, handed to `append` as a slice, took
+24 bytes of it a number; `tests/525_std_drawing_arena_runtime.mlx`
+compares every length at every capacity with that code).
 
 Two argument-passing surfaces coexist: an explicit `Argument` (tagged
 two-word struct, `printArguments`) used directly in bootstrap code before

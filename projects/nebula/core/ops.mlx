@@ -1,0 +1,302 @@
+// nebula core: the usual things done to an image, each done, recorded in
+// its history (one step each, named `name`; inside history.begin() ...
+// end() they join that step) and the image told where it looks different.
+//
+// Pixels of a node are changed between beginPixels() and endPixels():
+//
+//     ops.beginPixels(image, layer)
+//     ... write layer.*.device ...
+//     const area = ops.endPixels(image, layer, "Brush stroke")
+//
+// (cancelPixels() puts them back instead.) The selection the same way
+// with beginSelection() and endSelection().
+const std = @import("std")
+const device_module = @import("./device.mlx")
+const mask_module = @import("./mask.mlx")
+const node_module = @import("./node.mlx")
+const image_module = @import("./image.mlx")
+const history_module = @import("./history.mlx")
+const geom = @import("./geom.mlx")
+const blend = @import("./blend.mlx")
+const scratch = @import("./scratch.mlx")
+
+pub const Image = image_module.Image
+pub const Node = node_module.Node
+pub const Props = node_module.Props
+pub const Rect = geom.Rect
+
+// ---------------------------------------------------------------------------
+// The tree
+
+// Puts `node` (in no tree, made with image_module.newId's number) into
+// `parent` as child number `index`, and makes it the active node. False
+// when it could not be put there (the node is still the caller's then).
+pub fn add(image: *Image, node: *Node, parent: *Node, index: usize, name: []const u8) -> bool {
+    if !node_module.insert(parent, node, index) { return false }
+    history_module.added(image.*.history, name, node)
+    image_module.damage(image, history_module.footprint(image, node))
+    image_module.touch(image)
+    if !node_module.isMask(node.*.kind) { image.*.active = node }
+    return true
+}
+
+pub const Place = struct {
+    parent: *Node
+    index: usize
+}
+
+// Where a new layer goes: above the active one, in its group (into a
+// group that is active and not folded; on top of the image when there is
+// no active node).
+pub fn placeForNew(image: *Image) -> Place {
+    const top = Place.{ .parent = image.*.root, .index = node_module.childCount(image.*.root) }
+    if image.*.active == null { return top }
+    const at = node_module.layerOf(image.*.active.?)
+    if !node_module.isUnder(at, image.*.root) || at.*.parent == null { return top }
+    if at.*.kind == node_module.GROUP && !at.*.collapsed {
+        return Place.{ .parent = at, .index = node_module.childCount(at) }
+    }
+    const found = node_module.indexIn(at.*.parent.?, at)
+    if found == null { return top }
+    return Place.{ .parent = at.*.parent.?, .index = found.? + 1 }
+}
+
+// How many of a node's children are layers, not masks.
+pub fn layerCount(node: *Node) -> usize {
+    var count: usize = 0
+    for child in node.*.children.items() {
+        if !node_module.isMask(child.*.kind) { count += 1 }
+    }
+    return count
+}
+
+// A new layer of `kind` above the active one, active itself. Null without
+// memory.
+pub fn newLayer(image: *Image, kind: u8, title: []const u8, name: []const u8) -> ?*Node {
+    const made = node_module.create(image.*.allocator, kind, image_module.newId(image), title)
+    if made == null { return null }
+    const place = placeForNew(image)
+    if !add(image, made.?, place.parent, place.index, name) {
+        node_module.destroy(made.?)
+        return null
+    }
+    return made
+}
+
+// A new mask of `kind` on `layer` (after its other masks). Null without
+// memory.
+pub fn newMask(image: *Image, layer: *Node, kind: u8, title: []const u8, name: []const u8) -> ?*Node {
+    const made = node_module.create(image.*.allocator, kind, image_module.newId(image), title)
+    if made == null { return null }
+    if !add(image, made.?, layer, node_module.childCount(layer), name) {
+        node_module.destroy(made.?)
+        return null
+    }
+    return made
+}
+
+// Takes `node` out of the image (the history keeps it for undo).
+pub fn remove(image: *Image, node: *Node, name: []const u8) -> void {
+    if node.*.parent == null { return }
+    const parent = node.*.parent.?
+    const index = node_module.indexIn(parent, node)
+    if index == null { return }
+    const area = history_module.footprint(image, node)
+    node_module.detach(node)
+    history_module.removed(image.*.history, name, node, parent.*.id, index.?)
+    image_module.damage(image, area)
+    image_module.touch(image)
+    if image.*.active != null && @intFromPtr(image.*.active.?) == @intFromPtr(node) {
+        image.*.active = null
+        // The one below takes over, else the one that is above now.
+        const left = node_module.childCount(parent)
+        if left > 0 {
+            image.*.active = node_module.childAt(parent, if index.? > 0 { index.? - 1 } else { 0 })
+        } else if @intFromPtr(parent) != @intFromPtr(image.*.root) {
+            image.*.active = parent
+        }
+    }
+    image_module.settleActive(image)
+}
+
+// Moves `node` to be child number `index` of `parent` (the number it has
+// once it is there). False when it cannot go there (under itself).
+pub fn move(image: *Image, node: *Node, parent: *Node, index: usize, name: []const u8) -> bool {
+    if node.*.parent == null || node_module.isUnder(parent, node) { return false }
+    const from = node.*.parent.?
+    const from_index = node_module.indexIn(from, node)
+    if from_index == null { return false }
+    if @intFromPtr(from) == @intFromPtr(parent) && from_index.? == index { return true }
+    node_module.detach(node)
+    if !node_module.insert(parent, node, index) {
+        _ = node_module.insert(from, node, from_index.?)
+        return false
+    }
+    const now = node_module.indexIn(parent, node)
+    history_module.moved(image.*.history, name, node.*.id, from.*.id, from_index.?, parent.*.id, if now != null { now.? } else { index })
+    image_module.damage(image, history_module.footprint(image, node))
+    image_module.touch(image)
+    return true
+}
+
+// `node`'s properties were changed from `before` to what it has now.
+pub fn changed(image: *Image, node: *Node, before: *const Props, name: []const u8) -> void {
+    const after = node_module.props(node)
+    history_module.props(image.*.history, name, node.*.id, before, &after)
+    image_module.damage(image, history_module.footprint(image, node))
+    image_module.touch(image)
+}
+
+pub fn setVisible(image: *Image, node: *Node, visible: bool, name: []const u8) -> void {
+    if node.*.visible == visible { return }
+    const before = node_module.props(node)
+    node.*.visible = visible
+    changed(image, node, &before, name)
+}
+
+pub fn setOpacity(image: *Image, node: *Node, opacity: u8, name: []const u8) -> void {
+    if node.*.opacity == opacity { return }
+    const before = node_module.props(node)
+    node.*.opacity = opacity
+    changed(image, node, &before, name)
+}
+
+pub fn setBlend(image: *Image, node: *Node, mode: u16, name: []const u8) -> void {
+    if node.*.blend == mode { return }
+    const before = node_module.props(node)
+    node.*.blend = mode
+    changed(image, node, &before, name)
+}
+
+pub fn rename(image: *Image, node: *Node, title: []const u8, name: []const u8) -> void {
+    const before = node_module.props(node)
+    node_module.setName(node, title)
+    changed(image, node, &before, name)
+}
+
+// ---------------------------------------------------------------------------
+// Pixels
+
+// The pixels of `node` are about to change. False for a node with none.
+pub fn beginPixels(image: *Image, node: *Node) -> bool {
+    if node.*.device == null { return false }
+    device_module.begin(node.*.device.?)
+    return true
+}
+
+// They changed: one step `name`. The image's rectangle that looks
+// different (empty: nothing changed, nothing recorded).
+pub fn endPixels(image: *Image, node: *Node, name: []const u8) -> Rect {
+    if node.*.device == null { return geom.empty() }
+    const change = device_module.commit(node.*.device.?)
+    if change == null { return geom.empty() }
+    const area = change.?.*.area
+    history_module.pixels(image.*.history, name, node.*.id, change.?)
+    image_module.damage(image, area)
+    image.*.modified = true
+    return area
+}
+
+// They are put back as they were. The image's rectangle that looks
+// different again.
+pub fn cancelPixels(image: *Image, node: *Node) -> Rect {
+    if node.*.device == null { return geom.empty() }
+    const area = device_module.rollback(node.*.device.?)
+    image_module.damage(image, area)
+    return area
+}
+
+// The selection is about to change.
+pub fn beginSelection(image: *Image) -> void {
+    device_module.begin(image.*.selection)
+}
+
+// It changed, and there is one now or not (`selected`): one step `name`.
+// A selection of nothing is none.
+pub fn endSelection(image: *Image, selected: bool, name: []const u8) -> void {
+    const was = image.*.selected
+    var is = selected
+    if is && mask_module.isNothing(image.*.selection) { is = false }
+    if !is {
+        // None: the mask is emptied, so the next one starts from nothing.
+        device_module.setDefault(image.*.selection, mask_module.NOTHING)
+        device_module.clear(image.*.selection)
+    }
+    const change = device_module.commit(image.*.selection)
+    if change == null && was == is { return }
+    image.*.selected = is
+    image_module.selectionChanged(image)
+    history_module.selection(image.*.history, name, change, was, is)
+}
+
+pub fn cancelSelection(image: *Image) -> void {
+    _ = device_module.rollback(image.*.selection)
+    image_module.selectionChanged(image)
+}
+
+// ---------------------------------------------------------------------------
+// Overlays
+
+// What a tool painted over `node` as its overlay (core/node.mlx) becomes
+// the node's own pixels: mixed in as the overlay showed (its blend mode
+// and opacity, only where the selection is when it was masked, keeping
+// alpha on a layer whose alpha is locked), one step `name`; the overlay
+// is taken off the node and ended. The image's rectangle that changed.
+pub fn mergeOverlay(image: *Image, node: *Node, name: []const u8) -> Rect {
+    if node.*.overlay == null { return geom.empty() }
+    const overlay = node.*.overlay.?
+    var area = geom.empty()
+    if node.*.device != null {
+        const target = node.*.device.?
+        device_module.begin(target)
+        var keys = std.ArrayList(u64).init(image.*.allocator)
+        defer keys.deinit()
+        const pool = scratch.common()
+        const mark = scratch.mark(pool)
+        const amounts = scratch.bytes(pool, 4096)
+        const rows = scratch.words(pool, 4096)
+        const masked = node.*.overlayMasked && image.*.selected && amounts != null
+        const flags: u32 = if node.*.alphaLocked { blend.FLAG_ALPHA_LOCK } else { 0 }
+        if rows != null && device_module.keys(overlay, &keys) {
+            for key in keys.items() {
+                // The overlay's tile as a rectangle of the image, mixed
+                // into the layer by rows (the two need not share a grid).
+                const tile = device_module.tileArea(overlay, device_module.keyX(key), device_module.keyY(key))
+                const source = device_module.tileRead(overlay, device_module.keyX(key), device_module.keyY(key))
+                if source == null { continue }
+                device_module.readRect(target, tile, rows.?, 64)
+                if masked { mask_module.readBytes(image.*.selection, tile, amounts.?, 64) }
+                var row: usize = 0
+                while row < 64 {
+                    var line: ?[*]const u8 = null
+                    if masked { line = amounts.? + row * 64 }
+                    blend.compositeSpan(node.*.overlayBlend, rows.? + row * 64, source.? + row * 64, 64, @intCast(u32, node.*.overlayOpacity), line, flags)
+                    row += 1
+                }
+                _ = device_module.writeRect(target, tile, rows.?, 64)
+            }
+        }
+        scratch.release(pool, mark)
+        const change = device_module.commit(target)
+        if change != null {
+            area = change.?.*.area
+            history_module.pixels(image.*.history, name, node.*.id, change.?)
+            image.*.modified = true
+        }
+    }
+    area = geom.unite(area, device_module.extent(overlay))
+    node.*.overlay = null
+    device_module.destroy(overlay)
+    image_module.damage(image, area)
+    return area
+}
+
+// The overlay is thrown away: the node shows what it holds again.
+pub fn dropOverlay(image: *Image, node: *Node) -> Rect {
+    if node.*.overlay == null { return geom.empty() }
+    const area = device_module.extent(node.*.overlay.?)
+    device_module.destroy(node.*.overlay.?)
+    node.*.overlay = null
+    image_module.damage(image, area)
+    return area
+}

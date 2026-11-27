@@ -1,0 +1,1501 @@
+// nebula filters: the blurs (the Filter menu's Blur group), and what every
+// filter that reads around a pixel is made of (filters/enhance.mlx is
+// built on it too).
+//
+// Such a filter never mixes the picture's straight pixels: a transparent
+// pixel's colour must not count. The pixels are widened first (widen():
+// alpha times 255 and each colour times the alpha, both 0 to 65025, 16
+// bits a channel in one u64), filtered so, and brought back (narrow():
+// the colours over the alpha, rounded; nothing left of the alpha gives
+// 0). Widening and narrowing a pixel gives the pixel again.
+//
+// What is outside the rectangle is its nearest pixel inside: the picture
+// is thought continued that way without end and that picture is filtered,
+// whatever number of passes a filter makes. So a part of a picture
+// filtered with margin() more pixels around it comes out as the same part
+// of the picture filtered whole, to the bit: all sums are whole numbers,
+// so one that is carried along a row is the same wherever the row began.
+//
+// Three things do the work:
+//
+//   bands      a tall picture goes through in bands of rows, so that the
+//              working memory stays small: bandsBegin, then for each
+//              bandsNext: bandsLoad (the band widened, with the rows it
+//              needs above and below), the filter, bandsStore
+//   lines      filters that work along rows and then along columns (a
+//              gaussian, a box, a wavelet's smoothing): an Axis of up to
+//              three passes for each direction, separable()
+//   kernels    any other neighbourhood as a table of weights: convolve().
+//              It slides along a row (or down the columns, where that
+//              is less to do) and adds only where the weights change
+//              from one pixel to the next, so a flat shape costs its
+//              rows, not its area
+//
+//     var horizontal: blur.Axis = undefined
+//     var vertical: blur.Axis = undefined
+//     blur.oneAxis(&horizontal, blur.BOX, 3)        // 7 pixels wide
+//     blur.oneAxis(&vertical, blur.BOX, 1)          // 3 pixels tall
+//     const mark = scratch.mark(pool)
+//     _ = blur.smooth(pixels, width, height, stride, &horizontal, &vertical, pool)
+//     scratch.release(pool, mark)
+//
+// Working memory is core/scratch.mlx's; a filter that gets none leaves
+// the pixels as they are. The loops use the wrapping operators where the
+// ranges are known not to overflow (said at each place): the checked ones
+// cost a branch for every sample.
+//
+// The list of the filters is copied once into memory that stays, the
+// lists of numbers with it (types.keepList, core/table.mlx says why):
+// what list() and so the registry hand out stays where it is.
+//
+// Not done: the gaussian of a large radius is three box passes, which is
+// a bell to within a few hundredths of its height, not the exact one.
+// A kernel whose weights fall toward its edge (Blur with Strength) costs
+// its area, or a good part of it, for every pixel. A kernel's shape is
+// worked out anew at every call (every block the compositor hands in),
+// which for the largest takes some milliseconds. The edge of a large
+// flat shape has only a few steps of cover (the weights of the fast way
+// add up to no more than LANE_ROOM). A band holds the reach of rows
+// above and below it, also where the picture is lower than that.
+const math = @import("std.math")
+const types = @import("./types.mlx")
+const scratch = @import("../core/scratch.mlx")
+const table = @import("../core/table.mlx")
+
+pub const Params = types.Params
+
+pub const GAUSSIAN_BLUR: u16 = 100
+pub const BLUR: u16 = 101
+pub const MOTION_BLUR: u16 = 102
+pub const LENS_BLUR: u16 = 103
+
+// ---------------------------------------------------------------------
+// A filter's numbers
+
+// The number at `index` of the list `list` describes, held in its range;
+// its initial value where none was handed in (NaN).
+pub fn number(params: *const Params, list: []const types.Param, index: usize) -> f64 {
+    const value = params.*.values[index]
+    if value != value { return list[index].initial }
+    if value < list[index].low { return list[index].low }
+    if value > list[index].high { return list[index].high }
+    return value
+}
+
+// The same as the nearest whole number (0 for a number below nothing:
+// the lists here have none).
+pub fn whole(params: *const Params, list: []const types.Param, index: usize) -> usize {
+    const value = math.floor(number(params, list, index) + 0.5)
+    if value <= 0.0 { return 0 }
+    return @intFromFloat(usize, value)
+}
+
+// ---------------------------------------------------------------------
+// Wide pixels
+
+// Two of a wide pixel's four channels, with room above each for sums.
+const LANES: u64 = 0x0000FFFF0000FFFF
+const LOW: u64 = 0xFFFFFFFF
+
+// A straight pixel as a wide one: alpha times 255 at the top, then red,
+// green and blue, each times the alpha (a transparent pixel is 0
+// whatever its colour).
+pub inline fn widen(pixel: u32) -> u64 {
+    const a = @intCast(u64, pixel >> 24)
+    return ((a * 255) << 48) | ((@intCast(u64, (pixel >> 16) & 255) * a) << 32) | ((@intCast(u64, (pixel >> 8) & 255) * a) << 16) | (@intCast(u64, pixel & 255) * a)
+}
+
+// A wide pixel as a straight one: the alpha to the nearest 255th, each
+// colour over the alpha; 0 when no alpha is left.
+pub inline fn narrow(wide: u64) -> u32 {
+    var alpha = @intCast(u32, wide >> 48)
+    if alpha > 65025 { alpha = 65025 }
+    // x / 255 as (x + 1 + (x >> 8)) >> 8, right up to 65534.
+    const rounded = alpha + 127
+    const a = (rounded + 1 + (rounded >> 8)) >> 8
+    if a == 0 { return 0 }
+    var r = @intCast(u32, (wide >> 32) & 0xFFFF)
+    var g = @intCast(u32, (wide >> 16) & 0xFFFF)
+    var b = @intCast(u32, wide & 0xFFFF)
+    // A colour is at most its alpha: what rounding or a sharpening put
+    // above is cut.
+    if r > alpha { r = alpha }
+    if g > alpha { g = alpha }
+    if b > alpha { b = alpha }
+    if alpha == 65025 {
+        r += 127
+        g += 127
+        b += 127
+        r = (r + 1 + (r >> 8)) >> 8
+        g = (g + 1 + (g >> 8)) >> 8
+        b = (b + 1 + (b >> 8)) >> 8
+    } else {
+        const half = alpha >> 1
+        r = (r * 255 + half) / alpha
+        g = (g * 255 + half) / alpha
+        b = (b * 255 + half) / alpha
+    }
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+// `count` straight pixels widened, and wide ones narrowed.
+pub fn widenRow(into: [*]u64, from: [*]const u32, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        into[index] = widen(from[index])
+        index += 1
+    }
+}
+
+pub fn narrowRow(into: [*]u32, from: [*]const u64, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        into[index] = narrow(from[index])
+        index += 1
+    }
+}
+
+// `count` wide pixels of working memory, not cleared. Null without memory.
+pub fn wides(pool: *scratch.Pool, count: usize) -> ?[*]u64 {
+    const memory = scratch.bytes(pool, count * 8)
+    if memory == null { return null }
+    unsafe { return @ptrCast([*]u64, memory.?) }
+}
+
+// `count` wide pixels from `from` to `into` (apart, or the same place).
+pub fn copyWides(into: [*]u64, from: [*]const u64, count: usize) -> void {
+    var index: usize = 0
+    while index < count {
+        into[index] = from[index]
+        index += 1
+    }
+}
+
+// Each row of a plane holds `width` pixels with room for `pad` more on
+// either side: those become the row's first and its last pixel.
+pub fn spreadEdges(plane: [*]u64, rowStride: usize, rows: usize, width: usize, pad: usize) -> void {
+    if pad == 0 { return }
+    var row: usize = 0
+    while row < rows {
+        const line = plane + row * rowStride
+        const first = line[pad]
+        const last = line[pad + width - 1]
+        var index: usize = 0
+        while index < pad {
+            line[index] = first
+            line[pad + width + index] = last
+            index += 1
+        }
+        row += 1
+    }
+}
+
+// ---------------------------------------------------------------------
+// Bands
+
+// About this many pixels go through at a time.
+const BAND_PIXELS: usize = 262144
+
+pub const Bands = struct {
+    pixels: [*]u32
+    width: usize
+    height: usize
+    stride: usize
+    // The rows of the picture a band's filter reads above and below it.
+    margin: usize
+    // The `margin` rows above the band as they were before the bands
+    // above it were written.
+    kept: [*]u32
+    // The band: the rows from `first` up to `last` (without it).
+    first: usize
+    last: usize
+    // The rows of a band (the last one may have up to half as many more).
+    step: usize
+}
+
+// Readies `bands` to go through `width` x `height` pixels for a filter
+// that reads `margin` rows above and below a pixel. False without memory
+// and for a picture of no pixels: there is nothing to go through then.
+pub fn bandsBegin(bands: *Bands, pool: *scratch.Pool, pixels: [*]u32, width: usize, height: usize, stride: usize, margin: usize) -> bool {
+    if width == 0 || height == 0 { return false }
+    // A band is at least eight times as tall as what it reads beyond
+    // itself, so that not more than a fifth of the work is done twice.
+    var step = BAND_PIXELS / width
+    if step < 8 * margin { step = 8 * margin }
+    if step < 16 { step = 16 }
+    if height <= step + step / 2 { step = height }
+    bands.*.pixels = pixels
+    bands.*.width = width
+    bands.*.height = height
+    bands.*.stride = stride
+    bands.*.margin = margin
+    bands.*.kept = pixels
+    bands.*.first = 0
+    bands.*.last = 0
+    bands.*.step = step
+    if step < height && margin > 0 {
+        const kept = scratch.words(pool, margin * width)
+        if kept == null { return false }
+        bands.*.kept = kept.?
+    }
+    return true
+}
+
+// The rows of the tallest band's plane (the band and its margins).
+pub fn bandsTallest(bands: *const Bands) -> usize {
+    var rows = bands.*.height
+    if bands.*.step < rows { rows = bands.*.step + bands.*.step / 2 }
+    return rows + 2 * bands.*.margin
+}
+
+// On to the next band. False: the picture is through.
+pub fn bandsNext(bands: *Bands) -> bool {
+    if bands.*.last >= bands.*.height { return false }
+    bands.*.first = bands.*.last
+    var last = bands.*.first + bands.*.step
+    // A rest too small for a band of its own goes with this one.
+    if last + bands.*.step / 2 >= bands.*.height { last = bands.*.height }
+    bands.*.last = last
+    return true
+}
+
+// The rows of this band's plane.
+pub fn bandsRows(bands: *const Bands) -> usize {
+    return bands.*.last - bands.*.first + 2 * bands.*.margin
+}
+
+// The band widened into `plane` (`rowStride` pixels a row, each row's
+// pixels from `offset` on): first its `margin` rows above, last those
+// below, the picture's first and last row again where it ends. To be
+// called once for a band, before bandsStore: it also sets aside what the
+// next band needs of this one.
+pub fn bandsLoad(bands: *Bands, plane: [*]u64, rowStride: usize, offset: usize) -> void {
+    const margin = bands.*.margin
+    const first = bands.*.first
+    const width = bands.*.width
+    const rows = bandsRows(bands)
+    var row: usize = 0
+    while row < rows {
+        var y: usize = 0
+        if first + row > margin { y = first + row - margin }
+        if y >= bands.*.height { y = bands.*.height - 1 }
+        var source: [*]const u32 = bands.*.pixels + y * bands.*.stride
+        if y < first { source = bands.*.kept + (y + margin - first) * width }
+        widenRow(plane + row * rowStride + offset, source, width)
+        row += 1
+    }
+    if bands.*.last < bands.*.height && margin > 0 {
+        row = 0
+        while row < margin {
+            const source = bands.*.pixels + (bands.*.last - margin + row) * bands.*.stride
+            const target = bands.*.kept + row * width
+            var x: usize = 0
+            while x < width {
+                target[x] = source[x]
+                x += 1
+            }
+            row += 1
+        }
+    }
+}
+
+// The band's own rows of `plane` (laid out as for bandsLoad) narrowed
+// into the picture.
+pub fn bandsStore(bands: *const Bands, plane: [*]const u64, rowStride: usize, offset: usize) -> void {
+    var y = bands.*.first
+    while y < bands.*.last {
+        narrowRow(bands.*.pixels + y * bands.*.stride, plane + (y - bands.*.first + bands.*.margin) * rowStride + offset, bands.*.width)
+        y += 1
+    }
+}
+
+// ---------------------------------------------------------------------
+// Lines
+
+// The mean of the 2 radius + 1 pixels around a pixel.
+pub const BOX: u8 = 0
+// The pixel and its neighbours up to `radius` by `weights`: weights[0]
+// for the pixel itself, weights[n] for both neighbours n away; all
+// together they are 32768.
+pub const WEIGHTED: u8 = 1
+// A quarter of each of the two pixels `radius` away and half the pixel:
+// a wavelet's smoothing.
+pub const HAT: u8 = 2
+
+pub const Pass = struct {
+    kind: u8
+    radius: usize
+    weights: [*]const u64
+}
+
+// What happens along one direction: its passes one after the other.
+pub const Axis = struct {
+    count: usize
+    passes: [3]Pass
+}
+
+// How far an axis reads along its direction.
+pub fn axisReach(axis: *const Axis) -> usize {
+    var reach: usize = 0
+    var index: usize = 0
+    while index < axis.*.count {
+        reach += axis.*.passes[index].radius
+        index += 1
+    }
+    return reach
+}
+
+fn axisWidest(axis: *const Axis) -> usize {
+    var widest: usize = 0
+    var index: usize = 0
+    while index < axis.*.count {
+        if axis.*.passes[index].radius > widest { widest = axis.*.passes[index].radius }
+        index += 1
+    }
+    return widest
+}
+
+// How far a line has to be continued beyond its ends before the first
+// pass, for every pass to see the picture continued and not what the
+// pass before made of the picture's edge: all passes' reach but the last
+// one's (each pass repeats the line's ends for itself).
+fn axisExtension(axis: *const Axis) -> usize {
+    if axis.*.count == 0 { return 0 }
+    return axisReach(axis) - axis.*.passes[axis.*.count - 1].radius
+}
+
+// `axis` as a single pass (radius 0: the direction left alone).
+pub fn oneAxis(axis: *Axis, kind: u8, radius: usize) -> void {
+    axis.*.count = 1
+    axis.*.passes[0].kind = kind
+    axis.*.passes[0].radius = radius
+}
+
+// The buffers separable() works in.
+pub const Lines = struct {
+    // A row continued beyond its ends.
+    line: [*]u64
+    // A line with a pass's reach of its first and last pixel around it.
+    padded: [*]u64
+    // COLUMNS columns of a plane, each in one piece.
+    strip: [*]u64
+}
+
+// As many columns are taken out of a plane together: each row of the
+// plane then gives a cache line or two at a time, not one pixel.
+const COLUMNS: usize = 16
+
+// The buffers for planes of `width` x `rows` and these axes. False
+// without memory.
+pub fn linesBegin(lines: *Lines, pool: *scratch.Pool, width: usize, rows: usize, horizontal: *const Axis, vertical: *const Axis) -> bool {
+    const extended = width + 2 * axisExtension(horizontal)
+    var longest = extended
+    if rows > longest { longest = rows }
+    var widest = axisWidest(horizontal)
+    if axisWidest(vertical) > widest { widest = axisWidest(vertical) }
+    const line = wides(pool, extended)
+    const padded = wides(pool, longest + 2 * widest)
+    const strip = wides(pool, COLUMNS * rows)
+    if line == null || padded == null || strip == null { return false }
+    lines.*.line = line.?
+    lines.*.padded = padded.?
+    lines.*.strip = strip.?
+    return true
+}
+
+fn padLine(padded: [*]u64, line: [*]const u64, count: usize, radius: usize) -> void {
+    const first = line[0]
+    const last = line[count - 1]
+    var index: usize = 0
+    while index < radius {
+        padded[index] = first
+        padded[radius + count + index] = last
+        index += 1
+    }
+    copyWides(padded + radius, line, count)
+}
+
+// The running sums hold two channels each, 32 bits apart: a channel is
+// below 65536 and a window has at most some thousand pixels, so a sum
+// stays below 2^32 and neither `+%` nor `-%` carries into the other
+// channel (what leaves a window was added to it before).
+fn boxLine(into: [*]u64, padded: [*]const u64, count: usize, radius: usize) -> void {
+    const window = 2 * radius + 1
+    // sum / window as (sum * (2^32 / window) + 2^31) >> 32: off by less
+    // than a hundredth, so that a flat line stays what it is.
+    const share: u64 = (4294967296 + window / 2) / window
+    var even: u64 = 0
+    var odd: u64 = 0
+    var index: usize = 0
+    while index < window {
+        const pixel = padded[index]
+        even +%= pixel & LANES
+        odd +%= (pixel >> 16) & LANES
+        index += 1
+    }
+    var at: usize = 0
+    while true {
+        const b = ((even & LOW) *% share +% 2147483648) >> 32
+        const r = ((even >> 32) *% share +% 2147483648) >> 32
+        const g = ((odd & LOW) *% share +% 2147483648) >> 32
+        const a = ((odd >> 32) *% share +% 2147483648) >> 32
+        into[at] = (a << 48) | (r << 32) | (g << 16) | b
+        at += 1
+        if at >= count { break }
+        const incoming = padded[at + window - 1]
+        const outgoing = padded[at - 1]
+        even = even +% (incoming & LANES) -% (outgoing & LANES)
+        odd = odd +% ((incoming >> 16) & LANES) -% ((outgoing >> 16) & LANES)
+    }
+}
+
+// Two channels in each product again: the weights are 32768 together, so
+// a channel's sum with its rounding half stays below 2^31.
+fn weightedLine(into: [*]u64, padded: [*]const u64, count: usize, radius: usize, weights: [*]const u64) -> void {
+    const middle = weights[0]
+    const half: u64 = 16384 | (16384 << 32)
+    var at: usize = 0
+    while at < count {
+        const centre = padded + (at + radius)
+        const pixel = centre[0]
+        var even = (pixel & LANES) *% middle +% half
+        var odd = ((pixel >> 16) & LANES) *% middle +% half
+        var away: usize = 1
+        while away <= radius {
+            const left = (centre - away)[0]
+            const right = centre[away]
+            const weight = weights[away]
+            even +%= ((left & LANES) +% (right & LANES)) *% weight
+            odd +%= (((left >> 16) & LANES) +% ((right >> 16) & LANES)) *% weight
+            away += 1
+        }
+        into[at] = (((odd >> 47) & 0xFFFF) << 48) | (((even >> 47) & 0xFFFF) << 32) | (((odd >> 15) & 0xFFFF) << 16) | ((even >> 15) & 0xFFFF)
+        at += 1
+    }
+}
+
+fn hatLine(into: [*]u64, padded: [*]const u64, count: usize, step: usize) -> void {
+    const half: u64 = 2 | (2 << 32)
+    var at: usize = 0
+    while at < count {
+        const left = padded[at]
+        const pixel = padded[at + step]
+        const right = padded[at + 2 * step]
+        // Four times a channel and 2: 18 bits, in room for 32.
+        const even = (left & LANES) +% ((pixel & LANES) << 1) +% (right & LANES) +% half
+        const odd = ((left >> 16) & LANES) +% (((pixel >> 16) & LANES) << 1) +% ((right >> 16) & LANES) +% half
+        into[at] = ((even >> 2) & LANES) | (((odd >> 2) & LANES) << 16)
+        at += 1
+    }
+}
+
+// The passes of `axis` over the `count` pixels at `from`, the outcome at
+// `into` (which may be `from`).
+fn runAxis(axis: *const Axis, into: [*]u64, from: [*]const u64, count: usize, padded: [*]u64) -> void {
+    var source = from
+    var index: usize = 0
+    while index < axis.*.count {
+        const pass = &axis.*.passes[index]
+        const radius = pass.*.radius
+        if radius > 0 {
+            padLine(padded, source, count, radius)
+            if pass.*.kind == BOX {
+                boxLine(into, padded, count, radius)
+            } else if pass.*.kind == WEIGHTED {
+                weightedLine(into, padded, count, radius, pass.*.weights)
+            } else {
+                hatLine(into, padded, count, radius)
+            }
+            source = into
+        }
+        index += 1
+    }
+    if @intFromPtr(source) != @intFromPtr(into) { copyWides(into, from, count) }
+}
+
+// The plane at `from` (`rows` rows of `width` wide pixels, `rowStride`
+// apart) through `horizontal` along its rows and `vertical` along its
+// columns, into the plane at `into` laid out the same (it may be `from`).
+// What a pass reads beyond a line's end is the line's last pixel there.
+pub fn separable(into: [*]u64, from: [*]const u64, rowStride: usize, width: usize, rows: usize, horizontal: *const Axis, vertical: *const Axis, lines: *const Lines) -> void {
+    const extension = axisExtension(horizontal)
+    var row: usize = 0
+    while row < rows {
+        const source = from + row * rowStride
+        const target = into + row * rowStride
+        if extension == 0 {
+            runAxis(horizontal, target, source, width, lines.*.padded)
+        } else {
+            const line = lines.*.line
+            const first = source[0]
+            const last = source[width - 1]
+            var index: usize = 0
+            while index < extension {
+                line[index] = first
+                line[extension + width + index] = last
+                index += 1
+            }
+            copyWides(line + extension, source, width)
+            runAxis(horizontal, line, line, width + 2 * extension, lines.*.padded)
+            copyWides(target, line + extension, width)
+        }
+        row += 1
+    }
+    if axisReach(vertical) == 0 { return }
+    const strip = lines.*.strip
+    var left: usize = 0
+    while left < width {
+        var columns = width - left
+        if columns > COLUMNS { columns = COLUMNS }
+        row = 0
+        while row < rows {
+            const source = into + (row * rowStride + left)
+            var column: usize = 0
+            while column < columns {
+                strip[column * rows + row] = source[column]
+                column += 1
+            }
+            row += 1
+        }
+        var column: usize = 0
+        while column < columns {
+            const line = strip + column * rows
+            runAxis(vertical, line, line, rows, lines.*.padded)
+            column += 1
+        }
+        row = 0
+        while row < rows {
+            const target = into + (row * rowStride + left)
+            column = 0
+            while column < columns {
+                target[column] = strip[column * rows + row]
+                column += 1
+            }
+            row += 1
+        }
+        left += columns
+    }
+}
+
+// The rectangle through `horizontal` along its rows and `vertical` along
+// its columns. False without memory (the pixels stay).
+pub fn smooth(pixels: [*]u32, width: usize, height: usize, stride: usize, horizontal: *const Axis, vertical: *const Axis, pool: *scratch.Pool) -> bool {
+    var bands: Bands = undefined
+    if !bandsBegin(&bands, pool, pixels, width, height, stride, axisReach(vertical)) { return false }
+    const rows = bandsTallest(&bands)
+    const plane = wides(pool, width * rows)
+    var lines: Lines = undefined
+    if plane == null || !linesBegin(&lines, pool, width, rows, horizontal, vertical) { return false }
+    while bandsNext(&bands) {
+        bandsLoad(&bands, plane.?, width, 0)
+        separable(plane.?, plane.?, width, width, bandsRows(&bands), horizontal, vertical, &lines)
+        bandsStore(&bands, plane.?, width, 0)
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------
+// The gaussian
+
+// A radius as Krita's dialogs ask for it is this bell's deviation
+// (Krita's relation, so that a file's numbers look the same here).
+pub fn sigmaOf(radius: f64) -> f64 { return 0.3 * radius + 0.3 }
+
+// Up to this deviation the bell is weighed out pixel by pixel as far as
+// three deviations; a wider one is three boxes, whose cost does not grow
+// with the radius.
+const WEIGHED_UP_TO: f64 = 4.0
+
+// The radii of the three boxes that one after the other come nearest to
+// a bell of deviation `sigma`: boxes of two widths two apart, as many of
+// the narrower as bring the three variances together nearest to sigma's.
+fn boxRadii(sigma: f64, radii: *[3]usize) -> void {
+    const spread = 12.0 * sigma * sigma
+    var lower = @intFromFloat(usize, math.floor(math.sqrt(spread / 3.0 + 1.0)))
+    if lower % 2 == 0 { lower -= 1 }
+    const narrow = @floatFromInt(f64, lower)
+    var narrower = math.round((spread - 3.0 * narrow * narrow - 12.0 * narrow - 9.0) / (-4.0 * narrow - 4.0))
+    if narrower < 0.0 { narrower = 0.0 }
+    if narrower > 3.0 { narrower = 3.0 }
+    const count = @intFromFloat(usize, narrower)
+    var index: usize = 0
+    while index < 3 {
+        radii.*[index] = if index < count { (lower - 1) / 2 } else { (lower + 1) / 2 }
+        index += 1
+    }
+}
+
+// How far a gaussian of `radius` reads along its direction.
+pub fn gaussianReach(radius: f64) -> usize {
+    if radius <= 0.0 { return 0 }
+    const sigma = sigmaOf(radius)
+    if sigma > WEIGHED_UP_TO {
+        var radii: [3]usize = [3]usize{ 0, 0, 0 }
+        boxRadii(sigma, &radii)
+        return radii[0] + radii[1] + radii[2]
+    }
+    return @intFromFloat(usize, math.ceil(3.0 * sigma))
+}
+
+// `axis` as the gaussian of `radius` (none: the axis left alone). With
+// `cut` above 0 the bell is weighed out as far as `cut` pixels, whatever
+// its width. Its weights are taken from `pool`: they last until the
+// caller's release. False without memory.
+pub fn gaussianAxis(axis: *Axis, pool: *scratch.Pool, radius: f64, cut: usize) -> bool {
+    axis.*.count = 0
+    if radius <= 0.0 { return true }
+    const sigma = sigmaOf(radius)
+    if cut == 0 && sigma > WEIGHED_UP_TO {
+        var radii: [3]usize = [3]usize{ 0, 0, 0 }
+        boxRadii(sigma, &radii)
+        var index: usize = 0
+        while index < 3 {
+            axis.*.passes[index].kind = BOX
+            axis.*.passes[index].radius = radii[index]
+            index += 1
+        }
+        axis.*.count = 3
+        return true
+    }
+    var reach = cut
+    if reach == 0 { reach = @intFromFloat(usize, math.ceil(3.0 * sigma)) }
+    const weights = wides(pool, reach + 1)
+    if weights == null { return false }
+    const falloff = -0.5 / (sigma * sigma)
+    var total: f64 = 1.0
+    var away: usize = 1
+    while away <= reach {
+        const distance = @floatFromInt(f64, away)
+        total += 2.0 * math.exp(distance * distance * falloff)
+        away += 1
+    }
+    // The middle takes what rounding left of the 32768, so that a flat
+    // line comes out as it went in.
+    var rest: u64 = 32768
+    away = 1
+    while away <= reach {
+        const distance = @floatFromInt(f64, away)
+        var weight = @intFromFloat(u64, math.exp(distance * distance * falloff) / total * 32768.0 + 0.5)
+        // (Only a bell cut very far out could round its way past the
+        // whole: nothing is left for the middle to give then.)
+        if 2 * weight > rest { weight = rest / 2 }
+        weights.?[away] = weight
+        rest -= 2 * weight
+        away += 1
+    }
+    weights.?[0] = rest
+    axis.*.count = 1
+    axis.*.passes[0].kind = WEIGHTED
+    axis.*.passes[0].radius = reach
+    axis.*.passes[0].weights = weights.?
+    return true
+}
+
+// ---------------------------------------------------------------------
+// Kernels
+
+// A neighbourhood as weights: each pixel becomes the sum of the pixels
+// around it times their weights, divided by `total`.
+pub const Kernel = struct {
+    // The columns and rows on each side of the middle.
+    reachX: usize
+    reachY: usize
+    // 2 reachY + 1 rows of 2 reachX + 1 weights.
+    weights: [*]const i32
+    // The weights' sum for an average; never 0 or below.
+    total: i64
+}
+
+// What two channels' sums may reach in the halves of a u64: the weights
+// of a kernel that add up to no more go the fast way.
+const LANE_ROOM: i64 = 66051
+
+// A pixel from its channels' sums, `full` being the sum of an opaque
+// one's alpha and `perFull` 255 / full. The colours are taken over the
+// alpha as the sums have it, before that is held at `full`: weights
+// below nothing bring a pixel inside a painted shape more alpha than an
+// opaque one's where a neighbour is transparent, and its colour must not
+// be the brighter for that neighbour (it would be, taken over `full`).
+inline fn resolve(alpha: i64, red: i64, green: i64, blue: i64, full: i64, perFull: f64) -> u32 {
+    if alpha <= 0 { return 0 }
+    var shown: u32 = 255
+    var scale = perFull
+    if alpha != full {
+        scale = 255.0 / @floatFromInt(f64, alpha)
+        if alpha < full {
+            shown = @intFromFloat(u32, @floatFromInt(f64, alpha) * perFull + 0.5)
+            if shown == 0 { return 0 }
+        }
+    }
+    // A colour between nothing and its alpha: negative weights may have
+    // put it outside.
+    var r: u32 = 255
+    var g: u32 = 255
+    var b: u32 = 255
+    if red <= 0 { r = 0 } else if red < alpha { r = @intFromFloat(u32, @floatFromInt(f64, red) * scale + 0.5) }
+    if green <= 0 { g = 0 } else if green < alpha { g = @intFromFloat(u32, @floatFromInt(f64, green) * scale + 0.5) }
+    if blue <= 0 { b = 0 } else if blue < alpha { b = @intFromFloat(u32, @floatFromInt(f64, blue) * scale + 0.5) }
+    return (shown << 24) | (r << 16) | (g << 8) | b
+}
+
+// What a kernel's work on a band needs.
+const Slide = struct {
+    weights: [*]const i32
+    columns: usize
+    kernelRows: usize
+    rowStride: usize
+    // Where the weights change from one column to the next (or, going
+    // down the columns, from one row to the next): the place, counted
+    // from the kernel's first row and column, and by how much; as many
+    // as `count`.
+    places: [*]const u64
+    changes: [*]const u64
+    count: usize
+    full: i64
+    perFull: f64
+}
+
+// The changes of `kernel`'s weights along its rows (`down`: along its
+// columns) into `places` and `changes`; how many there are. Moving the
+// kernel one pixel on, a weight leaves its pixel and the weight before
+// it comes there: the sum changes by the pixel times their difference,
+// and only where the two differ is anything to do. Beyond the kernel's
+// ends the weight is nothing.
+fn changesOf(kernel: *const Kernel, rowStride: usize, down: bool, places: [*]u64, changes: [*]u64) -> usize {
+    const columns = 2 * kernel.*.reachX + 1
+    const rows = 2 * kernel.*.reachY + 1
+    const lines = if down { columns } else { rows }
+    const length = if down { rows } else { columns }
+    var count: usize = 0
+    var line: usize = 0
+    while line < lines {
+        var before: i32 = 0
+        var at: usize = 0
+        while at <= length {
+            const row = if down { at } else { line }
+            const column = if down { line } else { at }
+            var weight: i32 = 0
+            if at < length { weight = kernel.*.weights[row * columns + column] }
+            if weight != before {
+                places[count] = row * rowStride + column
+                changes[count] = @bitCast(u64, @intCast(i64, before) - @intCast(i64, weight))
+                count += 1
+            }
+            before = weight
+            at += 1
+        }
+        line += 1
+    }
+    return count
+}
+
+// One row of the picture: `base` is the kernel's first row and column
+// for the row's first pixel. The sums are two channels in each u64 (the
+// kernel's weights add up to at most LANE_ROOM, so a channel's sum is
+// below 2^32); a change's amount is added as it is or as the two's
+// complement of what is taken away, which comes to the same in the end
+// since each channel's true sum is never below 0.
+fn slideLanes(slide: *const Slide, target: [*]u32, base: [*]const u64, width: usize) -> void {
+    const columns = slide.*.columns
+    const places = slide.*.places
+    const changes = slide.*.changes
+    const count = slide.*.count
+    const full = slide.*.full
+    const per_full = slide.*.perFull
+    var even: u64 = 0
+    var odd: u64 = 0
+    var row: usize = 0
+    while row < slide.*.kernelRows {
+        const line = base + row * slide.*.rowStride
+        const shares = slide.*.weights + row * columns
+        var column: usize = 0
+        while column < columns {
+            if shares[column] != 0 {
+                const pixel = line[column]
+                const weight = @intCast(u64, shares[column])
+                even +%= (pixel & LANES) *% weight
+                odd +%= ((pixel >> 16) & LANES) *% weight
+            }
+            column += 1
+        }
+        row += 1
+    }
+    var x: usize = 0
+    while true {
+        target[x] = resolve(@intCast(i64, odd >> 32), @intCast(i64, even >> 32), @intCast(i64, odd & LOW), @intCast(i64, even & LOW), full, per_full)
+        x += 1
+        if x >= width { break }
+        const from = base + (x - 1)
+        var index: usize = 0
+        while index < count {
+            const pixel = from[places[index]]
+            const change = changes[index]
+            even +%= (pixel & LANES) *% change
+            odd +%= ((pixel >> 16) & LANES) *% change
+            index += 1
+        }
+    }
+}
+
+// The same with a sum of its own for each channel: for weights below 0
+// and for sums beyond 32 bits. Nothing overflows: a channel is below
+// 2^16 and a kernel's total below 2^31 (convolveWith sees to it).
+fn slideWide(slide: *const Slide, target: [*]u32, base: [*]const u64, width: usize) -> void {
+    const columns = slide.*.columns
+    const places = slide.*.places
+    const changes = slide.*.changes
+    const count = slide.*.count
+    const full = slide.*.full
+    const per_full = slide.*.perFull
+    var a: i64 = 0
+    var r: i64 = 0
+    var g: i64 = 0
+    var b: i64 = 0
+    var row: usize = 0
+    while row < slide.*.kernelRows {
+        const line = base + row * slide.*.rowStride
+        const shares = slide.*.weights + row * columns
+        var column: usize = 0
+        while column < columns {
+            if shares[column] != 0 {
+                const pixel = line[column]
+                const weight = @intCast(i64, shares[column])
+                a +%= @intCast(i64, pixel >> 48) *% weight
+                r +%= @intCast(i64, (pixel >> 32) & 0xFFFF) *% weight
+                g +%= @intCast(i64, (pixel >> 16) & 0xFFFF) *% weight
+                b +%= @intCast(i64, pixel & 0xFFFF) *% weight
+            }
+            column += 1
+        }
+        row += 1
+    }
+    var x: usize = 0
+    while true {
+        target[x] = resolve(a, r, g, b, full, per_full)
+        x += 1
+        if x >= width { break }
+        const from = base + (x - 1)
+        var index: usize = 0
+        while index < count {
+            const pixel = from[places[index]]
+            const change = @bitCast(i64, changes[index])
+            a +%= @intCast(i64, pixel >> 48) *% change
+            r +%= @intCast(i64, (pixel >> 32) & 0xFFFF) *% change
+            g +%= @intCast(i64, (pixel >> 16) & 0xFFFF) *% change
+            b +%= @intCast(i64, pixel & 0xFFFF) *% change
+            index += 1
+        }
+    }
+}
+
+// `weight` times each of the `width` pixels at `line` added to the sums
+// of the columns (two u64 a column, two channels in each as in
+// slideLanes).
+fn addLine(sums: [*]u64, line: [*]const u64, width: usize, weight: u64) -> void {
+    var x: usize = 0
+    while x < width {
+        const pixel = line[x]
+        const sum = sums + 2 * x
+        sum[0] +%= (pixel & LANES) *% weight
+        sum[1] +%= ((pixel >> 16) & LANES) *% weight
+        x += 1
+    }
+}
+
+// `rows` rows of the picture at `target` (`stride` words a row) with the
+// kernel going down instead of along: every column keeps its sums in
+// `sums` and each change of the weights down a column adds a row of the
+// plane to them. `plane` is the kernel's first row and column for the
+// first of the rows. For a kernel taller than wide (a streak that goes
+// up, a narrow upright shape) this is the cheap direction.
+fn slideDown(slide: *const Slide, sums: [*]u64, target: [*]u32, stride: usize, plane: [*]const u64, width: usize, rows: usize) -> void {
+    const columns = slide.*.columns
+    var index: usize = 0
+    while index < 2 * width {
+        sums[index] = 0
+        index += 1
+    }
+    var row: usize = 0
+    while row < slide.*.kernelRows {
+        var column: usize = 0
+        while column < columns {
+            const share = slide.*.weights[row * columns + column]
+            if share != 0 { addLine(sums, plane + (row * slide.*.rowStride + column), width, @intCast(u64, share)) }
+            column += 1
+        }
+        row += 1
+    }
+    var y: usize = 0
+    while true {
+        const line = target + y * stride
+        var x: usize = 0
+        while x < width {
+            const even = sums[2 * x]
+            const odd = sums[2 * x + 1]
+            line[x] = resolve(@intCast(i64, odd >> 32), @intCast(i64, even >> 32), @intCast(i64, odd & LOW), @intCast(i64, even & LOW), slide.*.full, slide.*.perFull)
+            x += 1
+        }
+        y += 1
+        if y >= rows { break }
+        const from = plane + (y - 1) * slide.*.rowStride
+        index = 0
+        while index < slide.*.count {
+            addLine(sums, from + slide.*.places[index], width, slide.*.changes[index])
+            index += 1
+        }
+    }
+}
+
+fn convolveWith(kernel: *const Kernel, pixels: [*]u32, width: usize, height: usize, stride: usize, pool: *scratch.Pool) -> bool {
+    if kernel.*.total <= 0 || kernel.*.total > 0x7FFFFFFF { return false }
+    const reach_x = kernel.*.reachX
+    const columns = 2 * reach_x + 1
+    const kernel_rows = 2 * kernel.*.reachY + 1
+    const row_stride = width + 2 * reach_x
+    var bands: Bands = undefined
+    if !bandsBegin(&bands, pool, pixels, width, height, stride, kernel.*.reachY) { return false }
+    const plane = wides(pool, row_stride * bandsTallest(&bands))
+    const most = (kernel_rows + 1) * (columns + 1)
+    const along_places = wides(pool, most)
+    const along_changes = wides(pool, most)
+    const down_places = wides(pool, most)
+    const down_changes = wides(pool, most)
+    const sums = wides(pool, 2 * width)
+    if plane == null || along_places == null || along_changes == null || down_places == null || down_changes == null || sums == null { return false }
+    // Whether two channels' sums fit one u64: no weight below nothing,
+    // and all together within the room.
+    var sum: i64 = 0
+    var lanes = true
+    var index: usize = 0
+    while index < kernel_rows * columns {
+        const weight = kernel.*.weights[index]
+        if weight < 0 { lanes = false }
+        sum += @intCast(i64, weight)
+        index += 1
+    }
+    if sum != kernel.*.total || sum > LANE_ROOM { lanes = false }
+    const full = kernel.*.total * 65025
+    var slide = Slide.{
+        .weights = kernel.*.weights,
+        .columns = columns,
+        .kernelRows = kernel_rows,
+        .rowStride = row_stride,
+        .places = along_places.?,
+        .changes = along_changes.?,
+        .count = changesOf(kernel, row_stride, false, along_places.?, along_changes.?),
+        .full = full,
+        .perFull = 255.0 / @floatFromInt(f64, full),
+    }
+    // Down the columns where that is clearly less to do (a change costs
+    // somewhat more there: the sums are in memory). Both ways add up the
+    // same whole numbers, so which is taken shows in no pixel.
+    var down = false
+    if lanes {
+        const count = changesOf(kernel, row_stride, true, down_places.?, down_changes.?)
+        if count * 3 < slide.count * 2 {
+            down = true
+            slide.places = down_places.?
+            slide.changes = down_changes.?
+            slide.count = count
+        }
+    }
+    while bandsNext(&bands) {
+        bandsLoad(&bands, plane.?, row_stride, reach_x)
+        spreadEdges(plane.?, row_stride, bandsRows(&bands), width, reach_x)
+        if down {
+            slideDown(&slide, sums.?, pixels + bands.first * stride, stride, plane.?, width, bands.last - bands.first)
+        } else {
+            var y = bands.first
+            while y < bands.last {
+                const base: [*]const u64 = plane.? + (y - bands.first) * row_stride
+                if lanes {
+                    slideLanes(&slide, pixels + y * stride, base, width)
+                } else {
+                    slideWide(&slide, pixels + y * stride, base, width)
+                }
+                y += 1
+            }
+        }
+    }
+    return true
+}
+
+// The rectangle through `kernel`. False without memory and for a kernel
+// whose total is not above 0 (the pixels stay).
+pub fn convolve(kernel: *const Kernel, pixels: [*]u32, width: usize, height: usize, stride: usize) -> bool {
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const done = convolveWith(kernel, pixels, width, height, stride, pool)
+    scratch.release(pool, mark)
+    return done
+}
+
+// A weight has at least this many steps where the weights are not all
+// the same (a shape whose weights fall toward its edge).
+const FALLING_LEVELS: i64 = 24
+
+// A neighbourhood before its weights are whole numbers: 2 reachY + 1
+// rows of 2 reachX + 1 shares of any size, none below 0.
+const Shares = struct {
+    values: [*]const f64
+    reachX: usize
+    reachY: usize
+    // The shares are not just a shape's cover: they fall toward its edge.
+    falling: bool
+}
+
+// The rectangle averaged by `shares` around each pixel. The shares become
+// whole weights, as fine as the fast way's room allows (a big flat
+// shape's edge is then coarser, which does not show in so wide an
+// average).
+fn average(pixels: [*]u32, width: usize, height: usize, stride: usize, given: *const Shares, pool: *scratch.Pool) -> bool {
+    const shares = given.*.values
+    const reach_x = given.*.reachX
+    const reach_y = given.*.reachY
+    const falling = given.*.falling
+    const count = (2 * reach_x + 1) * (2 * reach_y + 1)
+    const weights = scratch.ints(pool, count)
+    if weights == null { return false }
+    var highest: f64 = 0.0
+    var covered: i64 = 0
+    var index: usize = 0
+    while index < count {
+        if shares[index] > highest { highest = shares[index] }
+        if shares[index] > 0.0 { covered += 1 }
+        index += 1
+    }
+    if covered == 0 { return true }
+    var levels = LANE_ROOM / covered
+    if levels > 255 { levels = 255 }
+    if levels < 1 { levels = 1 }
+    if falling && levels < FALLING_LEVELS { levels = FALLING_LEVELS }
+    const scale = @floatFromInt(f64, levels) / highest
+    var total: i64 = 0
+    index = 0
+    while index < count {
+        const weight = @intFromFloat(i32, shares[index] * scale + 0.5)
+        weights.?[index] = weight
+        total += @intCast(i64, weight)
+        index += 1
+    }
+    const kernel = Kernel.{ .reachX = reach_x, .reachY = reach_y, .weights = weights.?, .total = total }
+    return convolveWith(&kernel, pixels, width, height, stride, pool)
+}
+
+// ---------------------------------------------------------------------
+// Gaussian Blur
+
+const GAUSSIAN_PARAMS = [2]types.Param{
+    types.Param.{ .name = "Horizontal radius", .german = "Horizontaler Radius", .kind = types.FLOAT, .low = 0.0, .high = 1000.0, .initial = 5.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Vertical radius", .german = "Vertikaler Radius", .kind = types.FLOAT, .low = 0.0, .high = 1000.0, .initial = 5.0, .choices = "", .choicesGerman = "" },
+}
+
+fn gaussianMargin(params: *const Params) -> i32 {
+    const across = gaussianReach(number(params, numbers(GAUSSIAN), 0))
+    const down = gaussianReach(number(params, numbers(GAUSSIAN), 1))
+    return @intCast(i32, if across > down { across } else { down })
+}
+
+// A bell of deviation 0.3 radius + 0.3 along each direction (Krita's
+// relation); radius 0 leaves a direction alone.
+fn gaussianBlur(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    const across = number(params, numbers(GAUSSIAN), 0)
+    const down = number(params, numbers(GAUSSIAN), 1)
+    if across <= 0.0 && down <= 0.0 { return }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    var horizontal: Axis = undefined
+    var vertical: Axis = undefined
+    if gaussianAxis(&horizontal, pool, across, 0) && gaussianAxis(&vertical, pool, down, 0) {
+        _ = smooth(pixels, width, height, stride, &horizontal, &vertical, pool)
+    }
+    scratch.release(pool, mark)
+}
+
+// ---------------------------------------------------------------------
+// Blur
+
+// The shapes in the order of the choice: a circle first.
+const RECTANGLE: usize = 1
+
+const BLUR_PARAMS = [5]types.Param{
+    types.Param.{ .name = "Half width", .german = "Halbe Breite", .kind = types.INT, .low = 0.0, .high = 100.0, .initial = 5.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Half height", .german = "Halbe Höhe", .kind = types.INT, .low = 0.0, .high = 100.0, .initial = 5.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Strength", .german = "Stärke", .kind = types.INT, .low = 0.0, .high = 100.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Rotation", .german = "Drehung", .kind = types.ANGLE, .low = 0.0, .high = 360.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Shape", .german = "Form", .kind = types.CHOICE, .low = 0.0, .high = 1.0, .initial = 0.0, .choices = "Circle|Rectangle", .choicesGerman = "Kreis|Rechteck" },
+}
+
+// What the Blur filter's numbers come to.
+const Shape = struct {
+    // Half the shape's width and height: the pixels counted to each side
+    // and half of the middle one.
+    across: f64
+    down: f64
+    // The part of the way from the middle to the edge that counts full.
+    core: f64
+    // Turned by this, counter-clockwise, in radians.
+    turn: f64
+    rectangle: bool
+    // The pixels the turned shape reaches to each side.
+    reachX: usize
+    reachY: usize
+    // A rectangle that counts every pixel the same and lies along the
+    // rows and columns: two boxes do it.
+    boxes: bool
+    // Nothing to do.
+    still: bool
+}
+
+// Just below the next whole number a reach is rounded up to, so that a
+// shape that ends on a pixel's edge does not claim the next pixel for
+// what the sine of a quarter turn is off by.
+const NEARLY: f64 = 0.000000001
+
+fn reachOf(extent: f64) -> usize {
+    const reach = math.ceil(extent - 0.5 - NEARLY)
+    if reach <= 0.0 { return 0 }
+    return @intFromFloat(usize, reach)
+}
+
+fn shapeOf(params: *const Params, shape: *Shape) -> void {
+    const half_width = whole(params, numbers(KRITA), 0)
+    const half_height = whole(params, numbers(KRITA), 1)
+    const strength = number(params, numbers(KRITA), 2)
+    const degrees = number(params, numbers(KRITA), 3)
+    shape.*.across = @floatFromInt(f64, half_width) + 0.5
+    shape.*.down = @floatFromInt(f64, half_height) + 0.5
+    shape.*.core = 1.0 - strength / 100.0
+    shape.*.turn = degrees * math.pi / 180.0
+    shape.*.rectangle = whole(params, numbers(KRITA), 4) == RECTANGLE
+    shape.*.still = half_width == 0 && half_height == 0
+    const upright = degrees == 0.0 || degrees == 180.0 || degrees == 360.0
+    const lying = degrees == 90.0 || degrees == 270.0
+    shape.*.boxes = shape.*.rectangle && strength <= 0.0 && (upright || lying)
+    if shape.*.boxes {
+        shape.*.reachX = if lying { half_height } else { half_width }
+        shape.*.reachY = if lying { half_width } else { half_height }
+        return
+    }
+    const cosine = math.abs(math.cos(shape.*.turn))
+    const sine = math.abs(math.sin(shape.*.turn))
+    const a = shape.*.across
+    const b = shape.*.down
+    if shape.*.rectangle {
+        shape.*.reachX = reachOf(a * cosine + b * sine)
+        shape.*.reachY = reachOf(a * sine + b * cosine)
+    } else {
+        shape.*.reachX = reachOf(math.sqrt(a * a * cosine * cosine + b * b * sine * sine))
+        shape.*.reachY = reachOf(math.sqrt(a * a * sine * sine + b * b * cosine * cosine))
+    }
+}
+
+fn blurMargin(params: *const Params) -> i32 {
+    var shape: Shape = undefined
+    shapeOf(params, &shape)
+    if shape.still { return 0 }
+    return @intCast(i32, if shape.reachX > shape.reachY { shape.reachX } else { shape.reachY })
+}
+
+// How much of each pixel around the middle the shape counts: the mean of
+// the shape's weight over the pixel's area, looked at in a grid of
+// points (8 x 8, 4 x 4 for a big shape).
+fn shapeShares(shares: [*]f64, shape: *const Shape) -> void {
+    const columns = 2 * shape.*.reachX + 1
+    const rows = 2 * shape.*.reachY + 1
+    var points: usize = 8
+    if columns * rows > 4096 { points = 4 }
+    const fine = 1.0 / @floatFromInt(f64, points)
+    const cosine = math.cos(shape.*.turn)
+    const sine = math.sin(shape.*.turn)
+    const core = shape.*.core
+    var row: usize = 0
+    while row < rows {
+        const top = @floatFromInt(f64, row) - @floatFromInt(f64, shape.*.reachY) - 0.5
+        var column: usize = 0
+        while column < columns {
+            const left = @floatFromInt(f64, column) - @floatFromInt(f64, shape.*.reachX) - 0.5
+            var sum: f64 = 0.0
+            var py: usize = 0
+            while py < points {
+                const y = top + (@floatFromInt(f64, py) + 0.5) * fine
+                var px: usize = 0
+                while px < points {
+                    const x = left + (@floatFromInt(f64, px) + 0.5) * fine
+                    // The point in the shape's own directions, 1 at its edge.
+                    const u = math.abs((x * cosine - y * sine) / shape.*.across)
+                    const v = math.abs((x * sine + y * cosine) / shape.*.down)
+                    var distance = if u > v { u } else { v }
+                    if !shape.*.rectangle { distance = math.sqrt(u * u + v * v) }
+                    if distance <= core {
+                        sum += 1.0
+                    } else if distance < 1.0 {
+                        sum += (1.0 - distance) / (1.0 - core)
+                    }
+                    px += 1
+                }
+                py += 1
+            }
+            shares[row * columns + column] = sum
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// Krita's "blur": the mean over a circle (an ellipse) or a rectangle of
+// 2 half width + 1 by 2 half height + 1 pixels, turned by the rotation.
+// Strength is Krita's number of that name and means what it means
+// there, which is not a stronger blur: at 0 every pixel of the shape
+// counts the same, with more the weights fall toward the edge from ever
+// nearer the middle (at 100 from the middle itself), which blurs less.
+fn blur(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    var shape: Shape = undefined
+    shapeOf(params, &shape)
+    if shape.still { return }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    if shape.boxes {
+        var horizontal: Axis = undefined
+        var vertical: Axis = undefined
+        oneAxis(&horizontal, BOX, shape.reachX)
+        oneAxis(&vertical, BOX, shape.reachY)
+        _ = smooth(pixels, width, height, stride, &horizontal, &vertical, pool)
+    } else {
+        const shares = scratch.doubles(pool, (2 * shape.reachX + 1) * (2 * shape.reachY + 1))
+        if shares != null {
+            shapeShares(shares.?, &shape)
+            const given = Shares.{ .values = shares.?, .reachX = shape.reachX, .reachY = shape.reachY, .falling = shape.core < 1.0 }
+            _ = average(pixels, width, height, stride, &given, pool)
+        }
+    }
+    scratch.release(pool, mark)
+}
+
+// ---------------------------------------------------------------------
+// Motion Blur
+
+const MOTION_PARAMS = [2]types.Param{
+    types.Param.{ .name = "Angle", .german = "Winkel", .kind = types.ANGLE, .low = 0.0, .high = 360.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Length", .german = "Länge", .kind = types.INT, .low = 0.0, .high = 256.0, .initial = 5.0, .choices = "", .choicesGerman = "" },
+}
+
+// The streak of a motion blur: `length` pixels to each side of the pixel
+// along (dx, dy).
+const Streak = struct {
+    length: f64
+    dx: f64
+    dy: f64
+    reachX: usize
+    reachY: usize
+}
+
+fn streakOf(params: *const Params, streak: *Streak) -> void {
+    const turn = number(params, numbers(MOTION), 0) * math.pi / 180.0
+    streak.*.length = @floatFromInt(f64, whole(params, numbers(MOTION), 1))
+    // Counter-clockwise on the screen, where y grows downward.
+    streak.*.dx = math.cos(turn)
+    streak.*.dy = -math.sin(turn)
+    const across = math.ceil(streak.*.length * math.abs(streak.*.dx) - NEARLY)
+    const down = math.ceil(streak.*.length * math.abs(streak.*.dy) - NEARLY)
+    streak.*.reachX = if across <= 0.0 { 0 } else { @intFromFloat(usize, across) }
+    streak.*.reachY = if down <= 0.0 { 0 } else { @intFromFloat(usize, down) }
+}
+
+fn motionMargin(params: *const Params) -> i32 {
+    var streak: Streak = undefined
+    streakOf(params, &streak)
+    return @intCast(i32, if streak.reachX > streak.reachY { streak.reachX } else { streak.reachY })
+}
+
+// `amount` to the kernel's pixel `x`, `y` from its middle, if it has it
+// (a point a hair beside a row would else name a row the kernel has not).
+fn deposit(shares: [*]f64, streak: *const Streak, x: f64, y: f64, amount: f64) -> void {
+    const column = x + @floatFromInt(f64, streak.*.reachX)
+    const row = y + @floatFromInt(f64, streak.*.reachY)
+    if column < 0.0 || row < 0.0 { return }
+    const c = @intFromFloat(usize, column)
+    const r = @intFromFloat(usize, row)
+    if c > 2 * streak.*.reachX || r > 2 * streak.*.reachY { return }
+    shares[r * (2 * streak.*.reachX + 1) + c] += amount
+}
+
+// The line's weights: points a quarter pixel apart along it, each shared
+// among the four pixels around it by its nearness, so that the line is
+// one pixel thick whatever its direction and its ends fade.
+fn streakShares(shares: [*]f64, streak: *const Streak) -> void {
+    const count = (2 * streak.*.reachX + 1) * (2 * streak.*.reachY + 1)
+    var index: usize = 0
+    while index < count {
+        shares[index] = 0.0
+        index += 1
+    }
+    const steps = 2 * @intFromFloat(usize, math.ceil(streak.*.length * 4.0))
+    var step: usize = 0
+    while step <= steps {
+        const along = streak.*.length * (2.0 * @floatFromInt(f64, step) / @floatFromInt(f64, steps) - 1.0)
+        // The two ends count half: they are the middle of half a step.
+        const amount: f64 = if step == 0 || step == steps { 0.5 } else { 1.0 }
+        const x = along * streak.*.dx
+        const y = along * streak.*.dy
+        const left = math.floor(x)
+        const top = math.floor(y)
+        const fx = x - left
+        const fy = y - top
+        deposit(shares, streak, left, top, amount * (1.0 - fx) * (1.0 - fy))
+        deposit(shares, streak, left + 1.0, top, amount * fx * (1.0 - fy))
+        deposit(shares, streak, left, top + 1.0, amount * (1.0 - fx) * fy)
+        deposit(shares, streak, left + 1.0, top + 1.0, amount * fx * fy)
+        step += 1
+    }
+}
+
+// The mean along a line through the pixel, `Length` pixels to each side
+// (as Krita counts it) in the direction of `Angle`.
+fn motionBlur(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    var streak: Streak = undefined
+    streakOf(params, &streak)
+    if streak.length <= 0.0 { return }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const shares = scratch.doubles(pool, (2 * streak.reachX + 1) * (2 * streak.reachY + 1))
+    if shares != null {
+        streakShares(shares.?, &streak)
+        const given = Shares.{ .values = shares.?, .reachX = streak.reachX, .reachY = streak.reachY, .falling = false }
+        _ = average(pixels, width, height, stride, &given, pool)
+    }
+    scratch.release(pool, mark)
+}
+
+// ---------------------------------------------------------------------
+// Lens Blur
+
+// The iris' shapes in the order of the choice: 3 to 8 sides, then round.
+const ROUND_IRIS: usize = 6
+
+const LENS_PARAMS = [3]types.Param{
+    types.Param.{ .name = "Radius", .german = "Radius", .kind = types.FLOAT, .low = 0.0, .high = 100.0, .initial = 5.0, .choices = "", .choicesGerman = "" },
+    types.Param.{ .name = "Iris shape", .german = "Blendenform", .kind = types.CHOICE, .low = 0.0, .high = 6.0, .initial = 2.0, .choices = "Triangle|Quadrilateral|Pentagon|Hexagon|Heptagon|Octagon|Circle", .choicesGerman = "Dreieck|Viereck|Fünfeck|Sechseck|Siebeneck|Achteck|Kreis" },
+    types.Param.{ .name = "Iris rotation", .german = "Blendendrehung", .kind = types.ANGLE, .low = 0.0, .high = 360.0, .initial = 0.0, .choices = "", .choicesGerman = "" },
+}
+
+fn lensReach(params: *const Params) -> usize {
+    return @intFromFloat(usize, math.ceil(number(params, numbers(LENS), 0)))
+}
+
+fn lensMargin(params: *const Params) -> i32 {
+    return @intCast(i32, lensReach(params))
+}
+
+// How much of each pixel around the middle the iris covers: a polygon of
+// `sides` corners `radius` from the middle, the first at `turn`
+// (counter-clockwise, radians), or the circle through them for no
+// sides. A grid of points in each pixel is asked (8 x 8, 4 x 4 for a
+// big iris).
+fn irisShares(shares: [*]f64, reach: usize, radius: f64, sides: usize, turn: f64) -> void {
+    const columns = 2 * reach + 1
+    var points: usize = 8
+    if columns * columns > 4096 { points = 4 }
+    const fine = 1.0 / @floatFromInt(f64, points)
+    // A point is inside when it is not beyond any side: its part along
+    // each side's outward direction is at most the side's distance. The
+    // weights are the iris turned half round (each point is asked as its
+    // opposite): a bright pixel spreads into the iris as it stands, since
+    // a pixel that lies right of the bright one has it on its left.
+    var across: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var down: [8]f64 = [8]f64{ 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 }
+    var side: usize = 0
+    while side < sides {
+        const outward = turn + (2.0 * @floatFromInt(f64, side) + 1.0) * math.pi / @floatFromInt(f64, sides)
+        across[side] = math.cos(outward)
+        down[side] = -math.sin(outward)
+        side += 1
+    }
+    var distance = radius
+    if sides > 0 { distance = radius * math.cos(math.pi / @floatFromInt(f64, sides)) }
+    var row: usize = 0
+    while row < columns {
+        const top = @floatFromInt(f64, row) - @floatFromInt(f64, reach) - 0.5
+        var column: usize = 0
+        while column < columns {
+            const left = @floatFromInt(f64, column) - @floatFromInt(f64, reach) - 0.5
+            var inside: usize = 0
+            var py: usize = 0
+            while py < points {
+                const y = top + (@floatFromInt(f64, py) + 0.5) * fine
+                var px: usize = 0
+                while px < points {
+                    const x = left + (@floatFromInt(f64, px) + 0.5) * fine
+                    var within = true
+                    if sides == 0 {
+                        within = x * x + y * y <= distance * distance
+                    } else {
+                        side = 0
+                        while side < sides {
+                            if x * across[side] + y * down[side] < -distance { within = false }
+                            side += 1
+                        }
+                    }
+                    if within { inside += 1 }
+                    px += 1
+                }
+                py += 1
+            }
+            shares[row * columns + column] = @floatFromInt(f64, inside)
+            column += 1
+        }
+        row += 1
+    }
+}
+
+// What a lens out of focus makes of a point: the iris' shape, every
+// pixel in it counting the same. The iris reaches `Radius` pixels and
+// half the middle one from the middle.
+fn lensBlur(params: *const Params, pixels: [*]u32, width: usize, height: usize, stride: usize) -> void {
+    const radius = number(params, numbers(LENS), 0)
+    if radius <= 0.0 { return }
+    const shape = whole(params, numbers(LENS), 1)
+    const sides: usize = if shape >= ROUND_IRIS { 0 } else { shape + 3 }
+    const turn = number(params, numbers(LENS), 2) * math.pi / 180.0
+    const reach = lensReach(params)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const shares = scratch.doubles(pool, (2 * reach + 1) * (2 * reach + 1))
+    if shares != null {
+        irisShares(shares.?, reach, radius + 0.5, sides, turn)
+        const given = Shares.{ .values = shares.?, .reachX = reach, .reachY = reach, .falling = false }
+        _ = average(pixels, width, height, stride, &given, pool)
+    }
+    scratch.release(pool, mark)
+}
+
+// ---------------------------------------------------------------------
+
+const FILTERS = [4]types.Info{
+    types.Info.{ .id = GAUSSIAN_BLUR, .key = "gaussian blur", .name = "Gaussian Blur", .german = "Gaußscher Weichzeichner", .category = types.BLUR, .params = GAUSSIAN_PARAMS[0..], .margin = gaussianMargin, .apply = gaussianBlur },
+    types.Info.{ .id = BLUR, .key = "blur", .name = "Blur", .german = "Weichzeichnen", .category = types.BLUR, .params = BLUR_PARAMS[0..], .margin = blurMargin, .apply = blur },
+    types.Info.{ .id = MOTION_BLUR, .key = "motion blur", .name = "Motion Blur", .german = "Bewegungsunschärfe", .category = types.BLUR, .params = MOTION_PARAMS[0..], .margin = motionMargin, .apply = motionBlur },
+    types.Info.{ .id = LENS_BLUR, .key = "lens blur", .name = "Lens Blur", .german = "Linsenunschärfe", .category = types.BLUR, .params = LENS_PARAMS[0..], .margin = lensMargin, .apply = lensBlur },
+}
+
+// The filters' places in the list.
+const GAUSSIAN: usize = 0
+const KRITA: usize = 1
+const MOTION: usize = 2
+const LENS: usize = 3
+
+// The list in memory that stays, once it was asked for.
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's filters. What it gives stays valid and where it is (only
+// without memory at the first asking is it the table itself, good until
+// the window's loop turns; the next asking tries again).
+pub fn list() -> []const types.Info {
+    if kept.address != 0 { return table.rows(types.Info, &kept) }
+    return types.keepList(&kept, FILTERS[0..])
+}
+
+// The numbers' descriptions of the filter at `place`.
+fn numbers(place: usize) -> []const types.Param {
+    return list()[place].params
+}

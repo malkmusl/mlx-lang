@@ -1,0 +1,302 @@
+// nebula brush: the deform brush ("deform"): every dab moves the pixels
+// under it about: it makes them larger or smaller around its centre,
+// turns them about it, pushes them along with the pen, or shakes them.
+//
+// For a pixel whose centre lies at v from the dab's centre c, within the
+// dab's radius R (r = |v| / R < 1), with the strength s = the brush's
+// amount times the dab's opacity (0..1), the pixel takes the colour the
+// picture has at
+//
+//     GROW        c + v (1 - s (1 - r^2) / 2)      (what is near the centre
+//                                                  is spread out: up to
+//                                                  twice as large)
+//     SHRINK      c + v (1 + s (1 - r^2) / 2)
+//     SWIRL_CW    c + v turned back by s (1 - r) 90 degrees (the picture
+//                 turns clockwise on the screen, most at the centre);
+//                 SWIRL_CCW the other way
+//     MOVE        p - d s (1 - r^2)                (d: the way from the dab
+//                                                  before to this one: the
+//                                                  picture goes with the pen)
+//     LENS_IN     as GROW, LENS_OUT as SHRINK, on the layer as it was
+//                 before the stroke: a lens moved over the picture, which
+//                 does not pile up dab after dab
+//     COLOR       p moved at random by up to s R (1 - r) / 4 each way (the
+//                 stroke's random numbers: the same seed, the same pixels)
+//
+// read between the four pixels around that place (bilinear, the colours
+// weighed by alpha: only mixes of colours that are there come out; where
+// the place lies beyond what was read, the nearest pixel read). Pixels at
+// r >= 1 keep their own colour. The result is laid down through the tip's
+// mask times the dab's flow (clone_engine's layDown): so the tip says
+// where the deformation shows, the radius is the dab's.
+//
+// Every dab reads what the dabs before it left (the deformations add up
+// along the stroke), or with VALUE_OLD_DATA the layer as it was before the
+// stroke (Krita's "use old data"; clone_engine.keepBefore says what
+// "before" is on a layer whose change is open). A mirror image of a dab
+// turns the other way, and every copy of the dabs (mirrored, wrapped)
+// moves with its own way (clone_engine.follow).
+//
+// Not done: Krita's "use counter" (the strength growing with the dabs).
+const math = @import("std.math")
+const random = @import("std.random")
+const types = @import("./types.mlx")
+const shared = @import("./clone_engine.mlx")
+const geom = @import("../core/geom.mlx")
+const device_module = @import("../core/device.mlx")
+const scratch = @import("../core/scratch.mlx")
+const table = @import("../core/table.mlx")
+
+pub const Rect = geom.Rect
+
+// The engine's numbers in Settings.values: the mode (below), the amount
+// (0..1), and 1 to read the layer as it was before the stroke.
+pub const VALUE_MODE: usize = 0
+pub const VALUE_AMOUNT: usize = 1
+pub const VALUE_OLD_DATA: usize = 2
+
+pub const GROW: u8 = 0
+pub const SHRINK: u8 = 1
+pub const SWIRL_CW: u8 = 2
+pub const SWIRL_CCW: u8 = 3
+pub const MOVE: u8 = 4
+pub const LENS_IN: u8 = 5
+pub const LENS_OUT: u8 = 6
+pub const COLOR: u8 = 7
+pub const MODES: usize = 8
+
+// What people call mode `mode`, in English or German ("" for a number
+// that is none).
+pub fn modeName(mode: u8, german: bool) -> []const u8 {
+    if mode == GROW { return if german { "Vergrößern" } else { "Grow" } }
+    if mode == SHRINK { return if german { "Verkleinern" } else { "Shrink" } }
+    if mode == SWIRL_CW { return if german { "Wirbel im Uhrzeigersinn" } else { "Swirl clockwise" } }
+    if mode == SWIRL_CCW { return if german { "Wirbel gegen den Uhrzeigersinn" } else { "Swirl counter-clockwise" } }
+    if mode == MOVE { return if german { "Verschieben" } else { "Move" } }
+    if mode == LENS_IN { return if german { "Lupe vergrößernd" } else { "Lens zoom in" } }
+    if mode == LENS_OUT { return if german { "Lupe verkleinernd" } else { "Lens zoom out" } }
+    if mode == COLOR { return if german { "Farbverformung" } else { "Colour deformation" } }
+    return ""
+}
+
+const TRAILS: usize = 4
+
+const Own = struct {
+    area: shared.Area
+    before: ?*device_module.Device
+    oldData: bool
+    mode: u8
+    trails: [4]shared.Trail
+    clock: u64
+}
+
+fn ownOf(stroke: *types.Stroke) -> *Own {
+    unsafe { return @ptrFromInt(*Own, stroke.*.engineState) }
+}
+
+// The mode a brush's number names (GROW for one that is none).
+fn modeOf(value: f32) -> u8 {
+    if !(value >= 0.0) || value >= @floatFromInt(f32, MODES) { return GROW }
+    const mode = @intFromFloat(u8, value + 0.5)
+    return if @intCast(usize, mode) < MODES { mode } else { GROW }
+}
+
+// A deform brush: types.defaults() with this engine, 60 pixels, growing
+// by 0.3.
+pub fn defaults(settings: *types.Settings) -> void {
+    types.defaults(settings)
+    types.setName(settings, "Deform")
+    settings.*.engine = types.ENGINE_DEFORM
+    settings.*.paintMode = types.MODE_BUILD_UP
+    settings.*.size = 60.0
+    settings.*.values[VALUE_MODE] = @floatFromInt(f32, GROW)
+    settings.*.values[VALUE_AMOUNT] = 0.3
+}
+
+fn begin(stroke: *types.Stroke) -> bool {
+    const memory = stroke.*.allocator.alloc(@sizeOf(Own), 16)
+    if memory == null { return false }
+    const own: *Own = unsafe { @ptrCast(*Own, memory.?) }
+    own.*.before = null
+    shared.clearTrails(&own.*.trails, TRAILS)
+    own.*.clock = 0
+    stroke.*.engineState = @intFromPtr(own)
+    const settings = stroke.*.settings
+    own.*.mode = modeOf(settings.*.values[VALUE_MODE])
+    own.*.oldData = settings.*.values[VALUE_OLD_DATA] > 0.5 || own.*.mode == LENS_IN || own.*.mode == LENS_OUT
+    if own.*.oldData { return shared.keepBefore(stroke, &own.*.before) }
+    return true
+}
+
+fn free(stroke: *types.Stroke) -> void {
+    if stroke.*.engineState == 0 { return }
+    const own = ownOf(stroke)
+    shared.dropBefore(&own.*.before)
+    unsafe { stroke.*.allocator.free(@ptrFromInt([*]u8, stroke.*.engineState), @sizeOf(Own), 16) }
+    stroke.*.engineState = 0
+}
+
+// The colour at (x, y) of `wide` x `high` pixels (rows `wide` apart),
+// (0, 0) being the first pixel's centre: between the four pixels around
+// it, each weighed by its alpha; a place beyond them is held to the
+// nearest. (On a pixel's centre, or among four equal pixels, that is the
+// pixel itself, transparent ones as 0: worked out without the sums.)
+fn bilinear(pixels: [*]const u32, wide: i32, high: i32, x: f64, y: f64) -> u32 {
+    const most_x = @floatFromInt(f64, wide - 1)
+    const most_y = @floatFromInt(f64, high - 1)
+    const fx = if !(x > 0.0) { 0.0 } else if x > most_x { most_x } else { x }
+    const fy = if !(y > 0.0) { 0.0 } else if y > most_y { most_y } else { y }
+    const x0 = @intFromFloat(i32, fx)
+    const y0 = @intFromFloat(i32, fy)
+    const x1 = if x0 + 1 < wide { x0 + 1 } else { x0 }
+    const y1 = if y0 + 1 < high { y0 + 1 } else { y0 }
+    // Weights in 256ths along each axis: 65536 together.
+    const tx = @intFromFloat(u64, (fx - @floatFromInt(f64, x0)) * 256.0 + 0.5)
+    const ty = @intFromFloat(u64, (fy - @floatFromInt(f64, y0)) * 256.0 + 0.5)
+    const stride = @intCast(usize, wide)
+    const top = @intCast(usize, y0) * stride
+    const bottom = @intCast(usize, y1) * stride
+    const a = pixels[top + @intCast(usize, x0)]
+    const b = pixels[top + @intCast(usize, x1)]
+    const c = pixels[bottom + @intCast(usize, x0)]
+    const d = pixels[bottom + @intCast(usize, x1)]
+    if (tx == 0 && ty == 0) || (a == b && a == c && a == d) { return if a >> 24 == 0 { 0 } else { a } }
+    const wa = (256 - tx) * (256 - ty) * @intCast(u64, a >> 24)
+    const wb = tx * (256 - ty) * @intCast(u64, b >> 24)
+    const wc = (256 - tx) * ty * @intCast(u64, c >> 24)
+    const wd = tx * ty * @intCast(u64, d >> 24)
+    const alpha = wa + wb + wc + wd
+    if alpha == 0 { return 0 }
+    const red = wa * @intCast(u64, (a >> 16) & 255) + wb * @intCast(u64, (b >> 16) & 255) + wc * @intCast(u64, (c >> 16) & 255) + wd * @intCast(u64, (d >> 16) & 255)
+    const green = wa * @intCast(u64, (a >> 8) & 255) + wb * @intCast(u64, (b >> 8) & 255) + wc * @intCast(u64, (c >> 8) & 255) + wd * @intCast(u64, (d >> 8) & 255)
+    const blue = wa * @intCast(u64, a & 255) + wb * @intCast(u64, b & 255) + wc * @intCast(u64, c & 255) + wd * @intCast(u64, d & 255)
+    const half = alpha / 2
+    return (@intCast(u32, (alpha + 32768) >> 16) << 24) | (@intCast(u32, (red + half) / alpha) << 16) | (@intCast(u32, (green + half) / alpha) << 8) | @intCast(u32, (blue + half) / alpha)
+}
+
+fn paint(stroke: *types.Stroke, dab: *const types.Dab) -> Rect {
+    const own = ownOf(stroke)
+    if !shared.dabArea(stroke, dab, &own.*.area) { return geom.empty() }
+    const area = &own.*.area
+    const mode = own.*.mode
+    var strength = @floatCast(f64, stroke.*.settings.*.values[VALUE_AMOUNT]) * dab.*.opacity
+    if !(strength > 0.0) { strength = 0.0 }
+    if strength > 1.0 { strength = 1.0 }
+    const radius = math.max(dab.*.diameter * 0.5, 0.5)
+    // The way from this copy's dab before (MOVE), at most a radius (a
+    // longer one is a jump, not a push).
+    var drag_x: f64 = 0.0
+    var drag_y: f64 = 0.0
+    const slot = shared.follow(&own.*.trails, TRAILS, stroke, dab, &own.*.clock)
+    if slot < TRAILS {
+        const trail = &own.*.trails[slot]
+        if trail.*.live {
+            drag_x = dab.*.x - trail.*.x
+            drag_y = dab.*.y - trail.*.y
+            const way = math.hypot(drag_x, drag_y)
+            if way > radius {
+                drag_x *= radius / way
+                drag_y *= radius / way
+            }
+        }
+        trail.*.live = true
+        trail.*.x = dab.*.x
+        trail.*.y = dab.*.y
+    }
+    // No place read lies further out of the area than a radius and the
+    // drag (a swirl of a narrow tip reaches the whole circle).
+    const margin = @intFromFloat(i32, @ceil(radius + math.hypot(drag_x, drag_y))) + 2
+    if @intCast(i64, area.*.x0) - @intCast(i64, margin) < -2147483647 || @intCast(i64, area.*.y0) - @intCast(i64, margin) < -2147483647 { return geom.empty() }
+    if @intCast(i64, area.*.x1) + @intCast(i64, margin) > 2147483647 || @intCast(i64, area.*.y1) + @intCast(i64, margin) > 2147483647 { return geom.empty() }
+    const width = shared.areaWidth(area)
+    const height = shared.areaHeight(area)
+    const wide = area.*.x1 - area.*.x0 + 2 * margin
+    const high = area.*.y1 - area.*.y0 + 2 * margin
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const weights = scratch.bytes(pool, width * height)
+    const want = scratch.words(pool, width * height)
+    const source = scratch.words(pool, @intCast(usize, wide) * @intCast(usize, high))
+    if weights == null || want == null || source == null || !shared.amounts(stroke, area, shared.level(dab.*.flow), weights.?) {
+        scratch.release(pool, mark)
+        return geom.empty()
+    }
+    const first_x = area.*.x0 - margin
+    const first_y = area.*.y0 - margin
+    if own.*.oldData {
+        shared.readBefore(stroke, own.*.before, geom.rect(first_x, first_y, wide, high), source.?, @intCast(usize, wide))
+    } else {
+        device_module.readRect(stroke.*.target.device, geom.rect(first_x, first_y, wide, high), source.?, @intCast(usize, wide))
+    }
+    // A mirror image of the dab turns the other way.
+    const mirrored = dab.*.mirrorHorizontal != dab.*.mirrorVertical
+    var turn = strength * math.pi * 0.5
+    if (mode == SWIRL_CCW) != mirrored { turn = 0.0 - turn }
+    const reach = radius * radius
+    // The dab's centre in the source's pixels (0: the first one's centre).
+    const centre_x = dab.*.x - @floatFromInt(f64, first_x) - 0.5
+    const centre_y = dab.*.y - @floatFromInt(f64, first_y) - 0.5
+    const rng = &stroke.*.state.random
+    var y: usize = 0
+    while y < height {
+        // The pixel's centre from the dab's, and its place in the source.
+        const vy = @floatFromInt(f64, area.*.y0 + @intCast(i32, y)) + 0.5 - dab.*.y
+        const sy = @intCast(usize, @intCast(i32, y) + margin)
+        var x: usize = 0
+        while x < width {
+            const vx = @floatFromInt(f64, area.*.x0 + @intCast(i32, x)) + 0.5 - dab.*.x
+            const distance2 = vx * vx + vy * vy
+            const sx = @intCast(usize, @intCast(i32, x) + margin)
+            var result = source.?[sy * @intCast(usize, wide) + sx]
+            if distance2 < reach && strength > 0.0 {
+                const r2 = distance2 / reach
+                var qx = vx
+                var qy = vy
+                if mode == GROW || mode == LENS_IN {
+                    const k = 1.0 - strength * (1.0 - r2) * 0.5
+                    qx = vx * k
+                    qy = vy * k
+                } else if mode == SHRINK || mode == LENS_OUT {
+                    const k = 1.0 + strength * (1.0 - r2) * 0.5
+                    qx = vx * k
+                    qy = vy * k
+                } else if mode == SWIRL_CW || mode == SWIRL_CCW {
+                    // Turned back by the angle: what was there comes here.
+                    const angle = 0.0 - turn * (1.0 - @sqrt(r2))
+                    const cos = math.cos(angle)
+                    const sin = math.sin(angle)
+                    qx = vx * cos - vy * sin
+                    qy = vx * sin + vy * cos
+                } else if mode == MOVE {
+                    const k = strength * (1.0 - r2)
+                    qx = vx - drag_x * k
+                    qy = vy - drag_y * k
+                } else {
+                    const most = strength * radius * (1.0 - @sqrt(r2)) * 0.25
+                    qx = vx + (random.unit(rng) * 2.0 - 1.0) * most
+                    qy = vy + (random.unit(rng) * 2.0 - 1.0) * most
+                }
+                result = bilinear(source.?, wide, high, centre_x + qx, centre_y + qy)
+            }
+            want.?[y * width + x] = result
+            x += 1
+        }
+        y += 1
+    }
+    shared.layDown(stroke, area, want.?, width, weights.?, false)
+    scratch.release(pool, mark)
+    return geom.rect(area.*.x0, area.*.y0, area.*.x1 - area.*.x0, area.*.y1 - area.*.y0)
+}
+
+const ENGINES = [1]types.Engine{
+    types.Engine.{ .id = types.ENGINE_DEFORM, .key = "deform", .name = "Deform", .german = "Verformen", .flags = types.ENGINE_DIRECT, .begin = begin, .dab = paint, .end = null, .free = free },
+}
+
+var kept: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The module's engine, "deform" (brush/engines.mlx lists it): a copy of
+// the table in heap memory made at the first asking (core/table.mlx).
+pub fn list() -> []const types.Engine {
+    if kept.address != 0 { return table.rows(types.Engine, &kept) }
+    return table.keep(types.Engine, &kept, ENGINES[0..])
+}

@@ -173,6 +173,24 @@ extends_signed_wrapping() {
     return $ok
 }
 
+# Whether programs $1 builds trap on an overflow of a type narrower than
+# 64 bits and hold its values in range (tests/524_narrow_overflow_runtime.mlx
+# exits 13: its overflowing cases end children by the trap); older
+# compilers checked the unsigned types only, so the sum of two i32 kept
+# its 33rd bit and compared greater than the i32 maximum.
+traps_narrow_overflow() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/524_narrow_overflow_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether $1 gives a plugin a soname and its exports a symbol version
 # (--soname, --symbol-version; compiler/libc/pulse needs them).
 writes_symbol_versions() {
@@ -529,6 +547,22 @@ negates_floats_by_sign() {
     probe=$(mktemp -d mlx-out/probe.XXXXXX)
     local ok=1
     if "$1" --quiet tests/435_float_negative_zero_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 passes a comparison of floats as a bool
+# (tests/456_float_comparison_values_runtime.mlx exits 13); older
+# compilers passed it in a float register, where the callee did not look.
+passes_float_comparisons_as_values() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/456_float_comparison_values_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
         local status=0
         "$probe/probe" > /dev/null 2>&1 || status=$?
         [[ $status -eq 13 ]] && ok=0
@@ -1042,6 +1076,50 @@ shifts_powers_of_two() {
     return $ok
 }
 
+# Whether $1 gives a module-level const table whose rows hold strings,
+# functions and slices of other tables one read-only image holding their
+# addresses (tests/523_constant_table_addresses_runtime.mlx exits 13: a
+# row, a field, the length, a slice of the table and a walk over it take
+# nothing from the aggregate arena, two slices of it are the same storage,
+# a row's slice is the other table's image).
+reads_constant_tables_with_addresses() {
+    local probe
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=1
+    if "$1" --quiet tests/523_constant_table_addresses_runtime.mlx -o "$probe/probe" > /dev/null 2>&1; then
+        local status=0
+        "$probe/probe" > /dev/null 2>&1 || status=$?
+        [[ $status -eq 13 ]] && ok=0
+    fi
+    rm -rf -- "$probe"
+    return $ok
+}
+
+# Whether $1 keeps an optional holding its payload's zero apart from null
+# and an absent one null (tests/526_optional_zero_values_runtime.mlx exits
+# 13): an optional float tagged as the integers are (it was its payload
+# alone, so a `?f64` holding 0.0 was null), an inline function's result and
+# an `if`'s or a `match`'s branches made the optional, a local's tag where
+# a pointer to it finds it, `null` for a generic `?T` passed whole; and
+# whether it writes module-level optionals given a float or a struct with
+# their tag (tests/527_optional_zero_globals_runtime.mlx compiles and exits
+# 13; older compilers refused them, MLX-E9001).
+tags_optional_zeros() {
+    local probe test
+    probe=$(mktemp -d mlx-out/probe.XXXXXX)
+    local ok=0
+    for test in tests/526_optional_zero_values_runtime.mlx tests/527_optional_zero_globals_runtime.mlx; do
+        local status=1
+        if "$1" --quiet "$test" -o "$probe/probe" > /dev/null 2>&1; then
+            status=0
+            "$probe/probe" > /dev/null 2>&1 || status=$?
+        fi
+        [[ $status -eq 13 ]] || ok=1
+    done
+    rm -rf -- "$probe"
+    return $ok
+}
+
 # Whether programs $1 builds keep their globals that start zero out of the
 # file, in a .bss in memory only (tests/support/zero_data_static.mlx, test
 # 512's program static, exits 13); earlier compilers wrote every global's
@@ -1125,12 +1203,16 @@ probes=(
     "reads_constant_tables_from_static_data|module-level const tables read from static data"
     "aligns_functions|functions at multiples of 16"
     "types_slices_of_constants|slices of constants and of by-value parameters as []const T"
+    "passes_float_comparisons_as_values|comparisons of floats passed as bools"
     "takes_addresses_of_constants|the address of a module-level constant"
     "writes_places_through_try|places with a try among their parts as writable as without"
     "nests_function_types|function types with function types among their parameters"
     "ends_statements_after_postfix|a statement ended by a line's last .* or .?"
     "addresses_constants|the address of a module-level constant"
     "shifts_powers_of_two|divisions and products by a constant power of two as shifts and masks"
+    "reads_constant_tables_with_addresses|const tables of strings, functions and slices of other tables read from one read-only image"
+    "traps_narrow_overflow|checked arithmetic on i8 to i32 and u8 to u32 trapping at the type's bounds"
+    "tags_optional_zeros|optionals holding zero apart from null (a ?f64 holding 0.0 tagged)"
     "keeps_zero_data_out_of_files|globals that start zero in a .bss, out of the program's file"
 )
 

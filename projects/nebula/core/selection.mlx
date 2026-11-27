@@ -1,0 +1,1645 @@
+// nebula core: what is done to a selection: the Select menu and the
+// selection tools. A selection is a mask (core/mask.mlx: a Device of
+// opaque greys, 0 nothing, 255 all; a pixel counts as selected from 128
+// on, which is where the outline runs). The image's is image.*.selection,
+// in use while image.*.selected. These functions take any mask and know
+// neither the image nor its history: who changes the image's selection
+// puts them between ops.beginSelection() and ops.endSelection():
+//
+//     ops.beginSelection(image)
+//     _ = selection.fromRect(image.*.selection, dragged, selection.ADD, 0.0)
+//     _ = selection.grow(image.*.selection, 4)
+//     _ = selection.clip(image.*.selection, image_module.bounds(image))
+//     ops.endSelection(image, true, "Select")
+//
+// There is: joining a mask with a shape in one of five modes (combine()
+// with another mask, fromRect(), fromAlpha(), fromLuma(), fromColor()),
+// selectAll(), clear(), invert(), clip(); changing its outline
+// (feather(), grow(), shrink(), border(), smooth(), sharpen()); asking
+// (bounds(), isEmpty(), isRectangle(); the amount at one place is
+// mask.at); the outline as segments for the marching ants (outline());
+// and a selection applied to a layer's pixels (clearSelected(),
+// copySelected(), fillSelected(): what cut, copy, clear and fill do).
+//
+// A selection never reaches outside its image: selectAll(), invert(),
+// fromColor() and shrink() take the image's rectangle and keep to it;
+// what can carry a selection across the image's edge (a rectangle or a
+// layer that lies across it, grow(), feather(), border()) is followed by
+// clip().
+//
+// Every function that changes a mask returns false when memory ran out;
+// the mask may then be changed in part, and who opened a change puts it
+// back (ops.cancelSelection()). What goes through a mask pixel by pixel
+// writes only the tiles that come out different, so a change holds no
+// more than what changed.
+//
+// A mask's default is nothing or all (mask.create makes no other); what a
+// mask of all means far from its tiles is kept by every function here:
+// subtracting from "all" leaves all but the shape, feathering a hole in it
+// softens the hole's edge.
+//
+// Working memory comes from core/scratch.mlx and is given back before
+// each function returns; feather(), grow(), shrink() and smooth() go
+// through the mask in bands of rows, about 8 MiB of planes at a time
+// whatever the mask's size (more only for radii of many hundred pixels:
+// a band is never less than a radius high).
+//
+// Not here: the outline as a path (core/raster.mlx makes paths), and
+// growing that keeps a soft edge soft (grow() and shrink() move the
+// outline and leave a hard edge: smooth() or feather() soften it again).
+const std = @import("std")
+const device_module = @import("./device.mlx")
+const mask_module = @import("./mask.mlx")
+const geom = @import("./geom.mlx")
+const pixel = @import("./pixel.mlx")
+const blend = @import("./blend.mlx")
+const scratch = @import("./scratch.mlx")
+
+pub const Device = device_module.Device
+pub const Rect = geom.Rect
+
+// How a shape joins what a mask holds already: the shape instead of it,
+// the larger amount of both, the mask less the shape (amount times one
+// minus the shape's), the smaller amount of both, and where the two
+// differ (the distance between the amounts).
+pub const REPLACE: u8 = 0
+pub const ADD: u8 = 1
+pub const SUBTRACT: u8 = 2
+pub const INTERSECT: u8 = 3
+pub const SYMMETRIC_DIFFERENCE: u8 = 4
+
+// The largest radius feather(), grow(), shrink() and border() work with
+// (a larger one is taken as this).
+pub const LARGEST_RADIUS: i32 = 2048
+
+// A piece of the outline, from corner (x0, y0) to corner (x1, y1) of the
+// pixel grid (image coordinates; pixel (x, y) lies between the corners
+// (x, y) and (x + 1, y + 1)): level (y0 == y1) or upright (x0 == x1),
+// x0 <= x1 and y0 <= y1.
+pub const Segment = struct {
+    x0: i32
+    y0: i32
+    x1: i32
+    y1: i32
+}
+
+const TILE: i32 = 64
+const TILE_PIXELS: usize = 4096
+// From this amount on a pixel is inside the outline.
+const HALF: u32 = 128
+// What the planes of one band of rows may take, about.
+const BAND_BYTES: usize = 8388608
+// No rectangle given from outside is taken to reach farther than this
+// from the origin: the sums of its edges then stay far inside an i32.
+const FAR: i32 = 16777216
+
+fn larger(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+fn smaller(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+
+// `area` as far as the engine goes (empty for one without width or
+// height): what comes in from outside may hold any numbers.
+fn sane(area: Rect) -> Rect {
+    if area.width <= 0 || area.height <= 0 { return geom.empty() }
+    const limit = @intCast(i64, FAR)
+    var x0 = @intCast(i64, area.x)
+    var y0 = @intCast(i64, area.y)
+    var x1 = x0 + @intCast(i64, area.width)
+    var y1 = y0 + @intCast(i64, area.height)
+    if x0 < -limit { x0 = -limit }
+    if y0 < -limit { y0 = -limit }
+    if x1 > limit { x1 = limit }
+    if y1 > limit { y1 = limit }
+    if x1 <= x0 || y1 <= y0 { return geom.empty() }
+    return geom.rect(@intCast(i32, x0), @intCast(i32, y0), @intCast(i32, x1 - x0), @intCast(i32, y1 - y0))
+}
+
+// As far as coordinates go, in every direction.
+fn everywhere() -> Rect {
+    return geom.rect(-FAR, -FAR, FAR * 2, FAR * 2)
+}
+
+// A radius in whole pixels, between 0 and LARGEST_RADIUS.
+fn wholeRadius(radius: f64) -> i32 {
+    // (Written so that a radius that is no number counts as none.)
+    if !(radius >= 0.5) { return 0 }
+    if radius >= @floatFromInt(f64, LARGEST_RADIUS) { return LARGEST_RADIUS }
+    return @intFromFloat(i32, radius + 0.5)
+}
+
+// ---------------------------------------------------------------------------
+// Shapes and how they join a mask
+//
+// What is combined with a mask is a shape: another mask, a rectangle, or
+// amounts read off a layer's pixels (its alpha, its lightness, how close
+// each pixel is to a colour). One loop joins them all, tile by tile of
+// the mask.
+
+const KIND_MASK: u8 = 0
+const KIND_RECT: u8 = 1
+const KIND_ALPHA: u8 = 2
+const KIND_LUMA: u8 = 3
+const KIND_COLOR: u8 = 4
+
+const Shape = struct {
+    kind: u8
+    // The mask, or the layer whose pixels say the amounts (none for a
+    // rectangle).
+    device: ?*Device
+    // `bounded`: the shape is nothing outside `area`.
+    bounded: bool
+    area: Rect
+    // KIND_COLOR: the colour looked for, premultiplied, and how far a
+    // pixel may be from it.
+    color: u32
+    threshold: u32
+    softness: u32
+}
+
+inline fn apart(a: u32, b: u32) -> u32 { return if a > b { a - b } else { b - a } }
+
+// The amount a layer's pixel stands for in a shape made of pixels.
+fn pixelAmount(shape: *const Shape, value: u32) -> u32 {
+    if shape.*.kind == KIND_ALPHA { return value >> 24 }
+    if shape.*.kind == KIND_LUMA { return pixel.mul(pixel.luma(value), value >> 24) }
+    // Premultiplied, so that the colour a transparent pixel happens to
+    // hold does not count and a faint one counts little.
+    const own = pixel.premultiplied(value)
+    const wanted = shape.*.color
+    var distance = apart(own >> 24, wanted >> 24)
+    distance = pixel.larger(distance, apart(pixel.red(own), pixel.red(wanted)))
+    distance = pixel.larger(distance, apart(pixel.green(own), pixel.green(wanted)))
+    distance = pixel.larger(distance, apart(pixel.blue(own), pixel.blue(wanted)))
+    if distance <= shape.*.threshold { return 255 }
+    const past = distance - shape.*.threshold
+    if past >= shape.*.softness { return 0 }
+    return (255 * (shape.*.softness - past) + shape.*.softness / 2) / shape.*.softness
+}
+
+// The part of the tile `place` a shape can be anything in. (A function of
+// its own, as workOf() below: a rectangle that is one of two, held in a
+// variable assigned twice or made by an `if`, is taken from the value
+// arena each time, and this runs for every tile.)
+fn partOf(shape: *const Shape, place: Rect) -> Rect {
+    if shape.*.bounded { return geom.intersect(place, shape.*.area) }
+    return place
+}
+
+// The shape's amounts over `place`, one tile of the mask it joins. The
+// amount when it is one all over the tile (nothing is written then),
+// else -1 and the amounts in `bytes`, 64 a row. `words` is room for the
+// tile's pixels.
+fn shapeAmounts(shape: *const Shape, place: Rect, bytes: [*]u8, words: [*]u32) -> i32 {
+    if shape.*.kind == KIND_MASK {
+        const source = shape.*.device.?
+        if !device_module.touches(source, place) { return @intCast(i32, source.*.defaultPixel & 255) }
+        mask_module.readBytes(source, place, bytes, 64)
+        return -1
+    }
+    const part = partOf(shape, place)
+    if geom.isEmpty(part) { return 0 }
+    var uniform: i32 = 255
+    if shape.*.kind != KIND_RECT {
+        const source = shape.*.device.?
+        if device_module.touches(source, part) {
+            uniform = -1
+            device_module.readRect(source, part, words, 64)
+        } else {
+            uniform = @intCast(i32, pixelAmount(shape, source.*.defaultPixel))
+        }
+    }
+    const whole = part.width == TILE && part.height == TILE
+    if uniform == 0 || (uniform > 0 && whole) { return uniform }
+    if !whole { std.mem.zero(bytes, TILE_PIXELS) }
+    const first = @intCast(usize, ((part.y - place.y) << 6) | (part.x - place.x))
+    const count = @intCast(usize, part.width)
+    const rows = @intCast(usize, part.height)
+    var row: usize = 0
+    while row < rows {
+        const target = bytes + (first + row * 64)
+        if uniform >= 0 {
+            std.mem.set(target, @intCast(u8, uniform), count)
+        } else {
+            const source = words + row * 64
+            var index: usize = 0
+            while index < count {
+                target[index] = @intCast(u8, pixelAmount(shape, source[index]))
+                index += 1
+            }
+        }
+        row += 1
+    }
+    return -1
+}
+
+// What a mask's amount `held` and a shape's amount `given` make in `mode`
+// (a mode that is none of the five replaces).
+inline fn combined(mode: u8, held: u32, given: u32) -> u32 {
+    if mode == ADD { return if held > given { held } else { given } }
+    if mode == SUBTRACT { return pixel.mul(held, 255 - given) }
+    if mode == INTERSECT { return if held < given { held } else { given } }
+    if mode == SYMMETRIC_DIFFERENCE { return apart(held, given) }
+    return given
+}
+
+// Whether a shape's amount `given` leaves every amount as it is.
+fn keeps(mode: u8, given: u32) -> bool {
+    if mode == INTERSECT { return given == 255 }
+    return given == 0 && (mode == ADD || mode == SUBTRACT || mode == SYMMETRIC_DIFFERENCE)
+}
+
+// Tile (tx, ty) of `target` joined with the shape. `settled` is what the
+// mask's default will be when all tiles are done: a tile that is that all
+// over is not kept. False without memory.
+fn combineTile(target: *Device, shape: *const Shape, mode: u8, tx: i32, ty: i32, settled: u32, bytes: [*]u8, words: [*]u32) -> bool {
+    const blank = target.*.defaultPixel & 255
+    const own = device_module.tileRead(target, tx, ty)
+    const uniform = shapeAmounts(shape, device_module.tileArea(target, tx, ty), bytes, words)
+    if uniform >= 0 {
+        const given = @intCast(u32, uniform)
+        if own == null {
+            const value = combined(mode, blank, given)
+            if value == settled { return true }
+            const made = device_module.tileWrite(target, tx, ty)
+            if made == null { return false }
+            device_module.fillWords(made.?, TILE_PIXELS, pixel.gray(value))
+            return true
+        }
+        if keeps(mode, given) { return true }
+        std.mem.set(bytes, @intCast(u8, uniform), TILE_PIXELS)
+    }
+    // The shape's amounts in `bytes` become the results; whether any
+    // differs from what is there, and from the default to come, decides
+    // what happens to the tile.
+    var plain = true
+    var index: usize = 0
+    if own == null {
+        while index < TILE_PIXELS {
+            const value = combined(mode, blank, @intCast(u32, bytes[index]))
+            if value != settled { plain = false }
+            bytes[index] = @intCast(u8, value)
+            index += 1
+        }
+        if plain { return true }
+    } else {
+        const held = own.?
+        var changed = false
+        while index < TILE_PIXELS {
+            const value = combined(mode, held[index] & 255, @intCast(u32, bytes[index]))
+            if value != settled { plain = false }
+            if pixel.gray(value) != held[index] { changed = true }
+            bytes[index] = @intCast(u8, value)
+            index += 1
+        }
+        if !changed { return true }
+        if plain {
+            device_module.dropTile(target, tx, ty)
+            return true
+        }
+    }
+    const made = device_module.tileWrite(target, tx, ty)
+    if made == null { return false }
+    const out = made.?
+    index = 0
+    while index < TILE_PIXELS {
+        out[index] = pixel.gray(@intCast(u32, bytes[index]))
+        index += 1
+    }
+    return true
+}
+
+// Where joining a shape in `mode` can change a mask or make it differ
+// from its default to come: around the tiles of both and a bounded
+// shape's rectangle. Where the mask has no tile nothing can be taken
+// from nothing and nothing added to all, whatever the shape is there:
+// then its own tiles are all there is to do (clipping a small selection
+// to a large image looks at the selection only).
+fn reachOf(target: *Device, shape: *const Shape, mode: u8) -> Rect {
+    const blank = target.*.defaultPixel & 255
+    if blank == 0 && (mode == SUBTRACT || mode == INTERSECT) { return device_module.extent(target) }
+    if blank == 255 && mode == ADD { return device_module.extent(target) }
+    if shape.*.bounded { return geom.unite(device_module.extent(target), shape.*.area) }
+    if shape.*.device == null { return device_module.extent(target) }
+    return geom.unite(device_module.extent(target), device_module.extent(shape.*.device.?))
+}
+
+// `target` joined with the shape in `mode`, wherever either is anything:
+// every tile of the mask's own grid that the tiles of the two (and a
+// bounded shape's rectangle) reach, and the default for all the rest.
+fn apply(target: *Device, shape: *const Shape, mode: u8) -> bool {
+    const blank = target.*.defaultPixel & 255
+    // What the shape is far from everything.
+    var far: u32 = 0
+    if !shape.*.bounded && shape.*.device != null {
+        const source = shape.*.device.?
+        far = if shape.*.kind == KIND_MASK { source.*.defaultPixel & 255 } else { pixelAmount(shape, source.*.defaultPixel) }
+    }
+    const region = reachOf(target, shape, mode)
+    const settled = combined(mode, blank, far)
+    var whole = true
+    if !geom.isEmpty(region) {
+        const pool = scratch.common()
+        const mark = scratch.mark(pool)
+        const bytes = scratch.bytes(pool, TILE_PIXELS)
+        const words = scratch.words(pool, TILE_PIXELS)
+        if bytes == null || words == null {
+            scratch.release(pool, mark)
+            return false
+        }
+        const tx1 = (region.x + region.width - 1 - target.*.x) >> 6
+        const ty1 = (region.y + region.height - 1 - target.*.y) >> 6
+        // (Not on once memory ran out: what is left would fail too.)
+        var ty = (region.y - target.*.y) >> 6
+        while ty <= ty1 && whole {
+            var tx = (region.x - target.*.x) >> 6
+            while tx <= tx1 && whole {
+                whole = combineTile(target, shape, mode, tx, ty, settled, bytes.?, words.?)
+                tx += 1
+            }
+            ty += 1
+        }
+        scratch.release(pool, mark)
+    }
+    if settled != blank { device_module.setDefault(target, pixel.gray(settled)) }
+    return whole
+}
+
+fn rectShape(area: Rect) -> Shape {
+    return Shape.{ .kind = KIND_RECT, .device = null, .bounded = true, .area = sane(area), .color = 0, .threshold = 0, .softness = 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Combining
+
+// `target` joined with the mask `shape` in `mode` (REPLACE, ADD, SUBTRACT,
+// INTERSECT, SYMMETRIC_DIFFERENCE), everywhere: also where only the
+// defaults of the two say what they are (a mask of all less a shape is
+// all but the shape). REPLACE shares the shape's tiles and takes over the
+// place it sits at. False without memory (the mask then changed in part).
+pub fn combine(target: *Device, shape: *Device, mode: u8) -> bool {
+    if mode != ADD && mode != SUBTRACT && mode != INTERSECT && mode != SYMMETRIC_DIFFERENCE {
+        if @intFromPtr(target) == @intFromPtr(shape) { return true }
+        return device_module.assign(target, shape)
+    }
+    const from = Shape.{ .kind = KIND_MASK, .device = shape, .bounded = false, .area = geom.empty(), .color = 0, .threshold = 0, .softness = 0 }
+    return apply(target, &from, mode)
+}
+
+// Everything in `area` (the image's rectangle) is selected and nothing
+// else. False without memory.
+pub fn selectAll(target: *Device, area: Rect) -> bool {
+    const from = rectShape(area)
+    return apply(target, &from, REPLACE)
+}
+
+// Nothing is selected.
+pub fn clear(target: *Device) -> void {
+    device_module.clear(target)
+    if target.*.defaultPixel != mask_module.NOTHING { device_module.setDefault(target, mask_module.NOTHING) }
+}
+
+// Every amount inside `area` (the image's rectangle) becomes what it
+// lacked of all; outside nothing changes (twice is as never). False
+// without memory.
+pub fn invert(target: *Device, area: Rect) -> bool {
+    const from = rectShape(area)
+    return apply(target, &from, SYMMETRIC_DIFFERENCE)
+}
+
+// Nothing is selected outside `area` (the image's rectangle). False
+// without memory.
+pub fn clip(target: *Device, area: Rect) -> bool {
+    const from = rectShape(area)
+    return apply(target, &from, INTERSECT)
+}
+
+// `target` joined in `mode` with the rectangle `rect`, its edge softened
+// by feather() of `soft` pixels (0: a hard edge; a soft one reaches that
+// far beyond the rectangle). False without memory.
+pub fn fromRect(target: *Device, rect: Rect, mode: u8, soft: f64) -> bool {
+    if wholeRadius(soft) == 0 {
+        const from = rectShape(rect)
+        return apply(target, &from, mode)
+    }
+    const made = mask_module.create(target.*.allocator, false)
+    if made == null { return false }
+    var done = device_module.fill(made.?, sane(rect), mask_module.ALL)
+    if done { done = feather(made.?, soft) }
+    if done { done = combine(target, made.?, mode) }
+    device_module.destroy(made.?)
+    return done
+}
+
+// `target` joined in `mode` with what is opaque in the layer `source`:
+// each pixel's alpha is its amount ("select opaque"). False without
+// memory.
+pub fn fromAlpha(target: *Device, source: *Device, mode: u8) -> bool {
+    const from = Shape.{ .kind = KIND_ALPHA, .device = source, .bounded = false, .area = geom.empty(), .color = 0, .threshold = 0, .softness = 0 }
+    return apply(target, &from, mode)
+}
+
+// `target` joined in `mode` with what is light in the layer `source`:
+// each pixel's lightness (pixel.luma) times its alpha is its amount.
+// False without memory.
+pub fn fromLuma(target: *Device, source: *Device, mode: u8) -> bool {
+    const from = Shape.{ .kind = KIND_LUMA, .device = source, .bounded = false, .area = geom.empty(), .color = 0, .threshold = 0, .softness = 0 }
+    return apply(target, &from, mode)
+}
+
+// `target` joined in `mode` with the pixels of `source` inside `area`
+// (the image's rectangle) that look like `color` ("similar colour
+// selection"). How far a pixel is from the colour is the largest
+// difference of alpha and of the colour channels times alpha (0-255): up
+// to `threshold` it is selected wholly, and over the next `softness`
+// levels less and less (255 * (softness - k) / softness at k levels past
+// the threshold; softness 0: a hard edge; both are taken as at most
+// 255). False without memory.
+pub fn fromColor(target: *Device, source: *Device, color: u32, threshold: u32, softness: u32, area: Rect, mode: u8) -> bool {
+    const from = Shape.{
+        .kind = KIND_COLOR,
+        .device = source,
+        .bounded = true,
+        .area = sane(area),
+        .color = pixel.premultiplied(color),
+        .threshold = pixel.smaller(threshold, 255),
+        .softness = pixel.smaller(softness, 255),
+    }
+    return apply(target, &from, mode)
+}
+
+// ---------------------------------------------------------------------------
+// Changing
+//
+// What follows reads a mask around each pixel while it writes it, so it
+// reads a copy made first (which shares the tiles: only what is written
+// comes to exist twice), in bands of rows.
+
+// Whether the amounts at `from` (`stride` bytes a row) are what rows
+// row0..row1, columns col0..col1 of a tile hold already (`held` null: no
+// tile, every amount is `blank`).
+fn holds(held: ?[*]const u32, blank: u8, from: [*]const u8, stride: usize, row0: i32, row1: i32, col0: i32, col1: i32) -> bool {
+    const span = @intCast(usize, col1 - col0)
+    var row = row0
+    while row < row1 {
+        const source = from + @intCast(usize, row - row0) * stride
+        var index: usize = 0
+        if held == null {
+            while index < span {
+                if source[index] != blank { return false }
+                index += 1
+            }
+        } else {
+            const words = held.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63))
+            while index < span {
+                if words[index] != pixel.gray(@intCast(u32, source[index])) { return false }
+                index += 1
+            }
+        }
+        row += 1
+    }
+    return true
+}
+
+// The amounts of `area` become the bytes at `from` (`stride` a row), as
+// mask.writeBytes does it, but a tile whose part of them is there already
+// is left alone: not made, not copied when shared, not in the change.
+// False without memory.
+fn store(target: *Device, area: Rect, from: [*]const u8, stride: usize) -> bool {
+    if geom.isEmpty(area) { return true }
+    const blank = @intCast(u8, target.*.defaultPixel & 255)
+    const left = area.x - target.*.x
+    const top = area.y - target.*.y
+    const right = left + area.width
+    const bottom = top + area.height
+    var whole = true
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * TILE)
+        const row1 = smaller(bottom, ty * TILE + TILE)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const col0 = larger(left, tx * TILE)
+            const col1 = smaller(right, tx * TILE + TILE)
+            const source = from + (@intCast(usize, row0 - top) * stride + @intCast(usize, col0 - left))
+            if !holds(device_module.tileRead(target, tx, ty), blank, source, stride, row0, row1, col0, col1) {
+                const made = device_module.tileWrite(target, tx, ty)
+                if made == null {
+                    whole = false
+                } else {
+                    const span = @intCast(usize, col1 - col0)
+                    var row = row0
+                    while row < row1 {
+                        const bytes = source + @intCast(usize, row - row0) * stride
+                        const words = made.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63))
+                        var index: usize = 0
+                        while index < span {
+                            words[index] = pixel.gray(@intCast(u32, bytes[index]))
+                            index += 1
+                        }
+                        row += 1
+                    }
+                }
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+    return whole
+}
+
+// How many rows a band of the mask gives when each row takes
+// `row_bytes` of planes and `margin` rows more are read above and below:
+// as many as BAND_BYTES hold, but not so few that most of a band is
+// margin read twice.
+fn bandRows(row_bytes: usize, margin: usize, height: usize) -> usize {
+    var rows = BAND_BYTES / row_bytes
+    rows = if rows > margin * 2 + 64 { rows - margin * 2 } else { 64 }
+    if rows < margin { rows = margin }
+    if rows > height { rows = height }
+    return rows
+}
+
+// The sums of every 2 * radius + 1 neighbours among the `count` values at
+// `line`: count - 2 * radius sums at `into`. (Whole numbers, so the sums
+// are exact: after three boxes of LARGEST_RADIUS one is below 2^40.)
+fn boxSums(line: [*]const u64, count: usize, radius: usize, into: [*]u64) -> void {
+    const window = radius * 2 + 1
+    var sum: u64 = 0
+    var index: usize = 0
+    while index < window {
+        sum += line[index]
+        index += 1
+    }
+    into[0] = sum
+    // From the second sum on, one value enters at `ahead` and one leaves.
+    const ahead = line + window
+    const later = into + 1
+    const results = count - window
+    index = 0
+    while index < results {
+        sum = sum + ahead[index] - line[index]
+        later[index] = sum
+        index += 1
+    }
+}
+
+// The same of `count` amounts (the first box of a row).
+fn boxBytes(line: [*]const u8, count: usize, radius: usize, into: [*]u64) -> void {
+    const window = radius * 2 + 1
+    var sum: u64 = 0
+    var index: usize = 0
+    while index < window {
+        sum += @intCast(u64, line[index])
+        index += 1
+    }
+    into[0] = sum
+    const ahead = line + window
+    const later = into + 1
+    const results = count - window
+    index = 0
+    while index < results {
+        sum = sum + @intCast(u64, ahead[index]) - @intCast(u64, line[index])
+        later[index] = sum
+        index += 1
+    }
+}
+
+// The three box radii that make up a feather of `reach` pixels (the
+// first is never 0).
+fn boxRadius(reach: usize, pass: usize) -> usize {
+    return (reach + 2 - pass) / 3
+}
+
+// One row of amounts blurred along itself: `wide` bytes become
+// wide - 2 * reach values of 256 times an amount at `into` (each sum
+// exact, rounded once).
+fn blurRow(bytes: [*]const u8, wide: usize, reach: usize, line_a: [*]u64, line_b: [*]u64, into: [*]u16) -> void {
+    const first = boxRadius(reach, 0)
+    boxBytes(bytes, wide, first, line_a)
+    var from = line_a
+    var to = line_b
+    var count = wide - first * 2
+    var weight: f64 = @floatFromInt(f64, first * 2 + 1)
+    var pass: usize = 1
+    while pass < 3 {
+        const radius = boxRadius(reach, pass)
+        if radius > 0 {
+            boxSums(from, count, radius, to)
+            const swap = from
+            from = to
+            to = swap
+            count -= radius * 2
+            weight = weight * @floatFromInt(f64, radius * 2 + 1)
+        }
+        pass += 1
+    }
+    const scale = 256.0 / weight
+    var index: usize = 0
+    while index < count {
+        into[index] = @intCast(u16, @intFromFloat(u32, @floatFromInt(f64, from[index]) * scale + 0.5))
+        index += 1
+    }
+}
+
+// Rows `at` .. `at + rows` of the plane (`width` values a row), each
+// replaced by the mean of itself and the 2 * radius rows after it: the
+// rows - 2 * radius means come to lie one row earlier, from row at - 1
+// on (the row a mean is written to is the one that just left the sum).
+// `sums` is room for a row of sums.
+fn boxColumns(plane: [*]u16, width: usize, rows: usize, radius: usize, at: usize, sums: [*]u32) -> void {
+    const window = radius * 2 + 1
+    // sum * factor >> 32 is sum / window, rounded: no division a pixel.
+    const factor = (@intCast(u64, 4294967296) + @intCast(u64, window / 2)) / @intCast(u64, window)
+    var x: usize = 0
+    while x < width {
+        sums[x] = 0
+        x += 1
+    }
+    var row: usize = 0
+    while row < window {
+        const line = plane + (at + row) * width
+        x = 0
+        while x < width {
+            sums[x] += @intCast(u32, line[x])
+            x += 1
+        }
+        row += 1
+    }
+    const results = rows - radius * 2
+    row = 0
+    while row < results {
+        const into = plane + (at + row - 1) * width
+        x = 0
+        if row == 0 {
+            while x < width {
+                into[x] = @intCast(u16, (@intCast(u64, sums[x]) * factor + 2147483648) >> 32)
+                x += 1
+            }
+        } else {
+            // `into` is the row that leaves the window: read before it
+            // is written.
+            const entering = plane + (at + row + radius * 2) * width
+            while x < width {
+                const sum = sums[x] + @intCast(u32, entering[x]) - @intCast(u32, into[x])
+                sums[x] = sum
+                into[x] = @intCast(u16, (@intCast(u64, sum) * factor + 2147483648) >> 32)
+                x += 1
+            }
+        }
+        row += 1
+    }
+}
+
+// feather()'s work: `target` blurred, read from `before`, which differs
+// from its default only inside `changed`.
+fn blurBands(target: *Device, before: *Device, changed: Rect, reach: i32, pool: *scratch.Pool) -> bool {
+    const out = geom.grown(changed, reach)
+    const margin = @intCast(usize, reach)
+    const width = @intCast(usize, out.width)
+    const wide = width + margin * 2
+    const band = bandRows(width * 2, margin, @intCast(usize, out.height))
+    // Three rows more than a band reads: each of the three passes down
+    // the columns moves its rows up by one.
+    const plane_bytes = scratch.bytes(pool, (band + margin * 2 + 3) * width * 2)
+    const chunk = scratch.bytes(pool, 64 * wide)
+    const result = scratch.bytes(pool, 64 * width)
+    const line_a = scratch.bytes(pool, wide * 8)
+    const line_b = scratch.bytes(pool, wide * 8)
+    const sums = scratch.words(pool, width)
+    if plane_bytes == null || chunk == null || result == null || line_a == null || line_b == null || sums == null { return false }
+    var plane: [*]u16 = undefined
+    var sums_a: [*]u64 = undefined
+    var sums_b: [*]u64 = undefined
+    unsafe { plane = @ptrCast([*]u16, plane_bytes.?) }
+    unsafe { sums_a = @ptrCast([*]u64, line_a.?) }
+    unsafe { sums_b = @ptrCast([*]u64, line_b.?) }
+    const blank = @intCast(u16, (before.*.defaultPixel & 255) << 8)
+    const bottom = out.y + out.height
+    const changed_bottom = changed.y + changed.height
+    var whole = true
+    var y0 = out.y
+    while y0 < bottom && whole {
+        const rows = smaller(@intCast(i32, band), bottom - y0)
+        const total = @intCast(usize, rows) + margin * 2
+        // Every row the band needs, blurred along itself. Rows the mask
+        // says nothing about stay its default; the others are read 64
+        // at a time.
+        var read_from = y0 - reach
+        var read_rows: i32 = 0
+        var index: usize = 0
+        while index < total {
+            const y = y0 - reach + @intCast(i32, index)
+            const into = plane + (index + 3) * width
+            if y < changed.y || y >= changed_bottom {
+                var x: usize = 0
+                while x < width {
+                    into[x] = blank
+                    x += 1
+                }
+            } else {
+                if y >= read_from + read_rows {
+                    read_from = y
+                    read_rows = smaller(64, changed_bottom - y)
+                    mask_module.readBytes(before, geom.rect(out.x - reach, y, @intCast(i32, wide), read_rows), chunk.?, wide)
+                }
+                blurRow(chunk.? + @intCast(usize, y - read_from) * wide, wide, margin, sums_a, sums_b, into)
+            }
+            index += 1
+        }
+        // Then down the columns, three boxes again.
+        var left = total
+        var pass: usize = 0
+        while pass < 3 {
+            const radius = boxRadius(margin, pass)
+            boxColumns(plane, width, left, radius, 3 - pass, sums.?)
+            left -= radius * 2
+            pass += 1
+        }
+        // What is left are the band's rows, 256 times each amount.
+        var done: i32 = 0
+        while done < rows {
+            const count = smaller(64, rows - done)
+            var row: usize = 0
+            while row < @intCast(usize, count) {
+                const from = plane + (@intCast(usize, done) + row) * width
+                const into = result.? + row * width
+                var x: usize = 0
+                while x < width {
+                    into[x] = @intCast(u8, (@intCast(u32, from[x]) + 128) >> 8)
+                    x += 1
+                }
+                row += 1
+            }
+            if !store(target, geom.rect(out.x, y0 + done, out.width, count), result.?, width) { whole = false }
+            done += count
+        }
+        y0 += rows
+    }
+    return whole
+}
+
+// The edge of what is selected softened: every amount becomes a weighted
+// mean of those within `radius` pixels (rounded to whole pixels, at most
+// LARGEST_RADIUS; less than half a pixel: nothing happens). Not a true
+// gaussian: the weights are those of three box blurs in a row along each
+// axis, whose radii add up to the radius. That is close to a gaussian
+// bell with a deviation of about a third of the radius, but it ends
+// exactly `radius` pixels away, so nothing farther from the old edge than
+// that changes, and it takes the same time whatever the radius (running
+// sums). A straight edge keeps its place: the amounts on its two sides add
+// up to 255. The sum of all amounts stays (but for rounding). A mirrored
+// mask feathers to the mirror image exactly; one turned by a quarter may
+// differ by a level here and there (along the rows the sums are exact and
+// rounded once, to 1/256 of a level; down the columns after each of the
+// three boxes). False without memory.
+pub fn feather(target: *Device, radius: f64) -> bool {
+    const reach = wholeRadius(radius)
+    if reach == 0 { return true }
+    const changed = device_module.exactBounds(target)
+    if geom.isEmpty(changed) { return true }
+    const before = device_module.copy(target)
+    if before == null { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const done = blurBands(target, before.?, changed, reach, pool)
+    scratch.release(pool, mark)
+    device_module.destroy(before.?)
+    return done
+}
+
+// How far to each side a column whose nearest seed is d rows away covers
+// a row, for a disc of `radius`: spans[d], the whole part of the root of
+// radius^2 - d^2; -1 for d = radius + 1 (no seed near enough).
+fn fillSpans(spans: [*]i32, radius: i32) -> void {
+    var distance: i32 = 0
+    while distance <= radius {
+        const square = radius * radius - distance * distance
+        var root = @intFromFloat(i32, @sqrt(@floatFromInt(f64, square)))
+        while root * root > square { root -= 1 }
+        while (root + 1) * (root + 1) <= square { root += 1 }
+        spans[@intCast(usize, distance)] = root
+        distance += 1
+    }
+    spans[@intCast(usize, radius + 1)] = -1
+}
+
+// One row of the distance plane begun: 0 where the amount is a seed
+// (selected, for `selecting`; not selected otherwise), `beyond`
+// elsewhere. Only columns lo..hi can be seeds.
+fn seedRow(amounts: [*]const u8, into: [*]u16, width: usize, selecting: bool, beyond: u16, lo: usize, hi: usize) -> void {
+    var x: usize = 0
+    while x < width {
+        into[x] = beyond
+        x += 1
+    }
+    x = lo
+    while x < hi {
+        if (@intCast(u32, amounts[x]) >= HALF) == selecting { into[x] = 0 }
+        x += 1
+    }
+}
+
+// Every amount of the row that has a seed within the disc becomes
+// `value`. `distances` says for each column how many rows away its
+// nearest seed is; a column covers the row as far to each side as
+// `spans` says for that, and the row's covered part is all these
+// stretches together: found by one walk to the right and one to the left.
+fn coverRow(amounts: [*]u8, distances: [*]const u16, width: usize, spans: [*]const i32, value: u8) -> void {
+    const count = @intCast(i32, width)
+    var reach: i32 = -1
+    var x: i32 = 0
+    while x < count {
+        const span = spans[@intCast(usize, distances[@intCast(usize, x)])]
+        if span >= 0 && x + span > reach { reach = x + span }
+        if reach >= x { amounts[@intCast(usize, x)] = value }
+        x += 1
+    }
+    reach = count
+    x = count - 1
+    while x >= 0 {
+        const span = spans[@intCast(usize, distances[@intCast(usize, x)])]
+        if span >= 0 && x - span < reach { reach = x - span }
+        if reach <= x { amounts[@intCast(usize, x)] = value }
+        x -= 1
+    }
+}
+
+// grow()'s and shrink()'s work over `work`, read from `before`: wherever
+// a seed lies within `radius` (the exact distance between pixel centres)
+// the amount becomes all (`selecting`: seeds are the selected pixels) or
+// nothing (seeds are the others, and only those inside `inside`).
+fn spreadBands(target: *Device, before: *Device, work: Rect, radius: i32, selecting: bool, inside: Rect, pool: *scratch.Pool) -> bool {
+    const width = @intCast(usize, work.width)
+    const reach = @intCast(usize, radius)
+    const band = bandRows(width * 2, reach, @intCast(usize, work.height))
+    // How many rows above or below each pixel its column's nearest seed
+    // is (radius + 1: farther than matters), for the rows of a band and
+    // `radius` more on both sides.
+    const plane_bytes = scratch.bytes(pool, (band + reach * 2) * width * 2)
+    const chunk = scratch.bytes(pool, 64 * width)
+    const spans = scratch.ints(pool, reach + 2)
+    if plane_bytes == null || chunk == null || spans == null { return false }
+    var plane: [*]u16 = undefined
+    unsafe { plane = @ptrCast([*]u16, plane_bytes.?) }
+    fillSpans(spans.?, radius)
+    const beyond = @intCast(u16, radius + 1)
+    const value: u8 = if selecting { 255 } else { 0 }
+    const lo = @intCast(usize, geom.clampInt(inside.x - work.x, 0, work.width))
+    const hi = @intCast(usize, geom.clampInt(inside.x + inside.width - work.x, 0, work.width))
+    const bottom = work.y + work.height
+    var whole = true
+    var y0 = work.y
+    while y0 < bottom && whole {
+        const rows = smaller(@intCast(i32, band), bottom - y0)
+        const top = larger(work.y, y0 - radius)
+        const end = smaller(bottom, y0 + rows + radius)
+        const total = @intCast(usize, end - top)
+        var y = top
+        while y < end {
+            const count = smaller(64, end - y)
+            mask_module.readBytes(before, geom.rect(work.x, y, work.width, count), chunk.?, width)
+            var row: i32 = 0
+            while row < count {
+                const open = y + row >= inside.y && y + row < inside.y + inside.height
+                seedRow(chunk.? + @intCast(usize, row) * width, plane + @intCast(usize, y + row - top) * width, width, selecting, beyond, if open { lo } else { 0 }, if open { hi } else { 0 })
+                row += 1
+            }
+            y += count
+        }
+        // Down the columns and up again: a row is at most one farther
+        // from a seed than the row next to it.
+        var index: usize = 1
+        while index < total {
+            const line = plane + index * width
+            const above = line - width
+            var x: usize = 0
+            while x < width {
+                if above[x] + 1 < line[x] { line[x] = above[x] + 1 }
+                x += 1
+            }
+            index += 1
+        }
+        index = total - 1
+        while index > 0 {
+            const line = plane + (index - 1) * width
+            const below = line + width
+            var x: usize = 0
+            while x < width {
+                if below[x] + 1 < line[x] { line[x] = below[x] + 1 }
+                x += 1
+            }
+            index -= 1
+        }
+        y = y0
+        while y < y0 + rows {
+            const count = smaller(64, y0 + rows - y)
+            mask_module.readBytes(before, geom.rect(work.x, y, work.width, count), chunk.?, width)
+            var row: i32 = 0
+            while row < count {
+                coverRow(chunk.? + @intCast(usize, row) * width, plane + @intCast(usize, y + row - top) * width, width, spans.?, value)
+                row += 1
+            }
+            if !store(target, geom.rect(work.x, y, work.width, count), chunk.?, width) { whole = false }
+            y += count
+        }
+        y0 += rows
+    }
+    return whole
+}
+
+fn spread(target: *Device, pixels: i32, selecting: bool, inside: Rect) -> bool {
+    if pixels <= 0 { return true }
+    const radius = smaller(pixels, LARGEST_RADIUS)
+    const changed = device_module.exactBounds(target)
+    if geom.isEmpty(changed) { return true }
+    // Where amounts can change, and with it every seed that matters:
+    // around what differs from the default by the radius, when the seeds
+    // are found only there; by one pixel, when the default itself is a
+    // seed and all that differs lies where seeds count (then a seed
+    // farther out has one of that ring between it and every pixel that
+    // can change, no farther from the pixel than it; a pixel outside
+    // `inside` can have its nearest seed beyond the ring).
+    const seeded = selecting == ((target.*.defaultPixel & 255) >= HALF) && geom.same(geom.intersect(changed, inside), changed)
+    const work = geom.grown(changed, if seeded { 1 } else { radius })
+    const before = device_module.copy(target)
+    if before == null { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const done = spreadBands(target, before.?, work, radius, selecting, inside, pool)
+    scratch.release(pool, mark)
+    device_module.destroy(before.?)
+    return done
+}
+
+// What is selected reaches `pixels` farther (at most LARGEST_RADIUS; 0
+// or less: nothing happens): every pixel within that distance of one
+// selected by half or more becomes selected wholly, nothing else changes.
+// The distance is the exact one between pixel centres (a round
+// structuring element: one pixel grows into the disc of all pixels whose
+// centres are within the radius, a straight edge moves by exactly
+// `pixels`), found from each column's nearest selected row, in time that
+// does not depend on the radius. The new edge is hard. False without
+// memory.
+pub fn grow(target: *Device, pixels: i32) -> bool {
+    return spread(target, pixels, true, everywhere())
+}
+
+// What is selected draws back by `pixels`, the opposite of grow(): every
+// pixel within that distance of one selected by less than half is
+// selected no more, nothing else changes. `area` is the image's
+// rectangle. `from_border` says whether its edge counts as an edge of the
+// selection: with it, what is selected draws back from the image's edge
+// too; without it, a selection that goes up to the image's edge stays
+// there (what is outside the image counts as selected then). False
+// without memory.
+pub fn shrink(target: *Device, pixels: i32, area: Rect, from_border: bool) -> bool {
+    if from_border { return spread(target, pixels, false, everywhere()) }
+    return spread(target, pixels, false, sane(area))
+}
+
+// Only a band along the outline stays selected: `width` pixels to each
+// side of it (2 * width in all, as Krita's border; at most
+// LARGEST_RADIUS; 0 or less: nothing happens). It is what grow() by the
+// width adds and what shrink() by it takes, of the mask sharpen()ed: all
+// or nothing, on a mask whose default is nothing. False without memory.
+pub fn border(target: *Device, width: i32) -> bool {
+    if width <= 0 { return true }
+    const outer = device_module.copy(target)
+    if outer == null { return false }
+    var done = sharpen(outer.?)
+    if done {
+        const inner = device_module.copy(outer.?)
+        done = inner != null
+        if done { done = grow(outer.?, width) }
+        if done { done = spread(inner.?, width, false, everywhere()) }
+        if done { done = combine(outer.?, inner.?, SUBTRACT) }
+        if inner != null { device_module.destroy(inner.?) }
+    }
+    if done { done = device_module.assign(target, outer.?) }
+    device_module.destroy(outer.?)
+    return done
+}
+
+// Jagged edges softened: every amount becomes the mean of itself and its
+// eight neighbours (rounded), as Krita's smooth. A pixel that stuck out
+// alone, or a corner, falls below half and out of the outline; a straight
+// hard edge becomes one of a third and two thirds. False without memory.
+pub fn smooth(target: *Device) -> bool {
+    const changed = device_module.exactBounds(target)
+    if geom.isEmpty(changed) { return true }
+    const work = geom.grown(changed, 1)
+    const before = device_module.copy(target)
+    if before == null { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const width = @intCast(usize, work.width)
+    const stride = width + 2
+    const source = scratch.bytes(pool, 66 * stride)
+    const result = scratch.bytes(pool, 64 * width)
+    const columns = scratch.words(pool, stride)
+    var whole = source != null && result != null && columns != null
+    if whole {
+        const threes = columns.?
+        const bottom = work.y + work.height
+        var y = work.y
+        while y < bottom && whole {
+            const count = smaller(64, bottom - y)
+            mask_module.readBytes(before.?, geom.rect(work.x - 1, y - 1, work.width + 2, count + 2), source.?, stride)
+            var row: usize = 0
+            while row < @intCast(usize, count) {
+                const above = source.? + row * stride
+                const line = above + stride
+                const below = line + stride
+                const into = result.? + row * width
+                // Each column's three first, then three of those.
+                var x: usize = 0
+                while x < stride {
+                    threes[x] = @intCast(u32, above[x]) + @intCast(u32, line[x]) + @intCast(u32, below[x])
+                    x += 1
+                }
+                x = 0
+                while x < width {
+                    // (sum + 4) / 9 as (sum + 4) * 58255 >> 19: the same
+                    // for every sum up to 9 * 255 + 4.
+                    into[x] = @intCast(u8, ((threes[x] + threes[x + 1] + threes[x + 2] + 4) * 58255) >> 19)
+                    x += 1
+                }
+                row += 1
+            }
+            if !store(target, geom.rect(work.x, y, work.width, count), result.?, width) { whole = false }
+            y += count
+        }
+    }
+    scratch.release(pool, mark)
+    device_module.destroy(before.?)
+    return whole
+}
+
+// Every amount becomes all (from half on) or nothing: a hard edge where
+// the outline runs. False without memory.
+pub fn sharpen(target: *Device) -> bool {
+    var keys = std.ArrayList(u64).init(target.*.allocator)
+    defer keys.deinit()
+    if !device_module.keys(target, &keys) { return false }
+    var whole = true
+    for key in keys.items() {
+        const tx = device_module.keyX(key)
+        const ty = device_module.keyY(key)
+        const held = device_module.tileRead(target, tx, ty)
+        if held != null {
+            var soft = false
+            var index: usize = 0
+            while index < TILE_PIXELS && !soft {
+                const value = held.?[index]
+                soft = value != mask_module.NOTHING && value != mask_module.ALL
+                index += 1
+            }
+            if soft {
+                const made = device_module.tileWrite(target, tx, ty)
+                if made == null {
+                    whole = false
+                } else {
+                    const out = made.?
+                    index = 0
+                    while index < TILE_PIXELS {
+                        out[index] = if (out[index] & 255) >= HALF { mask_module.ALL } else { mask_module.NOTHING }
+                        index += 1
+                    }
+                }
+            }
+        }
+    }
+    const blank = target.*.defaultPixel
+    if blank != mask_module.NOTHING && blank != mask_module.ALL {
+        device_module.setDefault(target, if (blank & 255) >= HALF { mask_module.ALL } else { mask_module.NOTHING })
+    }
+    return whole
+}
+
+// ---------------------------------------------------------------------------
+// Asking
+//
+// (The amount at one place is mask.at.)
+
+// The rectangle around every amount above nothing (empty: there is
+// none). Of a mask whose default is more than nothing
+// (mask.reachesEverywhere) this is only what its tiles hold.
+pub fn bounds(target: *Device) -> Rect {
+    var keys = std.ArrayList(u64).init(target.*.allocator)
+    defer keys.deinit()
+    // Without memory for the list: around all tiles, which is never too
+    // small.
+    if !device_module.keys(target, &keys) { return device_module.extent(target) }
+    var any = false
+    var x0: i32 = 0
+    var y0: i32 = 0
+    var x1: i32 = 0
+    var y1: i32 = 0
+    for key in keys.items() {
+        const left = device_module.keyX(key) * TILE
+        const top = device_module.keyY(key) * TILE
+        const held = device_module.tileRead(target, device_module.keyX(key), device_module.keyY(key))
+        // A tile inside what is known already adds nothing.
+        const known = any && left >= x0 && top >= y0 && left + TILE - 1 <= x1 && top + TILE - 1 <= y1
+        if held != null && !known {
+            const pixels = held.?
+            var row: i32 = 0
+            while row < TILE {
+                var column: i32 = 0
+                while column < TILE {
+                    if pixels[@intCast(usize, (row << 6) | column)] & 255 != 0 {
+                        const x = left + column
+                        const y = top + row
+                        if !any {
+                            x0 = x
+                            x1 = x
+                            y0 = y
+                            y1 = y
+                            any = true
+                        } else {
+                            if x < x0 { x0 = x }
+                            if x > x1 { x1 = x }
+                            if y < y0 { y0 = y }
+                            if y > y1 { y1 = y }
+                        }
+                    }
+                    column += 1
+                }
+                row += 1
+            }
+        }
+    }
+    if !any { return geom.empty() }
+    return geom.rect(x0 + target.*.x, y0 + target.*.y, x1 - x0 + 1, y1 - y0 + 1)
+}
+
+// Whether nothing is selected anywhere.
+pub fn isEmpty(target: *Device) -> bool {
+    return !mask_module.reachesEverywhere(target) && geom.isEmpty(bounds(target))
+}
+
+// Whether what is selected is exactly one rectangle, all of it wholly
+// selected: then `into` is that rectangle (tools take the short way with
+// it). False for nothing and for a mask whose default is not nothing.
+pub fn isRectangle(target: *Device, into: *Rect) -> bool {
+    if mask_module.reachesEverywhere(target) { return false }
+    const around = bounds(target)
+    if geom.isEmpty(around) { return false }
+    const left = around.x - target.*.x
+    const top = around.y - target.*.y
+    const right = left + around.width
+    const bottom = top + around.height
+    var ty = top >> 6
+    while ty <= (bottom - 1) >> 6 {
+        const row0 = larger(top, ty * TILE)
+        const row1 = smaller(bottom, ty * TILE + TILE)
+        var tx = left >> 6
+        while tx <= (right - 1) >> 6 {
+            const held = device_module.tileRead(target, tx, ty)
+            if held == null { return false }
+            const col0 = larger(left, tx * TILE)
+            const span = @intCast(usize, smaller(right, tx * TILE + TILE) - col0)
+            var row = row0
+            while row < row1 {
+                const words = held.? + @intCast(usize, ((row & 63) << 6) | (col0 & 63))
+                var index: usize = 0
+                while index < span {
+                    if words[index] & 255 != 255 { return false }
+                    index += 1
+                }
+                row += 1
+            }
+            tx += 1
+        }
+        ty += 1
+    }
+    into.* = around
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The outline (what the canvas draws as marching ants)
+
+// One line of pixel corners looked at: the level edges on line `y`
+// between the rows `above` and `row` of amounts (each `width` + 2 bytes,
+// the first for the column left of `left`), and, unless `last`, the
+// upright edges of `row`. An edge lies between a pixel inside the
+// outline and one outside; neighbouring edges that have the inside on
+// the same side are one segment. `open` holds for each upright line the
+// segment that ended on this line of corners (twice its number in
+// `into`, plus one when the inside is to its right; -1: none).
+fn outlineLine(above: [*]const u8, row: [*]const u8, left: i32, y: i32, width: usize, last: bool, open: [*]i32, into: *std.ArrayList(Segment)) -> bool {
+    // The level segment being drawn out, and where its inside is (1:
+    // below, 2: above, 0: there is none).
+    var run: usize = 0
+    var side: u32 = 0
+    var index: usize = 0
+    while index <= width {
+        const x = left + @intCast(i32, index)
+        const here = @intCast(u32, row[index + 1]) >= HALF
+        if index < width {
+            const over = @intCast(u32, above[index + 1]) >= HALF
+            const now: u32 = if here == over { 0 } else if here { 1 } else { 2 }
+            if now != 0 && now == side {
+                into.items()[run].x1 = x + 1
+            } else if now != 0 {
+                run = into.count()
+                if !into.append(Segment.{ .x0 = x, .y0 = y, .x1 = x + 1, .y1 = y }) { return false }
+            }
+            side = now
+        }
+        if !last {
+            const before = @intCast(u32, row[index]) >= HALF
+            if here == before {
+                open[index] = -1
+            } else {
+                const right: i32 = if here { 1 } else { 0 }
+                const held = open[index]
+                if held >= 0 && (held & 1) == right {
+                    into.items()[@intCast(usize, held >> 1)].y1 = y + 1
+                } else {
+                    const number = into.count()
+                    if number >= 1073741823 || !into.append(Segment.{ .x0 = x, .y0 = y, .x1 = x, .y1 = y + 1 }) { return false }
+                    open[index] = (@intCast(i32, number) << 1) | right
+                }
+            }
+        }
+        index += 1
+    }
+    return true
+}
+
+// The outline of what is selected inside `area` (the image's rectangle,
+// or the part of it that is on screen), added to `into`: the edges
+// between pixels selected by half or more and pixels selected by less,
+// each run of them a Segment from pixel corner to pixel corner. Edges on
+// the rim of `area` count when the pixels on their two sides differ (the
+// pixel outside is looked at), so the outline of all the image is its
+// rim and the outline of a selection larger than `area` is only cut
+// there, not closed. A run ends where the inside changes sides, so where
+// two selected pixels touch only at a corner the four edges that meet
+// there stay four. The order is by y0, then x0, a level segment before
+// an upright one from the same corner. False without memory (`into`
+// then holds a part).
+pub fn outline(target: *Device, area: Rect, into: *std.ArrayList(Segment)) -> bool {
+    // Outside what its tiles cover the mask is one amount: no edges.
+    const work = geom.intersect(sane(area), geom.grown(device_module.extent(target), 1))
+    if geom.isEmpty(work) { return true }
+    const width = @intCast(usize, work.width)
+    const stride = width + 2
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const rows = scratch.bytes(pool, 65 * stride)
+    const open = scratch.ints(pool, width + 1)
+    if rows == null || open == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    var index: usize = 0
+    while index <= width {
+        open.?[index] = -1
+        index += 1
+    }
+    var whole = true
+    const bottom = work.y + work.height
+    // Lines of corners y .. y + count, between the rows y - 1 .. y + count.
+    var y = work.y
+    while y <= bottom && whole {
+        const count = smaller(64, bottom + 1 - y)
+        const band = geom.rect(work.x - 1, y - 1, work.width + 2, count + 1)
+        if device_module.touches(target, band) {
+            mask_module.readBytes(target, band, rows.?, stride)
+            var line: i32 = 0
+            while line < count && whole {
+                const above = rows.? + @intCast(usize, line) * stride
+                whole = outlineLine(above, above + stride, work.x, y + line, width, y + line == bottom, open.?, into)
+                line += 1
+            }
+        } else {
+            // All one amount: no edge here, and none goes on below.
+            index = 0
+            while index <= width {
+                open.?[index] = -1
+                index += 1
+            }
+        }
+        y += count
+    }
+    scratch.release(pool, mark)
+    return whole
+}
+
+// ---------------------------------------------------------------------------
+// Applying a selection to pixels (cut, copy, clear, fill)
+
+// The part of `area` a selection can be anything in: all of it for no
+// selection and for one whose default is more than nothing, else no more
+// than its tiles cover (filling a small selection in a large image looks
+// at few tiles).
+fn selectedArea(selection: ?*Device, area: Rect) -> Rect {
+    if selection == null { return sane(area) }
+    if selection.?.*.defaultPixel & 255 != 0 { return sane(area) }
+    return geom.intersect(sane(area), device_module.extent(selection.?))
+}
+
+// The selection's amounts over `part` (inside one tile) at `bytes`, 64 a
+// row from the part's corner; no selection: all.
+fn selected(selection: ?*Device, part: Rect, bytes: [*]u8) -> void {
+    if selection == null {
+        std.mem.set(bytes, 255, TILE_PIXELS)
+    } else if !device_module.touches(selection.?, part) {
+        std.mem.set(bytes, @intCast(u8, selection.?.*.defaultPixel & 255), TILE_PIXELS)
+    } else {
+        mask_module.readBytes(selection.?, part, bytes, 64)
+    }
+}
+
+const NONE: u8 = 0
+const SOME: u8 = 1
+const WHOLE: u8 = 2
+
+// What the amounts over a part of `rows` rows of `count` are together:
+// nothing anywhere (NONE), all everywhere (WHOLE), or neither.
+fn coverage(bytes: [*]const u8, rows: usize, count: usize) -> u8 {
+    const first = bytes[0]
+    if first != 0 && first != 255 { return SOME }
+    var row: usize = 0
+    while row < rows {
+        const cover = bytes + row * 64
+        var index: usize = 0
+        while index < count {
+            if cover[index] != first { return SOME }
+            index += 1
+        }
+        row += 1
+    }
+    return if first == 0 { NONE } else { WHOLE }
+}
+
+// A pixel with its alpha times `amount` (transparent black when nothing
+// is left of it).
+fn faded(value: u32, amount: u32) -> u32 {
+    if amount == 255 { return value }
+    const alpha = pixel.mul(value >> 24, amount)
+    return if alpha == 0 { 0 } else { (value & 0x00FFFFFF) | (alpha << 24) }
+}
+
+fn clearTile(layer: *Device, selection: ?*Device, work: Rect, tx: i32, ty: i32, bytes: [*]u8) -> bool {
+    const held = device_module.tileRead(layer, tx, ty)
+    // Nothing there to take away.
+    if held == null && layer.*.defaultPixel >> 24 == 0 { return true }
+    const place = device_module.tileArea(layer, tx, ty)
+    const part = geom.intersect(place, work)
+    if geom.isEmpty(part) { return true }
+    selected(selection, part, bytes)
+    const first = @intCast(usize, ((part.y - place.y) << 6) | (part.x - place.x))
+    const count = @intCast(usize, part.width)
+    const rows = @intCast(usize, part.height)
+    // The tile is written (and with that made the layer's own, and part
+    // of the change) only when a pixel loses something: its alpha, or
+    // the colour a transparent pixel still held (as pixel.eraseSpan
+    // leaves nothing of a pixel without alpha).
+    var loses = false
+    if held == null {
+        loses = coverage(bytes, rows, count) != NONE
+    } else {
+        var row: usize = 0
+        while row < rows && !loses {
+            const words = held.? + (first + row * 64)
+            const cover = bytes + row * 64
+            var index: usize = 0
+            while index < count && !loses {
+                loses = cover[index] != 0 && words[index] != 0
+                index += 1
+            }
+            row += 1
+        }
+    }
+    if !loses { return true }
+    const made = device_module.tileWrite(layer, tx, ty)
+    if made == null { return false }
+    var row: usize = 0
+    while row < rows {
+        pixel.eraseSpan(made.? + (first + row * 64), bytes + row * 64, count, 255)
+        row += 1
+    }
+    return true
+}
+
+// Where clearing `area` of a layer can change it, and where there is
+// anything of it to copy: where something is selected, and a layer that
+// is transparent where it has no tile has nothing there.
+fn workOf(layer: *Device, selection: ?*Device, area: Rect) -> Rect {
+    if layer.*.defaultPixel >> 24 == 0 { return geom.intersect(selectedArea(selection, area), device_module.extent(layer)) }
+    return selectedArea(selection, area)
+}
+
+// What is selected is taken out of the layer inside `area`: every
+// pixel's alpha times what the selection leaves of it (one minus its
+// amount; no selection: nothing is left). Tiles in which no pixel loses
+// anything are not written. False without memory.
+pub fn clearSelected(layer: *Device, selection: ?*Device, area: Rect) -> bool {
+    const work = workOf(layer, selection, area)
+    if geom.isEmpty(work) { return true }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const bytes = scratch.bytes(pool, TILE_PIXELS)
+    if bytes == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    var whole = true
+    const tx1 = (work.x + work.width - 1 - layer.*.x) >> 6
+    const ty1 = (work.y + work.height - 1 - layer.*.y) >> 6
+    var ty = (work.y - layer.*.y) >> 6
+    while ty <= ty1 && whole {
+        var tx = (work.x - layer.*.x) >> 6
+        while tx <= tx1 && whole {
+            whole = clearTile(layer, selection, work, tx, ty, bytes.?)
+            tx += 1
+        }
+        ty += 1
+    }
+    scratch.release(pool, mark)
+    return whole
+}
+
+// Tile (tx, ty) of the copy `out` (which still shares it with the
+// source) cut down to what is selected inside `work`. `blank` is what
+// the source holds where it has no tile.
+fn copyTile(out: *Device, selection: ?*Device, work: Rect, blank: u32, tx: i32, ty: i32, bytes: [*]u8) -> bool {
+    const held = device_module.tileRead(out, tx, ty)
+    if held == null && blank >> 24 == 0 { return true }
+    const place = device_module.tileArea(out, tx, ty)
+    const part = geom.intersect(place, work)
+    selected(selection, part, bytes)
+    const first = @intCast(usize, ((part.y - place.y) << 6) | (part.x - place.x))
+    const count = @intCast(usize, part.width)
+    const rows = @intCast(usize, part.height)
+    const covered = coverage(bytes, rows, count)
+    // What a whole tile wholly selected holds is what the source holds:
+    // it stays shared.
+    if held != null && covered == WHOLE && part.width == TILE && part.height == TILE { return true }
+    if covered == NONE {
+        if held != null { device_module.dropTile(out, tx, ty) }
+        return true
+    }
+    const made = device_module.tileWrite(out, tx, ty)
+    if made == null { return false }
+    const pixels = made.?
+    if held == null {
+        // A tile made just now, transparent all over: the source's
+        // default goes where the selection says.
+        var row: usize = 0
+        while row < rows {
+            const cover = bytes + row * 64
+            const words = pixels + (first + row * 64)
+            var index: usize = 0
+            while index < count {
+                words[index] = faded(blank, @intCast(u32, cover[index]))
+                index += 1
+            }
+            row += 1
+        }
+        return true
+    }
+    // The source's pixels: nothing of them outside the part, and inside
+    // it as much as is selected.
+    const top = @intCast(usize, part.y - place.y)
+    const left = @intCast(usize, part.x - place.x)
+    var row: usize = 0
+    while row < 64 {
+        const words = pixels + row * 64
+        if row < top || row >= top + rows {
+            device_module.fillWords(words, 64, 0)
+        } else {
+            const cover = bytes + (row - top) * 64
+            device_module.fillWords(words, left, 0)
+            device_module.fillWords(words + (left + count), 64 - left - count, 0)
+            var index: usize = 0
+            while index < count {
+                words[left + index] = faded(words[left + index], @intCast(u32, cover[index]))
+                index += 1
+            }
+        }
+        row += 1
+    }
+    return true
+}
+
+// A new device (the caller's, to end with device.destroy) holding the
+// pixels of `source` inside `area` as far as they are selected: each
+// pixel's alpha times the selection's amount (null: all of `area`),
+// transparent everywhere else, at the place the source sits at. Tiles
+// that are selected wholly are shared with the source, not copied. Null
+// without memory.
+pub fn copySelected(source: *Device, selection: ?*Device, area: Rect) -> ?*Device {
+    const copied = device_module.copy(source)
+    if copied == null { return null }
+    const out = copied.?
+    const work = workOf(source, selection, area)
+    const blank = source.*.defaultPixel
+    device_module.setDefault(out, 0)
+    var whole = true
+    // What lies outside the area (or where nothing can be selected)
+    // goes; what lies across its edge or is selected in part is cut
+    // down.
+    var keys = std.ArrayList(u64).init(source.*.allocator)
+    defer keys.deinit()
+    if !device_module.keys(out, &keys) { whole = false }
+    for key in keys.items() {
+        const tx = device_module.keyX(key)
+        const ty = device_module.keyY(key)
+        if geom.isEmpty(geom.intersect(device_module.tileArea(out, tx, ty), work)) { device_module.dropTile(out, tx, ty) }
+    }
+    if whole && !geom.isEmpty(work) {
+        const pool = scratch.common()
+        const mark = scratch.mark(pool)
+        const bytes = scratch.bytes(pool, TILE_PIXELS)
+        if bytes == null {
+            whole = false
+        } else {
+            const tx1 = (work.x + work.width - 1 - out.*.x) >> 6
+            const ty1 = (work.y + work.height - 1 - out.*.y) >> 6
+            var ty = (work.y - out.*.y) >> 6
+            while ty <= ty1 && whole {
+                var tx = (work.x - out.*.x) >> 6
+                while tx <= tx1 && whole {
+                    whole = copyTile(out, selection, work, blank, tx, ty, bytes.?)
+                    tx += 1
+                }
+                ty += 1
+            }
+        }
+        scratch.release(pool, mark)
+    }
+    if !whole {
+        device_module.destroy(out)
+        return null
+    }
+    return out
+}
+
+fn fillTile(layer: *Device, selection: ?*Device, work: Rect, span: [*]const u32, mode: u16, opacity: u32, tx: i32, ty: i32, bytes: [*]u8) -> bool {
+    const place = device_module.tileArea(layer, tx, ty)
+    const part = geom.intersect(place, work)
+    selected(selection, part, bytes)
+    const count = @intCast(usize, part.width)
+    const rows = @intCast(usize, part.height)
+    // No tile is made where nothing is selected.
+    const covered = coverage(bytes, rows, count)
+    if covered == NONE { return true }
+    const made = device_module.tileWrite(layer, tx, ty)
+    if made == null { return false }
+    const first = @intCast(usize, ((part.y - place.y) << 6) | (part.x - place.x))
+    var row: usize = 0
+    while row < rows {
+        const under = made.? + (first + row * 64)
+        // Each span with its own first seed: Dissolve falls as in the
+        // rest of the image, not the same in every row.
+        const seed = blend.seedAt(part.x, part.y + @intCast(i32, row))
+        if covered == WHOLE {
+            blend.compositeSpanAt(mode, under, span, count, opacity, null, 0, seed)
+        } else {
+            const cover: [*]const u8 = bytes + row * 64
+            blend.compositeSpanAt(mode, under, span, count, opacity, cover, 0, seed)
+        }
+        row += 1
+    }
+    return true
+}
+
+// `color` put on the layer inside `area` where it is selected: mixed in
+// with the blend mode `mode` (core/blend.mlx) at `opacity` (0-255) times
+// the selection's amount (null: all of `area` alike). False without
+// memory.
+pub fn fillSelected(layer: *Device, selection: ?*Device, area: Rect, color: u32, mode: u16, opacity: u32) -> bool {
+    const work = selectedArea(selection, area)
+    if geom.isEmpty(work) || opacity == 0 { return true }
+    // A colour without alpha leaves every pixel as it is (but in the few
+    // modes that act where the source is transparent): no tile is made
+    // the layer's own for it, and no change holds one.
+    if color >> 24 == 0 && !blend.affectsWithoutSource(mode) { return true }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const bytes = scratch.bytes(pool, TILE_PIXELS)
+    const span = scratch.words(pool, 64)
+    if bytes == null || span == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    device_module.fillWords(span.?, 64, color)
+    var whole = true
+    const tx1 = (work.x + work.width - 1 - layer.*.x) >> 6
+    const ty1 = (work.y + work.height - 1 - layer.*.y) >> 6
+    var ty = (work.y - layer.*.y) >> 6
+    while ty <= ty1 && whole {
+        var tx = (work.x - layer.*.x) >> 6
+        while tx <= tx1 && whole {
+            whole = fillTile(layer, selection, work, span.?, mode, pixel.smaller(opacity, 255), tx, ty, bytes.?)
+            tx += 1
+        }
+        ty += 1
+    }
+    scratch.release(pool, mark)
+    return whole
+}

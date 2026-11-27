@@ -53,7 +53,10 @@ from the code:
   (program headers immediately follow the 64-byte ELF header), and
   `e_shoff` computed after code/rodata/`.shstrtab` are laid out.
 - **Program headers:** always one `PT_LOAD` segment covering `.text`
-  (`PF_R | PF_X`; the string literals live in the code); a second `PT_LOAD`
+  (`PF_R | PF_X`; the string literals live in the code, and the images of
+  the module-level constant tables before them, with the addresses some
+  of their words hold written in by `encoder.fillCodeAddresses`:
+  [ABI, Globals](abi.md#globals)); a second `PT_LOAD`
   segment for `.data` (`PF_R | PF_W`), on the page after the code, is added
   only when the program has a data area (module-level `var` globals, see
   [Globals](#globals) below): `elf64.dataOffsetAfterCode` names its place
@@ -125,7 +128,10 @@ adds three sections to it:
 - `.symtab` and `.strtab`: every function named where it is declared,
   `path:line:name` (the module's path as the compiler loaded it, the line
   of the function's name), next to the runtime's own `_start` and
-  `__mlx_*` routines. `nm`, `gdb` and `perf` show these names.
+  `__mlx_*` routines, and one symbol where the constant tables' images
+  start (`__mlx_constant_tables`) and one where the string literals do
+  (`__mlx_string_literals`), so that the last function takes in neither.
+  `nm`, `gdb` and `perf` show these names.
 - `.mlx_lines`: where the machine code of each source line starts. It is
   `"MLXLINES"`, the number of entries and of files (u32 each), then per
   entry the code offset from `.text`, the file and the line (u32 each,

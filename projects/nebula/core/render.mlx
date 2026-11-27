@@ -1,0 +1,269 @@
+// nebula core: what an image shows: its layers mixed from the lowest to
+// the topmost into image.projection.
+//
+//     image_module.damage(image, area)        // something changed there
+//     const drawn = render.update(image)      // the projection is right again
+//
+// update() goes over the stale part in blocks; for each it starts from
+// nothing and lets every shown layer of the root add itself in its blend
+// mode at its opacity (core/blend.mlx):
+//
+//   a paint layer    its pixels (or its `substitute`), its `overlay`
+//                    painted over them, then its masks
+//   a group          its children mixed the same way on their own, then
+//                    its masks (a pass-through group: its children mixed
+//                    straight into what is below)
+//   a fill layer     what its generator makes
+//   a filter layer   what is below it in its group, filtered, where its
+//                    mask says
+//   a clone          what the node it names shows, moved
+//
+// A transparency mask takes its layer's alpha down to its amounts; a
+// filter mask filters its layer where its amounts say. A layer that
+// inherits alpha shows only where what is below it in its group shows.
+//
+// A filter that reads around a pixel (a blur) needs the pixels around a
+// block: each block is mixed with a margin as wide as all such filters of
+// the image reach together, and what is stale grows by it too.
+const std = @import("std")
+const device_module = @import("./device.mlx")
+const mask_module = @import("./mask.mlx")
+const node_module = @import("./node.mlx")
+const image_module = @import("./image.mlx")
+const geom = @import("./geom.mlx")
+const pixel = @import("./pixel.mlx")
+const blend = @import("./blend.mlx")
+const scratch = @import("./scratch.mlx")
+const filters = @import("../filters/registry.mlx")
+const generators = @import("../generators/registry.mlx")
+
+pub const Image = image_module.Image
+pub const Node = node_module.Node
+pub const Rect = geom.Rect
+
+const BLOCK: i32 = 256
+// Clones of clones this deep show nothing (a ring of them would never end).
+const DEEPEST: usize = 24
+
+// How far the image's filters read around a pixel, all together.
+pub fn margin(node: *Node) -> i32 {
+    var total: i32 = 0
+    for child in node.*.children.items() {
+        if !child.*.visible { continue }
+        if child.*.kind == node_module.FILTER || child.*.kind == node_module.FILTER_MASK {
+            total += filters.margin(&child.*.params)
+        }
+        total += margin(child)
+    }
+    return total
+}
+
+fn hasMasks(node: *Node) -> bool {
+    for child in node.*.children.items() {
+        if node_module.isMask(child.*.kind) && child.*.visible { return true }
+    }
+    return false
+}
+
+// The masks of `node` applied to its `width` x `height` pixels of `area`.
+fn applyMasks(image: *Image, node: *Node, area: Rect, layer: [*]u32, pool: *scratch.Pool) -> void {
+    const width = @intCast(usize, area.width)
+    const count = width * @intCast(usize, area.height)
+    for child in node.*.children.items() {
+        if !node_module.isMask(child.*.kind) || !child.*.visible || child.*.device == null { continue }
+        if child.*.kind != node_module.TRANSPARENCY_MASK && child.*.kind != node_module.FILTER_MASK { continue }
+        const mark = scratch.mark(pool)
+        const amounts = scratch.bytes(pool, count)
+        if amounts == null {
+            scratch.release(pool, mark)
+            continue
+        }
+        mask_module.readBytes(child.*.device.?, area, amounts.?, width)
+        if child.*.kind == node_module.TRANSPARENCY_MASK {
+            var index: usize = 0
+            while index < count {
+                const amount = @intCast(u32, amounts.?[index])
+                if amount != 255 {
+                    const a = pixel.mul(layer[index] >> 24, amount)
+                    layer[index] = if a == 0 { 0 } else { (layer[index] & 0x00FFFFFF) | (a << 24) }
+                }
+                index += 1
+            }
+        } else {
+            const filtered = scratch.words(pool, count)
+            if filtered != null {
+                device_module.copyWords(filtered.?, layer, count)
+                if filters.apply(&child.*.params, filtered.?, width, @intCast(usize, area.height), width) {
+                    var index: usize = 0
+                    while index < count {
+                        const amount = @intCast(u32, amounts.?[index])
+                        if amount != 0 { layer[index] = pixel.mix(layer[index], filtered.?[index], amount) }
+                        index += 1
+                    }
+                }
+            }
+        }
+        scratch.release(pool, mark)
+    }
+}
+
+// What `node` shows in `area` (its own pixels, overlay and masks; not its
+// opacity and blend mode) into `layer`, area.width words a row. False:
+// nothing at all (`layer` is not written then).
+pub fn content(image: *Image, node: *Node, area: Rect, layer: [*]u32, pool: *scratch.Pool, depth: usize) -> bool {
+    const width = @intCast(usize, area.width)
+    const height = @intCast(usize, area.height)
+    const count = width * height
+    const kind = node.*.kind
+    if depth > DEEPEST { return false }
+    if kind == node_module.GROUP {
+        device_module.fillWords(layer, count, 0)
+        children(image, node, area, layer, pool, depth + 1)
+    } else if kind == node_module.FILL {
+        _ = generators.render(&node.*.params, area, layer, width, image.*.width, image.*.height)
+    } else if kind == node_module.CLONE {
+        const source = node_module.find(image.*.root, node.*.cloneOf)
+        if source == null || node_module.isMask(source.?.*.kind) || source.?.*.kind == node_module.FILTER { return false }
+        var dx: i32 = 0
+        var dy: i32 = 0
+        if node.*.device != null {
+            dx = node.*.device.?.*.x
+            dy = node.*.device.?.*.y
+        }
+        if !content(image, source.?, geom.moved(area, -dx, -dy), layer, pool, depth + 1) { return false }
+    } else if kind == node_module.FILTER || node_module.isMask(kind) {
+        return false
+    } else {
+        var source = node.*.device
+        if node.*.substitute != null { source = node.*.substitute }
+        if source == null { return false }
+        const painted = node.*.overlay != null && device_module.touches(node.*.overlay.?, area)
+        if !painted && source.?.*.defaultPixel == 0 && !device_module.touches(source.?, area) { return false }
+        device_module.readRect(source.?, area, layer, width)
+        if painted {
+            const mark = scratch.mark(pool)
+            const over = scratch.words(pool, count)
+            var amounts: ?[*]u8 = null
+            if node.*.overlayMasked && image.*.selected {
+                amounts = scratch.bytes(pool, count)
+                if amounts != null { mask_module.readBytes(image.*.selection, area, amounts.?, width) }
+            }
+            if over != null {
+                device_module.readRect(node.*.overlay.?, area, over.?, width)
+                const flags: u32 = if node.*.alphaLocked { blend.FLAG_ALPHA_LOCK } else { 0 }
+                var row: usize = 0
+                while row < height {
+                    var line: ?[*]const u8 = null
+                    if amounts != null { line = amounts.? + row * width }
+                    blend.compositeSpan(node.*.overlayBlend, layer + row * width, over.? + row * width, width, @intCast(u32, node.*.overlayOpacity), line, flags)
+                    row += 1
+                }
+            }
+            scratch.release(pool, mark)
+        }
+    }
+    applyMasks(image, node, area, layer, pool)
+    return true
+}
+
+// The children of `group` mixed over the `area` of `into` (area.width
+// words a row), the lowest first.
+pub fn children(image: *Image, group: *Node, area: Rect, into: [*]u32, pool: *scratch.Pool, depth: usize) -> void {
+    const width = @intCast(usize, area.width)
+    const height = @intCast(usize, area.height)
+    const count = width * height
+    for child in group.*.children.items() {
+        const kind = child.*.kind
+        if node_module.isMask(kind) || !child.*.visible || child.*.opacity == 0 { continue }
+        if kind == node_module.GROUP && child.*.passThrough && !hasMasks(child) {
+            children(image, child, area, into, pool, depth + 1)
+            continue
+        }
+        const mark = scratch.mark(pool)
+        const layer = scratch.words(pool, count)
+        if layer == null {
+            scratch.release(pool, mark)
+            continue
+        }
+        const opacity = @intCast(u32, child.*.opacity)
+        if kind == node_module.FILTER {
+            // What is below, filtered, where the layer's mask says.
+            device_module.copyWords(layer.?, into, count)
+            const amounts = scratch.bytes(pool, count)
+            if amounts != null && child.*.device != null && filters.apply(&child.*.params, layer.?, width, height, width) {
+                mask_module.readBytes(child.*.device.?, area, amounts.?, width)
+                if child.*.blend == blend.NORMAL {
+                    var index: usize = 0
+                    while index < count {
+                        const amount = pixel.mul(@intCast(u32, amounts.?[index]), opacity)
+                        if amount != 0 { into[index] = pixel.mix(into[index], layer.?[index], amount) }
+                        index += 1
+                    }
+                } else {
+                    var row: usize = 0
+                    while row < height {
+                        blend.compositeSpan(child.*.blend, into + row * width, layer.? + row * width, width, opacity, amounts.? + row * width, blend.FLAG_ALPHA_LOCK)
+                        row += 1
+                    }
+                }
+            }
+        } else if content(image, child, area, layer.?, pool, depth) {
+            const flags: u32 = if child.*.inheritAlpha { blend.FLAG_ALPHA_LOCK } else { 0 }
+            var row: usize = 0
+            while row < height {
+                blend.compositeSpan(child.*.blend, into + row * width, layer.? + row * width, width, opacity, null, flags)
+                row += 1
+            }
+        }
+        scratch.release(pool, mark)
+    }
+}
+
+// Brings the projection up to date where the image is stale. The image's
+// rectangle that was drawn again (empty: nothing was stale).
+pub fn update(image: *Image) -> Rect {
+    if geom.isEmpty(image.*.dirty) { return geom.empty() }
+    const reach = margin(image.*.root)
+    const area = geom.intersect(geom.grown(image.*.dirty, reach), image_module.bounds(image))
+    image.*.dirty = geom.empty()
+    if geom.isEmpty(area) { return area }
+    const pool = scratch.common()
+    var y = area.y
+    while y < geom.bottom(area) {
+        const height = if geom.bottom(area) - y < BLOCK { geom.bottom(area) - y } else { BLOCK }
+        var x = area.x
+        while x < geom.right(area) {
+            const width = if geom.right(area) - x < BLOCK { geom.right(area) - x } else { BLOCK }
+            const block = geom.rect(x, y, width, height)
+            const wide = geom.grown(block, reach)
+            const stride = @intCast(usize, wide.width)
+            const count = stride * @intCast(usize, wide.height)
+            const mark = scratch.mark(pool)
+            const buffer = scratch.words(pool, count)
+            if buffer != null {
+                device_module.fillWords(buffer.?, count, 0)
+                children(image, image.*.root, wide, buffer.?, pool, 0)
+                _ = device_module.writeRect(image.*.projection, block, buffer.? + (@intCast(usize, reach) * stride + @intCast(usize, reach)), stride)
+            }
+            scratch.release(pool, mark)
+            x += width
+        }
+        y += height
+    }
+    image_module.noteUpdate(image, area)
+    return area
+}
+
+// The pixels the whole image shows in `area`, into `into` (`stride` words
+// a row): the projection brought up to date first.
+pub fn read(image: *Image, area: Rect, into: [*]u32, stride: usize) -> void {
+    _ = update(image)
+    device_module.readRect(image.*.projection, area, into, stride)
+}
+
+// What one node alone shows in `area` (transparent where it shows
+// nothing): a layer's thumbnail, a layer exported by itself.
+pub fn readNode(image: *Image, node: *Node, area: Rect, into: [*]u32) -> void {
+    const count = @intCast(usize, area.width) * @intCast(usize, area.height)
+    if !content(image, node, area, into, scratch.common(), 0) { device_module.fillWords(into, count, 0) }
+}

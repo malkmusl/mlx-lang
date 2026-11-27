@@ -1,0 +1,2932 @@
+// nebula core: palettes. A palette is a named list of colours as the
+// palette docker shows it and files keep it, and the means to reduce a
+// picture to such a list (the Palettize filter, GIF export, "index
+// colours").
+//
+// A Palette lives in heap memory. Its entries are a colour (opaque,
+// straight 0xFFRRGGBB: a palette has no alpha), a name of up to 31 bytes
+// and the group they are in; group 0 is the palette's own, the nameless
+// one every entry of a file without groups is in:
+//
+//     const swatches = palette.create(std.heap.allocator()).?
+//     _ = palette.make(swatches, palette.DEFAULT, false)       // a built-in one
+//     _ = palette.add(swatches, 0xFF336699, "Sea", 0)
+//     const near = palette.nearest(swatches, 0xFF808080)        // ?usize: the entry
+//     _ = palette.quantize(pixels, width, height, stride, swatches, palette.FLOYD_STEINBERG, 1.0, true)
+//     palette.destroy(swatches)
+//
+// What holds throughout:
+//
+// - "Nearest" is the smallest distance in CIE Lab (CIE76), with Lab as
+//   core/color.mlx has it (D50); of two entries equally far the earlier
+//   one. The numbers come from tables read off color.toLab once and are
+//   its own to some 1e-12, so a colour that is in the palette is always
+//   its own nearest. nearest() looks at every entry; whoever maps many
+//   colours takes a Finder from scratch memory (finder, nearestOf): it
+//   remembers what it was asked before, and looks only at the entries a
+//   cell of a grid over Lab lists as possible (or, for few askings and
+//   long palettes, at those of a like lightness). Its answers are
+//   nearest()'s, to the entry.
+// - Dithering spreads the error (Floyd-Steinberg, Atkinson) or adds a
+//   pattern (the others) in the bytes as they are, not in linear light:
+//   what files and other programs do, and what keeps a flat area's mean
+//   byte. Diffusion runs each row the other way (serpentine); because
+//   every pixel takes its neighbours' errors, its result depends on the
+//   rectangle handed in: only a picture reduced whole has no seams. The
+//   patterns are anchored at the buffer's first pixel and repeat every 8
+//   pixels both ways (NOISE does not repeat, but is the same each time).
+// - Files are byte buffers here: reading and writing them is the
+//   caller's. read() tells the formats apart (GIMP's .gpl, Adobe's .aco
+//   and .ase, Krita's .kpl, a plain list of "#RRGGBB name" lines). A
+//   reader replaces what the palette holds; when it returns false the
+//   palette is empty. Readers trust nothing in the bytes: what is cut
+//   off or damaged gives false, never a trap.
+// - Nothing here takes pixel memory as a local: buffers come from
+//   core/scratch.mlx and are given back before a function returns.
+//
+// Not done: writing .aco, .ase and .kpl (they are read); colour books
+// (an .aco or .ase entry in a space other than RGB, HSB, CMYK, Lab or
+// grey is left out, and CMYK is color.mlx's plain formula, not a press);
+// of a .kpl's entries only those in sRGB (an sRGB element, or an RGB one
+// of an sRGB profile, its linear one of gamma 1.0 too) and grey are read,
+// its CMYK and Lab entries and RGB ones of other spaces (Adobe RGB, Rec.
+// 2020, ...) are left out, and its grid's empty places are not kept (the
+// entries close up);
+// groups in .gpl and in the plain list (the formats have none: the
+// entries are written in their order, read into group 0).
+const std = @import("std")
+const math = @import("std.math")
+const xml = @import("std.xml")
+const color = @import("./color.mlx")
+const pixel = @import("./pixel.mlx")
+const scratch = @import("./scratch.mlx")
+const table = @import("./table.mlx")
+const zip = @import("../io/zip.mlx")
+
+pub const Allocator = std.allocator.Allocator
+
+// The longest name of an entry and of a group, and of a palette, in bytes.
+pub const NAME: usize = 31
+pub const TITLE: usize = 63
+// The most entries a palette holds (an entry's place fits 16 bits) and
+// the most groups, group 0 included.
+pub const MOST: usize = 65535
+pub const GROUPS: usize = 64
+// The columns a new palette is shown in, and the most there are.
+pub const COLUMNS: u32 = 16
+pub const MOST_COLUMNS: u32 = 64
+
+const FIRST_CAPACITY: usize = 64
+
+pub const Entry = struct {
+    // Opaque: 0xFFRRGGBB.
+    color: u32
+    group: u16
+    nameLength: u8
+    name: [31]u8
+}
+
+pub const Group = struct {
+    nameLength: u8
+    name: [31]u8
+}
+
+pub const Palette = struct {
+    allocator: Allocator
+    name: [63]u8
+    nameLength: usize
+    // How many swatches the docker puts in a row, 1 to MOST_COLUMNS.
+    columns: u32
+    entries: [*]Entry
+    count: usize
+    capacity: usize
+    // GROUPS of them; groups[0] is the nameless one.
+    groups: [*]Group
+    groupCount: usize
+}
+
+// ---------------------------------------------------------------------------
+// A palette and its entries.
+
+inline fn atMost(a: usize, b: usize) -> usize { return if a < b { a } else { b } }
+
+// How much of `text` fits `most` bytes without cutting a character of
+// UTF-8 in two.
+fn fitting(text: []const u8, most: usize) -> usize {
+    if text.length <= most { return text.length }
+    var length = most
+    while length > 0 && text[length] & 0xC0 == 0x80 { length -= 1 }
+    return length
+}
+
+// `text` as a name of at most NAME bytes at `into`; returns its length.
+// Bytes that are no text (below a blank) become blanks: a name is one
+// line in every file.
+fn putName(into: [*]u8, text: []const u8) -> u8 {
+    const length = fitting(text, NAME)
+    var index: usize = 0
+    while index < length {
+        into[index] = if text[index] < 32 { 32 } else { text[index] }
+        index += 1
+    }
+    return @intCast(u8, length)
+}
+
+// A new palette without entries, named "", in COLUMNS columns. Null
+// without memory.
+pub fn create(allocator: Allocator) -> ?*Palette {
+    const memory = allocator.alloc(@sizeOf(Palette), @alignOf(Palette))
+    if memory == null { return null }
+    const groups = allocator.alloc(GROUPS * @sizeOf(Group), @alignOf(Group))
+    const entries = allocator.alloc(FIRST_CAPACITY * @sizeOf(Entry), @alignOf(Entry))
+    if groups == null || entries == null {
+        if groups != null { allocator.free(groups.?, GROUPS * @sizeOf(Group), @alignOf(Group)) }
+        if entries != null { allocator.free(entries.?, FIRST_CAPACITY * @sizeOf(Entry), @alignOf(Entry)) }
+        allocator.free(memory.?, @sizeOf(Palette), @alignOf(Palette))
+        return null
+    }
+    const palette: *Palette = unsafe { @ptrCast(*Palette, memory.?) }
+    palette.*.allocator = allocator
+    palette.*.nameLength = 0
+    palette.*.columns = COLUMNS
+    unsafe { palette.*.entries = @ptrCast([*]Entry, entries.?) }
+    palette.*.count = 0
+    palette.*.capacity = FIRST_CAPACITY
+    unsafe { palette.*.groups = @ptrCast([*]Group, groups.?) }
+    palette.*.groupCount = 1
+    palette.*.groups[0].nameLength = 0
+    return palette
+}
+
+// Gives back the palette's memory and the palette.
+pub fn destroy(palette: *Palette) -> void {
+    const allocator = palette.*.allocator
+    unsafe {
+        allocator.free(@ptrCast([*]u8, palette.*.entries), palette.*.capacity * @sizeOf(Entry), @alignOf(Entry))
+        allocator.free(@ptrCast([*]u8, palette.*.groups), GROUPS * @sizeOf(Group), @alignOf(Group))
+        allocator.free(@ptrCast([*]u8, palette), @sizeOf(Palette), @alignOf(Palette))
+    }
+}
+
+// Room for `wanted` entries. False without memory or beyond MOST (the
+// palette stays as it is).
+fn reserve(palette: *Palette, wanted: usize) -> bool {
+    if wanted <= palette.*.capacity { return true }
+    if wanted > MOST { return false }
+    var better = palette.*.capacity * 2
+    if better < wanted { better = wanted }
+    if better > MOST { better = MOST }
+    var moved: ?[*]u8 = null
+    unsafe { moved = palette.*.allocator.resize(@ptrCast([*]u8, palette.*.entries), palette.*.capacity * @sizeOf(Entry), better * @sizeOf(Entry), @alignOf(Entry)) }
+    if moved == null { return false }
+    unsafe { palette.*.entries = @ptrCast([*]Entry, moved.?) }
+    palette.*.capacity = better
+    return true
+}
+
+// No entries and no groups but the nameless one; the palette's name and
+// columns stay.
+pub fn clear(palette: *Palette) -> void {
+    palette.*.count = 0
+    palette.*.groupCount = 1
+}
+
+// The palette's name, and a new one for it (what does not fit TITLE
+// bytes is left off).
+pub fn name(palette: *const Palette) -> []const u8 {
+    const bytes: [*]const u8 = &palette.*.name
+    return bytes[0..palette.*.nameLength]
+}
+
+pub fn rename(palette: *Palette, text: []const u8) -> void {
+    const length = fitting(text, TITLE)
+    var index: usize = 0
+    while index < length {
+        palette.*.name[index] = if text[index] < 32 { 32 } else { text[index] }
+        index += 1
+    }
+    palette.*.nameLength = length
+}
+
+// The columns the palette is shown in, held to 1..MOST_COLUMNS.
+pub fn setColumns(palette: *Palette, columns: u32) -> void {
+    palette.*.columns = if columns < 1 { 1 } else if columns > MOST_COLUMNS { MOST_COLUMNS } else { columns }
+}
+
+// How many entries the palette has.
+pub fn count(palette: *const Palette) -> usize { return palette.*.count }
+
+// The colour of entry `index` (0, the transparent pixel, when there is
+// no such entry), its name ("" then) and its group (0 then).
+pub fn colorAt(palette: *const Palette, index: usize) -> u32 {
+    if index >= palette.*.count { return 0 }
+    return palette.*.entries[index].color
+}
+
+pub fn nameAt(palette: *const Palette, index: usize) -> []const u8 {
+    if index >= palette.*.count { return "" }
+    const entry = &palette.*.entries[index]
+    const bytes: [*]const u8 = &entry.*.name
+    return bytes[0..@intCast(usize, entry.*.nameLength)]
+}
+
+pub fn groupAt(palette: *const Palette, index: usize) -> usize {
+    if index >= palette.*.count { return 0 }
+    return @intCast(usize, palette.*.entries[index].group)
+}
+
+// A new entry at place `at` (0..count; what is there and after it moves
+// one up) of colour `value` (its alpha is not kept), named `text`, in
+// `group`. False for a place or a group that is not there, beyond MOST
+// entries and without memory.
+pub fn insert(palette: *Palette, at: usize, value: u32, text: []const u8, group: usize) -> bool {
+    if at > palette.*.count || group >= palette.*.groupCount { return false }
+    if !reserve(palette, palette.*.count + 1) { return false }
+    var index = palette.*.count
+    while index > at {
+        palette.*.entries[index] = palette.*.entries[index - 1]
+        index -= 1
+    }
+    const entry = &palette.*.entries[at]
+    entry.*.color = value | 0xFF000000
+    entry.*.group = @intCast(u16, group)
+    entry.*.nameLength = putName(&entry.*.name, text)
+    palette.*.count += 1
+    return true
+}
+
+// A new entry after the last.
+pub fn add(palette: *Palette, value: u32, text: []const u8, group: usize) -> bool {
+    return insert(palette, palette.*.count, value, text, group)
+}
+
+// Takes entry `index` out; those after it move one down. False when
+// there is no such entry.
+pub fn remove(palette: *Palette, index: usize) -> bool {
+    if index >= palette.*.count { return false }
+    var at = index
+    while at + 1 < palette.*.count {
+        palette.*.entries[at] = palette.*.entries[at + 1]
+        at += 1
+    }
+    palette.*.count -= 1
+    return true
+}
+
+// Entry `from` to place `to`: it is entry `to` afterwards, those between
+// move one toward where it was. False when either is not there.
+pub fn move(palette: *Palette, from: usize, to: usize) -> bool {
+    if from >= palette.*.count || to >= palette.*.count { return false }
+    if from == to { return true }
+    const entries = palette.*.entries
+    const moved = entries[from]
+    var at = from
+    while at < to {
+        entries[at] = entries[at + 1]
+        at += 1
+    }
+    while at > to {
+        entries[at] = entries[at - 1]
+        at -= 1
+    }
+    entries[to] = moved
+    return true
+}
+
+// An entry's colour (the alpha given is not kept), name and group anew.
+// False when the entry or the group is not there.
+pub fn setColor(palette: *Palette, index: usize, value: u32) -> bool {
+    if index >= palette.*.count { return false }
+    palette.*.entries[index].color = value | 0xFF000000
+    return true
+}
+
+pub fn setName(palette: *Palette, index: usize, text: []const u8) -> bool {
+    if index >= palette.*.count { return false }
+    const entry = &palette.*.entries[index]
+    entry.*.nameLength = putName(&entry.*.name, text)
+    return true
+}
+
+pub fn setGroup(palette: *Palette, index: usize, group: usize) -> bool {
+    if index >= palette.*.count || group >= palette.*.groupCount { return false }
+    palette.*.entries[index].group = @intCast(u16, group)
+    return true
+}
+
+// The first entry of exactly this colour (alpha not looked at); null:
+// there is none.
+pub fn find(palette: *const Palette, value: u32) -> ?usize {
+    const wanted = value | 0xFF000000
+    var index: usize = 0
+    while index < palette.*.count {
+        if palette.*.entries[index].color == wanted { return index }
+        index += 1
+    }
+    return null
+}
+
+// How many groups there are, the nameless group 0 included.
+pub fn groupCount(palette: *const Palette) -> usize { return palette.*.groupCount }
+
+// A new group named `text`, after the others: its number. Null when
+// there are GROUPS already.
+pub fn addGroup(palette: *Palette, text: []const u8) -> ?usize {
+    if palette.*.groupCount >= GROUPS { return null }
+    const group = &palette.*.groups[palette.*.groupCount]
+    group.*.nameLength = putName(&group.*.name, text)
+    palette.*.groupCount += 1
+    return palette.*.groupCount - 1
+}
+
+// A group's name ("" for group 0 and for one that is not there).
+pub fn groupName(palette: *const Palette, group: usize) -> []const u8 {
+    if group == 0 || group >= palette.*.groupCount { return "" }
+    const held = &palette.*.groups[group]
+    const bytes: [*]const u8 = &held.*.name
+    return bytes[0..@intCast(usize, held.*.nameLength)]
+}
+
+// False for group 0 (it has no name) and a group that is not there.
+pub fn renameGroup(palette: *Palette, group: usize, text: []const u8) -> bool {
+    if group == 0 || group >= palette.*.groupCount { return false }
+    const held = &palette.*.groups[group]
+    held.*.nameLength = putName(&held.*.name, text)
+    return true
+}
+
+// Takes a group away: its entries are in group 0 afterwards, the groups
+// after it are numbered one lower. False for group 0 and a group that is
+// not there.
+pub fn removeGroup(palette: *Palette, group: usize) -> bool {
+    if group == 0 || group >= palette.*.groupCount { return false }
+    var index: usize = 0
+    while index < palette.*.count {
+        const entry = &palette.*.entries[index]
+        const held = @intCast(usize, entry.*.group)
+        if held == group {
+            entry.*.group = 0
+        } else if held > group {
+            entry.*.group = @intCast(u16, held - 1)
+        }
+        index += 1
+    }
+    index = group
+    while index + 1 < palette.*.groupCount {
+        palette.*.groups[index] = palette.*.groups[index + 1]
+        index += 1
+    }
+    palette.*.groupCount -= 1
+    return true
+}
+
+// How many entries are in `group`.
+pub fn countIn(palette: *const Palette, group: usize) -> usize {
+    var total: usize = 0
+    var index: usize = 0
+    while index < palette.*.count {
+        if @intCast(usize, palette.*.entries[index].group) == group { total += 1 }
+        index += 1
+    }
+    return total
+}
+
+// `target` made the same as `source`: name, columns, groups, entries
+// (a palette copied to itself stays as it is). False without memory
+// (`target` is empty then).
+pub fn copy(target: *Palette, source: *const Palette) -> bool {
+    // (Cleared first, a palette given as both would lose its entries.)
+    if @intFromPtr(target) == @intFromPtr(source) { return true }
+    clear(target)
+    if !reserve(target, source.*.count) { return false }
+    rename(target, name(source))
+    target.*.columns = source.*.columns
+    var index: usize = 0
+    while index < source.*.groupCount {
+        target.*.groups[index] = source.*.groups[index]
+        index += 1
+    }
+    target.*.groupCount = source.*.groupCount
+    index = 0
+    while index < source.*.count {
+        target.*.entries[index] = source.*.entries[index]
+        index += 1
+    }
+    target.*.count = source.*.count
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// The built-in palettes.
+
+// A palette the program brings along: its colours in rows of `columns`.
+// `names` has a name for every colour, or one for every row (an entry is
+// then "Red 3", the third of its row), or none (an entry is named by its
+// colour, "#336699").
+pub const Builtin = struct {
+    name: []const u8
+    german: []const u8
+    columns: u32
+    colors: []const u32
+    names: []const []const u8
+    germanNames: []const []const u8
+}
+
+// Which is which in the list of built-in palettes.
+pub const DEFAULT: usize = 0
+pub const GREYS: usize = 1
+pub const WEB_SAFE: usize = 2
+pub const SKIN_TONES: usize = 3
+pub const PASTEL: usize = 4
+pub const PC_16: usize = 5
+pub const MATERIAL: usize = 6
+pub const HANDHELD_4: usize = 7
+pub const CONSOLE_16: usize = 8
+pub const BUILTINS: usize = 9
+
+// A painter's palette: eight shades of each of seven hues and of an
+// earth, from light to dark, the lights leaning toward yellow and the
+// darks away from it as paint does, and a row of greys. The colours are
+// even steps of lightness in OKLCh, their chroma held inside sRGB.
+const DEFAULT_COLORS = [72]u32{
+    0xFFFFDFDE, 0xFFFFB4B1, 0xFFFF7E79, 0xFFF14442, 0xFFC92420, 0xFF9D0800, 0xFF6B0D00, 0xFF3F0700,
+    0xFFFFE1D2, 0xFFFFB891, 0xFFFF8526, 0xFFD46B00, 0xFFA75600, 0xFF7C4100, 0xFF552C00, 0xFF311800,
+    0xFFFFF5D8, 0xFFF8D55D, 0xFFD8B500, 0xFFB19700, 0xFF8C7A00, 0xFF6A5E00, 0xFF4A4400, 0xFF2D2A00,
+    0xFFC1F9C9, 0xFF88E493, 0xFF4BC957, 0xFF2EA72F, 0xFF1C8600, 0xFF206300, 0xFF1A4300, 0xFF0F2600,
+    0xFFB6F5F8, 0xFF6CE0E2, 0xFF00C3C3, 0xFF00A19E, 0xFF007F7C, 0xFF00605B, 0xFF00423D, 0xFF002622,
+    0xFFDCE8FF, 0xFFAECCFF, 0xFF76ABFF, 0xFF3289FC, 0xFF006CD2, 0xFF00529A, 0xFF003969, 0xFF00203D,
+    0xFFEBE3FF, 0xFFD4BDFF, 0xFFBE8FFF, 0xFFA765EC, 0xFF8B47C4, 0xFF6D2D99, 0xFF4E186C, 0xFF300544,
+    0xFFF9E3D2, 0xFFE6C3A6, 0xFFCEA17A, 0xFFAD825C, 0xFF8D6542, 0xFF6C4A2C, 0xFF4B311A, 0xFF2D1A09,
+    0xFFFFFFFF, 0xFFDBDBDB, 0xFFB6B6B6, 0xFF929292, 0xFF6D6D6D, 0xFF494949, 0xFF242424, 0xFF000000,
+}
+const DEFAULT_ROWS = [9][]const u8{ "Red", "Orange", "Yellow", "Green", "Teal", "Blue", "Violet", "Earth", "Grey" }
+const DEFAULT_ROWS_GERMAN = [9][]const u8{ "Rot", "Orange", "Gelb", "Grün", "Blaugrün", "Blau", "Violett", "Erde", "Grau" }
+
+// Sixteen greys in even steps from black to white.
+const GREY_COLORS = [16]u32{
+    0xFF000000, 0xFF111111, 0xFF222222, 0xFF333333, 0xFF444444, 0xFF555555, 0xFF666666, 0xFF777777,
+    0xFF888888, 0xFF999999, 0xFFAAAAAA, 0xFFBBBBBB, 0xFFCCCCCC, 0xFFDDDDDD, 0xFFEEEEEE, 0xFFFFFFFF,
+}
+
+// The 216 colours whose channels are multiples of 0x33: what a screen of
+// 256 colours could show without dithering.
+const WEB_COLORS = [216]u32{
+    0xFF000000, 0xFF000033, 0xFF000066, 0xFF000099, 0xFF0000CC, 0xFF0000FF, 0xFF003300, 0xFF003333, 0xFF003366, 0xFF003399, 0xFF0033CC, 0xFF0033FF,
+    0xFF006600, 0xFF006633, 0xFF006666, 0xFF006699, 0xFF0066CC, 0xFF0066FF, 0xFF009900, 0xFF009933, 0xFF009966, 0xFF009999, 0xFF0099CC, 0xFF0099FF,
+    0xFF00CC00, 0xFF00CC33, 0xFF00CC66, 0xFF00CC99, 0xFF00CCCC, 0xFF00CCFF, 0xFF00FF00, 0xFF00FF33, 0xFF00FF66, 0xFF00FF99, 0xFF00FFCC, 0xFF00FFFF,
+    0xFF330000, 0xFF330033, 0xFF330066, 0xFF330099, 0xFF3300CC, 0xFF3300FF, 0xFF333300, 0xFF333333, 0xFF333366, 0xFF333399, 0xFF3333CC, 0xFF3333FF,
+    0xFF336600, 0xFF336633, 0xFF336666, 0xFF336699, 0xFF3366CC, 0xFF3366FF, 0xFF339900, 0xFF339933, 0xFF339966, 0xFF339999, 0xFF3399CC, 0xFF3399FF,
+    0xFF33CC00, 0xFF33CC33, 0xFF33CC66, 0xFF33CC99, 0xFF33CCCC, 0xFF33CCFF, 0xFF33FF00, 0xFF33FF33, 0xFF33FF66, 0xFF33FF99, 0xFF33FFCC, 0xFF33FFFF,
+    0xFF660000, 0xFF660033, 0xFF660066, 0xFF660099, 0xFF6600CC, 0xFF6600FF, 0xFF663300, 0xFF663333, 0xFF663366, 0xFF663399, 0xFF6633CC, 0xFF6633FF,
+    0xFF666600, 0xFF666633, 0xFF666666, 0xFF666699, 0xFF6666CC, 0xFF6666FF, 0xFF669900, 0xFF669933, 0xFF669966, 0xFF669999, 0xFF6699CC, 0xFF6699FF,
+    0xFF66CC00, 0xFF66CC33, 0xFF66CC66, 0xFF66CC99, 0xFF66CCCC, 0xFF66CCFF, 0xFF66FF00, 0xFF66FF33, 0xFF66FF66, 0xFF66FF99, 0xFF66FFCC, 0xFF66FFFF,
+    0xFF990000, 0xFF990033, 0xFF990066, 0xFF990099, 0xFF9900CC, 0xFF9900FF, 0xFF993300, 0xFF993333, 0xFF993366, 0xFF993399, 0xFF9933CC, 0xFF9933FF,
+    0xFF996600, 0xFF996633, 0xFF996666, 0xFF996699, 0xFF9966CC, 0xFF9966FF, 0xFF999900, 0xFF999933, 0xFF999966, 0xFF999999, 0xFF9999CC, 0xFF9999FF,
+    0xFF99CC00, 0xFF99CC33, 0xFF99CC66, 0xFF99CC99, 0xFF99CCCC, 0xFF99CCFF, 0xFF99FF00, 0xFF99FF33, 0xFF99FF66, 0xFF99FF99, 0xFF99FFCC, 0xFF99FFFF,
+    0xFFCC0000, 0xFFCC0033, 0xFFCC0066, 0xFFCC0099, 0xFFCC00CC, 0xFFCC00FF, 0xFFCC3300, 0xFFCC3333, 0xFFCC3366, 0xFFCC3399, 0xFFCC33CC, 0xFFCC33FF,
+    0xFFCC6600, 0xFFCC6633, 0xFFCC6666, 0xFFCC6699, 0xFFCC66CC, 0xFFCC66FF, 0xFFCC9900, 0xFFCC9933, 0xFFCC9966, 0xFFCC9999, 0xFFCC99CC, 0xFFCC99FF,
+    0xFFCCCC00, 0xFFCCCC33, 0xFFCCCC66, 0xFFCCCC99, 0xFFCCCCCC, 0xFFCCCCFF, 0xFFCCFF00, 0xFFCCFF33, 0xFFCCFF66, 0xFFCCFF99, 0xFFCCFFCC, 0xFFCCFFFF,
+    0xFFFF0000, 0xFFFF0033, 0xFFFF0066, 0xFFFF0099, 0xFFFF00CC, 0xFFFF00FF, 0xFFFF3300, 0xFFFF3333, 0xFFFF3366, 0xFFFF3399, 0xFFFF33CC, 0xFFFF33FF,
+    0xFFFF6600, 0xFFFF6633, 0xFFFF6666, 0xFFFF6699, 0xFFFF66CC, 0xFFFF66FF, 0xFFFF9900, 0xFFFF9933, 0xFFFF9966, 0xFFFF9999, 0xFFFF99CC, 0xFFFF99FF,
+    0xFFFFCC00, 0xFFFFCC33, 0xFFFFCC66, 0xFFFFCC99, 0xFFFFCCCC, 0xFFFFCCFF, 0xFFFFFF00, 0xFFFFFF33, 0xFFFFFF66, 0xFFFFFF99, 0xFFFFFFCC, 0xFFFFFFFF,
+}
+
+// Skin: six depths of four undertones.
+const SKIN_COLORS = [24]u32{
+    0xFFFEE1D7, 0xFFF2C1B2, 0xFFDB9D89, 0xFFB87661, 0xFF8A5241, 0xFF5B3428,
+    0xFFFCE2D3, 0xFFEFC4AA, 0xFFD7A07F, 0xFFB57955, 0xFF875636, 0xFF593621,
+    0xFFF8E4D0, 0xFFE9C7A4, 0xFFD0A576, 0xFFAD7F4A, 0xFF815A2D, 0xFF55391A,
+    0xFFF1E6D5, 0xFFDDCBAD, 0xFFC2AA83, 0xFF9F8559, 0xFF75603B, 0xFF4C3D23,
+}
+const SKIN_ROWS = [4][]const u8{ "Rosy", "Neutral", "Golden", "Olive" }
+const SKIN_ROWS_GERMAN = [4][]const u8{ "Rosig", "Neutral", "Golden", "Oliv" }
+
+// Pastels: twelve hues around the wheel, pale and a little stronger.
+const PASTEL_COLORS = [24]u32{
+    0xFFFFDAD9, 0xFFFFDDCA, 0xFFF6E2C0, 0xFFE6E8C2, 0xFFD4EDCE, 0xFFC5F0DF, 0xFFBFEFF2, 0xFFC5EBFF, 0xFFD6E6FF, 0xFFE3E1FF, 0xFFF4DAFA, 0xFFFFD8E9,
+    0xFFFFB9B8, 0xFFFCBE9C, 0xFFEBC88E, 0xFFD1D392, 0xFFB1DCA7, 0xFF94E0C5, 0xFF87DFE4, 0xFF92D9FB, 0xFFB2CFFF, 0xFFCCC6FF, 0xFFE7BCF1, 0xFFF9B7D6,
+}
+const PASTEL_ROWS = [2][]const u8{ "Pale", "Soft" }
+const PASTEL_ROWS_GERMAN = [2][]const u8{ "Blass", "Zart" }
+
+// The sixteen colours of the PC's first colour graphics cards: each of
+// red, green and blue on or off, all of them dim or bright, and the dim
+// yellow made a brown.
+const PC_COLORS = [16]u32{
+    0xFF000000, 0xFF0000AA, 0xFF00AA00, 0xFF00AAAA, 0xFFAA0000, 0xFFAA00AA, 0xFFAA5500, 0xFFAAAAAA,
+    0xFF555555, 0xFF5555FF, 0xFF55FF55, 0xFF55FFFF, 0xFFFF5555, 0xFFFF55FF, 0xFFFFFF55, 0xFFFFFFFF,
+}
+const PC_NAMES = [16][]const u8{ "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Brown", "Light grey", "Dark grey", "Light blue", "Light green", "Light cyan", "Light red", "Light magenta", "Yellow", "White" }
+const PC_NAMES_GERMAN = [16][]const u8{ "Schwarz", "Blau", "Grün", "Cyan", "Rot", "Magenta", "Braun", "Hellgrau", "Dunkelgrau", "Hellblau", "Hellgrün", "Hellcyan", "Hellrot", "Hellmagenta", "Gelb", "Weiß" }
+
+// Flat colours for interfaces and illustration: five shades of sixteen
+// families.
+const MATERIAL_COLORS = [80]u32{
+    0xFFFFDBD6, 0xFFFFA096, 0xFFFF544C, 0xFFC92324, 0xFF8B000A,
+    0xFFFFD9E2, 0xFFFF9BB7, 0xFFF5558F, 0xFFBF2966, 0xFF850241,
+    0xFFF8D8FF, 0xFFEB9AFD, 0xFFCC67E3, 0xFF9D3EB1, 0xFF6B1D7B,
+    0xFFDDE3FF, 0xFFADB8FF, 0xFF808AFF, 0xFF5A60CA, 0xFF383B8F,
+    0xFFD4E6FF, 0xFF91C1FF, 0xFF4499FF, 0xFF0E6DCF, 0xFF00468C,
+    0xFFC8EAFF, 0xFF6FC9FB, 0xFF16A4E2, 0xFF0078A7, 0xFF004E6F,
+    0xFFBDEFF5, 0xFF5FD1DD, 0xFF00ACBA, 0xFF007E88, 0xFF005259,
+    0xFFC2F0E7, 0xFF70D2C2, 0xFF0EB09E, 0xFF008173, 0xFF00544B,
+    0xFFC6F2C9, 0xFF7AD786, 0xFF32B550, 0xFF00862E, 0xFF00581B,
+    0xFFE6FCC4, 0xFFBAE26D, 0xFF90BD00, 0xFF6C8F00, 0xFF496200,
+    0xFFFDF4B9, 0xFFE8D34C, 0xFFC2AC00, 0xFF928100, 0xFF655900,
+    0xFFFFF0D7, 0xFFFFC761, 0xFFDD9E00, 0xFFA77600, 0xFF745100,
+    0xFFFFDDC5, 0xFFFFA65E, 0xFFE07A00, 0xFFA55800, 0xFF6D3800,
+    0xFFF2E1D6, 0xFFD7B6A1, 0xFFB68F75, 0xFF89664F, 0xFF5C412E,
+    0xFFDEE6EC, 0xFFB0C0CC, 0xFF889BA9, 0xFF60717E, 0xFF3C4A54,
+    0xFFE4E4E4, 0xFFBEBEBE, 0xFF989898, 0xFF6F6F6F, 0xFF484848,
+}
+const MATERIAL_ROWS = [16][]const u8{ "Red", "Pink", "Purple", "Indigo", "Blue", "Sky", "Cyan", "Teal", "Green", "Lime", "Yellow", "Amber", "Orange", "Brown", "Blue grey", "Grey" }
+const MATERIAL_ROWS_GERMAN = [16][]const u8{ "Rot", "Pink", "Purpur", "Indigo", "Blau", "Himmelblau", "Cyan", "Blaugrün", "Grün", "Limette", "Gelb", "Bernstein", "Orange", "Braun", "Blaugrau", "Grau" }
+
+// Four greens from dark to light, as a handheld's screen of four greys
+// behind a green glass.
+const HANDHELD_COLORS = [4]u32{ 0xFF1A2B1F, 0xFF3C6245, 0xFF86A957, 0xFFD8E8A8 }
+const HANDHELD_NAMES = [4][]const u8{ "Darkest", "Dark", "Light", "Lightest" }
+const HANDHELD_NAMES_GERMAN = [4][]const u8{ "Dunkelstes", "Dunkel", "Hell", "Hellstes" }
+
+// Sixteen colours for pixel art in the manner of the small fantasy
+// consoles: a dark and a bright half, each with what a sprite needs.
+const CONSOLE_COLORS = [16]u32{
+    0xFF101018, 0xFF232B57, 0xFF7A2A52, 0xFF0E8050, 0xFFA8553A, 0xFF5A5650, 0xFFC0C3C8, 0xFFFFF4E6,
+    0xFFF0164E, 0xFFFFA210, 0xFFFFEA3A, 0xFF1EDC40, 0xFF35A8F8, 0xFF84779A, 0xFFFF7CA6, 0xFFFFCBA6,
+}
+const CONSOLE_NAMES = [16][]const u8{ "Black", "Navy", "Plum", "Forest", "Brown", "Slate", "Silver", "Cream", "Red", "Orange", "Yellow", "Lime", "Sky", "Lavender", "Pink", "Peach" }
+const CONSOLE_NAMES_GERMAN = [16][]const u8{ "Schwarz", "Marineblau", "Pflaume", "Waldgrün", "Braun", "Schiefer", "Silber", "Creme", "Rot", "Orange", "Gelb", "Limette", "Himmelblau", "Lavendel", "Rosa", "Pfirsich" }
+
+const NO_NAMES = [0][]const u8{}
+
+const BUILTIN = [9]Builtin{
+    Builtin.{ .name = "Default", .german = "Standard", .columns = 8, .colors = DEFAULT_COLORS[0..], .names = DEFAULT_ROWS[0..], .germanNames = DEFAULT_ROWS_GERMAN[0..] },
+    Builtin.{ .name = "Greys", .german = "Grautöne", .columns = 8, .colors = GREY_COLORS[0..], .names = NO_NAMES[0..], .germanNames = NO_NAMES[0..] },
+    Builtin.{ .name = "Web-safe", .german = "Websicher", .columns = 12, .colors = WEB_COLORS[0..], .names = NO_NAMES[0..], .germanNames = NO_NAMES[0..] },
+    Builtin.{ .name = "Skin tones", .german = "Hauttöne", .columns = 6, .colors = SKIN_COLORS[0..], .names = SKIN_ROWS[0..], .germanNames = SKIN_ROWS_GERMAN[0..] },
+    Builtin.{ .name = "Pastel", .german = "Pastell", .columns = 12, .colors = PASTEL_COLORS[0..], .names = PASTEL_ROWS[0..], .germanNames = PASTEL_ROWS_GERMAN[0..] },
+    Builtin.{ .name = "PC 16 colours", .german = "PC 16 Farben", .columns = 8, .colors = PC_COLORS[0..], .names = PC_NAMES[0..], .germanNames = PC_NAMES_GERMAN[0..] },
+    Builtin.{ .name = "Material", .german = "Material", .columns = 5, .colors = MATERIAL_COLORS[0..], .names = MATERIAL_ROWS[0..], .germanNames = MATERIAL_ROWS_GERMAN[0..] },
+    Builtin.{ .name = "Handheld 4 greens", .german = "Handheld 4 Grüntöne", .columns = 4, .colors = HANDHELD_COLORS[0..], .names = HANDHELD_NAMES[0..], .germanNames = HANDHELD_NAMES_GERMAN[0..] },
+    Builtin.{ .name = "Pixel console 16", .german = "Pixelkonsole 16", .columns = 8, .colors = CONSOLE_COLORS[0..], .names = CONSOLE_NAMES[0..], .germanNames = CONSOLE_NAMES_GERMAN[0..] },
+}
+
+var keptBuiltins: table.Kept = table.Kept.{ .address = 0, .length = 0 }
+
+// The built-in palettes, BUILTINS of them, in the order of the numbers
+// above. Kept in heap memory with the tables of colours and names their
+// rows name (a deep keep, core/table.mlx: those tables are built in the
+// value arena beside the rows, and a copy of the rows alone would point
+// at what the window's loop takes back at its next turn). Without memory
+// the table itself, good until the loop turns (the next asking tries
+// again).
+pub fn builtins() -> []const Builtin {
+    if keptBuiltins.address != 0 { return table.rows(Builtin, &keptBuiltins) }
+    const list = BUILTIN[0..]
+    var bytes = table.room(Builtin, list.length)
+    var index: usize = 0
+    while index < list.length {
+        bytes += table.room(u32, list[index].colors.length) + table.room([]const u8, list[index].names.length) + table.room([]const u8, list[index].germanNames.length)
+        index += 1
+    }
+    var block = table.Block.{ .at = 0, .end = 0 }
+    if !table.open(&block, bytes) { return list }
+    const rows = table.put(Builtin, &block, list)
+    index = 0
+    while index < list.length {
+        rows[index].colors = table.put(u32, &block, list[index].colors)[0..list[index].colors.length]
+        rows[index].names = table.put([]const u8, &block, list[index].names)[0..list[index].names.length]
+        rows[index].germanNames = table.put([]const u8, &block, list[index].germanNames)[0..list[index].germanNames.length]
+        index += 1
+    }
+    return table.note(Builtin, &keptBuiltins, rows, list.length)
+}
+
+// The name of built-in palette `which` ("" when there is none).
+pub fn builtinName(which: usize, german: bool) -> []const u8 {
+    if which >= BUILTINS { return "" }
+    const list = builtins()
+    return if german { list[which].german } else { list[which].name }
+}
+
+// The colours of built-in palette `which` (opaque, in its order; none
+// when there is no such palette): constant data, for whoever reduces a
+// picture to a built-in palette without making it a Palette.
+pub fn builtinColors(which: usize) -> []const u32 {
+    const list = builtins()
+    if which >= list.length { return list[0].colors[0..0] }
+    return list[which].colors
+}
+
+// `palette` made built-in palette `which`, its own name and its entries'
+// names in German or in English. False when there is no such palette and
+// without memory.
+pub fn make(palette: *Palette, which: usize, german: bool) -> bool {
+    clear(palette)
+    if which >= BUILTINS { return false }
+    const list = builtins()
+    const set = &list[which]
+    const colors = set.*.colors
+    const names = if german { set.*.germanNames } else { set.*.names }
+    rename(palette, if german { set.*.german } else { set.*.name })
+    palette.*.columns = set.*.columns
+    if !reserve(palette, colors.length) { return false }
+    // The names are put together in scratch memory: a local array whose
+    // address is handed on would be taken from the value arena each time.
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const room = scratch.bytes(pool, 48)
+    if room == null { return false }
+    const bytes = room.?
+    var index: usize = 0
+    while index < colors.length {
+        var length: usize = 0
+        if names.length == colors.length {
+            length = std.text.append(bytes, 0, 48, names[index])
+        } else if names.length > 0 {
+            const row = colors.length / names.length
+            length = std.text.append(bytes, 0, 48, names[index / row])
+            length = std.text.appendByte(bytes, length, 48, 32)
+            length = decimal(bytes, length, 48, index % row + 1)
+        } else {
+            length = color.formatHex(colors[index], bytes, false)
+        }
+        // (Cannot fail: the room was reserved.)
+        _ = add(palette, colors[index], bytes[0..length], 0)
+        index += 1
+    }
+    scratch.release(pool, mark)
+    return true
+}
+
+// How many digits `value` has in decimal.
+fn digitsOf(value: usize) -> usize {
+    var count: usize = 1
+    var rest = value / 10
+    while rest > 0 {
+        count += 1
+        rest /= 10
+    }
+    return count
+}
+
+// `value` in decimal at `at` of `into` (`capacity` bytes; nothing of it
+// when it does not fit); returns where it ends. std.text's appender
+// takes a buffer of the value arena at every call: this writes the
+// digits where they go, the last first.
+fn decimal(into: [*]u8, at: usize, capacity: usize, value: usize) -> usize {
+    const end = at + digitsOf(value)
+    if end > capacity { return at }
+    var place = end
+    var rest = value
+    while place > at {
+        place -= 1
+        into[place] = @intCast(u8, 48 + rest % 10)
+        rest /= 10
+    }
+    return end
+}
+
+// ---------------------------------------------------------------------------
+// Lab from tables, and the nearest entry.
+//
+// Lab is three curves of three sums: X, Y and Z (relative to the white)
+// are each a sum of what the red, the green and the blue byte give, and
+// f of each sum makes L, a and b. What a byte gives is read off
+// color.toLab once (the colour with only that channel, its Lab turned
+// back into the sums), so that nothing of color.mlx's matrices is
+// repeated here; the cube root in f is a step of Halley's from a table
+// of 4096 roots, 6e-15 off at most.
+
+const LAB_EPSILON: f64 = 216.0 / 24389.0
+const LAB_KAPPA: f64 = 24389.0 / 27.0
+const ROOTS: f64 = 4096.0
+
+// What byte `value` of channel `c` (0 red, 1 green, 2 blue) gives to sum
+// `s` (0 X, 1 Y, 2 Z): axis_table[s * 768 + c * 256 + value].
+var axis_table: [2304]f64 = undefined
+// The cube roots of index / 4096, up to 4097.
+var root_table: [4098]f64 = undefined
+var lab_ready: bool = false
+
+// f backwards: the sum of an f.
+fn curveBack(f: f64) -> f64 {
+    const cube = f * f * f
+    return if cube > LAB_EPSILON { cube } else { (116.0 * f - 16.0) / LAB_KAPPA }
+}
+
+fn buildLab() -> void {
+    var channel: usize = 0
+    while channel < 3 {
+        var byte: usize = 1
+        while byte < 256 {
+            var l: f64 = 0.0
+            var a: f64 = 0.0
+            var b: f64 = 0.0
+            color.toLab(@intCast(u32, byte) << @intCast(u32, 16 - 8 * channel), &l, &a, &b)
+            const fy = (l + 16.0) / 116.0
+            axis_table[channel * 256 + byte] = curveBack(fy + a / 500.0)
+            axis_table[768 + channel * 256 + byte] = curveBack(fy)
+            axis_table[1536 + channel * 256 + byte] = curveBack(fy - b / 200.0)
+            byte += 1
+        }
+        // Black gives nothing.
+        axis_table[channel * 256] = 0.0
+        axis_table[768 + channel * 256] = 0.0
+        axis_table[1536 + channel * 256] = 0.0
+        channel += 1
+    }
+    var index: usize = 0
+    while index < 4098 {
+        root_table[index] = math.cbrt(@floatFromInt(f64, index) / ROOTS)
+        index += 1
+    }
+    lab_ready = true
+}
+
+// Lab's f of a sum `t` (0..1): the cube root above the CIE's epsilon, a
+// straight piece below it.
+inline fn curve(roots: [*]const f64, t: f64) -> f64 {
+    if !(t > LAB_EPSILON) { return (LAB_KAPPA * t + 16.0) / 116.0 }
+    const place = t * ROOTS
+    var index = @intFromFloat(usize, place)
+    if index > 4096 { index = 4096 }
+    const low = roots[index]
+    const guess = low + (roots[index + 1] - low) * (place - @floatFromInt(f64, index))
+    const cube = guess * guess * guess
+    return guess * (cube + 2.0 * t) / (2.0 * cube + t)
+}
+
+// The Lab of a colour (its low 24 bits): color.toLab's to some 1e-12.
+fn labOf(rgb: u32, l: *f64, a: *f64, b: *f64) -> void {
+    if !lab_ready { buildLab() }
+    const table: [*]const f64 = &axis_table
+    const roots: [*]const f64 = &root_table
+    const r = @intCast(usize, (rgb >> 16) & 255)
+    const g = @intCast(usize, (rgb >> 8) & 255) + 256
+    const bl = @intCast(usize, rgb & 255) + 512
+    const fx = curve(roots, table[r] + table[g] + table[bl])
+    const fy = curve(roots, table[768 + r] + table[768 + g] + table[768 + bl])
+    const fz = curve(roots, table[1536 + r] + table[1536 + g] + table[1536 + bl])
+    l.* = 116.0 * fy - 16.0
+    a.* = 500.0 * (fx - fy)
+    b.* = 200.0 * (fy - fz)
+}
+
+// The entry nearest to a colour (its alpha is not looked at); null for a
+// palette without entries. Looks at every entry: for one colour now and
+// then (the docker's "which swatch is this"). Many colours: a Finder.
+pub fn nearest(palette: *const Palette, value: u32) -> ?usize {
+    if palette.*.count == 0 { return null }
+    var l: f64 = 0.0
+    var a: f64 = 0.0
+    var b: f64 = 0.0
+    labOf(value, &l, &a, &b)
+    var best = math.infinity()
+    var found: usize = 0
+    var index: usize = 0
+    while index < palette.*.count {
+        var el: f64 = 0.0
+        var ea: f64 = 0.0
+        var eb: f64 = 0.0
+        labOf(palette.*.entries[index].color, &el, &ea, &eb)
+        const distance = (el - l) * (el - l) + (ea - a) * (ea - a) + (eb - b) * (eb - b)
+        if distance < best {
+            best = distance
+            found = index
+        }
+        index += 1
+    }
+    return found
+}
+
+// Colours to find the nearest of, made ready for many askings: their Lab
+// in the order of their lightness (a colour far off in lightness alone
+// cannot be the nearest, so a search goes outward from the asked
+// lightness and ends as soon as the lightness alone is farther than the
+// best found); for many askings a grid over Lab whose cells list the
+// colours that can be nearest to some point of the cell (all others are
+// farther from every point of it than one of those is), made for a cell
+// when it is first asked; and what was answered before, by colour. The
+// answers are exact either way. All of it is scratch memory: a Finder
+// lasts until the pool is released to a mark taken before it was made.
+pub const Finder = struct {
+    count: usize
+    // L, a, b of each colour, the darkest first.
+    labs: [*]f64
+    // Which colour of the list each of those is.
+    order: [*]u32
+    // 257 places in that order: the first colour with a lightness of at
+    // least step * 100 / 256.
+    starts: [*]u32
+    // The colours as given, without alpha: 0x00RRGGBB.
+    colors: [*]u32
+    // Answers: (1 << 40) | (rgb << 16) | place, at a slot of the colour's
+    // hash; 0: nothing yet.
+    cache: [*]u64
+    // 32 less the bits of the cache's size.
+    shift: u32
+    // Whether there is a grid: GRID_CELLS cells, each CELL_UNKNOWN,
+    // CELL_SEARCHED (too many colours for a list) or (start << 6) | n:
+    // the places (in the order of lightness) lists[start] to
+    // lists[start + n - 1].
+    gridded: bool
+    cells: [*]u32
+    lists: [*]u16
+    listed: usize
+}
+
+// The grid: L from 0 to 100 in 32 steps, a and b from -128 to 128 in 32
+// steps each (sRGB's colours are all inside: what is not, is searched);
+// a cell's number is (L step << 10) | (a step << 5) | b step.
+const GRID_CELLS: usize = 32768
+const L_STEP: f64 = 3.125
+const AB_STEP: f64 = 8.0
+const AB_LOW: f64 = -128.0
+// A cell lists at most CELL_MOST colours; all lists together LIST_ROOM.
+const CELL_MOST: usize = 32
+const LIST_ROOM: usize = 65536
+const CELL_UNKNOWN: u32 = 0
+const CELL_SEARCHED: u32 = 0xFFFFFFFF
+// A grid is made from GRID_FROM askings on, for up to GRID_COLORS
+// colours (more lie close together: the search ends soon).
+const GRID_FROM: usize = 4096
+const GRID_COLORS: usize = 1024
+
+const CACHE_LEAST: usize = 64
+const CACHE_MOST: usize = 16384
+
+// A Finder for `count` colours at `colors` (1..MOST of them; alpha not
+// looked at), sized for about `askings` askings. Null without memory and
+// for a count outside that.
+fn finderOf(pool: *scratch.Pool, colors: [*]const u32, count: usize, askings: usize) -> ?*Finder {
+    if count == 0 || count > MOST { return null }
+    var slots = CACHE_LEAST
+    var bits: u32 = 6
+    while slots < CACHE_MOST && slots < askings *| 2 {
+        slots *= 2
+        bits += 1
+    }
+    const memory = scratch.bytes(pool, @sizeOf(Finder))
+    const labs = scratch.doubles(pool, count * 3)
+    const order = scratch.words(pool, count)
+    const starts = scratch.words(pool, 257)
+    const held = scratch.words(pool, count)
+    const cache = scratch.bytes(pool, slots * 8)
+    if memory == null || labs == null || order == null || starts == null || held == null || cache == null { return null }
+    const finder: *Finder = unsafe { @ptrCast(*Finder, memory.?) }
+    finder.*.count = count
+    finder.*.labs = labs.?
+    finder.*.order = order.?
+    finder.*.starts = starts.?
+    finder.*.colors = held.?
+    unsafe { finder.*.cache = @ptrCast([*]u64, cache.?) }
+    finder.*.shift = 32 - bits
+    var index: usize = 0
+    while index < slots {
+        finder.*.cache[index] = 0
+        index += 1
+    }
+    finder.*.gridded = false
+    if askings >= GRID_FROM && count <= GRID_COLORS {
+        const cells = scratch.words(pool, GRID_CELLS)
+        const lists = scratch.bytes(pool, LIST_ROOM * 2)
+        if cells == null || lists == null { return null }
+        finder.*.gridded = true
+        finder.*.cells = cells.?
+        unsafe { finder.*.lists = @ptrCast([*]u16, lists.?) }
+        finder.*.listed = 0
+        index = 0
+        while index < GRID_CELLS {
+            finder.*.cells[index] = CELL_UNKNOWN
+            index += 1
+        }
+    }
+
+    // The order of lightness: sorted by the bits of 116 f(Y), which is
+    // L + 16 and above 0, with the colour's place in the low 16 bits; a
+    // pass of insertion on the exact numbers then sets right what those
+    // 16 bits blurred.
+    const mark = scratch.mark(pool)
+    const sorting = scratch.bytes(pool, count * 8)
+    if sorting == null { return null }
+    var keys: [*]u64 = undefined
+    unsafe { keys = @ptrCast([*]u64, sorting.?) }
+    index = 0
+    while index < count {
+        const rgb = colors[index] & 0x00FFFFFF
+        finder.*.colors[index] = rgb
+        var l: f64 = 0.0
+        var a: f64 = 0.0
+        var b: f64 = 0.0
+        labOf(rgb, &l, &a, &b)
+        keys[index] = (@bitCast(u64, l + 16.0) & 0xFFFFFFFFFFFF0000) | @intCast(u64, index)
+        index += 1
+    }
+    std.mem.sortU64(keys, count)
+    index = 0
+    while index < count {
+        const which = @intCast(usize, keys[index] & 0xFFFF)
+        finder.*.order[index] = @intCast(u32, which)
+        labOf(finder.*.colors[which], &finder.*.labs[index * 3], &finder.*.labs[index * 3 + 1], &finder.*.labs[index * 3 + 2])
+        index += 1
+    }
+    scratch.release(pool, mark)
+    index = 1
+    while index < count {
+        var at = index
+        while at > 0 && finder.*.labs[(at - 1) * 3] > finder.*.labs[at * 3] {
+            var part: usize = 0
+            while part < 3 {
+                const swapped = finder.*.labs[at * 3 + part]
+                finder.*.labs[at * 3 + part] = finder.*.labs[(at - 1) * 3 + part]
+                finder.*.labs[(at - 1) * 3 + part] = swapped
+                part += 1
+            }
+            const place = finder.*.order[at]
+            finder.*.order[at] = finder.*.order[at - 1]
+            finder.*.order[at - 1] = place
+            at -= 1
+        }
+        index += 1
+    }
+
+    var step: usize = 0
+    index = 0
+    while step < 257 {
+        const least = @floatFromInt(f64, step) * (100.0 / 256.0)
+        while index < count && finder.*.labs[index * 3] < least { index += 1 }
+        finder.*.starts[step] = @intCast(u32, index)
+        step += 1
+    }
+    return finder
+}
+
+// A Finder for a palette's entries (the place it answers with is the
+// entry's), in `pool`'s memory: take a mark before, release it when the
+// Finder is done with. `askings`: about how many colours will be asked
+// for (it sizes what is remembered; from GRID_FROM on, for palettes of
+// up to GRID_COLORS entries, a grid is made, some 400 KiB). Null for a
+// palette without entries and without memory.
+pub fn finder(pool: *scratch.Pool, palette: *const Palette, askings: usize) -> ?*Finder {
+    if palette.*.count == 0 { return null }
+    const mark = scratch.mark(pool)
+    const colors = scratch.words(pool, palette.*.count)
+    if colors == null { return null }
+    var index: usize = 0
+    while index < palette.*.count {
+        colors.?[index] = palette.*.entries[index].color
+        index += 1
+    }
+    const made = finderOf(pool, colors.?, palette.*.count, askings)
+    if made == null { scratch.release(pool, mark) }
+    return made
+}
+
+// The same for a plain list of colours.
+pub fn finderOfColors(pool: *scratch.Pool, colors: []const u32, askings: usize) -> ?*Finder {
+    const mark = scratch.mark(pool)
+    const made = finderOf(pool, colors.pointer, colors.length, askings)
+    if made == null { scratch.release(pool, mark) }
+    return made
+}
+
+// The place, in the order of lightness, of the colour nearest to Lab
+// (l, a, b); of two equally near the earlier in the list. Goes outward
+// from the asked lightness, up and down in turn, until the difference in
+// lightness alone is more than the best distance found; the colour at
+// place `seed` is the first best, so a seed near the answer ends the
+// search soon.
+fn search(held: *const Finder, l: f64, a: f64, b: f64, seed: usize) -> usize {
+    const labs = held.*.labs
+    const order = held.*.order
+    const count = held.*.count
+    const sl = labs[seed * 3] - l
+    const sa = labs[seed * 3 + 1] - a
+    const sb = labs[seed * 3 + 2] - b
+    var best = sl * sl + sa * sa + sb * sb
+    var best_at = seed
+    var found = @intCast(usize, order[seed])
+    var step: usize = 0
+    if l > 0.0 {
+        step = @intFromFloat(usize, l * 2.56)
+        if step > 256 { step = 256 }
+    }
+    var up = @intCast(usize, held.*.starts[step])
+    var down = up
+    while true {
+        var moved: bool = false
+        if up < count {
+            const at = up * 3
+            const dl = labs[at] - l
+            const dl2 = dl * dl
+            // (The first ones upward may still be darker than what is
+            // asked, in the same step of lightness: those come nearer as
+            // it goes up, and say nothing about the ones after them.)
+            if dl <= 0.0 || dl2 <= best {
+                const da = labs[at + 1] - a
+                const db = labs[at + 2] - b
+                const distance = dl2 + da * da + db * db
+                if distance <= best {
+                    const which = @intCast(usize, order[up])
+                    if distance < best || which < found {
+                        best = distance
+                        best_at = up
+                        found = which
+                    }
+                }
+                up += 1
+                moved = true
+            } else {
+                up = count
+            }
+        }
+        if down > 0 {
+            const at = (down - 1) * 3
+            const dl = l - labs[at]
+            const dl2 = dl * dl
+            if dl2 <= best {
+                const da = labs[at + 1] - a
+                const db = labs[at + 2] - b
+                const distance = dl2 + da * da + db * db
+                if distance <= best {
+                    const which = @intCast(usize, order[down - 1])
+                    if distance < best || which < found {
+                        best = distance
+                        best_at = down - 1
+                        found = which
+                    }
+                }
+                down -= 1
+                moved = true
+            } else {
+                down = 0
+            }
+        }
+        if !moved { break }
+    }
+    return best_at
+}
+
+// The cell of the grid a Lab colour is in; GRID_CELLS for one outside
+// the grid (and for what is no number).
+fn cellOf(l: f64, a: f64, b: f64) -> usize {
+    if !(l >= 0.0 && l <= 100.0 && a >= AB_LOW && a < 0.0 - AB_LOW && b >= AB_LOW && b < 0.0 - AB_LOW) { return GRID_CELLS }
+    const li = pixel.smaller(@intFromFloat(u32, l * (1.0 / L_STEP)), 31)
+    const ai = pixel.smaller(@intFromFloat(u32, (a - AB_LOW) * (1.0 / AB_STEP)), 31)
+    const bi = pixel.smaller(@intFromFloat(u32, (b - AB_LOW) * (1.0 / AB_STEP)), 31)
+    return @intCast(usize, (li << 10) | (ai << 5) | bi)
+}
+
+// How far `value` is from the range `low`..`high` (0 inside it), and how
+// far from the farther of its ends.
+inline fn outside(value: f64, low: f64, high: f64) -> f64 {
+    return if value < low { low - value } else if value > high { value - high } else { 0.0 }
+}
+
+inline fn farther(value: f64, low: f64, high: f64) -> f64 {
+    const down = if value > low { value - low } else { low - value }
+    const up = if value > high { value - high } else { high - value }
+    return if down > up { down } else { up }
+}
+
+// The list of `cell`: the colours whose least distance to the cell is no
+// more than the least, over the colours, of the greatest distance to it.
+// CELL_SEARCHED when there would be more than CELL_MOST of them or the
+// room for lists is full.
+fn fillCell(held: *Finder, cell: usize) -> u32 {
+    const labs = held.*.labs
+    const count = held.*.count
+    // The cell, made a hair larger: a colour on its border, rounded into
+    // it, is inside.
+    const l0 = @floatFromInt(f64, cell >> 10) * L_STEP - 1.0e-9
+    const a0 = @floatFromInt(f64, (cell >> 5) & 31) * AB_STEP + AB_LOW - 1.0e-9
+    const b0 = @floatFromInt(f64, cell & 31) * AB_STEP + AB_LOW - 1.0e-9
+    const l1 = l0 + L_STEP + 2.0e-9
+    const a1 = a0 + AB_STEP + 2.0e-9
+    const b1 = b0 + AB_STEP + 2.0e-9
+    var bound = math.infinity()
+    var place: usize = 0
+    while place < count {
+        const dl = farther(labs[place * 3], l0, l1)
+        const da = farther(labs[place * 3 + 1], a0, a1)
+        const db = farther(labs[place * 3 + 2], b0, b1)
+        const far = dl * dl + da * da + db * db
+        if far < bound { bound = far }
+        place += 1
+    }
+    const first = held.*.listed
+    var listed: usize = 0
+    place = 0
+    while place < count {
+        const dl = outside(labs[place * 3], l0, l1)
+        const da = outside(labs[place * 3 + 1], a0, a1)
+        const db = outside(labs[place * 3 + 2], b0, b1)
+        if dl * dl + da * da + db * db <= bound {
+            if listed == CELL_MOST || first + listed == LIST_ROOM { return CELL_SEARCHED }
+            held.*.lists[first + listed] = @intCast(u16, place)
+            listed += 1
+        }
+        place += 1
+    }
+    held.*.listed = first + listed
+    return @intCast(u32, (first << 6) | listed)
+}
+
+// The place, in the order of lightness, of the nearest of the colours a
+// cell lists (`value`: the cell's (start << 6) | n); of two equally near
+// the earlier in the list.
+fn scanCell(held: *const Finder, l: f64, a: f64, b: f64, value: u32) -> usize {
+    const labs = held.*.labs
+    const order = held.*.order
+    const first = @intCast(usize, value >> 6)
+    const end = first + @intCast(usize, value & 63)
+    var best = math.infinity()
+    var best_at: usize = 0
+    var found: usize = MOST
+    var index = first
+    while index < end {
+        const place = @intCast(usize, held.*.lists[index])
+        const dl = labs[place * 3] - l
+        const da = labs[place * 3 + 1] - a
+        const db = labs[place * 3 + 2] - b
+        const distance = dl * dl + da * da + db * db
+        if distance <= best {
+            const which = @intCast(usize, order[place])
+            if distance < best || which < found {
+                best = distance
+                best_at = place
+                found = which
+            }
+        }
+        index += 1
+    }
+    return best_at
+}
+
+// The place (in the list the Finder was made of) of the colour nearest
+// to `value` (its alpha is not looked at).
+pub fn nearestOf(held: *Finder, value: u32) -> usize {
+    const rgb = value & 0x00FFFFFF
+    const slot = @intCast(usize, (rgb *% 0x9E3779B1) >> held.*.shift)
+    const tag = @intCast(u64, rgb | 0x01000000)
+    const answer = held.*.cache[slot]
+    if answer >> 16 == tag { return @intCast(usize, answer & 0xFFFF) }
+    var l: f64 = 0.0
+    var a: f64 = 0.0
+    var b: f64 = 0.0
+    labOf(rgb, &l, &a, &b)
+    var place: usize = 0
+    var listed = false
+    if held.*.gridded {
+        const cell = cellOf(l, a, b)
+        if cell < GRID_CELLS {
+            var list = held.*.cells[cell]
+            if list == CELL_UNKNOWN {
+                list = fillCell(held, cell)
+                held.*.cells[cell] = list
+            }
+            if list != CELL_SEARCHED {
+                place = scanCell(held, l, a, b, list)
+                listed = true
+            }
+        }
+    }
+    if !listed {
+        // The search starts from the colour of the nearest lightness.
+        var seed = @intCast(usize, held.*.starts[if l > 0.0 { pixel.smaller(@intFromFloat(u32, l * 2.56), 256) } else { 0 }])
+        if seed >= held.*.count { seed = held.*.count - 1 }
+        place = search(held, l, a, b, seed)
+    }
+    const found = @intCast(usize, held.*.order[place])
+    held.*.cache[slot] = (tag << 16) | @intCast(u64, found)
+    return found
+}
+
+// The colour (0x00RRGGBB) at a place of the Finder's list.
+pub inline fn colorOf(held: *const Finder, place: usize) -> u32 {
+    return held.*.colors[place]
+}
+
+// ---------------------------------------------------------------------------
+// Reducing a picture to a list of colours.
+
+// How the steps between the colours are hidden.
+pub const NONE: u8 = 0
+// Each pixel's error goes to its neighbours not yet done: 7/16 ahead,
+// 3/16, 5/16 and 1/16 below.
+pub const FLOYD_STEINBERG: u8 = 1
+// A pattern of thresholds is added before the nearest colour is taken:
+// Bayer's dispersed dots of 8 x 8, 4 x 4 and 2 x 2, a clustered dot (a
+// print's screen), diagonal lines, and noise that is the same each time.
+pub const ORDERED_BAYER_8: u8 = 2
+pub const ORDERED_BAYER_4: u8 = 3
+pub const ORDERED_BAYER_2: u8 = 4
+pub const HALFTONE: u8 = 5
+pub const LINES: u8 = 6
+pub const NOISE: u8 = 7
+// Six eighths of the error go to six neighbours, a quarter is dropped:
+// more contrast and cleaner flats than Floyd-Steinberg's.
+pub const ATKINSON: u8 = 8
+pub const DITHERS: u8 = 9
+
+const DITHER_NAMES = [9][]const u8{ "None", "Floyd-Steinberg", "Bayer 8 x 8", "Bayer 4 x 4", "Bayer 2 x 2", "Halftone", "Lines", "Noise", "Atkinson" }
+const DITHER_NAMES_GERMAN = [9][]const u8{ "Keines", "Floyd-Steinberg", "Bayer 8 x 8", "Bayer 4 x 4", "Bayer 2 x 2", "Raster", "Linien", "Rauschen", "Atkinson" }
+
+// A dithering method's name ("" when there is none such).
+pub fn ditherName(dither: u8, german: bool) -> []const u8 {
+    if dither >= DITHERS { return "" }
+    const place = @intCast(usize, dither)
+    return if german { DITHER_NAMES_GERMAN[place] } else { DITHER_NAMES[place] }
+}
+
+// The clustered dot: the order in which the 64 places of a cell turn on,
+// from the corners toward the middle (a round dot's edge by a spot
+// function of two cosines).
+const DOTS = [64]u8{
+    0, 7, 16, 28, 30, 21, 5, 2,
+    8, 15, 26, 43, 46, 39, 14, 11,
+    17, 27, 48, 53, 55, 50, 24, 18,
+    29, 45, 54, 62, 60, 56, 40, 32,
+    31, 47, 52, 61, 63, 58, 42, 34,
+    20, 38, 49, 57, 59, 51, 35, 22,
+    4, 13, 25, 41, 44, 36, 12, 9,
+    1, 10, 19, 33, 37, 23, 6, 3,
+}
+
+// A pixel not to be given a colour (transparent), in the row of places.
+const SKIPPED: u32 = 0xFFFFFFFF
+
+// Bayer's matrix of 2^bits to a side at (x, y): each bit pair of the
+// place, the lowest first, is the next two bits of the rank from the top.
+fn bayer(x: usize, y: usize, bits: usize) -> usize {
+    var rank: usize = 0
+    var bit: usize = 0
+    while bit < bits {
+        const xb = (x >> bit) & 1
+        const yb = (y >> bit) & 1
+        rank = (rank << 2) | ((xb ^ yb) << 1) | yb
+        bit += 1
+    }
+    return rank
+}
+
+// How far apart the colours of a list are, 0-255: the mean over the
+// colours (of a long list: over some 256 of them) of the largest channel
+// difference to the nearest other colour. A pattern of thresholds has to
+// reach this far to mix neighbours: 255 for black and white, 51 for the
+// web-safe cube.
+fn spreadOf(colors: [*]const u32, count: usize) -> f64 {
+    if count < 2 { return 0.0 }
+    const stride = (count + 255) / 256
+    var total: u64 = 0
+    var asked: u64 = 0
+    var index: usize = 0
+    while index < count {
+        const mine = colors[index]
+        var least: u32 = 255
+        var other: usize = 0
+        while other < count {
+            if other != index {
+                const gap = color.distanceRgb(mine, colors[other])
+                if gap < least { least = gap }
+            }
+            other += 1
+        }
+        total += @intCast(u64, least)
+        asked += 1
+        index += stride
+    }
+    return @floatFromInt(f64, total) / @floatFromInt(f64, asked)
+}
+
+// The 64 numbers a pattern adds to a pixel's channels, by place in the
+// 8 x 8 cell (NOISE: by rank), for a reach of `amplitude`.
+fn fillOffsets(offsets: [*]i32, dither: u8, amplitude: f64) -> void {
+    var place: usize = 0
+    while place < 64 {
+        const x = place & 7
+        const y = place >> 3
+        var rank: usize = place
+        var levels: f64 = 64.0
+        if dither == ORDERED_BAYER_8 {
+            rank = bayer(x, y, 3)
+        } else if dither == ORDERED_BAYER_4 {
+            rank = bayer(x & 3, y & 3, 2)
+            levels = 16.0
+        } else if dither == ORDERED_BAYER_2 {
+            rank = bayer(x & 1, y & 1, 1)
+            levels = 4.0
+        } else if dither == HALFTONE {
+            rank = @intCast(usize, DOTS[place])
+        } else if dither == LINES {
+            // Four lines to a period, turned on in the order 0, 2, 1, 3.
+            const line = (x + y) & 3
+            rank = ((line & 1) << 1) | (line >> 1)
+            levels = 4.0
+        }
+        const threshold = (@floatFromInt(f64, rank) + 0.5) / levels - 0.5
+        offsets[place] = @intFromFloat(i32, math.round(threshold * amplitude))
+        place += 1
+    }
+}
+
+// The places of a row's nearest colours, each pixel from itself alone.
+// (A run of one colour, what pictures are mostly made of, asks once.)
+fn pickPlain(held: *Finder, row: [*]const u32, picked: [*]u32, width: usize, least: u32) -> void {
+    var last: u32 = 0
+    var last_place: u32 = SKIPPED
+    var x: usize = 0
+    while x < width {
+        const value = row[x]
+        if value >> 24 < least {
+            picked[x] = SKIPPED
+        } else {
+            if last_place == SKIPPED || (value ^ last) & 0x00FFFFFF != 0 {
+                last = value
+                last_place = @intCast(u32, nearestOf(held, value))
+            }
+            picked[x] = last_place
+        }
+        x += 1
+    }
+}
+
+// The same with a pattern's number added to each channel first.
+fn pickOrdered(held: *Finder, row: [*]const u32, picked: [*]u32, width: usize, least: u32, offsets: [*]const i32, y: usize, noise: bool) -> void {
+    const line = (y & 7) * 8
+    const salt = @intCast(u32, y & 0xFFFFFFFF) *% 0x85EBCA6B
+    var x: usize = 0
+    while x < width {
+        const value = row[x]
+        if value >> 24 < least {
+            picked[x] = SKIPPED
+        } else {
+            var place = line + (x & 7)
+            if noise {
+                var mixed = (@intCast(u32, x & 0xFFFFFFFF) *% 0x9E3779B1) ^ salt
+                mixed = (mixed ^ (mixed >> 15)) *% 0x2C1B3C6D
+                mixed = mixed ^ (mixed >> 12)
+                place = @intCast(usize, mixed & 63)
+            }
+            const offset = offsets[place]
+            const r = pixel.clamp(@intCast(i32, (value >> 16) & 255) + offset)
+            const g = pixel.clamp(@intCast(i32, (value >> 8) & 255) + offset)
+            const b = pixel.clamp(@intCast(i32, value & 255) + offset)
+            picked[x] = @intCast(u32, nearestOf(held, (r << 16) | (g << 8) | b))
+        }
+        x += 1
+    }
+}
+
+// Errors are sixteenths of a byte's step. A row of them has two cells
+// (of three channels) before its first pixel and two after its last, so
+// that no share needs to ask whether its neighbour is there: cell x is at
+// (x + 2) * 3.
+const PAD: usize = 2
+
+// What a pixel may ask for with the errors it was handed, in sixteenths:
+// a byte and as much again on either side. Without this hold a picture
+// outside what the colours can mix (a red one, a palette of greys) piles
+// its error up without end and bleeds it far.
+const WANT_LOW: i32 = -4080
+const WANT_HIGH: i32 = 8160
+
+inline fn held16(value: i32) -> i32 {
+    return if value < WANT_LOW { WANT_LOW } else if value > WANT_HIGH { WANT_HIGH } else { value }
+}
+
+// One channel's error `e` to Floyd and Steinberg's four neighbours; the
+// last takes what the rounding of the others left, so nothing is lost.
+inline fn giveFloyd(here: [*]i32, below: [*]i32, at: usize, ahead: usize, behind: usize, e: i32) -> void {
+    const first = (e * 7) >> 4
+    const second = (e * 3) >> 4
+    const third = (e * 5) >> 4
+    here[ahead] += first
+    below[behind] += second
+    below[at] += third
+    below[ahead] += e - first - second - third
+}
+
+// One channel's error to Atkinson's six neighbours, an eighth each.
+inline fn giveAtkinson(here: [*]i32, below: [*]i32, beyond: [*]i32, at: usize, ahead: usize, ahead2: usize, behind: usize, e: i32) -> void {
+    const share = e >> 3
+    here[ahead] += share
+    here[ahead2] += share
+    below[behind] += share
+    below[at] += share
+    below[ahead] += share
+    beyond[at] += share
+}
+
+// What fell beside a row of errors goes to its first and its last pixel.
+fn foldPads(errors: [*]i32, width: usize) -> void {
+    const first = PAD * 3
+    const last = (width - 1 + PAD) * 3
+    var channel: usize = 0
+    while channel < 3 {
+        errors[first + channel] += errors[channel] + errors[3 + channel]
+        errors[last + channel] += errors[last + 3 + channel] + errors[last + 6 + channel]
+        errors[channel] = 0
+        errors[3 + channel] = 0
+        errors[last + 3 + channel] = 0
+        errors[last + 6 + channel] = 0
+        channel += 1
+    }
+}
+
+// The places of a row's colours with the row's errors `here` taken in
+// and each pixel's own error handed on (`amount` of it, 0-256), from the
+// left or `backwards`.
+fn pickDiffused(held: *Finder, row: [*]const u32, picked: [*]u32, width: usize, least: u32, here: [*]i32, below: [*]i32, beyond: [*]i32, backwards: bool, atkinson: bool, amount: i32) -> void {
+    const colors = held.*.colors
+    var done: usize = 0
+    while done < width {
+        const x = if backwards { width - 1 - done } else { done }
+        const at = (x + PAD) * 3
+        const value = row[x]
+        if value >> 24 < least {
+            // A transparent pixel has no colour to be wrong about: it
+            // takes no error and hands none on.
+            picked[x] = SKIPPED
+        } else {
+            const r = held16(@intCast(i32, (value >> 16) & 255) * 16 + here[at])
+            const g = held16(@intCast(i32, (value >> 8) & 255) * 16 + here[at + 1])
+            const b = held16(@intCast(i32, value & 255) * 16 + here[at + 2])
+            const place = nearestOf(held, (pixel.clamp((r + 8) >> 4) << 16) | (pixel.clamp((g + 8) >> 4) << 8) | pixel.clamp((b + 8) >> 4))
+            picked[x] = @intCast(u32, place)
+            const chosen = colors[place]
+            const er = ((r - @intCast(i32, (chosen >> 16) & 255) * 16) * amount) >> 8
+            const eg = ((g - @intCast(i32, (chosen >> 8) & 255) * 16) * amount) >> 8
+            const eb = ((b - @intCast(i32, chosen & 255) * 16) * amount) >> 8
+            const ahead = if backwards { at - 3 } else { at + 3 }
+            const behind = if backwards { at + 3 } else { at - 3 }
+            if atkinson {
+                const ahead2 = if backwards { at - 6 } else { at + 6 }
+                giveAtkinson(here, below, beyond, at, ahead, ahead2, behind, er)
+                giveAtkinson(here, below, beyond, at + 1, ahead + 1, ahead2 + 1, behind + 1, eg)
+                giveAtkinson(here, below, beyond, at + 2, ahead + 2, ahead2 + 2, behind + 2, eb)
+            } else {
+                giveFloyd(here, below, at, ahead, behind, er)
+                giveFloyd(here, below, at + 1, ahead + 1, behind + 1, eg)
+                giveFloyd(here, below, at + 2, ahead + 2, behind + 2, eb)
+            }
+        }
+        done += 1
+    }
+}
+
+// A row's places as pixels: each colour at the pixel's own alpha, or
+// (`keep_alpha` false) opaque where the pixel was at least half there
+// and nothing where it was not. A pixel that ends transparent is 0.
+fn emitPixels(row: [*]u32, picked: [*]const u32, colors: [*]const u32, width: usize, keep_alpha: bool) -> void {
+    var x: usize = 0
+    while x < width {
+        const place = picked[x]
+        if place == SKIPPED {
+            row[x] = 0
+        } else if keep_alpha {
+            row[x] = (row[x] & 0xFF000000) | colors[@intCast(usize, place)]
+        } else {
+            row[x] = 0xFF000000 | colors[@intCast(usize, place)]
+        }
+        x += 1
+    }
+}
+
+fn emitIndices(into: [*]u8, picked: [*]const u32, width: usize, transparent: u8) -> void {
+    var x: usize = 0
+    while x < width {
+        const place = picked[x]
+        into[x] = if place == SKIPPED { transparent } else { @intCast(u8, place) }
+        x += 1
+    }
+}
+
+// The work of quantize and quantizeIndices: `source`'s pixels to the
+// nearest of `count` colours, written as pixels to `target` (the same
+// rows as `source`) or as places to `into` (`width` bytes a row). A
+// pixel with an alpha below `least` gets no colour.
+fn reduce(source: [*]const u32, target: ?[*]u32, into: ?[*]u8, width: usize, height: usize, stride: usize, colors: [*]const u32, count: usize, dither: u8, strength: f64, least: u32, keep_alpha: bool, transparent: u8) -> bool {
+    if count == 0 || count > MOST { return false }
+    if width == 0 || height == 0 { return true }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const held = finderOf(pool, colors, count, width *| height)
+    const picked = scratch.words(pool, width)
+    if held == null || picked == null {
+        scratch.release(pool, mark)
+        return false
+    }
+    // What is no number counts as all of it; the rest is held to 0..1.
+    const share = if strength != strength { 1.0 } else if strength < 0.0 { 0.0 } else if strength > 1.0 { 1.0 } else { strength }
+    var method = if dither < DITHERS { dither } else { NONE }
+    if share == 0.0 { method = NONE }
+    const diffusing = method == FLOYD_STEINBERG || method == ATKINSON
+
+    var offsets: [*]i32 = undefined
+    var here: [*]i32 = undefined
+    var below: [*]i32 = undefined
+    var beyond: [*]i32 = undefined
+    const cells = (width + PAD * 2) * 3
+    if diffusing {
+        const errors = scratch.ints(pool, cells * 3)
+        if errors == null {
+            scratch.release(pool, mark)
+            return false
+        }
+        here = errors.?
+        below = here + cells
+        beyond = below + cells
+        var index: usize = 0
+        while index < cells * 3 {
+            here[index] = 0
+            index += 1
+        }
+    } else if method != NONE {
+        const numbers = scratch.ints(pool, 64)
+        if numbers == null {
+            scratch.release(pool, mark)
+            return false
+        }
+        offsets = numbers.?
+        fillOffsets(offsets, method, spreadOf(held.?.*.colors, count) * share)
+    }
+    const amount = @intFromFloat(i32, share * 256.0 + 0.5)
+
+    var y: usize = 0
+    while y < height {
+        const row = source + y * stride
+        if diffusing {
+            foldPads(here, width)
+            pickDiffused(held.?, row, picked.?, width, least, here, below, beyond, y & 1 == 1, method == ATKINSON, amount)
+            // What the row's last pixels handed on past its end belongs
+            // to the row below, at that end.
+            const last = (width - 1 + PAD) * 3
+            var channel: usize = 0
+            while channel < 3 {
+                below[PAD * 3 + channel] += here[channel] + here[3 + channel]
+                below[last + channel] += here[last + 3 + channel] + here[last + 6 + channel]
+                channel += 1
+            }
+            var index: usize = 0
+            while index < cells {
+                here[index] = 0
+                index += 1
+            }
+            const used = here
+            here = below
+            below = beyond
+            beyond = used
+        } else if method == NONE {
+            pickPlain(held.?, row, picked.?, width, least)
+        } else {
+            pickOrdered(held.?, row, picked.?, width, least, offsets, y, method == NOISE)
+        }
+        if target != null {
+            emitPixels(target.? + y * stride, picked.?, held.?.*.colors, width, keep_alpha)
+        } else if into != null {
+            emitIndices(into.? + y * width, picked.?, width, transparent)
+        }
+        y += 1
+    }
+    scratch.release(pool, mark)
+    return true
+}
+
+// Gives every pixel of `width` x `height` straight pixels at `pixels`
+// (`stride` words a row) the colour of the palette's nearest entry, in
+// place, dithered by `dither` (NONE, FLOYD_STEINBERG, ...) at `strength`
+// (0..1: how much of the error is handed on, how far the pattern
+// reaches; what is no number counts as 1). With `keep_alpha` each pixel
+// keeps its alpha and a fully transparent one gets no colour (it ends as
+// 0); without, a pixel is opaque afterwards where its alpha was 128 or
+// more and 0 where it was less. A transparent pixel takes no part in the
+// diffusion of errors. False, and the pixels as they were, for a palette
+// without entries and without memory.
+pub fn quantize(pixels: [*]u32, width: usize, height: usize, stride: usize, palette: *const Palette, dither: u8, strength: f64, keep_alpha: bool) -> bool {
+    if palette.*.count == 0 { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const colors = scratch.words(pool, palette.*.count)
+    if colors == null { return false }
+    var index: usize = 0
+    while index < palette.*.count {
+        colors.?[index] = palette.*.entries[index].color
+        index += 1
+    }
+    const done = reduce(pixels, pixels, null, width, height, stride, colors.?, palette.*.count, dither, strength, if keep_alpha { 1 } else { 128 }, keep_alpha, 0)
+    scratch.release(pool, mark)
+    return done
+}
+
+// The same to a plain list of colours (their alpha is not looked at):
+// what a filter with a constant table of colours calls.
+pub fn quantizeColors(pixels: [*]u32, width: usize, height: usize, stride: usize, colors: []const u32, dither: u8, strength: f64, keep_alpha: bool) -> bool {
+    return reduce(pixels, pixels, null, width, height, stride, colors.pointer, colors.length, dither, strength, if keep_alpha { 1 } else { 128 }, keep_alpha, 0)
+}
+
+// What quantize without `keep_alpha` would make of the pixels, as the
+// entries' places: `width` bytes a row at `into`, no gaps between the
+// rows; a pixel with an alpha below 128 gets `transparent` (a GIF's
+// transparent index; a picture without such pixels never gets it). The
+// pixels stay as they are. False for a palette without entries or with
+// more than 256, and without memory.
+pub fn quantizeIndices(pixels: [*]const u32, width: usize, height: usize, stride: usize, palette: *const Palette, dither: u8, strength: f64, transparent: u8, into: [*]u8) -> bool {
+    if palette.*.count == 0 || palette.*.count > 256 { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const colors = scratch.words(pool, palette.*.count)
+    if colors == null { return false }
+    var index: usize = 0
+    while index < palette.*.count {
+        colors.?[index] = palette.*.entries[index].color
+        index += 1
+    }
+    const done = reduce(pixels, null, into, width, height, stride, colors.?, palette.*.count, dither, strength, 128, false, transparent)
+    scratch.release(pool, mark)
+    return done
+}
+
+// ---------------------------------------------------------------------------
+// Sorting.
+
+// The entries in the order of `keys`, one for each entry, its place in
+// the low 16 bits (so equal keys keep their order): sorts the keys.
+// False without scratch memory (the order stays).
+fn arrange(palette: *Palette, pool: *scratch.Pool, keys: [*]u64) -> bool {
+    const total = palette.*.count
+    const mark = scratch.mark(pool)
+    const entry_memory = scratch.bytes(pool, total * @sizeOf(Entry))
+    if entry_memory == null { return false }
+    const held: [*]Entry = unsafe { @ptrCast([*]Entry, entry_memory.?) }
+    var index: usize = 0
+    while index < total {
+        held[index] = palette.*.entries[index]
+        index += 1
+    }
+    std.mem.sortU64(keys, total)
+    index = 0
+    while index < total {
+        palette.*.entries[index] = held[@intCast(usize, keys[index] & 0xFFFF)]
+        index += 1
+    }
+    scratch.release(pool, mark)
+    return true
+}
+
+// The entries in a new order by a key of each: stable (entries of one
+// key keep their order), so the entries of a group stay together as far
+// as they were. False without scratch memory (the order stays).
+fn sortBy(palette: *Palette, by_hue: bool) -> bool {
+    const total = palette.*.count
+    if total < 2 { return true }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const key_memory = scratch.bytes(pool, total * 8)
+    if key_memory == null { return false }
+    const keys: [*]u64 = unsafe { @ptrCast([*]u64, key_memory.?) }
+    var index: usize = 0
+    while index < total {
+        const value = palette.*.entries[index].color
+        var l: f64 = 0.0
+        var a: f64 = 0.0
+        var b: f64 = 0.0
+        labOf(value, &l, &a, &b)
+        var h: f64 = 0.0
+        var s: f64 = 0.0
+        var v: f64 = 0.0
+        color.toHsv(value, &h, &s, &v)
+        // 24 bits of lightness, 16 of hue; the entry's place in the low
+        // 16 bits makes equal keys keep their order.
+        const light = @intFromFloat(u64, (if !(l > 0.0) { 0.0 } else if l > 100.0 { 100.0 } else { l }) * 167772.15)
+        const hue = @intFromFloat(u64, (if !(h > 0.0) { 0.0 } else if h > 1.0 { 1.0 } else { h }) * 65535.0)
+        var key = (light << 16) | hue
+        if by_hue {
+            const colored: u64 = if s > 0.0 { 1 } else { 0 }
+            key = (colored << 40) | (hue << 24) | light
+        }
+        keys[index] = (key << 16) | @intCast(u64, index)
+        index += 1
+    }
+    const done = arrange(palette, pool, keys)
+    scratch.release(pool, mark)
+    return done
+}
+
+// The entries around the colour wheel: the greys first (the darkest
+// first), then by hue from red through yellow, green and blue to
+// magenta, entries of one hue from dark to light.
+pub fn sortByHue(palette: *Palette) -> bool {
+    return sortBy(palette, true)
+}
+
+// The entries from dark to light (Lab's lightness), those equally light
+// by hue.
+pub fn sortByLightness(palette: *Palette) -> bool {
+    return sortBy(palette, false)
+}
+
+// ---------------------------------------------------------------------------
+// A palette from a picture: median cut.
+//
+// The picture's colours are counted first, each with how often it is
+// there: exactly, as long as there are no more than 65536 different
+// ones, otherwise in 32768 cells of the colour cube (5 bits a channel),
+// each cell standing for the mean of what fell in it. Those are cut into
+// boxes: the box whose colours vary most (the largest weighted sum of
+// squares along one channel) is cut across that channel at its weighted
+// median, until there are as many boxes as colours wanted or no box
+// holds two colours. A box's colour is its weighted mean. A few rounds
+// of k-means (each colour to its nearest box colour, each box colour to
+// the mean of its colours) then move the colours to where they fit best,
+// if that is not too much work.
+
+// The most colours fromPixels makes.
+pub const FROM_PIXELS_MOST: usize = 4096
+
+const EXACT_MOST: usize = 65536
+const EXACT_SLOTS: usize = 131072
+const BINS: usize = 32768
+const REFINE_ROUNDS: usize = 3
+// Colours times boxes up to which the rounds of k-means are done.
+const REFINE_WORK: usize = 4194304
+
+inline fn channelOf(value: u32, axis: u32) -> u32 {
+    return (value >> (16 - 8 * axis)) & 255
+}
+
+// How much the colours of a box (items `start` to `end`) vary: the
+// largest of the three channels' weighted sums of squares about the
+// mean, and into `axis` that channel (0 red, 1 green, 2 blue). 0 for a
+// box that cannot be cut: fewer than two colours.
+fn measure(colors: [*]const u32, weights: [*]const u32, start: usize, end: usize, axis: *u32) -> f64 {
+    axis.* = 0
+    if end - start < 2 { return 0.0 }
+    var w: f64 = 0.0
+    var sr: f64 = 0.0
+    var sg: f64 = 0.0
+    var sb: f64 = 0.0
+    var qr: f64 = 0.0
+    var qg: f64 = 0.0
+    var qb: f64 = 0.0
+    var low: u32 = 0x00FFFFFF
+    var high: u32 = 0
+    var index = start
+    while index < end {
+        const value = colors[index]
+        const weight = @floatFromInt(f64, weights[index])
+        const r = @floatFromInt(f64, (value >> 16) & 255)
+        const g = @floatFromInt(f64, (value >> 8) & 255)
+        const b = @floatFromInt(f64, value & 255)
+        w += weight
+        sr += weight * r
+        sg += weight * g
+        sb += weight * b
+        qr += weight * r * r
+        qg += weight * g * g
+        qb += weight * b * b
+        // The least and the most of each channel, the three side by side.
+        low = (pixel.smaller(low & 0xFF0000, value & 0xFF0000)) | (pixel.smaller(low & 0xFF00, value & 0xFF00)) | pixel.smaller(low & 0xFF, value & 0xFF)
+        high = (pixel.larger(high & 0xFF0000, value & 0xFF0000)) | (pixel.larger(high & 0xFF00, value & 0xFF00)) | pixel.larger(high & 0xFF, value & 0xFF)
+        index += 1
+    }
+    // Only a channel with two different values can be cut; the sums are
+    // large numbers taken from each other, so what they leave is not
+    // trusted to tell that.
+    var best: f64 = -1.0
+    if (low ^ high) & 0xFF0000 != 0 {
+        best = qr - sr * sr / w
+        axis.* = 0
+    }
+    if (low ^ high) & 0xFF00 != 0 && qg - sg * sg / w > best {
+        best = qg - sg * sg / w
+        axis.* = 1
+    }
+    if (low ^ high) & 0xFF != 0 && qb - sb * sb / w > best {
+        best = qb - sb * sb / w
+        axis.* = 2
+    }
+    if best == -1.0 && (low ^ high) == 0 { return 0.0 }
+    return if best > 1.0e-9 { best } else { 1.0e-9 }
+}
+
+// Cuts a box across channel `axis`, along which it has two different
+// values, at its weighted median: the colours up to the median come
+// first. Returns where the second part begins (inside the box). `tally`:
+// 256 doubles to work in.
+fn cut(colors: [*]u32, weights: [*]u32, start: usize, end: usize, axis: u32, tally: [*]f64) -> usize {
+    var level: usize = 0
+    while level < 256 {
+        tally[level] = 0.0
+        level += 1
+    }
+    var low: usize = 255
+    var high: usize = 0
+    var total: f64 = 0.0
+    var index = start
+    while index < end {
+        const at = @intCast(usize, channelOf(colors[index], axis))
+        const weight = @floatFromInt(f64, weights[index])
+        tally[at] += weight
+        total += weight
+        if at < low { low = at }
+        if at > high { high = at }
+        index += 1
+    }
+    // The last level of the first part: where half of the weight is
+    // reached, but never the highest, which is the second part's.
+    var last = low
+    var sum: f64 = 0.0
+    while last + 1 < high {
+        sum += tally[last]
+        if sum * 2.0 >= total { break }
+        last += 1
+    }
+    var front = start
+    var back = end
+    while front < back {
+        if @intCast(usize, channelOf(colors[front], axis)) <= last {
+            front += 1
+        } else {
+            back -= 1
+            const value = colors[front]
+            colors[front] = colors[back]
+            colors[back] = value
+            const weight = weights[front]
+            weights[front] = weights[back]
+            weights[back] = weight
+        }
+    }
+    return front
+}
+
+fn cutColors(palette: *Palette, pool: *scratch.Pool, pixels: [*]const u32, count: usize, wanted: usize) -> bool {
+    const most = if wanted > FROM_PIXELS_MOST { FROM_PIXELS_MOST } else { wanted }
+    if most == 0 {
+        clear(palette)
+        return true
+    }
+    const key_memory = scratch.words(pool, EXACT_SLOTS)
+    const tally_memory = scratch.words(pool, EXACT_SLOTS)
+    const color_memory = scratch.words(pool, EXACT_MOST)
+    const weight_memory = scratch.words(pool, EXACT_MOST)
+    if key_memory == null || tally_memory == null || color_memory == null || weight_memory == null { return false }
+    const keys = key_memory.?
+    const tallies = tally_memory.?
+    const colors = color_memory.?
+    const weights = weight_memory.?
+
+    // The colours with their numbers, exactly: a table by the colour's
+    // hash, the colour made opaque so that none is 0, which is "empty".
+    var index: usize = 0
+    while index < EXACT_SLOTS {
+        keys[index] = 0
+        index += 1
+    }
+    var distinct: usize = 0
+    var exact: bool = true
+    index = 0
+    while index < count {
+        const value = pixels[index]
+        index += 1
+        if value >> 24 == 0 { continue }
+        const key = value | 0xFF000000
+        var slot = @intCast(usize, (key *% 0x9E3779B1) >> 15)
+        while keys[slot] != 0 && keys[slot] != key { slot = (slot + 1) & (EXACT_SLOTS - 1) }
+        if keys[slot] == 0 {
+            if distinct == EXACT_MOST {
+                exact = false
+                break
+            }
+            keys[slot] = key
+            tallies[slot] = 0
+            distinct += 1
+        }
+        tallies[slot] +|= 1
+    }
+
+    var items: usize = 0
+    if exact {
+        index = 0
+        while index < EXACT_SLOTS {
+            if keys[index] != 0 {
+                colors[items] = keys[index] & 0x00FFFFFF
+                weights[items] = tallies[index]
+                items += 1
+            }
+            index += 1
+        }
+    } else {
+        // Too many different colours: all pixels again, into the cells.
+        const cell_counts = scratch.words(pool, BINS)
+        const cell_sums = scratch.doubles(pool, BINS * 3)
+        if cell_counts == null || cell_sums == null { return false }
+        const counts = cell_counts.?
+        const sums = cell_sums.?
+        index = 0
+        while index < BINS {
+            counts[index] = 0
+            sums[index * 3] = 0.0
+            sums[index * 3 + 1] = 0.0
+            sums[index * 3 + 2] = 0.0
+            index += 1
+        }
+        index = 0
+        while index < count {
+            const value = pixels[index]
+            index += 1
+            if value >> 24 == 0 { continue }
+            const cell = @intCast(usize, ((value >> 9) & 0x7C00) | ((value >> 6) & 0x3E0) | ((value >> 3) & 0x1F))
+            counts[cell] +|= 1
+            sums[cell * 3] += @floatFromInt(f64, (value >> 16) & 255)
+            sums[cell * 3 + 1] += @floatFromInt(f64, (value >> 8) & 255)
+            sums[cell * 3 + 2] += @floatFromInt(f64, value & 255)
+        }
+        index = 0
+        while index < BINS {
+            if counts[index] != 0 {
+                // (The sums count every pixel, the count stops at what a
+                // u32 holds: the mean is taken with the same number the
+                // weight is.)
+                const held = @floatFromInt(f64, counts[index])
+                const r = pixel.smaller(@intFromFloat(u32, sums[index * 3] / held + 0.5), 255)
+                const g = pixel.smaller(@intFromFloat(u32, sums[index * 3 + 1] / held + 0.5), 255)
+                const b = pixel.smaller(@intFromFloat(u32, sums[index * 3 + 2] / held + 0.5), 255)
+                colors[items] = (r << 16) | (g << 8) | b
+                weights[items] = counts[index]
+                items += 1
+            }
+            index += 1
+        }
+    }
+    if items == 0 {
+        clear(palette)
+        return true
+    }
+
+    const start_memory = scratch.words(pool, most)
+    const end_memory = scratch.words(pool, most)
+    const axis_memory = scratch.words(pool, most)
+    const score_memory = scratch.doubles(pool, most)
+    const center_memory = scratch.words(pool, most)
+    const sum_memory = scratch.doubles(pool, most * 4)
+    const tally = scratch.doubles(pool, 256)
+    if start_memory == null || end_memory == null || axis_memory == null || score_memory == null || center_memory == null || sum_memory == null || tally == null { return false }
+    const starts = start_memory.?
+    const ends = end_memory.?
+    const axes = axis_memory.?
+    const scores = score_memory.?
+    const centers = center_memory.?
+    const sums = sum_memory.?
+
+    var axis: u32 = 0
+    starts[0] = 0
+    ends[0] = @intCast(u32, items)
+    scores[0] = measure(colors, weights, 0, items, &axis)
+    axes[0] = axis
+    var boxes: usize = 1
+    while boxes < most {
+        var pick: usize = 0
+        var box: usize = 1
+        while box < boxes {
+            if scores[box] > scores[pick] { pick = box }
+            box += 1
+        }
+        if !(scores[pick] > 0.0) { break }
+        const first = @intCast(usize, starts[pick])
+        const last = @intCast(usize, ends[pick])
+        const middle = cut(colors, weights, first, last, axes[pick], tally.?)
+        ends[pick] = @intCast(u32, middle)
+        scores[pick] = measure(colors, weights, first, middle, &axis)
+        axes[pick] = axis
+        starts[boxes] = @intCast(u32, middle)
+        ends[boxes] = @intCast(u32, last)
+        scores[boxes] = measure(colors, weights, middle, last, &axis)
+        axes[boxes] = axis
+        boxes += 1
+    }
+
+    // Each box's colour: the weighted mean of what is in it.
+    var box: usize = 0
+    while box < boxes {
+        var w: f64 = 0.0
+        var r: f64 = 0.0
+        var g: f64 = 0.0
+        var b: f64 = 0.0
+        index = @intCast(usize, starts[box])
+        while index < @intCast(usize, ends[box]) {
+            const weight = @floatFromInt(f64, weights[index])
+            w += weight
+            r += weight * @floatFromInt(f64, (colors[index] >> 16) & 255)
+            g += weight * @floatFromInt(f64, (colors[index] >> 8) & 255)
+            b += weight * @floatFromInt(f64, colors[index] & 255)
+            index += 1
+        }
+        centers[box] = (pixel.smaller(@intFromFloat(u32, r / w + 0.5), 255) << 16) | (pixel.smaller(@intFromFloat(u32, g / w + 0.5), 255) << 8) | pixel.smaller(@intFromFloat(u32, b / w + 0.5), 255)
+        box += 1
+    }
+
+    if boxes > 1 && items * boxes <= REFINE_WORK {
+        var round: usize = 0
+        while round < REFINE_ROUNDS {
+            index = 0
+            while index < boxes * 4 {
+                sums[index] = 0.0
+                index += 1
+            }
+            index = 0
+            while index < items {
+                const r = @intCast(i32, (colors[index] >> 16) & 255)
+                const g = @intCast(i32, (colors[index] >> 8) & 255)
+                const b = @intCast(i32, colors[index] & 255)
+                var near: usize = 0
+                var least: i32 = 2147483647
+                box = 0
+                while box < boxes {
+                    const dr = r - @intCast(i32, (centers[box] >> 16) & 255)
+                    const dg = g - @intCast(i32, (centers[box] >> 8) & 255)
+                    const db = b - @intCast(i32, centers[box] & 255)
+                    const apart = dr * dr + dg * dg + db * db
+                    if apart < least {
+                        least = apart
+                        near = box
+                    }
+                    box += 1
+                }
+                const weight = @floatFromInt(f64, weights[index])
+                sums[near * 4] += weight * @floatFromInt(f64, r)
+                sums[near * 4 + 1] += weight * @floatFromInt(f64, g)
+                sums[near * 4 + 2] += weight * @floatFromInt(f64, b)
+                sums[near * 4 + 3] += weight
+                index += 1
+            }
+            box = 0
+            while box < boxes {
+                const w = sums[box * 4 + 3]
+                // (A box colour nothing is nearest to stays where it is.)
+                if w > 0.0 {
+                    centers[box] = (pixel.smaller(@intFromFloat(u32, sums[box * 4] / w + 0.5), 255) << 16) | (pixel.smaller(@intFromFloat(u32, sums[box * 4 + 1] / w + 0.5), 255) << 8) | pixel.smaller(@intFromFloat(u32, sums[box * 4 + 2] / w + 0.5), 255)
+                }
+                box += 1
+            }
+            round += 1
+        }
+    }
+
+    if !reserve(palette, boxes) { return false }
+    clear(palette)
+    box = 0
+    while box < boxes {
+        // Two means may round to one colour: it is in the palette once.
+        if find(palette, centers[box]) == null { _ = add(palette, centers[box], "", 0) }
+        box += 1
+    }
+    _ = sortBy(palette, false)
+    return true
+}
+
+// Makes the palette's entries the up to `wanted` colours (at most
+// FROM_PIXELS_MOST) that stand best for `count` straight pixels at
+// `pixels`: by median cut in RGB, each colour weighed by how often it is
+// there, then a few rounds of k-means. Fully transparent pixels are not
+// looked at, of the others only the colour. The entries have no names,
+// are in group 0 and go from dark to light; a picture of no more colours
+// than wanted gives exactly its colours. The palette's name and columns
+// stay. False without memory (the palette is as it was).
+pub fn fromPixels(palette: *Palette, pixels: [*]const u32, count: usize, wanted: usize) -> bool {
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const done = cutColors(palette, pool, pixels, count, wanted)
+    scratch.release(pool, mark)
+    return done
+}
+
+// ---------------------------------------------------------------------------
+// Files.
+
+// What a reader starts from and leaves when it fails: no entries, no
+// groups, no name, COLUMNS columns (a file says its own or has none).
+fn fresh(palette: *Palette) -> void {
+    clear(palette)
+    palette.*.nameLength = 0
+    palette.*.columns = COLUMNS
+}
+
+// What read() found the bytes to be.
+pub const UNKNOWN: u8 = 0
+pub const GPL: u8 = 1
+pub const ACO: u8 = 2
+pub const ASE: u8 = 3
+pub const HEX: u8 = 4
+pub const KPL: u8 = 5
+
+inline fn isBlank(byte: u8) -> bool { return byte == 32 || byte == 9 }
+
+// Where the line that begins at `at` ends: at its '\n' or '\r' (files
+// from old Macs end their lines with '\r' alone; of "\r\n" the '\n' is
+// then an empty line) or at the end of the bytes.
+fn lineEnd(bytes: []const u8, at: usize) -> usize {
+    var end = at
+    while end < bytes.length && bytes[end] != 10 && bytes[end] != 13 { end += 1 }
+    return end
+}
+
+// Where the text of `bytes` begins: after a byte order mark, if it has
+// one.
+fn textStart(bytes: []const u8) -> usize {
+    if bytes.length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF { return 3 }
+    return 0
+}
+
+// The whole number at `at.*` of `line`, blanks before it skipped;
+// `at.*` is after it then. False when no digit is there. What is beyond
+// 65535 is 65535.
+fn number(line: []const u8, at: *usize, into: *u32) -> bool {
+    var index = at.*
+    while index < line.length && isBlank(line[index]) { index += 1 }
+    const first = index
+    var value: u32 = 0
+    while index < line.length && line[index] >= 48 && line[index] <= 57 {
+        value = value * 10 + @intCast(u32, line[index] - 48)
+        if value > 65535 { value = 65535 }
+        index += 1
+    }
+    if index == first { return false }
+    at.* = index
+    into.* = value
+    return true
+}
+
+// Reads a GIMP palette (.gpl): the line "GIMP Palette", then "Name: ..."
+// and "Columns: N" (either may be missing, as in old files), '#'
+// comments, and a colour a line: three numbers of 0-255 and, after
+// blanks or a tab, its name (which may be missing). Tolerant of what
+// such files have: a byte order mark, "\r\n" or '\r', empty lines, other
+// "Key: value" lines, numbers above 255 (they are 255), lines that are
+// no colour (skipped), "Channels: RGBA" with a fourth number a colour
+// (not kept). False when the first line is not "GIMP Palette", for more
+// than MOST colours and without memory.
+pub fn readGpl(palette: *Palette, bytes: []const u8) -> bool {
+    fresh(palette)
+    var at = textStart(bytes)
+    var headed: bool = false
+    var alpha: bool = false
+    while at < bytes.length {
+        const end = lineEnd(bytes, at)
+        const line = std.text.trimmed(bytes[at..end])
+        at = end + 1
+        if line.length == 0 { continue }
+        if !headed {
+            if !std.text.startsWith(line, "GIMP Palette") { return false }
+            headed = true
+            continue
+        }
+        if line[0] == 35 { continue }
+        if std.text.startsWith(line, "Name:") {
+            rename(palette, std.text.trimmed(line[5..]))
+            continue
+        }
+        var place: usize = 0
+        var r: u32 = 0
+        var g: u32 = 0
+        var b: u32 = 0
+        if std.text.startsWith(line, "Columns:") {
+            place = 8
+            if number(line, &place, &r) { setColumns(palette, if r == 0 { COLUMNS } else { r }) }
+            continue
+        }
+        if std.text.startsWith(line, "Channels:") {
+            alpha = std.text.contains(line, "RGBA")
+            continue
+        }
+        if !number(line, &place, &r) || !number(line, &place, &g) || !number(line, &place, &b) { continue }
+        if alpha {
+            var a: u32 = 0
+            _ = number(line, &place, &a)
+        }
+        if !add(palette, pixel.rgb(pixel.smaller(r, 255), pixel.smaller(g, 255), pixel.smaller(b, 255)), std.text.trimmed(line[place..]), 0) {
+            fresh(palette)
+            return false
+        }
+    }
+    return headed
+}
+
+// `value` in decimal, blanks before it up to `width` bytes.
+fn putNumber(into: *std.ArrayList(u8), value: usize, width: usize) -> bool {
+    const length = digitsOf(value)
+    var blanks = length
+    while blanks < width {
+        if !into.append(32) { return false }
+        blanks += 1
+    }
+    const at = into.count()
+    if !into.resize(at + length) { return false }
+    _ = decimal(into.items().pointer, at, at + length, value)
+    return true
+}
+
+// Appends the palette as a GIMP palette (.gpl) to `into`: what readGpl
+// reads back to the same name, columns, colours and names. Groups are
+// not in it (the format has none). False without memory.
+pub fn writeGpl(palette: *const Palette, into: *std.ArrayList(u8)) -> bool {
+    if !into.appendSlice("GIMP Palette\n") { return false }
+    if palette.*.nameLength > 0 {
+        if !into.appendSlice("Name: ") || !into.appendSlice(name(palette)) || !into.append(10) { return false }
+    }
+    if !into.appendSlice("Columns: ") || !putNumber(into, @intCast(usize, palette.*.columns), 0) || !into.appendSlice("\n#\n") { return false }
+    var index: usize = 0
+    while index < palette.*.count {
+        const value = palette.*.entries[index].color
+        if !putNumber(into, @intCast(usize, pixel.red(value)), 3) || !into.append(32) { return false }
+        if !putNumber(into, @intCast(usize, pixel.green(value)), 3) || !into.append(32) { return false }
+        if !putNumber(into, @intCast(usize, pixel.blue(value)), 3) { return false }
+        const text = nameAt(palette, index)
+        if text.length > 0 {
+            if !into.append(9) || !into.appendSlice(text) { return false }
+        }
+        if !into.append(10) { return false }
+        index += 1
+    }
+    return true
+}
+
+// Reads a plain list: a colour a line as color.parseHex reads it
+// ("#RRGGBB", "RRGGBB", "#RGB", "#AARRGGBB" with the alpha not kept),
+// then blanks and its name, if it has one. Empty lines and lines that
+// begin with ';' or "//" are skipped. False for a line that is neither,
+// for no colour at all, for more than MOST and without memory.
+pub fn readHexList(palette: *Palette, bytes: []const u8) -> bool {
+    fresh(palette)
+    var at = textStart(bytes)
+    while at < bytes.length {
+        const end = lineEnd(bytes, at)
+        const line = std.text.trimmed(bytes[at..end])
+        at = end + 1
+        if line.length == 0 || line[0] == 59 || std.text.startsWith(line, "//") { continue }
+        var word: usize = 0
+        while word < line.length && !isBlank(line[word]) { word += 1 }
+        var value: u32 = 0
+        if !color.parseHex(line[0..word], &value) || !add(palette, value, std.text.trimmed(line[word..]), 0) {
+            fresh(palette)
+            return false
+        }
+    }
+    return palette.*.count > 0
+}
+
+// Appends the palette as such a list to `into`: "#rrggbb name" a line.
+// False without memory.
+pub fn writeHexList(palette: *const Palette, into: *std.ArrayList(u8)) -> bool {
+    var index: usize = 0
+    while index < palette.*.count {
+        // "#rrggbb" straight into the list.
+        const at = into.count()
+        if !into.resize(at + 7) { return false }
+        _ = color.formatHex(palette.*.entries[index].color, into.items().pointer + at, false)
+        const text = nameAt(palette, index)
+        if text.length > 0 {
+            if !into.append(32) || !into.appendSlice(text) { return false }
+        }
+        if !into.append(10) { return false }
+        index += 1
+    }
+    return true
+}
+
+// The colours of a text like "#RRGGBB #RRGGBB ..." (each as
+// color.parseHex reads it; blanks, line ends, commas or semicolons
+// between them) to `into`, opaque, at most `capacity` of them; returns
+// how many. What is no colour is left out.
+pub fn parseColors(text: []const u8, into: [*]u32, capacity: usize) -> usize {
+    var found: usize = 0
+    var at: usize = 0
+    while at < text.length && found < capacity {
+        while at < text.length && (text[at] <= 32 || text[at] == 44 || text[at] == 59) { at += 1 }
+        var end = at
+        while end < text.length && text[end] > 32 && text[end] != 44 && text[end] != 59 { end += 1 }
+        var value: u32 = 0
+        if end > at && color.parseHex(text[at..end], &value) {
+            into[found] = value | 0xFF000000
+            found += 1
+        }
+        at = end
+    }
+    return found
+}
+
+// Two and four bytes of a file, the high one first. The caller has
+// looked that they are there.
+inline fn be16(bytes: []const u8, at: usize) -> u32 {
+    return (@intCast(u32, bytes[at]) << 8) | @intCast(u32, bytes[at + 1])
+}
+
+inline fn be32(bytes: []const u8, at: usize) -> u32 {
+    return (be16(bytes, at) << 16) | be16(bytes, at + 2)
+}
+
+// `units` UTF-16 code units (the high byte first) from `at` of `bytes`
+// as UTF-8 at `into`: up to a NUL and to what fits `most` bytes in whole
+// characters; returns the length. The caller has looked that the units
+// are there.
+fn utf16(bytes: []const u8, at: usize, units: usize, into: [*]u8, most: usize) -> usize {
+    var length: usize = 0
+    var index: usize = 0
+    while index < units {
+        var point = be16(bytes, at + index * 2)
+        index += 1
+        if point == 0 { break }
+        if point >= 0xD800 && point < 0xDC00 && index < units {
+            const low = be16(bytes, at + index * 2)
+            if low >= 0xDC00 && low < 0xE000 {
+                point = 0x10000 + ((point - 0xD800) << 10) + (low - 0xDC00)
+                index += 1
+            } else {
+                point = 0xFFFD
+            }
+        } else if point >= 0xD800 && point < 0xE000 {
+            // Half a pair alone is no character.
+            point = 0xFFFD
+        }
+        const size: usize = if point < 0x80 { 1 } else if point < 0x800 { 2 } else if point < 0x10000 { 3 } else { 4 }
+        if length + size > most { break }
+        if size == 1 {
+            into[length] = @intCast(u8, point)
+        } else if size == 2 {
+            into[length] = @intCast(u8, 0xC0 | (point >> 6))
+            into[length + 1] = @intCast(u8, 0x80 | (point & 63))
+        } else if size == 3 {
+            into[length] = @intCast(u8, 0xE0 | (point >> 12))
+            into[length + 1] = @intCast(u8, 0x80 | ((point >> 6) & 63))
+            into[length + 2] = @intCast(u8, 0x80 | (point & 63))
+        } else {
+            into[length] = @intCast(u8, 0xF0 | (point >> 18))
+            into[length + 1] = @intCast(u8, 0x80 | ((point >> 12) & 63))
+            into[length + 2] = @intCast(u8, 0x80 | ((point >> 6) & 63))
+            into[length + 3] = @intCast(u8, 0x80 | (point & 63))
+        }
+        length += size
+    }
+    return length
+}
+
+// A 16-bit number of a file that stands for a signed one.
+inline fn signed16(value: u32) -> f64 {
+    return if value >= 32768 { @floatFromInt(f64, value) - 65536.0 } else { @floatFromInt(f64, value) }
+}
+
+// The colour of an .aco entry: its colour space and four numbers of 16
+// bits. False for a space that needs a colour book (the entry is left
+// out).
+fn acoColor(space: u32, w: u32, x: u32, y: u32, z: u32, into: *u32) -> bool {
+    if space == 0 {
+        // RGB, 0-65535 a channel.
+        into.* = pixel.rgb((w + 128) / 257, (x + 128) / 257, (y + 128) / 257)
+        return true
+    }
+    if space == 1 {
+        // Hue (the full turn is 65536), saturation, brightness.
+        into.* = color.fromHsv(@floatFromInt(f64, w) / 65536.0, @floatFromInt(f64, x) / 65535.0, @floatFromInt(f64, y) / 65535.0, 255)
+        return true
+    }
+    if space == 2 {
+        // CMYK, 0 being all of an ink.
+        var r: f64 = 0.0
+        var g: f64 = 0.0
+        var b: f64 = 0.0
+        color.cmykToRgb(1.0 - @floatFromInt(f64, w) / 65535.0, 1.0 - @floatFromInt(f64, x) / 65535.0, 1.0 - @floatFromInt(f64, y) / 65535.0, 1.0 - @floatFromInt(f64, z) / 65535.0, &r, &g, &b)
+        into.* = color.fromRgb(r, g, b, 255)
+        return true
+    }
+    if space == 7 {
+        // Lab: L 0-10000 for 0-100, a and b signed hundredths.
+        into.* = color.fromLab(@floatFromInt(f64, w) / 100.0, signed16(x) / 100.0, signed16(y) / 100.0, 255)
+        return true
+    }
+    if space == 8 {
+        // Grey, 0-10000 from black to white.
+        const grey = (pixel.smaller(w, 10000) * 255 + 5000) / 10000
+        into.* = pixel.rgb(grey, grey, grey)
+        return true
+    }
+    return false
+}
+
+// One section of an .aco file from `at`: a version (1: colours only, 2:
+// each followed by its name in UTF-16), a count, the entries; the names
+// are made in `name_bytes` (NAME bytes). Returns where the section ends,
+// 0 when it is cut off.
+fn acoSection(palette: *Palette, bytes: []const u8, at: usize, name_bytes: [*]u8) -> usize {
+    if bytes.length < at + 4 { return 0 }
+    const named = be16(bytes, at) == 2
+    const swatches = @intCast(usize, be16(bytes, at + 2))
+    var place = at + 4
+    var index: usize = 0
+    while index < swatches {
+        if bytes.length < place + 10 { return 0 }
+        var value: u32 = 0
+        const known = acoColor(be16(bytes, place), be16(bytes, place + 2), be16(bytes, place + 4), be16(bytes, place + 6), be16(bytes, place + 8), &value)
+        place += 10
+        var length: usize = 0
+        if named {
+            if bytes.length < place + 4 { return 0 }
+            const units = @intCast(usize, be32(bytes, place))
+            place += 4
+            if units > (bytes.length - place) / 2 { return 0 }
+            length = utf16(bytes, place, units, name_bytes, NAME)
+            place += units * 2
+        }
+        if known && !add(palette, value, name_bytes[0..length], 0) { return 0 }
+        index += 1
+    }
+    return place
+}
+
+// Reads an Adobe colour swatch file (.aco): version 1 (colours without
+// names), version 2 (with names), or, as most files are, both one after
+// the other: the named section is the one taken then. RGB, HSB, CMYK (by
+// the plain formula), Lab and grey entries are read, entries of other
+// spaces (colour books) left out. False for bytes that are no such file,
+// a file cut off inside a section, one without a colour that could be
+// read, and without memory.
+pub fn readAco(palette: *Palette, bytes: []const u8) -> bool {
+    fresh(palette)
+    if bytes.length < 4 { return false }
+    const version = be16(bytes, 0)
+    if version != 1 && version != 2 { return false }
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const room = scratch.bytes(pool, NAME)
+    if room == null { return false }
+    var end = acoSection(palette, bytes, 0, room.?)
+    if end != 0 && version == 1 && bytes.length - end >= 4 && be16(bytes, end) == 2 {
+        fresh(palette)
+        end = acoSection(palette, bytes, end, room.?)
+    }
+    scratch.release(pool, mark)
+    if end == 0 || palette.*.count == 0 {
+        fresh(palette)
+        return false
+    }
+    return true
+}
+
+// A float of four bytes, the high one first.
+inline fn beFloat(bytes: []const u8, at: usize) -> f64 {
+    return @floatCast(f64, @bitCast(f32, be32(bytes, at)))
+}
+
+// The work of readAse, the names made in `name_bytes` (NAME bytes).
+fn aseBlocks(palette: *Palette, bytes: []const u8, name_bytes: [*]u8) -> bool {
+    if bytes.length < 12 { return false }
+    if bytes[0] != 65 || bytes[1] != 83 || bytes[2] != 69 || bytes[3] != 70 { return false }
+    const blocks = @intCast(usize, be32(bytes, 8))
+    var at: usize = 12
+    var group: usize = 0
+    var block: usize = 0
+    while block < blocks {
+        if bytes.length < at + 6 { return false }
+        const kind = be16(bytes, at)
+        const size = @intCast(usize, be32(bytes, at + 2))
+        const body = at + 6
+        if size > bytes.length - body { return false }
+        at = body + size
+        block += 1
+        if kind == 0xC002 {
+            group = 0
+            continue
+        }
+        if kind != 0xC001 && kind != 0x0001 { continue }
+        // Both begin with a name: its length in UTF-16 units, the units.
+        if size < 2 { return false }
+        const units = @intCast(usize, be16(bytes, body))
+        if units * 2 > size - 2 { return false }
+        const length = utf16(bytes, body + 2, units, name_bytes, NAME)
+        var place = body + 2 + units * 2
+        if kind == 0xC001 {
+            // More groups than a palette holds: their colours go to the
+            // nameless one.
+            const made = addGroup(palette, name_bytes[0..length])
+            group = 0
+            if made != null { group = made.? }
+            continue
+        }
+        // A colour: four letters of its model, then that model's floats.
+        if at - place < 4 { return false }
+        const model = be32(bytes, place)
+        place += 4
+        var value: u32 = 0
+        if model == 0x52474220 {
+            if at - place < 12 { return false }
+            value = color.fromRgb(beFloat(bytes, place), beFloat(bytes, place + 4), beFloat(bytes, place + 8), 255)
+        } else if model == 0x434D594B {
+            if at - place < 16 { return false }
+            var r: f64 = 0.0
+            var g: f64 = 0.0
+            var b: f64 = 0.0
+            color.cmykToRgb(beFloat(bytes, place), beFloat(bytes, place + 4), beFloat(bytes, place + 8), beFloat(bytes, place + 12), &r, &g, &b)
+            value = color.fromRgb(r, g, b, 255)
+        } else if model == 0x4C414220 {
+            if at - place < 12 { return false }
+            value = color.fromLab(beFloat(bytes, place) * 100.0, beFloat(bytes, place + 4), beFloat(bytes, place + 8), 255)
+        } else if model == 0x47726179 {
+            if at - place < 4 { return false }
+            const grey = beFloat(bytes, place)
+            value = color.fromRgb(grey, grey, grey, 255)
+        } else {
+            continue
+        }
+        if !add(palette, value, name_bytes[0..length], group) { return false }
+    }
+    return palette.*.count > 0
+}
+
+// Reads an Adobe swatch exchange file (.ase): "ASEF", a version, a count
+// of blocks, the blocks: a group's start with its name, a group's end, a
+// colour with its name in UTF-16, a model ("RGB ", "CMYK", "LAB ",
+// "Gray") and that model's floats. The groups become the palette's (the
+// first GROUPS - 1 of them), a colour outside a group is in group 0;
+// CMYK is the plain formula, a grey of 1 is white; blocks and models not
+// known are left out. False for bytes that are no such file, a file cut
+// off or with a block that does not hold what it says, one without a
+// colour that could be read, and without memory.
+pub fn readAse(palette: *Palette, bytes: []const u8) -> bool {
+    fresh(palette)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const room = scratch.bytes(pool, NAME)
+    const done = room != null && aseBlocks(palette, bytes, room.?)
+    scratch.release(pool, mark)
+    if !done { fresh(palette) }
+    return done
+}
+
+// The largest colorset.xml a .kpl may unpack to: some 200 bytes an entry
+// for MOST entries. What claims more is not unpacked (a ZIP entry can
+// say it grows a thousandfold).
+const KPL_TEXT_MOST: usize = 16777216
+
+// The elements of a colorset.xml that mean something here.
+const KPL_OTHER: u8 = 0
+const KPL_ROOT: u8 = 1
+const KPL_GROUP: u8 = 2
+const KPL_ENTRY: u8 = 3
+const KPL_SRGB: u8 = 4
+const KPL_GRAY: u8 = 5
+const KPL_POSITION: u8 = 6
+// What Krita writes for a colour of an RGB space: its profile in the
+// attribute "space".
+const KPL_RGB: u8 = 7
+
+fn kplElement(name: xml.String) -> u8 {
+    if xml.equals(name, "ColorSetEntry") { return KPL_ENTRY }
+    if xml.equals(name, "RGB") { return KPL_RGB }
+    if xml.equals(name, "sRGB") { return KPL_SRGB }
+    if xml.equals(name, "Gray") { return KPL_GRAY }
+    if xml.equals(name, "Position") { return KPL_POSITION }
+    if xml.equals(name, "Group") { return KPL_GROUP }
+    // (Krita writes "Colorset"; "ColorSet" is read too.)
+    if xml.equals(name, "Colorset") || xml.equals(name, "ColorSet") { return KPL_ROOT }
+    return KPL_OTHER
+}
+
+// How the numbers of an entry's colour are to be taken, by the profile
+// its "space" names: as sRGB's bytes are (the sRGB element, and RGB or
+// Gray of a profile with sRGB's curve or none named), as linear light
+// (a profile of gamma 1.0, Krita's "...-g10.icc"), or not at all (RGB of
+// another space: Adobe RGB, Rec. 2020, ...).
+const KPL_AS_SRGB: u8 = 0
+const KPL_AS_LINEAR: u8 = 1
+const KPL_AS_NOTHING: u8 = 2
+
+// Whether `raw` has `needle` (lower case) in it, ignoring case.
+fn holds(raw: xml.String, needle: []const u8) -> bool {
+    if raw.length < needle.length { return false }
+    var at: usize = 0
+    while at + needle.length <= raw.length {
+        var index: usize = 0
+        while index < needle.length && std.ascii.toLower(raw.pointer[at + index]) == needle[index] { index += 1 }
+        if index == needle.length { return true }
+        at += 1
+    }
+    return false
+}
+
+// What the profile `space` (the attribute of an RGB or a Gray element)
+// makes of the element's numbers.
+fn kplSpace(element: u8, space: xml.String) -> u8 {
+    // An RGB profile that is not sRGB's has other primaries.
+    if element == KPL_RGB && space.length > 0 && !holds(space, "srgb") { return KPL_AS_NOTHING }
+    if holds(space, "g10") || holds(space, "linear") { return KPL_AS_LINEAR }
+    return KPL_AS_SRGB
+}
+
+// A component of 0..1 in linear light as sRGB's (what is no number stays
+// none, and is 0 then).
+fn fromLinear(value: f64) -> f64 {
+    if value != value { return value }
+    return color.linearToSrgb(if value < 0.0 { 0.0 } else if value > 1.0 { 1.0 } else { value })
+}
+
+// A number as an attribute writes it ("0.5", "-12", "1e-3", "1.0E2"),
+// NaN when it is none (what the colour functions make 0 of). Good to
+// some 1e-15, far below a byte's step; nothing outside the double's
+// range traps (it is 0 or an infinity).
+fn decimalOf(raw: xml.String) -> f64 {
+    const text = std.text.trimmed(raw.pointer[0..raw.length])
+    var at: usize = 0
+    var negative = false
+    if at < text.length && (text[at] == 45 || text[at] == 43) {
+        negative = text[at] == 45
+        at += 1
+    }
+    // 18 digits that count fit a u64; those after them only move the
+    // point (before it) or are too small to matter (after it).
+    var digits: u64 = 0
+    var kept: usize = 0
+    var power: i32 = 0
+    var any = false
+    var point = false
+    while at < text.length {
+        const byte = text[at]
+        if byte == 46 && !point {
+            point = true
+        } else if byte >= 48 && byte <= 57 {
+            any = true
+            if kept < 18 {
+                digits = digits * 10 + @intCast(u64, byte - 48)
+                if digits != 0 { kept += 1 }
+                if point { power -= 1 }
+            } else if !point && power < 1000 {
+                power += 1
+            }
+        } else {
+            break
+        }
+        at += 1
+    }
+    if !any { return math.nan() }
+    if at < text.length && (text[at] == 101 || text[at] == 69) {
+        at += 1
+        var down = false
+        if at < text.length && (text[at] == 45 || text[at] == 43) {
+            down = text[at] == 45
+            at += 1
+        }
+        if at >= text.length { return math.nan() }
+        var exponent: i32 = 0
+        var seen = false
+        while at < text.length && text[at] >= 48 && text[at] <= 57 {
+            if exponent < 1000 { exponent = exponent * 10 + @intCast(i32, text[at] - 48) }
+            seen = true
+            at += 1
+        }
+        if !seen { return math.nan() }
+        power = if down { power - exponent } else { power + exponent }
+    }
+    if at != text.length { return math.nan() }
+    var value = @floatFromInt(f64, digits)
+    if digits != 0 {
+        if power < -400 {
+            value = 0.0
+        } else if power > 400 {
+            value = math.infinity()
+        } else {
+            // 10^|power| at once (exact up to 10^22), then one division
+            // or product: one rounding instead of one a digit.
+            var scale: f64 = 1.0
+            var left = if power < 0 { 0 - power } else { power }
+            while left > 0 {
+                scale *= 10.0
+                left -= 1
+            }
+            value = if power < 0 { value / scale } else { value * scale }
+        }
+    }
+    return if negative { 0.0 - value } else { value }
+}
+
+// What one ColorSetEntry has said so far.
+const KplEntry = struct {
+    name: xml.String
+    model: u8
+    // KPL_AS_SRGB, KPL_AS_LINEAR or KPL_AS_NOTHING.
+    taken: u8
+    red: f64
+    green: f64
+    blue: f64
+    row: u64
+    column: u64
+    placed: bool
+}
+
+// The work of readKpl: colorset.xml's text read into the palette, each
+// entry's place in the docker (its group, its row and column) noted in
+// `keys` for arrange(). False for text that is no colorset, damaged XML,
+// a palette without a colour that could be read, and without memory.
+fn kplColors(palette: *Palette, pool: *scratch.Pool, text: []const u8) -> bool {
+    const tokenizer_memory = scratch.bytes(pool, @sizeOf(xml.Tokenizer))
+    const token_memory = scratch.bytes(pool, @sizeOf(xml.Token))
+    const entry_memory = scratch.bytes(pool, @sizeOf(KplEntry))
+    const decoded = scratch.bytes(pool, 256)
+    // An entry takes some 20 bytes of text at least: as many keys as
+    // could be there.
+    const most = atMost(text.length / 16 + 1, MOST)
+    const key_memory = scratch.bytes(pool, most * 8)
+    if tokenizer_memory == null || token_memory == null || entry_memory == null || decoded == null || key_memory == null { return false }
+    var tokenizer: *xml.Tokenizer = undefined
+    var token: *xml.Token = undefined
+    var entry: *KplEntry = undefined
+    var keys: [*]u64 = undefined
+    unsafe {
+        tokenizer = @ptrCast(*xml.Tokenizer, tokenizer_memory.?)
+        token = @ptrCast(*xml.Token, token_memory.?)
+        entry = @ptrCast(*KplEntry, entry_memory.?)
+        keys = @ptrCast([*]u64, key_memory.?)
+    }
+    xml.initAt(tokenizer, text.pointer, text.length)
+    // The element the attributes coming are of, the group entries go to,
+    // and whether a Colorset was the root.
+    var element = KPL_OTHER
+    var group: usize = 0
+    var rooted = false
+    var inside = false
+    var columns: u64 = @intCast(u64, COLUMNS)
+    while xml.next(tokenizer, token) {
+        const kind = token.*.kind
+        if kind == xml.TokenKind.elementStart {
+            element = kplElement(token.*.name)
+            if xml.depth(tokenizer) == 1 {
+                if element != KPL_ROOT { return false }
+                rooted = true
+            } else if element == KPL_GROUP {
+                // Its name makes it a group of the palette; until then,
+                // and for more groups than a palette holds, its colours
+                // go to the nameless one.
+                group = 0
+            } else if element == KPL_ENTRY {
+                inside = true
+                entry.*.name = xml.String.{ .pointer = text.pointer, .length = 0 }
+                entry.*.model = KPL_OTHER
+                entry.*.taken = KPL_AS_SRGB
+                entry.*.row = 0
+                entry.*.column = 0
+                entry.*.placed = false
+            } else if (element == KPL_SRGB || element == KPL_RGB || element == KPL_GRAY) && inside {
+                entry.*.model = element
+                entry.*.taken = KPL_AS_SRGB
+                entry.*.red = math.nan()
+                entry.*.green = math.nan()
+                entry.*.blue = math.nan()
+            }
+        } else if kind == xml.TokenKind.attribute {
+            const value = token.*.value
+            if element == KPL_ROOT {
+                if xml.equals(token.*.name, "name") {
+                    rename(palette, kplText(value, decoded.?))
+                } else if xml.equals(token.*.name, "columns") {
+                    const parsed = std.parse.unsigned(value)
+                    if parsed.valid && parsed.value > 0 {
+                        setColumns(palette, @intCast(u32, atMost(parsed.value, @intCast(usize, MOST_COLUMNS))))
+                        // The places are in the file's grid, which may be
+                        // wider than the palette is shown (held to 2^16:
+                        // a row then still sorts before the next).
+                        columns = @intCast(u64, atMost(parsed.value, 65536))
+                    }
+                }
+            } else if element == KPL_GROUP && xml.equals(token.*.name, "name") {
+                const made = addGroup(palette, kplText(value, decoded.?))
+                if made != null { group = made.? }
+            } else if element == KPL_ENTRY && xml.equals(token.*.name, "name") {
+                entry.*.name = value
+            } else if (element == KPL_SRGB || element == KPL_RGB) && inside {
+                if xml.equals(token.*.name, "r") { entry.*.red = decimalOf(value) }
+                if xml.equals(token.*.name, "g") { entry.*.green = decimalOf(value) }
+                if xml.equals(token.*.name, "b") { entry.*.blue = decimalOf(value) }
+                // (The sRGB element is sRGB whatever profile it names.)
+                if element == KPL_RGB && xml.equals(token.*.name, "space") { entry.*.taken = kplSpace(element, value) }
+            } else if element == KPL_GRAY && inside {
+                if xml.equals(token.*.name, "g") {
+                    const grey = decimalOf(value)
+                    entry.*.red = grey
+                    entry.*.green = grey
+                    entry.*.blue = grey
+                } else if xml.equals(token.*.name, "space") {
+                    entry.*.taken = kplSpace(element, value)
+                }
+            } else if element == KPL_POSITION && inside {
+                const parsed = std.parse.unsigned(value)
+                if parsed.valid {
+                    // (Held to 2^20: rows and columns that far out sort
+                    // last without a sum that overflows.)
+                    const place = @intCast(u64, atMost(parsed.value, 1048576))
+                    if xml.equals(token.*.name, "row") {
+                        entry.*.row = place
+                        entry.*.placed = true
+                    } else if xml.equals(token.*.name, "column") {
+                        entry.*.column = place
+                    }
+                }
+            }
+        } else if kind == xml.TokenKind.elementEnd {
+            const ended = kplElement(token.*.name)
+            if ended == KPL_GROUP {
+                group = 0
+            } else if ended == KPL_ENTRY && inside {
+                inside = false
+                if entry.*.model != KPL_OTHER && entry.*.taken != KPL_AS_NOTHING && palette.*.count < most {
+                    // An entry without a place in the grid comes after
+                    // those with one, in the order of the file.
+                    const index = @intCast(u64, palette.*.count)
+                    var place = (1 << 40) + index
+                    if entry.*.placed { place = entry.*.row * columns + entry.*.column }
+                    keys[palette.*.count] = (@intCast(u64, group) << 58) | (place << 16) | index
+                    var value = color.fromRgb(entry.*.red, entry.*.green, entry.*.blue, 255)
+                    if entry.*.taken == KPL_AS_LINEAR { value = color.fromRgb(fromLinear(entry.*.red), fromLinear(entry.*.green), fromLinear(entry.*.blue), 255) }
+                    if !add(palette, value, kplText(entry.*.name, decoded.?), group) { return false }
+                }
+            }
+            element = KPL_OTHER
+        }
+    }
+    if xml.failed(tokenizer) || !rooted || palette.*.count == 0 { return false }
+    return arrange(palette, pool, keys)
+}
+
+// An attribute's text with its entities expanded into `room` (256
+// bytes): a name's first 256 bytes are more than it keeps. A reference
+// that is none leaves the text as it was written.
+fn kplText(raw: xml.String, room: [*]u8) -> []const u8 {
+    const shown = xml.String.{ .pointer = raw.pointer, .length = atMost(raw.length, 256) }
+    const length = xml.decode(shown, room, 256)
+    if length < 0 { return shown.pointer[0..shown.length] }
+    return room[0..@bitCast(usize, length)]
+}
+
+// Reads a Krita palette (.kpl): a ZIP archive with the entry "mimetype"
+// ("krita/x-colorset"; an archive without it is read all the same) and
+// "colorset.xml": a Colorset element (its name and columns) holding
+// ColorSetEntry elements (a name; an sRGB element with r, g, b of 0..1,
+// or such an RGB element, or a Gray element with g, the latter two with
+// the profile they are in as "space": an RGB colour of a space that is
+// not sRGB is left out; a Position with row and column) directly or
+// in Group elements (each with its name). The entries come in the order
+// of the docker's grid, row by row, the nameless group's first, then
+// each group's in the order the groups are written. False for bytes that
+// are no such archive, a damaged one or damaged XML, one without a
+// colour that could be read, and without memory.
+pub fn readKpl(palette: *Palette, bytes: []const u8) -> bool {
+    fresh(palette)
+    const allocator = palette.*.allocator
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const reader_memory = scratch.bytes(pool, @sizeOf(zip.Reader))
+    if reader_memory == null { return false }
+    const reader: *zip.Reader = unsafe { @ptrCast(*zip.Reader, reader_memory.?) }
+    var done = false
+    if zip.open(reader, bytes, allocator) {
+        const kind = zip.find(reader, "mimetype")
+        var known = kind == null
+        if kind != null {
+            const label = "krita/x-colorset"
+            const room = scratch.bytes(pool, label.length)
+            known = room != null && zip.size(reader, kind.?) == label.length && zip.readInto(reader, kind.?, room.?, label.length) && std.mem.eql(room.?, label.pointer, label.length)
+        }
+        const index = zip.find(reader, "colorset.xml")
+        if known && index != null && zip.size(reader, index.?) <= KPL_TEXT_MOST {
+            const length = zip.size(reader, index.?)
+            const block = zip.read(reader, index.?, allocator)
+            if block != null {
+                done = kplColors(palette, pool, block.?[0..length])
+                zip.free(allocator, block.?, length)
+            }
+        }
+        zip.close(reader)
+    }
+    scratch.release(pool, mark)
+    if !done { fresh(palette) }
+    return done
+}
+
+// Reads a palette of whichever format the bytes are: "ASEF" at the start
+// is an .ase, "PK" and the bytes 3 and 4 a ZIP and so a .kpl, a first
+// number of 1 or 2 (two bytes, the high one first) an .aco, a first line
+// "GIMP Palette" a .gpl, anything else is tried as a plain list. Returns
+// ASE, KPL, ACO, GPL or HEX, or UNKNOWN when the bytes could not be read
+// as what they seemed to be (the palette is empty then).
+pub fn read(palette: *Palette, bytes: []const u8) -> u8 {
+    if bytes.length >= 4 && bytes[0] == 65 && bytes[1] == 83 && bytes[2] == 69 && bytes[3] == 70 {
+        return if readAse(palette, bytes) { ASE } else { UNKNOWN }
+    }
+    if bytes.length >= 4 && bytes[0] == 80 && bytes[1] == 75 && bytes[2] == 3 && bytes[3] == 4 {
+        return if readKpl(palette, bytes) { KPL } else { UNKNOWN }
+    }
+    if bytes.length >= 2 && bytes[0] == 0 && (bytes[1] == 1 || bytes[1] == 2) {
+        return if readAco(palette, bytes) { ACO } else { UNKNOWN }
+    }
+    if std.text.startsWith(std.text.trimmed(bytes[textStart(bytes)..]), "GIMP Palette") {
+        return if readGpl(palette, bytes) { GPL } else { UNKNOWN }
+    }
+    return if readHexList(palette, bytes) { HEX } else { UNKNOWN }
+}

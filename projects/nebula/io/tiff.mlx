@@ -1,0 +1,657 @@
+// nebula io: TIFF read and written (baseline: one page of 8-bit samples).
+//
+//     var picture: png.Picture = undefined
+//     if tiff.decode(bytes, allocator, &picture) == png.Status.ok { ... png.free(&picture) }
+//     _ = tiff.encode(&picture, &options, &list)                     // Deflate, predictor
+//     var settings = tiff.Settings.{ .compression = tiff.LZW, .bigEndian = true, .predictor = false, .tiled = true }
+//     _ = tiff.encodeWith(&picture, &settings, &list)
+//
+// Reading: the first image of the file, in either byte order ("II*\0",
+// "MM\0*"): 8 bits a sample, grey (with alpha), RGB, RGBA (the alpha
+// associated: premultiplied, made straight; or not), "white is zero"
+// grey turned round; in strips or in tiles; uncompressed, PackBits, LZW
+// and Deflate (zlib, both of its numbers), with or without the horizontal
+// predictor; the resolution in inches or centimetres. Refused with
+// png.Status.unsupported: other depths, palettes, CMYK and the other
+// photometric kinds, planes stored apart, other compressions (JPEG, CCITT,
+// ...). A strip or tile whose data is short or damaged makes the file
+// damaged; values that point outside the file never trap.
+//
+// Writing (encode, the format list's): RGBA of 8 bits, alpha not
+// associated, little-endian, strips of 64 rows (fewer on the last),
+// Deflate with the horizontal predictor; encodeWith() writes any of the
+// compressions read here, either byte order, strips or tiles of 64 x 64,
+// with or without the predictor (which TIFF allows only with LZW and
+// Deflate; it is left out for the others). One page: the composite.
+const std = @import("std")
+const flate = @import("std.flate")
+const png = @import("./png.mlx")
+const gif = @import("./gif.mlx")
+const psd = @import("./psd.mlx")
+const formats = @import("./formats.mlx")
+const pixel = @import("../core/pixel.mlx")
+const scratch = @import("../core/scratch.mlx")
+
+pub const Allocator = std.allocator.Allocator
+pub const Picture = png.Picture
+
+// The compressions.
+pub const NONE: u16 = 1
+pub const LZW: u16 = 5
+pub const DEFLATE: u16 = 8
+// Deflate's older number (Adobe's is 8).
+pub const DEFLATE_OLD: u16 = 32946
+pub const PACKBITS: u16 = 32773
+
+pub const Settings = struct {
+    compression: u16
+    bigEndian: bool
+    // The horizontal predictor (LZW and Deflate only).
+    predictor: bool
+    // Tiles of 64 x 64 instead of strips of 64 rows.
+    tiled: bool
+}
+
+// What the format list writes.
+pub fn settings() -> Settings {
+    return Settings.{ .compression = DEFLATE, .bigEndian = false, .predictor = true, .tiled = false }
+}
+
+// The tags read and written.
+const WIDTH: usize = 256
+const HEIGHT: usize = 257
+const BITS: usize = 258
+const COMPRESSION: usize = 259
+const PHOTOMETRIC: usize = 262
+const STRIP_OFFSETS: usize = 273
+const SAMPLES: usize = 277
+const ROWS_PER_STRIP: usize = 278
+const STRIP_COUNTS: usize = 279
+const X_RESOLUTION: usize = 282
+const Y_RESOLUTION: usize = 283
+const PLANAR: usize = 284
+const RESOLUTION_UNIT: usize = 296
+const PREDICTOR: usize = 317
+const TILE_WIDTH: usize = 322
+const TILE_HEIGHT: usize = 323
+const TILE_OFFSETS: usize = 324
+const TILE_COUNTS: usize = 325
+const EXTRA_SAMPLES: usize = 338
+
+// Whether `bytes` begin as a TIFF does.
+pub fn isTiff(bytes: []const u8) -> bool {
+    if bytes.length < 8 { return false }
+    const head = std.mem.readU32Big(bytes.pointer, 0)
+    return head == 0x49492A00 || head == 0x4D4D002A
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+const Reading = struct {
+    bytes: []const u8
+    big: bool
+    // Where the first directory's entries are and how many.
+    entries: usize
+    count: usize
+}
+
+fn get16(r: *const Reading, at: usize) -> usize {
+    if r.*.big { return @intCast(usize, std.mem.readU16Big(r.*.bytes.pointer, at)) }
+    return @intCast(usize, std.mem.readU16Little(r.*.bytes.pointer, at))
+}
+
+fn get32(r: *const Reading, at: usize) -> usize {
+    if r.*.big { return @intCast(usize, std.mem.readU32Big(r.*.bytes.pointer, at)) }
+    return @intCast(usize, std.mem.readU32Little(r.*.bytes.pointer, at))
+}
+
+// The entry of `tag` (where its 12 bytes are), null when there is none.
+fn entryOf(r: *const Reading, tag: usize) -> ?usize {
+    var index: usize = 0
+    while index < r.*.count {
+        const at = r.*.entries + index * 12
+        if get16(r, at) == tag { return at }
+        index += 1
+    }
+    return null
+}
+
+// How many values the entry of `tag` has (0: none).
+fn valueCount(r: *const Reading, tag: usize) -> usize {
+    const at = entryOf(r, tag)
+    if at == null { return 0 }
+    return get32(r, at.? + 4)
+}
+
+// Value `index` of the entry of `tag` (BYTE, SHORT or LONG; a RATIONAL's
+// numerator), into `into`. False when there is none, it is of another
+// type or it lies outside the file.
+fn valueAt(r: *const Reading, tag: usize, index: usize, into: *usize) -> bool {
+    const at = entryOf(r, tag)
+    if at == null { return false }
+    const kind = get16(r, at.? + 2)
+    const count = get32(r, at.? + 4)
+    if index >= count { return false }
+    const size: usize = if kind == 1 { 1 } else if kind == 3 { 2 } else if kind == 4 { 4 } else if kind == 5 { 8 } else { 0 }
+    if size == 0 { return false }
+    var place = at.? + 8
+    if count * size > 4 {
+        place = get32(r, at.? + 8)
+        if count > (r.*.bytes.length / size) || place > r.*.bytes.length - count * size { return false }
+    }
+    const value_at = place + index * size
+    if size == 1 {
+        into.* = @intCast(usize, r.*.bytes[value_at])
+    } else if size == 2 {
+        into.* = get16(r, value_at)
+    } else {
+        into.* = get32(r, value_at)
+    }
+    return true
+}
+
+fn valueOr(r: *const Reading, tag: usize, fallback: usize) -> usize {
+    var value: usize = 0
+    if valueAt(r, tag, 0, &value) { return value }
+    return fallback
+}
+
+// A RATIONAL's value (0 when there is none or it is 0 / 0).
+fn rationalOf(r: *const Reading, tag: usize) -> f64 {
+    const at = entryOf(r, tag)
+    if at == null || get16(r, at.? + 2) != 5 || get32(r, at.? + 4) < 1 { return 0.0 }
+    const place = get32(r, at.? + 8)
+    if place > r.*.bytes.length - 8 { return 0.0 }
+    const numerator = get32(r, place)
+    const denominator = get32(r, place + 4)
+    if denominator == 0 { return 0.0 }
+    return @floatFromInt(f64, numerator) / @floatFromInt(f64, denominator)
+}
+
+// How a page's samples are laid out.
+const Layout = struct {
+    width: usize
+    height: usize
+    samples: usize
+    photometric: usize
+    compression: usize
+    predictor: bool
+    // The alpha is premultiplied (associated).
+    associated: bool
+    // A chunk: strips (chunkWidth the page's) or tiles.
+    chunkWidth: usize
+    chunkHeight: usize
+    across: usize
+    chunks: usize
+    tiled: bool
+}
+
+// zlib data at `from` inflated into exactly `size` bytes at `into`.
+// (The inflater as zip.mlx keeps it: flate.decompress() takes 8 KiB of
+// the value arena at every call.)
+fn inflate(allocator: Allocator, from: []const u8, into: [*]u8, size: usize) -> bool {
+    var inflater: flate.Inflater = undefined
+    if flate.inflaterInit(&inflater, allocator, flate.Format.zlib) != flate.Status.ok { return false }
+    var consumed: usize = 0
+    var produced: usize = 0
+    var done = false
+    while true {
+        var progress: flate.Progress = undefined
+        const status = flate.inflaterRun(&inflater, from.pointer + consumed, from.length - consumed, into + produced, size - produced, &progress)
+        consumed += progress.consumed
+        produced += progress.produced
+        if status == flate.Status.done {
+            done = true
+            break
+        }
+        if status != flate.Status.ok || (progress.consumed == 0 && progress.produced == 0) { break }
+    }
+    flate.inflaterEnd(&inflater)
+    return done && produced == size
+}
+
+// One chunk's bytes (`length` at `from`) unpacked into `into` (exactly
+// `size` bytes). False for data that is short or damaged.
+fn unpack(layout: *const Layout, allocator: Allocator, from: []const u8, into: [*]u8, size: usize) -> bool {
+    const compression = layout.*.compression
+    if compression == 1 {
+        if from.length < size { return false }
+        std.mem.copy(into, from.pointer, size)
+        return true
+    }
+    if compression == 32773 {
+        var at: usize = 0
+        return psd.unpackBits(from, &at, into, size)
+    }
+    if compression == 5 {
+        var produced: usize = 0
+        return gif.lzwDecode(from, 8, gif.TIFF_FORM, into, size, &produced) && produced == size
+    }
+    if from.length == 0 { return false }
+    return inflate(allocator, from, into, size)
+}
+
+// The predictor undone on `rows` rows of `columns` pixels at `data`.
+fn unpredict(data: [*]u8, columns: usize, rows: usize, samples: usize) -> void {
+    const row_bytes = columns * samples
+    var row: usize = 0
+    while row < rows {
+        const line = data + row * row_bytes
+        var at = samples
+        while at < row_bytes {
+            line[at] = line[at] +% line[at - samples]
+            at += 1
+        }
+        row += 1
+    }
+}
+
+// The chunk's samples (`columns` x `rows` at `data`) into the picture at
+// (left, top), what lies past its edges left out.
+fn place(layout: *const Layout, data: [*]const u8, columns: usize, rows: usize, left: usize, top: usize, into: *Picture) -> void {
+    const samples = layout.*.samples
+    var row: usize = 0
+    while row < rows && top + row < layout.*.height {
+        const line = data + row * columns * samples
+        const target = into.*.pixels + (top + row) * layout.*.width
+        var x: usize = 0
+        while x < columns && left + x < layout.*.width {
+            const at = x * samples
+            var value: u32 = 0
+            if samples <= 2 {
+                var grey = @intCast(u32, line[at])
+                if layout.*.photometric == 0 { grey = 255 - grey }
+                const a: u32 = if samples == 2 { @intCast(u32, line[at + 1]) } else { 255 }
+                value = pixel.pack(a, grey, grey, grey)
+            } else {
+                const a: u32 = if samples >= 4 { @intCast(u32, line[at + 3]) } else { 255 }
+                value = pixel.pack(a, @intCast(u32, line[at]), @intCast(u32, line[at + 1]), @intCast(u32, line[at + 2]))
+            }
+            if layout.*.associated && value >> 24 != 255 {
+                value = pixel.straight(value)
+            }
+            target[left + x] = value
+            x += 1
+        }
+        row += 1
+    }
+}
+
+// The page's layout from its directory; png.Status.ok, or what is not
+// read here (unsupported) or does not make sense (damaged).
+fn layoutOf(r: *const Reading, layout: *Layout) -> png.Status {
+    var width: usize = 0
+    var height: usize = 0
+    if !valueAt(r, WIDTH, 0, &width) || !valueAt(r, HEIGHT, 0, &height) || width == 0 || height == 0 { return png.Status.damaged }
+    if width > png.LARGEST || height > png.LARGEST { return png.Status.tooLarge }
+    layout.*.width = width
+    layout.*.height = height
+    layout.*.samples = valueOr(r, SAMPLES, 1)
+    layout.*.photometric = valueOr(r, PHOTOMETRIC, 1)
+    layout.*.compression = valueOr(r, COMPRESSION, 1)
+    layout.*.predictor = valueOr(r, PREDICTOR, 1) == 2
+    layout.*.associated = valueOr(r, EXTRA_SAMPLES, 2) == 1
+    const samples = layout.*.samples
+    if samples == 0 || samples > 4 { return png.Status.unsupported }
+    // Each sample's bits (one value for all of them, or one each; 1 when
+    // the file says nothing).
+    const listed = valueCount(r, BITS)
+    var index: usize = 0
+    while index < samples {
+        var bits: usize = 1
+        if listed > 0 && !valueAt(r, BITS, if listed > index { index } else { 0 }, &bits) { return png.Status.damaged }
+        if bits != 8 { return png.Status.unsupported }
+        index += 1
+    }
+    const photometric = layout.*.photometric
+    if photometric > 2 || (photometric == 2 && samples < 3) || (photometric < 2 && samples > 2) { return png.Status.unsupported }
+    if valueOr(r, PLANAR, 1) != 1 { return png.Status.unsupported }
+    const compression = layout.*.compression
+    if compression != 1 && compression != 5 && compression != 8 && compression != 32946 && compression != 32773 { return png.Status.unsupported }
+    layout.*.tiled = entryOf(r, TILE_OFFSETS) != null
+    if layout.*.tiled {
+        layout.*.chunkWidth = valueOr(r, TILE_WIDTH, 0)
+        layout.*.chunkHeight = valueOr(r, TILE_HEIGHT, 0)
+        if layout.*.chunkWidth == 0 || layout.*.chunkHeight == 0 || layout.*.chunkWidth > png.LARGEST || layout.*.chunkHeight > png.LARGEST { return png.Status.damaged }
+        layout.*.across = (width + layout.*.chunkWidth - 1) / layout.*.chunkWidth
+        layout.*.chunks = layout.*.across * ((height + layout.*.chunkHeight - 1) / layout.*.chunkHeight)
+        if valueCount(r, TILE_OFFSETS) < layout.*.chunks || valueCount(r, TILE_COUNTS) < layout.*.chunks { return png.Status.damaged }
+    } else {
+        var rows = valueOr(r, ROWS_PER_STRIP, height)
+        if rows == 0 || rows > height { rows = height }
+        layout.*.chunkWidth = width
+        layout.*.chunkHeight = rows
+        layout.*.across = 1
+        layout.*.chunks = (height + rows - 1) / rows
+        if valueCount(r, STRIP_OFFSETS) < layout.*.chunks || valueCount(r, STRIP_COUNTS) < layout.*.chunks { return png.Status.damaged }
+    }
+    return png.Status.ok
+}
+
+// Every chunk into the picture.
+fn readChunks(r: *const Reading, layout: *const Layout, into: *Picture) -> png.Status {
+    const allocator = into.*.allocator
+    const chunk_bytes = layout.*.chunkWidth * layout.*.chunkHeight * layout.*.samples
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const data = scratch.bytes(pool, chunk_bytes)
+    var status = png.Status.noMemory
+    if data != null { status = png.Status.ok }
+    const offsets_tag = if layout.*.tiled { TILE_OFFSETS } else { STRIP_OFFSETS }
+    const counts_tag = if layout.*.tiled { TILE_COUNTS } else { STRIP_COUNTS }
+    var chunk: usize = 0
+    while status == png.Status.ok && chunk < layout.*.chunks {
+        var offset: usize = 0
+        var length: usize = 0
+        if !valueAt(r, offsets_tag, chunk, &offset) || !valueAt(r, counts_tag, chunk, &length) || offset > r.*.bytes.length || length > r.*.bytes.length - offset {
+            status = png.Status.damaged
+            break
+        }
+        const left = (chunk % layout.*.across) * layout.*.chunkWidth
+        const top = (chunk / layout.*.across) * layout.*.chunkHeight
+        // A strip at the bottom has only the rows that are left.
+        var rows = layout.*.chunkHeight
+        if !layout.*.tiled && top + rows > layout.*.height { rows = layout.*.height - top }
+        const size = layout.*.chunkWidth * rows * layout.*.samples
+        if !unpack(layout, allocator, r.*.bytes[offset..offset + length], data.?, size) {
+            status = png.Status.damaged
+            break
+        }
+        if layout.*.predictor { unpredict(data.?, layout.*.chunkWidth, rows, layout.*.samples) }
+        place(layout, data.?, layout.*.chunkWidth, rows, left, top, into)
+        chunk += 1
+    }
+    scratch.release(pool, mark)
+    return status
+}
+
+// The TIFF `bytes`' first page into `into` (png.free() it after
+// Status.ok). notThisFormat without the header, unsupported, damaged,
+// tooLarge, noMemory (see the header).
+pub fn decode(bytes: []const u8, allocator: Allocator, into: *Picture) -> png.Status {
+    into.*.width = 0
+    into.*.height = 0
+    into.*.resolution = 0.0
+    into.*.allocator = allocator
+    if !isTiff(bytes) { return png.Status.notThisFormat }
+    var r = Reading.{ .bytes = bytes, .big = bytes[0] == 77, .entries = 0, .count = 0 }
+    const directory = get32(&r, 4)
+    if directory > bytes.length - 2 { return png.Status.damaged }
+    r.count = get16(&r, directory)
+    r.entries = directory + 2
+    if r.count > (bytes.length - r.entries) / 12 { return png.Status.damaged }
+    var layout: Layout = undefined
+    const status = layoutOf(&r, &layout)
+    if status != png.Status.ok { return status }
+    const made = png.makePicture(into, layout.width, layout.height, allocator)
+    if made != png.Status.ok { return made }
+    const read = readChunks(&r, &layout, into)
+    if read != png.Status.ok {
+        png.free(into)
+        return read
+    }
+    var resolution = rationalOf(&r, X_RESOLUTION)
+    const unit = valueOr(&r, RESOLUTION_UNIT, 2)
+    if unit == 3 { resolution = resolution * 2.54 }
+    if unit == 1 || !(resolution > 0.0) || resolution > 100000.0 { resolution = 0.0 }
+    into.*.resolution = resolution
+    return png.Status.ok
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+const Writing = struct {
+    out: *std.ArrayList(u8)
+    big: bool
+    ok: bool
+}
+
+fn put16(w: *Writing, value: usize) -> void {
+    const low = @intCast(u8, value & 255)
+    const high = @intCast(u8, (value >> 8) & 255)
+    if w.*.big {
+        w.*.ok = w.*.ok && w.*.out.*.append(high) && w.*.out.*.append(low)
+    } else {
+        w.*.ok = w.*.ok && w.*.out.*.append(low) && w.*.out.*.append(high)
+    }
+}
+
+fn put32(w: *Writing, value: usize) -> void {
+    if w.*.big {
+        put16(w, (value >> 16) & 65535)
+        put16(w, value & 65535)
+    } else {
+        put16(w, value & 65535)
+        put16(w, (value >> 16) & 65535)
+    }
+}
+
+fn patch32(w: *Writing, at: usize, value: usize) -> void {
+    if !w.*.ok { return }
+    const bytes = w.*.out.*.items().pointer
+    if w.*.big { std.mem.writeU32Big(bytes, at, @intCast(u32, value)) } else { std.mem.writeU32Little(bytes, at, @intCast(u32, value)) }
+}
+
+// One directory entry: a SHORT or LONG value in place, or (count > 1, or a
+// RATIONAL) at `place`.
+fn entry(w: *Writing, tag: usize, kind: usize, count: usize, value: usize) -> void {
+    put16(w, tag)
+    put16(w, kind)
+    put32(w, count)
+    if kind == 3 && count == 1 {
+        put16(w, value)
+        put16(w, 0)
+    } else {
+        put32(w, value)
+    }
+}
+
+// The chunk of `columns` x `rows` pixels at (left, top) of the picture
+// (what lies past its edges zeros), RGBA bytes into `raw`.
+fn chunkBytes(picture: *const Picture, left: usize, top: usize, columns: usize, rows: usize, raw: [*]u8) -> void {
+    var row: usize = 0
+    while row < rows {
+        var x: usize = 0
+        while x < columns {
+            const at = (row * columns + x) * 4
+            var value: u32 = 0
+            if top + row < picture.*.height && left + x < picture.*.width { value = picture.*.pixels[(top + row) * picture.*.width + left + x] }
+            raw[at] = @intCast(u8, pixel.red(value))
+            raw[at + 1] = @intCast(u8, pixel.green(value))
+            raw[at + 2] = @intCast(u8, pixel.blue(value))
+            raw[at + 3] = @intCast(u8, value >> 24)
+            x += 1
+        }
+        row += 1
+    }
+}
+
+// The predictor applied (from the right, so each byte is taken from what
+// is still unchanged).
+fn predict(data: [*]u8, columns: usize, rows: usize) -> void {
+    const row_bytes = columns * 4
+    var row: usize = 0
+    while row < rows {
+        const line = data + row * row_bytes
+        var at = row_bytes
+        while at > 4 {
+            at -= 1
+            line[at] = line[at] -% line[at - 4]
+        }
+        row += 1
+    }
+}
+
+// One chunk compressed at the end of the file.
+fn putChunk(w: *Writing, compression: u16, raw: [*]u8, size: usize, columns: usize, rows: usize) -> void {
+    if !w.*.ok { return }
+    const out = w.*.out
+    if compression == NONE {
+        w.*.ok = out.*.appendSlice(raw[0..size])
+    } else if compression == PACKBITS {
+        // Each row on its own, as TIFF asks.
+        var row: usize = 0
+        while w.*.ok && row < rows {
+            w.*.ok = psd.packBits(raw + row * columns * 4, columns * 4, out)
+            row += 1
+        }
+    } else if compression == LZW {
+        w.*.ok = gif.lzwEncode(raw, size, 8, gif.TIFF_FORM, out)
+    } else {
+        const room = flate.compressBound(size, flate.Format.zlib)
+        const at = out.*.count()
+        w.*.ok = out.*.resize(at + room)
+        if w.*.ok {
+            const made = deflate(out.*.allocator, raw, size, out.*.items().pointer + at, room)
+            w.*.ok = made != 0 && out.*.resize(at + made)
+        }
+    }
+}
+
+// `size` bytes at `from` as zlib data into `into` (`room` bytes): how
+// many were made (0: they did not fit, no memory). (The compressor on the
+// heap, as zip.mlx keeps it: as a local it would be a new value of the
+// arena at every chunk.)
+fn deflate(allocator: Allocator, from: [*]const u8, size: usize, into: [*]u8, room: usize) -> usize {
+    const memory = allocator.alloc(@sizeOf(flate.Deflater), 16)
+    if memory == null { return 0 }
+    const deflater: *flate.Deflater = unsafe { @ptrCast(*flate.Deflater, memory.?) }
+    var made: usize = 0
+    if flate.deflaterInit(deflater, allocator, flate.options(6, flate.Format.zlib)) == flate.Status.ok {
+        var consumed: usize = 0
+        var status = flate.Status.ok
+        while status == flate.Status.ok {
+            var progress: flate.Progress = undefined
+            status = flate.deflaterRun(deflater, from + consumed, size - consumed, into + made, room - made, flate.Flush.finish, &progress)
+            consumed += progress.consumed
+            made += progress.produced
+            if status == flate.Status.ok && progress.consumed == 0 && progress.produced == 0 { break }
+        }
+        flate.deflaterEnd(deflater)
+        if status != flate.Status.done { made = 0 }
+    }
+    allocator.free(memory.?, @sizeOf(flate.Deflater), 16)
+    return made
+}
+
+// The picture as a TIFF of `settings` at the end of `into`. False
+// without memory, for a compression not written here, for a side of more
+// than 65535 and for a file of more than 4 GiB (`into` is as it was).
+pub fn encodeWith(picture: *const Picture, settings_: *const Settings, into: *std.ArrayList(u8)) -> bool {
+    const compression = settings_.*.compression
+    if compression != NONE && compression != LZW && compression != DEFLATE && compression != DEFLATE_OLD && compression != PACKBITS { return false }
+    const width = picture.*.width
+    const height = picture.*.height
+    if width == 0 || height == 0 || width > 65535 || height > 65535 { return false }
+    const predictor = settings_.*.predictor && (compression == LZW || compression == DEFLATE || compression == DEFLATE_OLD)
+    const tiled = settings_.*.tiled
+    const columns: usize = if tiled { 64 } else { width }
+    const across = if tiled { (width + 63) / 64 } else { 1 }
+    const chunks = across * ((height + 63) / 64)
+    const begun = into.*.count()
+    var w = Writing.{ .out = into, .big = settings_.*.bigEndian, .ok = true }
+    // The header; the directory's place filled in at the end.
+    w.ok = into.*.appendSlice(if w.big { "MM\x00\x2A" } else { "II\x2A\x00" })
+    put32(&w, 0)
+    const pool = scratch.common()
+    const mark = scratch.mark(pool)
+    const raw = scratch.bytes(pool, columns * 64 * 4)
+    const places = scratch.bytes(pool, chunks * 16)
+    w.ok = w.ok && raw != null && places != null
+    var offsets: [*]usize = undefined
+    var counts: [*]usize = undefined
+    if w.ok {
+        unsafe {
+            offsets = @ptrCast([*]usize, places.?)
+            counts = @ptrCast([*]usize, places.? + chunks * 8)
+        }
+    }
+    var chunk: usize = 0
+    while w.ok && chunk < chunks {
+        const left = (chunk % across) * columns
+        const top = (chunk / across) * 64
+        const rows = if tiled { 64 } else if height - top < 64 { height - top } else { 64 }
+        chunkBytes(picture, left, top, columns, rows, raw.?)
+        if predictor { predict(raw.?, columns, rows) }
+        offsets[chunk] = into.*.count() - begun
+        putChunk(&w, compression, raw.?, columns * rows * 4, columns, rows)
+        counts[chunk] = into.*.count() - begun - offsets[chunk]
+        chunk += 1
+    }
+    if w.ok && (into.*.count() - begun) % 2 != 0 { w.ok = into.*.append(0) }
+    if !w.ok {
+        scratch.release(pool, mark)
+        _ = into.*.resize(begun)
+        return false
+    }
+    // What does not fit in an entry: the bits, the chunks' places and
+    // lengths, the resolution.
+    const bits_at = into.*.count() - begun
+    put16(&w, 8)
+    put16(&w, 8)
+    put16(&w, 8)
+    put16(&w, 8)
+    const offsets_at = into.*.count() - begun
+    chunk = 0
+    while chunk < chunks {
+        put32(&w, offsets[chunk])
+        chunk += 1
+    }
+    const counts_at = into.*.count() - begun
+    chunk = 0
+    while chunk < chunks {
+        put32(&w, counts[chunk])
+        chunk += 1
+    }
+    const resolution_at = into.*.count() - begun
+    var resolution = picture.*.resolution
+    if !(resolution > 0.0) || resolution > 100000.0 { resolution = 72.0 }
+    const numerator = @intFromFloat(usize, resolution * 10000.0 + 0.5)
+    put32(&w, numerator)
+    put32(&w, 10000)
+    // The directory, its tags in their order.
+    const directory = into.*.count() - begun
+    var tags: usize = if tiled { 15 } else { 14 }
+    if predictor { tags += 1 }
+    put16(&w, tags)
+    entry(&w, WIDTH, 4, 1, width)
+    entry(&w, HEIGHT, 4, 1, height)
+    entry(&w, BITS, 3, 4, bits_at)
+    entry(&w, COMPRESSION, 3, 1, @intCast(usize, compression))
+    entry(&w, PHOTOMETRIC, 3, 1, 2)
+    if !tiled {
+        entry(&w, STRIP_OFFSETS, 4, chunks, if chunks == 1 { offsets[0] } else { offsets_at })
+    }
+    entry(&w, SAMPLES, 3, 1, 4)
+    if !tiled {
+        entry(&w, ROWS_PER_STRIP, 4, 1, 64)
+        entry(&w, STRIP_COUNTS, 4, chunks, if chunks == 1 { counts[0] } else { counts_at })
+    }
+    entry(&w, X_RESOLUTION, 5, 1, resolution_at)
+    entry(&w, Y_RESOLUTION, 5, 1, resolution_at)
+    entry(&w, PLANAR, 3, 1, 1)
+    entry(&w, RESOLUTION_UNIT, 3, 1, 2)
+    if predictor { entry(&w, PREDICTOR, 3, 1, 2) }
+    if tiled {
+        entry(&w, TILE_WIDTH, 4, 1, 64)
+        entry(&w, TILE_HEIGHT, 4, 1, 64)
+        entry(&w, TILE_OFFSETS, 4, chunks, if chunks == 1 { offsets[0] } else { offsets_at })
+        entry(&w, TILE_COUNTS, 4, chunks, if chunks == 1 { counts[0] } else { counts_at })
+    }
+    entry(&w, EXTRA_SAMPLES, 3, 1, 2)
+    put32(&w, 0)
+    scratch.release(pool, mark)
+    // (Its places are 32 bits: a file of more than 4 GiB cannot be.)
+    if into.*.count() - begun > 0xFFFFFFFF { w.ok = false }
+    patch32(&w, begun + 4, directory)
+    if !w.ok { _ = into.*.resize(begun) }
+    return w.ok
+}
+
+// The picture as the format list writes TIFF (settings()).
+pub fn encode(picture: *const Picture, options: *const formats.SaveOptions, into: *std.ArrayList(u8)) -> bool {
+    const chosen = settings()
+    return encodeWith(picture, &chosen, into)
+}

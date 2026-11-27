@@ -130,6 +130,17 @@ const GlobalInit = struct {
     moduleId: usize
 }
 
+// A word of a constant's image that holds an address known when the image
+// is written (staticAddresses): `offset` bytes into the image, the address
+// of `target` (lir.ADDRESS_*) plus `addend`. It becomes a
+// lir.GlobalAddress once the image is a global.
+const PendingAddress = struct {
+    offset: usize
+    kind: u8
+    target: usize
+    addend: usize
+}
+
 pub const LirBuilder = struct {
     lir: *lir.Lir
     loader: *loader_module.Loader
@@ -192,6 +203,14 @@ pub const LirBuilder = struct {
     // nobody asked, NO_IMAGE when it has none; and how many have one.
     constantImages: [*]usize
     constantImageCount: usize
+    // Whether a constant's image may hold addresses (a string's bytes, a
+    // function, another constant's image): only in a program loaded at the
+    // addresses it is linked for, whose image writer puts them there
+    // (setStaticAddresses). The constant's image being written (0: none)
+    // and the words of it noted to hold an address (PendingAddress).
+    staticAddresses: bool
+    staticImageBase: usize
+    pendingAddresses: *vector.Vector
     // The operator or builtin being lowered (for an unsupported form).
     operatorToken: usize
     firstUnsupportedOffset: usize
@@ -246,6 +265,7 @@ pub fn init(
         const address_taken_names = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const address_taken_modules = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const global_inits = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
+        const pending_addresses = @ptrCast(*vector.Vector, allocator.alloc(@sizeOf(vector.Vector), @alignOf(vector.Vector)).?)
         const symbol_capacity = if symbol_store.*.length > 0 { symbol_store.*.length } else { 1 }
         const lir_symbol_ids = @ptrCast([*]usize, allocator.alloc(symbol_capacity * @sizeOf(usize), @alignOf(usize)).?)
         const constant_images = @ptrCast([*]usize, allocator.alloc(symbol_capacity * @sizeOf(usize), @alignOf(usize)).?)
@@ -260,6 +280,7 @@ pub fn init(
         vector.Vector.initAt(address_taken_names, allocator, @sizeOf(AddressTakenName), @alignOf(AddressTakenName), 64)
         vector.Vector.initAt(address_taken_modules, allocator, @sizeOf(usize), @alignOf(usize), 16)
         vector.Vector.initAt(global_inits, allocator, @sizeOf(GlobalInit), @alignOf(GlobalInit), 16)
+        vector.Vector.initAt(pending_addresses, allocator, @sizeOf(PendingAddress), @alignOf(PendingAddress), 16)
         var symbol_index: usize = 0
         while symbol_index < symbol_capacity {
             lir_symbol_ids[symbol_index] = lir.NONE
@@ -306,6 +327,9 @@ pub fn init(
             .globalInits = global_inits,
             .constantImages = constant_images,
             .constantImageCount = 0,
+            .staticAddresses = false,
+            .staticImageBase = 0,
+            .pendingAddresses = pending_addresses,
             .initImageBase = 0,
             .initSymbolIndex = 0,
             .operatorToken = 0,
@@ -334,6 +358,16 @@ pub fn init(
     }
 }
 
+// Whether the program is loaded at the addresses it is linked for, so that
+// a constant table holding addresses (a string, a function, a slice of
+// another table) can be an image whose words the image writer fills in
+// (constantImageFor). Not a shared object, which is loaded anywhere, nor a
+// kernel, which runs elsewhere than it is linked (brixOS's, in the higher
+// half): there such a table is built where it is used.
+pub fn setStaticAddresses(builder: *LirBuilder, enabled: bool) -> void {
+    builder.*.staticAddresses = enabled
+}
+
 pub fn deinit(builder: *LirBuilder) -> void {
     vector.Vector.deinit(builder.*.bindings.*)
     vector.Vector.deinit(builder.*.bindingComponents.*)
@@ -344,6 +378,7 @@ pub fn deinit(builder: *LirBuilder) -> void {
     vector.Vector.deinit(builder.*.inlineStack.*)
     vector.Vector.deinit(builder.*.addressTakenNames.*)
     vector.Vector.deinit(builder.*.addressTakenModules.*)
+    vector.Vector.deinit(builder.*.pendingAddresses.*)
     unsafe {
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.bindings), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.bindingComponents), @sizeOf(vector.Vector), @alignOf(vector.Vector))
@@ -354,6 +389,7 @@ pub fn deinit(builder: *LirBuilder) -> void {
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.inlineStack), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.addressTakenNames), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.addressTakenModules), @sizeOf(vector.Vector), @alignOf(vector.Vector))
+        builder.*.allocator.free(@ptrCast([*]u8, builder.*.pendingAddresses), @sizeOf(vector.Vector), @alignOf(vector.Vector))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.lirSymbolIds), builder.*.lirSymbolCapacity * @sizeOf(usize), @alignOf(usize))
         builder.*.allocator.free(@ptrCast([*]u8, builder.*.typeCache), builder.*.typeCacheCapacity * @sizeOf(NodeTypeCache), @alignOf(NodeTypeCache))
     }
@@ -597,10 +633,15 @@ fn globalIndexFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                     vector.Vector.initAt(&own_bindings, builder.*.allocator, @sizeOf(Binding), @alignOf(Binding), 4)
                     const saved_bindings = builder.*.bindings
                     const components_length = builder.*.bindingComponents.*.length
+                    // (Its addresses are written when the program starts,
+                    // even when it is first named in a constant's image.)
+                    const saved_static_base = builder.*.staticImageBase
+                    builder.*.staticImageBase = 0
                     builder.*.bindings = &own_bindings
                     builder.*.initImageBase = @intFromPtr(target)
                     builder.*.initSymbolIndex = symbol_index
                     const written = writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target)
+                    builder.*.staticImageBase = saved_static_base
                     builder.*.bindings = saved_bindings
                     builder.*.bindingComponents.*.length = components_length
                     vector.Vector.deinit(own_bindings)
@@ -705,6 +746,16 @@ fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, t
     if node_index == ast.NONE { return false }
     const node = ast_store.Store.get(nodes, node_index)
     const value_type = types_store.Store.get(builder.*.typeStore, type_id)
+    // A tagged optional: its payload's bytes and then the tag, 1 (null and
+    // undefined leave it zeroed: absent). A `?f64` holding 0.0 is all zero
+    // bytes but the tag.
+    if isTaggedOptional(builder, type_id) {
+        if node.tag == ast.Tag.undefined_literal || node.tag == ast.Tag.null_literal { return true }
+        const payload_type = optionalPayloadType(builder, type_id)
+        if !writeInitialBytes(builder, given_index, payload_type, target) { return false }
+        target[types_store.Store.sizeOf(builder.*.typeStore, payload_type)] = 1
+        return true
+    }
     if node.tag == ast.Tag.array_literal {
         if value_type.*.kind != types_store.Kind.array { return false }
         const element_type = value_type.*.lhs
@@ -771,6 +822,12 @@ fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, t
         }
         return true
     }
+    if builder.*.staticImageBase != 0 {
+        // A constant's image (constantImageFor): an address known when the
+        // image is written is noted for the image writer.
+        if value_type.*.kind == types_store.Kind.slice { return writeStaticSlice(builder, node_index, value_type.*.lhs, target) }
+        if isAddressType(builder, type_id) { return writeStaticAddress(builder, node_index, type_id, target) }
+    }
     if isAddressType(builder, type_id) {
         // An address (a function, a string's bytes, another global): the
         // word stays zero here and is written when the program starts.
@@ -781,8 +838,7 @@ fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, t
     if !isScalarInitializer(node.tag) { return false }
     const scalar = lowerComptimeValue(builder, node_index)
     if scalar.kind != comptime_value.Kind.integer && scalar.kind != comptime_value.Kind.boolean { return false }
-    const tagged = isTaggedOptional(builder, type_id)
-    var width = types_store.Store.sizeOf(builder.*.typeStore, if tagged { optionalPayloadType(builder, type_id) } else { type_id })
+    var width = types_store.Store.sizeOf(builder.*.typeStore, type_id)
     if width == 0 || width > 8 { return false }
     const bits = @bitCast(u64, @intCast(i64, scalar.integer))
     var byte: usize = 0
@@ -790,8 +846,134 @@ fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, t
         target[byte] = @intCast(u8, (bits >> @intCast(u6, byte * 8)) & 255)
         byte += 1
     }
-    if tagged { target[width] = 1 }
     return true
+}
+
+// A slice in a constant's image (staticImageBase): a string literal, or a
+// constant whose value is one, for a `[]const u8`; or a slice of another
+// constant table that has an image, with bounds known at compile time
+// (`TABLE[0..]`, `TABLE[2..5]`, `module.TABLE[0..]`). Its pointer is
+// noted, its length written; false for another value (the table is then
+// built where it is used).
+fn writeStaticSlice(builder: *LirBuilder, node_index: usize, element_type: usize, target: [*]u8) -> bool {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    var length: usize = 0
+    if node.tag == ast.Tag.slice_expression {
+        const constant = constantTarget(builder, node.lhs)
+        if !constant.0 { return false }
+        const image = constantImageFor(builder, constant.1)
+        const table_type = types_store.Store.get(builder.*.typeStore, symbols_store.Store.get(builder.*.symbolStore, constant.1).*.typeId)
+        if table_type.*.kind != types_store.Kind.array || table_type.*.lhs != element_type { return false }
+        var low: usize = 0
+        var high = table_type.*.bits
+        if node.rhs != ast.NONE {
+            const bound = lowerComptimeValue(builder, node.rhs)
+            if bound.kind != comptime_value.Kind.integer || bound.integer < 0 { return false }
+            low = @intCast(usize, bound.integer)
+        }
+        if node.extra != ast.NONE {
+            const bound = lowerComptimeValue(builder, node.extra)
+            if bound.kind != comptime_value.Kind.integer || bound.integer < 0 { return false }
+            high = @intCast(usize, bound.integer)
+        }
+        if low > high || high > table_type.*.bits { return false }
+        notePendingAddress(builder, target, lir.ADDRESS_GLOBAL, image, low * types_store.Store.sizeOf(builder.*.typeStore, element_type))
+        length = high - low
+    } else {
+        if types_store.Store.sizeOf(builder.*.typeStore, element_type) != 1 { return false }
+        const text = staticString(builder, node_index)
+        if !text.0 { return false }
+        notePendingAddress(builder, target, lir.ADDRESS_STRING, text.1, 0)
+        length = text.2
+    }
+    var byte: usize = 0
+    while byte < 8 {
+        target[8 + byte] = @intCast(u8, (length >> @intCast(u6, byte * 8)) & 255)
+        byte += 1
+    }
+    return true
+}
+
+// An address in a constant's image (staticImageBase): a function, for a
+// function or an optional one (`null` is a zero word, written already).
+// False for another, a pointer among them (the table is then built where
+// it is used).
+fn writeStaticAddress(builder: *LirBuilder, node_index: usize, type_id: usize, target: [*]u8) -> bool {
+    var value = types_store.Store.get(builder.*.typeStore, type_id)
+    if value.*.kind == types_store.Kind.optional && value.*.lhs != 0 { value = types_store.Store.get(builder.*.typeStore, value.*.lhs) }
+    if value.*.kind != types_store.Kind.function { return false }
+    const function = staticFunction(builder, node_index)
+    if !function.0 { return false }
+    notePendingAddress(builder, target, lir.ADDRESS_FUNCTION, function.1, 0)
+    return true
+}
+
+fn notePendingAddress(builder: *LirBuilder, place: [*]u8, kind: u8, target: usize, addend: usize) -> void {
+    var entry = PendingAddress.{ .offset = @intFromPtr(place) - builder.*.staticImageBase, .kind = kind, .target = target, .addend = addend }
+    unsafe { const appended = vector.Vector.appendAt(builder.*.pendingAddresses, @ptrCast([*]const u8, &entry)) }
+}
+
+// The string a value in a constant's image stands for: a string literal,
+// or a module-level constant whose value is one (`.name = NAME`); the
+// literal's index (made now, emitted with the program's others) and its
+// length.
+fn staticString(builder: *LirBuilder, node_index: usize) -> (bool, usize, usize) {
+    const nodes = getNodes(builder)
+    const node = ast_store.Store.get(nodes, node_index)
+    if node.tag == ast.Tag.string_literal {
+        const token_length = tokenLength(builder, node.mainToken)
+        if token_length < 2 { return -> (false, 0, 0) }
+        // (The token has its quotes; the literal is what is between.)
+        var text: [*]const u8 = undefined
+        unsafe { text = @ptrFromInt([*]const u8, @intFromPtr(tokenPointer(builder, node.mainToken)) + 1) }
+        const literal = lir.addStringLiteral(builder.*.lir, text, token_length - 2)
+        return -> (true, literal, lir.getStringLiteral(builder.*.lir, literal).length)
+    }
+    if node.tag != ast.Tag.identifier && node.tag != ast.Tag.field_expression { return -> (false, 0, 0) }
+    const referenced = referencedSymbolIndex(builder, node_index)
+    if !referenced.0 { return -> (false, 0, 0) }
+    const symbol = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
+    if symbol.*.flags & symbol_module.FLAG_CONSTANT == 0 || symbol.*.flags & (symbol_module.FLAG_FUNCTION | symbol_module.FLAG_EXTERN) != 0 { return -> (false, 0, 0) }
+    if symbol.*.declaration == ast.NONE || symbol.*.ownerTypeId != 0 { return -> (false, 0, 0) }
+    // (Read in the constant's own module; only a literal there, so no
+    // chain of names is followed.)
+    const module_id = moduleForSymbol(builder, referenced.1)
+    const previous_module = builder.*.currentModuleId
+    if module_id != previous_module { switchToModule(builder, module_id) }
+    var found = false
+    var literal: usize = 0
+    var length: usize = 0
+    const own_nodes = getNodes(builder)
+    if symbol.*.declaration < own_nodes.*.length {
+        const declaration = ast_store.Store.get(own_nodes, symbol.*.declaration)
+        var value_node = if declaration.tag == ast.Tag.constant_declaration { declaration.rhs } else { ast.NONE }
+        while value_node != ast.NONE && (ast_store.Store.get(own_nodes, value_node).tag == ast.Tag.unsafe_block || ast_store.Store.get(own_nodes, value_node).tag == ast.Tag.unsafe_expression) {
+            value_node = ast_store.Store.get(own_nodes, value_node).lhs
+        }
+        if value_node != ast.NONE && ast_store.Store.get(own_nodes, value_node).tag == ast.Tag.string_literal {
+            const text = staticString(builder, value_node)
+            found = text.0
+            literal = text.1
+            length = text.2
+        }
+    }
+    if module_id != previous_module { switchToModule(builder, previous_module) }
+    return -> (found, literal, length)
+}
+
+// The function a value in a constant's image names (`paint`,
+// `module.paint`, `Type.method`): its LIR symbol. Not an `extern` one: a
+// C library's function has no address until the program is loaded.
+fn staticFunction(builder: *LirBuilder, node_index: usize) -> (bool, usize) {
+    const node = ast_store.Store.get(getNodes(builder), node_index)
+    if node.tag != ast.Tag.identifier && node.tag != ast.Tag.field_expression { return -> (false, 0) }
+    const referenced = referencedSymbolIndex(builder, node_index)
+    if !referenced.0 { return -> (false, 0) }
+    const symbol = symbols_store.Store.get(builder.*.symbolStore, referenced.1)
+    if symbol.*.flags & symbol_module.FLAG_FUNCTION == 0 || symbol.*.flags & symbol_module.FLAG_EXTERN != 0 { return -> (false, 0) }
+    const symbol_id = functionSymbolId(builder, referenced.1, symbol, moduleForSymbol(builder, referenced.1))
+    if lir.symbolFlags(builder.*.lir, symbol_id) & lir.SYMBOL_IMPORT != 0 { return -> (false, 0) }
+    return -> (true, symbol_id)
 }
 
 // A module-level `const` is a value built where it is used: every use
@@ -799,18 +981,27 @@ fn writeInitialBytes(builder: *LirBuilder, given_index: usize, type_id: usize, t
 // values known at compile time) that is all of its elements stored one by
 // one to read one of them, in storage of the using function's, or of the
 // aggregate arena, which is never freed, when it is over what a frame
-// takes. Such a constant has one image in the data area instead, as a
-// `var` has: its elements and fields are read from there (lowerPlace:
-// `TABLE[i]`, `TABLE.field`, `TABLE.length`), and where its whole value is
-// used (handed to a function, sliced, copied into a variable) the value is
-// one copy of the image, storage of its own as before: nothing can write
-// into the image, so it is the same value at every use.
+// takes. Such a constant has one image instead, a read-only global: its
+// bytes are code, after the functions, where nothing can write them (a
+// store through a slice of it that sema did not see, in the body of a
+// generic function, faults as one into a string literal does). Its
+// elements and fields are read there (lowerPlace: `TABLE[i]`,
+// `TABLE.field`, `TABLE.length`), as are a slice of it (`TABLE[a..b]`, a
+// `[]const T`) and the elements a `for` walks; where its whole value is
+// used (handed to a function by value, copied into a variable) the value
+// is one copy of the image, storage of its own as before.
+//
+// The image holds an address the image writer knows where the program is
+// loaded at the addresses it is linked for (staticAddresses): a string's
+// bytes, a function, a slice of another table's image (writeStaticSlice,
+// writeStaticAddress; lir.GlobalAddress).
 //
 // The constant's image (a global's index), made the first time it is asked
 // for; lir.NONE when the constant has none: no array or struct, a member
 // of an aggregate, an initializer that is no literal or holds what is not
-// known until the program runs or an address (those are written when the
-// program starts, which a constant must not wait for).
+// known until the program runs or another address (a pointer, any address
+// in a shared object or a kernel: written when the program starts, which a
+// constant must not wait for).
 const NO_IMAGE: usize = lir.NONE - 1
 
 fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
@@ -866,9 +1057,12 @@ fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                 }
                 // The initializer read as its module has it: no local of
                 // the function that happens to use the constant first, no
-                // instance's scope, no owner; and with no image to write
-                // addresses for (initImageBase 0: an address in the value
-                // makes it no image).
+                // instance's scope, no owner; and with no addresses to
+                // write when the program starts (initImageBase 0): those
+                // known when the image is written (a string, a function,
+                // another table's image) are noted in it where the program
+                // is loaded as linked (staticImageBase), any other makes it
+                // no image.
                 var own_bindings: vector.Vector = undefined
                 vector.Vector.initAt(&own_bindings, builder.*.allocator, @sizeOf(Binding), @alignOf(Binding), 4)
                 const saved_bindings = builder.*.bindings
@@ -876,13 +1070,17 @@ fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                 const saved_scope = builder.*.scopeOverride
                 const saved_owner = builder.*.currentMethodOwner
                 const saved_base = builder.*.initImageBase
+                const saved_static_base = builder.*.staticImageBase
                 const inits_before = builder.*.globalInits.*.length
+                const pending_before = builder.*.pendingAddresses.*.length
                 const unsupported_before = builder.*.unsupportedLoweringCount
                 builder.*.bindings = &own_bindings
                 builder.*.scopeOverride = 0
                 builder.*.currentMethodOwner = lir.NONE
                 builder.*.initImageBase = 0
+                builder.*.staticImageBase = if builder.*.staticAddresses { @intFromPtr(target) } else { 0 }
                 const written = writeInitialBytes(builder, declaration.rhs, symbol.*.typeId, target)
+                builder.*.staticImageBase = saved_static_base
                 builder.*.initImageBase = saved_base
                 builder.*.globalInits.*.length = inits_before
                 builder.*.currentMethodOwner = saved_owner
@@ -894,8 +1092,18 @@ fn constantImageFor(builder: *LirBuilder, symbol_index: usize) -> usize {
                     var alignment = types_store.Store.alignOf(builder.*.typeStore, symbol.*.typeId)
                     if alignment == 0 { alignment = 1 }
                     const label = lir.globalLabel(builder.*.lir, lir.globalCount(builder.*.lir))
-                    made = lir.addGlobal(builder.*.lir, label.0, label.1, size, alignment, 0, target, size, false, symbol_index)
+                    made = lir.addReadOnlyGlobal(builder.*.lir, label.0, label.1, size, alignment, target, symbol_index)
+                    // (Its own words: a table it names, made while it was
+                    // written, noted its own and took them away.)
+                    var pending = pending_before
+                    while pending < builder.*.pendingAddresses.*.length {
+                        var entry: PendingAddress = undefined
+                        unsafe { entry = @ptrCast(*PendingAddress, vector.Vector.at(builder.*.pendingAddresses.*, pending)).* }
+                        lir.addGlobalAddress(builder.*.lir, made, entry.offset, entry.kind, entry.target, entry.addend)
+                        pending += 1
+                    }
                 }
+                builder.*.pendingAddresses.*.length = pending_before
             }
         }
     }
@@ -1548,17 +1756,22 @@ fn addressTakenInModule(builder: *LirBuilder, name_ptr: [*]const u8, name_len: u
 // and promotes to registers; or, when the module takes the binding's
 // address somewhere, one block of adjacent words, so that a store through
 // that address (`into.* = slice` in a callee) reaches every word the
-// binding reads: a slice's length, an optional's payload.
-fn appendComponentStorage(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize, component_count: usize) -> void {
+// binding reads: a slice's length, an optional's payload. The block is laid
+// out as memory has the type (`type_id`): a tagged optional's tag is the
+// byte after its payload's bytes (at 1 for a `?u8`, not 8), where a load
+// or a store through the address finds it (tests/488).
+fn appendComponentStorage(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize, component_count: usize, type_id: usize) -> void {
     if component_count > 1 && addressTakenInModule(builder, name_ptr, name_len) {
         var block_inst = lir.initInst(lir.Opcode.alloca, lir.NONE)
         block_inst.arg0 = component_count * 8
         block_inst.arg1 = 1
         const block = lir.addInst(builder.*.lir, block_inst)
         unsafe { const appended = vector.Vector.appendAt(builder.*.bindingComponents, @ptrCast([*]const u8, &block)) }
+        const tagged = isTaggedOptional(builder, type_id)
         var component: usize = 1
         while component < component_count {
-            const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, component * 8))
+            const byte_offset = if tagged && component == component_count - 1 { types_store.Store.sizeOf(builder.*.typeStore, optionalPayloadType(builder, type_id)) } else { component * 8 }
+            const offset = lir.addInst(builder.*.lir, lir.constI(lir.NONE, byte_offset))
             var component_gep = lir.initInst(lir.Opcode.gep, lir.NONE)
             component_gep.arg0 = block
             component_gep.arg1 = offset
@@ -1575,6 +1788,17 @@ fn appendComponentStorage(builder: *LirBuilder, name_ptr: [*]const u8, name_len:
         unsafe { const appended = vector.Vector.appendAt(builder.*.bindingComponents, @ptrCast([*]const u8, &component_address)) }
         component += 1
     }
+}
+
+// The width a binding's component is stored and loaded at: the first as
+// its type has it (a tagged optional's payload as the payload), a tagged
+// optional's tag a byte, as in memory (in a block, appendComponentStorage,
+// a store through the binding's address writes that byte alone), any
+// other word whole.
+fn componentWidth(builder: *LirBuilder, type_id: usize, component: usize, component_count: usize) -> usize {
+    if component == 0 { return storageWidth(builder, type_id) }
+    if component + 1 == component_count && isTaggedOptional(builder, type_id) { return 1 }
+    return 8
 }
 
 fn pushComptimeBinding(builder: *LirBuilder, name_ptr: [*]const u8, name_len: usize, type_id: usize, value_type_id: usize, tag: u8, integer: isize) -> void {
@@ -2131,7 +2355,7 @@ fn genericArgumentForParameter(builder: *LirBuilder, parameter_index: usize, typ
 fn emitParameterStorage(builder: *LirBuilder, parameter_node: usize, parameter: ast.Node, type_id: usize) -> void {
     const components_start = builder.*.bindingComponents.*.length
     const component_count = typeWordCount(builder, type_id)
-    appendComponentStorage(builder, tokenPointer(builder, parameter.mainToken), tokenLength(builder, parameter.mainToken), component_count)
+    appendComponentStorage(builder, tokenPointer(builder, parameter.mainToken), tokenLength(builder, parameter.mainToken), component_count, type_id)
     var component_index: usize = 0
     while component_index < component_count {
         var param_inst = lir.initInst(lir.Opcode.param, if component_index == 0 { type_id } else { lir.NONE })
@@ -2140,6 +2364,7 @@ fn emitParameterStorage(builder: *LirBuilder, parameter_node: usize, parameter: 
         var parameter_store = lir.initInst(lir.Opcode.store, lir.NONE)
         parameter_store.arg0 = bindingComponentAt(builder, components_start + component_index)
         parameter_store.arg1 = parameter_value
+        if isTaggedOptional(builder, type_id) { parameter_store.arg2 = componentWidth(builder, type_id, component_index, component_count) }
         lir.addInst(builder.*.lir, parameter_store)
         builder.*.paramCounter += 1
         component_index += 1
@@ -2613,11 +2838,12 @@ fn isOptionalSlice(builder: *LirBuilder, type_id: usize) -> bool {
 }
 
 // Optionals. Of a pointer, a function or a slice, the optional is the
-// payload itself (null: 0, or (0, 0)). Of anything else but a float it
-// is "tagged": the payload and then a tag, 1 when a value is present, a
-// word after the payload's words in registers and the byte after the
-// payload's bytes in memory (the type's size is the payload's plus one),
-// so that `?usize` holding 0 is not null. A tagged optional of a struct,
+// payload itself (null: 0, or (0, 0)). Of anything else it is "tagged":
+// the payload and then a tag, 1 when a value is present, a word after the
+// payload's words in registers and the byte after the payload's bytes in
+// memory (the type's size is the payload's plus one), so that `?usize`
+// holding 0 is not null, nor `?f64` holding 0.0 (its bits are 0: as the
+// bare payload it was null, tests/488). A tagged optional of a struct,
 // union or array is a memory value (aggregate_copy.isMemoryType), as its
 // payload is: its address, the payload at offset 0.
 fn isTaggedOptional(builder: *LirBuilder, type_id: usize) -> bool {
@@ -2625,7 +2851,7 @@ fn isTaggedOptional(builder: *LirBuilder, type_id: usize) -> bool {
     const value = types_store.Store.get(builder.*.typeStore, type_id)
     if value.*.kind != types_store.Kind.optional || value.*.lhs == 0 { return false }
     const child = types_store.Store.get(builder.*.typeStore, value.*.lhs)
-    return child.*.kind != types_store.Kind.pointer && child.*.kind != types_store.Kind.many_pointer && child.*.kind != types_store.Kind.function && child.*.kind != types_store.Kind.slice && child.*.kind != types_store.Kind.float && child.*.kind != types_store.Kind.comptime_float_type
+    return child.*.kind != types_store.Kind.pointer && child.*.kind != types_store.Kind.many_pointer && child.*.kind != types_store.Kind.function && child.*.kind != types_store.Kind.slice
 }
 
 fn optionalPayloadType(builder: *LirBuilder, type_id: usize) -> usize {
@@ -2682,12 +2908,14 @@ fn optionalPayload(builder: *LirBuilder, value: usize, type_id: usize) -> usize 
 
 // `value` as the tagged optional `type_id`: a value of the type stays
 // one; `null` becomes the absent value; a payload becomes present.
-fn coerceToTaggedOptional(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
-    const given = valueType(builder, value)
-    if given == type_id { return value }
-    if given != 0 && given != lir.NONE && types_store.Store.get(builder.*.typeStore, given).*.kind == types_store.Kind.optional { return value }
+fn coerceToTaggedOptional(builder: *LirBuilder, given_value: usize, type_id: usize) -> usize {
+    const given = valueType(builder, given_value)
+    if given == type_id { return given_value }
+    if given != 0 && given != lir.NONE && types_store.Store.get(builder.*.typeStore, given).*.kind == types_store.Kind.optional { return given_value }
     const is_null = given == types_store.Store.primitive(builder.*.typeStore, types_store.Kind.null_type)
     const payload_type = optionalPayloadType(builder, type_id)
+    // (A float literal where a `?f32` is wanted: the f32's bits.)
+    const value = narrowFloat(builder, given_value, payload_type)
     if aggregate_copy.isMemoryType(builder.*.typeStore, type_id) {
         var size = types_store.Store.sizeOf(builder.*.typeStore, type_id)
         if size < 8 { size = 8 }
@@ -2902,7 +3130,10 @@ fn lowerSlice(builder: *LirBuilder, node_index: usize) -> usize {
     const container_type = types_store.Store.get(builder.*.typeStore, container_type_id)
     if (container_type.*.kind != types_store.Kind.array && container_type.*.kind != types_store.Kind.slice && container_type.*.kind != types_store.Kind.many_pointer) { return lir.NONE }
 
-    const base = lowerNode(builder, node.lhs)
+    // (A slice of a constant table with an image is a slice of the image,
+    // a `[]const T` sema lets nothing write through; the image is not
+    // writable either, for a generic function's body sema does not see.)
+    const base = if container_type.*.kind == types_store.Kind.array { lowerPlace(builder, node.lhs) } else { lowerNode(builder, node.lhs) }
     if base == lir.NONE { return lir.NONE }
     const lower_bound = if node.rhs == ast.NONE { lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0)) } else { lowerNode(builder, node.rhs) }
     if lower_bound == lir.NONE { return lir.NONE }
@@ -3595,20 +3826,26 @@ fn lowerIndexAddress(builder: *LirBuilder, node_index: usize) -> usize {
     return lir.addInst(builder.*.lir, address)
 }
 
+// The LIR symbol of function `symbol_index` (declared in `module_id`),
+// made the first time it is named.
+fn functionSymbolId(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
+    var sym_id = if symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] } else { lir.NONE }
+    if sym_id == lir.NONE {
+        const is_entry = (module_id == 0 && isMainName(symbol.*.namePointer, symbol.*.nameLength)) || hasPlainSymbolName(symbol)
+        sym_id = if symbol.*.ownerTypeId == 0 { lir.addModuleSymbol(builder.*.lir, module_id, symbol.*.namePointer, symbol.*.nameLength, is_entry) } else { lir.addMethodSymbol(builder.*.lir, module_id, symbol.*.ownerTypeId, symbol.*.namePointer, symbol.*.nameLength) }
+        recordLinkage(builder, sym_id, symbol)
+        if symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] = sym_id }
+    }
+    return sym_id
+}
+
 fn lowerSymbolValue(builder: *LirBuilder, symbol_index: usize, symbol: *symbol_module.Symbol, module_id: usize) -> usize {
     if symbol.*.comptimeTag == @intCast(u8, @intFromEnum(comptime_value.Kind.integer)) || symbol.*.comptimeTag == @intCast(u8, @intFromEnum(comptime_value.Kind.boolean)) {
         return lir.addInst(builder.*.lir, lir.constI(lir.NONE, @bitCast(usize, symbol.*.comptimeInteger)))
     }
     if symbol.*.flags & symbol_module.FLAG_FUNCTION != 0 {
-        var sym_id = if symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] } else { lir.NONE }
-        if sym_id == lir.NONE {
-            const is_entry = (module_id == 0 && isMainName(symbol.*.namePointer, symbol.*.nameLength)) || hasPlainSymbolName(symbol)
-            sym_id = if symbol.*.ownerTypeId == 0 { lir.addModuleSymbol(builder.*.lir, module_id, symbol.*.namePointer, symbol.*.nameLength, is_entry) } else { lir.addMethodSymbol(builder.*.lir, module_id, symbol.*.ownerTypeId, symbol.*.namePointer, symbol.*.nameLength) }
-            recordLinkage(builder, sym_id, symbol)
-            if symbol_index < builder.*.lirSymbolCapacity { builder.*.lirSymbolIds[symbol_index] = sym_id }
-        }
         var function_inst = lir.initInst(lir.Opcode.func_sym, lir.NONE)
-        function_inst.arg0 = sym_id
+        function_inst.arg0 = functionSymbolId(builder, symbol_index, symbol, module_id)
         return lir.addInst(builder.*.lir, function_inst)
     }
     if isGlobalSymbol(symbol) { return lowerGlobalValue(builder, symbol_index, symbol) }
@@ -4168,13 +4405,34 @@ fn expressionTypeUncached(builder: *LirBuilder, node_index: usize) -> usize {
             const else_type = expressionType(builder, node.extra)
             if else_type != 0 { return else_type }
         }
-        return then_type
+        return branchesType(builder, then_type, expressionType(builder, node.extra))
     }
     if node.tag == ast.Tag.match_statement && node.rhs != ast.NONE {
         const first_arm = ast_store.Store.get(nodes, node.rhs)
-        return expressionType(builder, first_arm.rhs)
+        var arms_type = expressionType(builder, first_arm.rhs)
+        var arm_index = first_arm.next
+        var arm_count: usize = 1
+        while arms_type != 0 && arm_index != ast.NONE && arm_count < node.extra {
+            const arm = ast_store.Store.get(nodes, arm_index)
+            arms_type = branchesType(builder, arms_type, expressionType(builder, arm.rhs))
+            arm_index = arm.next
+            arm_count += 1
+        }
+        return arms_type
     }
     return 0
+}
+
+// The type of an `if` or a `match` whose first branch is a `first` when
+// another is an `other`: the other when it is the first's optional. (`if
+// c { value } else { maybe }` was the first branch's `T`, one word: the
+// tag of the `?T` the else branch gave was dropped, and its null read as
+// present when the result became a `?T`, tests/488.)
+fn branchesType(builder: *LirBuilder, first: usize, other: usize) -> usize {
+    if first == 0 || other == 0 || other == first || other >= builder.*.typeStore.*.types.*.length { return first }
+    const other_value = types_store.Store.get(builder.*.typeStore, other)
+    if other_value.*.kind == types_store.Kind.optional && other_value.*.lhs == first { return other }
+    return first
 }
 
 fn storageWidth(builder: *LirBuilder, type_id: usize) -> usize {
@@ -4420,7 +4678,7 @@ fn lowerIdentifier(builder: *LirBuilder, main_token: usize) -> usize {
             const component_address = if @intFromPtr(binding) != 0 { bindingComponentAt(builder, binding.*.componentsStart + component) } else { addr }
             var load = lir.initInst(lir.Opcode.load, if component == 0 { type_id } else { lir.NONE })
             load.arg0 = component_address
-            load.arg1 = if component == 0 { storageWidth(builder, type_id) } else { 8 }
+            load.arg1 = componentWidth(builder, type_id, component, component_count)
             if component == 0 && loadsSigned(builder, type_id) { load.arg2 = 1 }
             const loaded = lir.addInst(builder.*.lir, load)
             if component == 0 { primary = loaded }
@@ -4662,6 +4920,20 @@ fn wrapInteger(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
     return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, type_id, raised, shift))
 }
 
+// An integer narrower than 64 bits is held in its 64-bit register as its
+// type extends it (zeros above an unsigned one, copies of the sign above a
+// signed one), and an operation on two such values is done on the whole
+// register. So + - * of an 8-, 16- or 32-bit type (and / of a signed one)
+// give the exact result, and it overflows when that is outside the type:
+// above its largest value, or for a signed type not what its low bits
+// extended as the type extends them say (a sum of two i32 near the top
+// kept its 33rd bit, a register above the i32 maximum). The checked
+// operators trap then (a compare and a branch, as the u8 one did: no
+// call), the saturating ones take the bound, the wrapping ones keep the
+// low bits extended (wrapInteger); every result is in range again. A
+// product of types wider than 32 bits may not fit the register at all:
+// it is also checked by dividing it by one factor (wrappedProduct).
+// (tests/524_narrow_overflow_runtime.mlx, tests/run_narrow_overflow.sh.)
 fn emitArithmeticPolicy(builder: *LirBuilder, kind: lexer.Kind, opcode: lir.Opcode, lhs: usize, rhs: usize, type_id: usize) -> usize {
     const raw = lir.addInst(builder.*.lir, lir.binary(opcode, type_id, lhs, rhs))
     const wrapping = kind == lexer.Kind.plus_percent || kind == lexer.Kind.minus_percent || kind == lexer.Kind.asterisk_percent
@@ -4669,14 +4941,21 @@ fn emitArithmeticPolicy(builder: *LirBuilder, kind: lexer.Kind, opcode: lir.Opco
 
     const saturating = kind == lexer.Kind.plus_pipe || kind == lexer.Kind.minus_pipe || kind == lexer.Kind.asterisk_pipe
     const bits = integerBitWidth(builder, type_id)
-    if !isUnsignedIntegerType(builder, type_id) || bits >= 64 { return raw }
+    if !isIntegerKind(builder, type_id) || bits >= 64 { return raw }
+    if isSignedIntegerType(builder, type_id) { return checkSignedResult(builder, opcode, lhs, rhs, raw, type_id, saturating) }
 
     const max = lir.addInst(builder.*.lir, lir.constI(type_id, integerMask(builder, type_id)))
     var overflow = lir.NONE
     if opcode == lir.Opcode.sub {
         overflow = emitComparison(builder, lir.CmpPredicate.ult, lhs, rhs)
-    } else if opcode == lir.Opcode.add || opcode == lir.Opcode.mul || opcode == lir.Opcode.shl {
+    } else if opcode == lir.Opcode.add {
         overflow = emitComparison(builder, lir.CmpPredicate.ugt, raw, max)
+    } else if opcode == lir.Opcode.mul {
+        overflow = emitComparison(builder, lir.CmpPredicate.ugt, raw, max)
+        if bits > 32 { overflow = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, overflow, wrappedProduct(builder, lhs, rhs, raw, false))) }
+    } else if opcode == lir.Opcode.shl {
+        overflow = emitComparison(builder, lir.CmpPredicate.ugt, raw, max)
+        if bits > 32 { overflow = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, overflow, shiftedOut(builder, lhs, rhs, raw, type_id))) }
     }
     if overflow == lir.NONE { return raw }
     if !saturating {
@@ -4685,6 +4964,102 @@ fn emitArithmeticPolicy(builder: *LirBuilder, kind: lexer.Kind, opcode: lir.Opco
     }
     const bound = if opcode == lir.Opcode.sub { lir.addInst(builder.*.lir, lir.constI(type_id, 0)) } else { max }
     return selectInteger(builder, overflow, raw, bound)
+}
+
+// The result of a checked or saturating operation on a signed type
+// narrower than 64 bits (emitArithmeticPolicy): `raw` when it is in the
+// type's range, else a trap (checked) or the bound on the side of the
+// exact result (saturating).
+fn checkSignedResult(builder: *LirBuilder, opcode: lir.Opcode, lhs: usize, rhs: usize, raw: usize, type_id: usize, saturating: bool) -> usize {
+    const bits = integerBitWidth(builder, type_id)
+    const checked = opcode == lir.Opcode.add || opcode == lir.Opcode.sub || opcode == lir.Opcode.mul || opcode == lir.Opcode.div || opcode == lir.Opcode.shl
+    if !checked || (!saturating && !builder.*.runtimeSafety) { return raw }
+    // Out of range: not its own low bits sign-extended.
+    var overflow = emitComparison(builder, lir.CmpPredicate.ne, raw, extendedAs(builder, raw, type_id))
+    // The side of the exact result: the sign of the register while that
+    // holds it, else the product's sign from its factors', or the shifted
+    // value's own.
+    var side = raw
+    if opcode == lir.Opcode.mul && bits > 32 {
+        overflow = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, overflow, wrappedProduct(builder, lhs, rhs, raw, true)))
+        side = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_xor, type_id, lhs, rhs))
+    }
+    if opcode == lir.Opcode.shl {
+        if bits > 32 { overflow = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, overflow, shiftedOut(builder, lhs, rhs, raw, type_id))) }
+        side = lhs
+    }
+    if !saturating {
+        emitTrapIf(builder, overflow)
+        return raw
+    }
+    // The largest value, or past it the smallest: the largest with every
+    // bit flipped when the side is negative (its sign spread over the word).
+    const max = lir.addInst(builder.*.lir, lir.constI(type_id, integerMask(builder, type_id) >> 1))
+    const sign_shift = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 63))
+    const sign = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, type_id, side, sign_shift))
+    const bound = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_xor, type_id, max, sign))
+    return selectInteger(builder, overflow, raw, bound)
+}
+
+// `value`'s low bits extended as `type_id` (an integer narrower than 64
+// bits) extends them, in one instruction (movsx or movzx; SBFM or UBFM),
+// for a range check to compare `value` with. (Only a comparison reads it.
+// wrapInteger, whose result is stored and passed on, keeps its shifts:
+// optimize.dropExtends, where narrowArithmetic is set, makes a 32-bit
+// extend read for its low bits alone a copy.)
+fn extendedAs(builder: *LirBuilder, value: usize, type_id: usize) -> usize {
+    var inst = lir.initInst(lir.Opcode.extend, type_id)
+    inst.arg0 = value
+    inst.arg1 = integerBitWidth(builder, type_id)
+    inst.arg2 = if isSignedIntegerType(builder, type_id) { 1 } else { 0 }
+    return lir.addInst(builder.*.lir, inst)
+}
+
+// Whether the 64-bit product `raw` of `lhs` and `rhs` lost bits above the
+// word (only factors wider than 32 bits can): it divided by a nonzero
+// `lhs` is not `rhs`. 1 or 0.
+fn wrappedProduct(builder: *LirBuilder, lhs: usize, rhs: usize, raw: usize, signed: bool) -> usize {
+    const zero = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 0))
+    const one = lir.addInst(builder.*.lir, lir.constI(lir.NONE, 1))
+    const nonzero = emitComparison(builder, lir.CmpPredicate.ne, lhs, zero)
+    // (Divided by 1 where lhs is 0, which no division may be by.)
+    const divisor = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_or, lir.NONE, lhs, lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_xor, lir.NONE, nonzero, one))))
+    const quotient = lir.addInst(builder.*.lir, lir.binary(if signed { lir.Opcode.div } else { lir.Opcode.udiv }, lir.NONE, raw, divisor))
+    const differs = emitComparison(builder, lir.CmpPredicate.ne, quotient, rhs)
+    return lir.addInst(builder.*.lir, lir.binary(lir.Opcode.bit_and, lir.NONE, nonzero, differs))
+}
+
+// Whether the left shift `raw` of `lhs` by `count` (below the type's
+// width) lost bits above the word: shifted back, it is not `lhs`. 1 or 0.
+fn shiftedOut(builder: *LirBuilder, lhs: usize, count: usize, raw: usize, type_id: usize) -> usize {
+    const back = lir.addInst(builder.*.lir, lir.binary(lir.Opcode.shr, type_id, raw, count))
+    return emitComparison(builder, lir.CmpPredicate.ne, back, lhs)
+}
+
+// `-x` of an integer narrower than 64 bits, `0 - x` on the whole register,
+// checked as that subtraction is (emitArithmeticPolicy): it overflows for
+// the smallest value of a signed type and for every value but 0 of an
+// unsigned one; `0 -% x` wraps.
+fn checkNegation(builder: *LirBuilder, operand: usize, negated: usize, type_id: usize) -> usize {
+    const bits = integerBitWidth(builder, type_id)
+    if !isIntegerKind(builder, type_id) || bits >= 64 || !builder.*.runtimeSafety { return negated }
+    const signed = isSignedIntegerType(builder, type_id)
+    // A constant whose negation fits (a negative literal, 0 - 5): nothing
+    // to check.
+    const operand_inst = lir.getInst(builder.*.lir, operand)
+    if operand_inst.opcode == lir.Opcode.const_i {
+        if !signed && operand_inst.arg0 == 0 { return negated }
+        const largest = @bitCast(isize, integerMask(builder, type_id) >> 1)
+        const value = @bitCast(isize, operand_inst.arg0)
+        if signed && value >= 0 - largest && value <= largest { return negated }
+    }
+    if signed {
+        emitTrapIf(builder, emitComparison(builder, lir.CmpPredicate.ne, negated, extendedAs(builder, negated, type_id)))
+    } else {
+        const zero = lir.addInst(builder.*.lir, lir.constI(type_id, 0))
+        emitTrapIf(builder, emitComparison(builder, lir.CmpPredicate.ne, operand, zero))
+    }
+    return negated
 }
 
 fn isShiftOperator(kind: lexer.Kind) -> bool {
@@ -5137,7 +5512,7 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
                     var component_store = lir.initInst(lir.Opcode.store, lir.NONE)
                     component_store.arg0 = bindingComponentAt(builder, binding.*.componentsStart + component)
                     component_store.arg1 = component_value
-                    component_store.arg2 = if component == 0 { width } else { 8 }
+                    component_store.arg2 = if component == 0 { width } else { componentWidth(builder, target_type, component, binding.*.componentCount) }
                     lir.addInst(builder.*.lir, component_store)
                     component += 1
                 }
@@ -5156,6 +5531,10 @@ fn lowerBinaryOp(builder: *LirBuilder, node_index: usize) -> usize {
             var load = lir.initInst(lir.Opcode.load, lir.NONE)
             load.arg0 = address
             load.arg1 = width
+            // `x op= y` of a narrow signed x: its value sign-extended, as
+            // any load of it (zero-extended, -5 of an i32 was 4294967291
+            // to the operation and its overflow check).
+            if loadsSigned(builder, target_type) { load.arg2 = 1 }
             const current = lir.addInst(builder.*.lir, load)
             result = lowerValueOperator(builder, assignmentOperator(kind), current, rhs_value, target_type)
         }
@@ -5288,7 +5667,12 @@ fn expandInlineCall(builder: *LirBuilder, candidate: inline_module.Candidate, sy
         parameter = value.next
         argument_index += 1
     }
-    const result = lowerNode(builder, candidate.returnExpression)
+    // The value as the function's result type, as its `return` makes it:
+    // `0` or `null` where a `?u8` is returned is the tagged optional, or
+    // the caller reads its tag from a word it does not have.
+    var result = lowerNode(builder, candidate.returnExpression)
+    const declared_result = if types_store.Store.get(builder.*.typeStore, function_type).*.kind == types_store.Kind.function { types_store.Store.get(builder.*.typeStore, function_type).*.lhs } else { 0 }
+    if declared_result != 0 && declared_result != lir.NONE { result = widenToType(builder, narrowFloat(builder, result, declared_result), declared_result) }
     builder.*.bindings.*.length = saved_bindings
     builder.*.bindingFloor = saved_floor
     builder.*.bindingComponents.*.length = saved_components
@@ -5373,7 +5757,12 @@ fn lowerCallArguments(builder: *LirBuilder, node: ast.Node, generic_instance: us
         if callArgumentIsRuntime(builder, child, generic_instance, source_argument_index) {
             var argument = lowerNode(builder, child)
             if parameters_known {
-                const parameter_type = types_store.Store.extraAt(builder.*.typeStore, parameters_start + argument_count)
+                // (A generic instance's type lists its comptime parameters
+                // too: an argument's parameter is at its place in the call.
+                // Counted without them, `null` for a `?T` after `T` took
+                // T's type and was passed as one word, read as present.)
+                const parameter_index = if generic_instance != lir.NONE { source_argument_index + implicit_count } else { argument_count }
+                const parameter_type = types_store.Store.extraAt(builder.*.typeStore, parameters_start + parameter_index)
                 argument = widenToType(builder, narrowFloat(builder, argument, parameter_type), parameter_type)
             }
             lir.setExtra(builder.*.lir, args_start + argument_count, argument)
@@ -5746,6 +6135,9 @@ fn lowerMatch(builder: *LirBuilder, node_index: usize) -> usize {
         const result_type = types_store.Store.get(builder.*.typeStore, result_type_id)
         has_secondary_result = result_type.*.kind == types_store.Kind.slice || result_type.*.kind == types_store.Kind.tuple || isOptionalSlice(builder, result_type_id) || (isTaggedOptional(builder, result_type_id) && typeWordCount(builder, result_type_id) == 2)
     }
+    // An optional result: each arm's value made one (`5` where the match
+    // is a `?u8` is present, with its tag), as an `if`'s branches are.
+    const widens = isTaggedOptional(builder, result_type_id) || isOptionalSlice(builder, result_type_id)
     const result_address = lir.addInst(builder.*.lir, lir.initInst(lir.Opcode.alloca, lir.NONE))
     var secondary_result_address = lir.NONE
     if has_secondary_result {
@@ -5762,7 +6154,8 @@ fn lowerMatch(builder: *LirBuilder, node_index: usize) -> usize {
         const arm = ast_store.Store.get(nodes, arm_index)
         if arm.lhs == ast.NONE {
             has_else = true
-            const else_value = lowerNode(builder, arm.rhs)
+            var else_value = lowerNode(builder, arm.rhs)
+            if widens { else_value = widenToType(builder, else_value, result_type_id) }
             if else_value == lir.NONE {
                 all_arms_have_values = false
             } else {
@@ -5783,7 +6176,8 @@ fn lowerMatch(builder: *LirBuilder, node_index: usize) -> usize {
         lir.addInst(builder.*.lir, lir.condBranch(condition, arm_block, next_block))
 
         lir.addInst(builder.*.lir, lir.blockLabelInst(arm_block))
-        const arm_value = lowerNode(builder, arm.rhs)
+        var arm_value = lowerNode(builder, arm.rhs)
+        if widens { arm_value = widenToType(builder, arm_value, result_type_id) }
         if arm_value == lir.NONE {
             all_arms_have_values = false
         } else {
@@ -5987,7 +6381,9 @@ fn lowerIterableFor(builder: *LirBuilder, node_index: usize) -> usize {
     const element_type = iterable_type.*.lhs
     var stride = types_store.Store.sizeOf(builder.*.typeStore, element_type)
     if stride == 0 { stride = 1 }
-    const iterable_value = lowerNode(builder, node.lhs)
+    // (A constant table with an image is walked there: its elements are
+    // copied or pointed to, `*const`, one by one.)
+    const iterable_value = if iterable_type.*.kind == types_store.Kind.array { lowerPlace(builder, node.lhs) } else { lowerNode(builder, node.lhs) }
     var length_value: usize = 0
     if iterable_type.*.kind == types_store.Kind.slice {
         var length_extract = lir.initInst(lir.Opcode.tuple_element, lir.NONE)
@@ -6016,7 +6412,7 @@ fn lowerIterableFor(builder: *LirBuilder, node_index: usize) -> usize {
     const capture_name_length = tokenLength(builder, capture.mainToken)
     const capture_words = typeWordCount(builder, capture_type)
     const capture_components = builder.*.bindingComponents.*.length
-    appendComponentStorage(builder, capture_name, capture_name_length, capture_words)
+    appendComponentStorage(builder, capture_name, capture_name_length, capture_words, capture_type)
     pushBindingComponents(builder, capture_name, capture_name_length, capture_components, capture_words, capture_type)
     if capture.endToken != ast.NONE {
         pushBinding(builder, tokenPointer(builder, capture.endToken), tokenLength(builder, capture.endToken), index_address, lir.NONE, lir.NONE, types_store.Store.sizeInteger(builder.*.typeStore, false))
@@ -6071,7 +6467,7 @@ fn lowerIterableFor(builder: *LirBuilder, node_index: usize) -> usize {
         var capture_store = lir.initInst(lir.Opcode.store, if capture_component == 0 { capture_type } else { lir.NONE })
         capture_store.arg0 = bindingComponentAt(builder, capture_components + capture_component)
         capture_store.arg1 = component_value
-        capture_store.arg2 = if capture_component == 0 { storageWidth(builder, capture_type) } else { 8 }
+        capture_store.arg2 = componentWidth(builder, capture_type, capture_component, capture_words)
         lir.addInst(builder.*.lir, capture_store)
         capture_component += 1
     }
@@ -6275,7 +6671,7 @@ fn lowerLocalBinding(builder: *LirBuilder, node_index: usize) -> usize {
     }
     const components_start = builder.*.bindingComponents.*.length
     const component_count = typeWordCount(builder, local_type)
-    appendComponentStorage(builder, name_ptr, name_len, component_count)
+    appendComponentStorage(builder, name_ptr, name_len, component_count, local_type)
     var component: usize = 0
     while component < component_count {
         const component_address = bindingComponentAt(builder, components_start + component)
@@ -6289,7 +6685,7 @@ fn lowerLocalBinding(builder: *LirBuilder, node_index: usize) -> usize {
         var component_store = lir.initInst(lir.Opcode.store, lir.NONE)
         component_store.arg0 = component_address
         component_store.arg1 = component_value
-        component_store.arg2 = if component == 0 { storageWidth(builder, local_type) } else { 8 }
+        component_store.arg2 = componentWidth(builder, local_type, component, component_count)
         lir.addInst(builder.*.lir, component_store)
         component += 1
     }
@@ -6340,11 +6736,12 @@ fn lowerAddressOf(builder: *LirBuilder, node_index: usize) -> usize {
     if child.tag == ast.Tag.identifier {
         const binding = findBindingRecord(builder, tokenPointer(builder, child.mainToken), tokenLength(builder, child.mainToken))
         const child_type_id = if @intFromPtr(binding) != 0 { binding.*.typeId } else { 0 }
-        if child_type_id != 0 {
-            const child_type = types_store.Store.get(builder.*.typeStore, child_type_id)
-            if child_type.*.kind == types_store.Kind.struct_type || child_type.*.kind == types_store.Kind.union_type || child_type.*.kind == types_store.Kind.array {
-                return lowerNode(builder, node_index)
-            }
+        // A struct, union or array local is held by its storage's address,
+        // and so is an optional of one (`&local` of a `?Pair` was the slot
+        // holding that address: `at.*` read its tag past the slot and
+        // `at.* = null` overwrote the frame, tests/488).
+        if child_type_id != 0 && aggregate_copy.isMemoryType(builder.*.typeStore, child_type_id) {
+            return lowerNode(builder, node_index)
         }
     }
     // A module-level constant that is a table with an image: the image's
@@ -6482,6 +6879,7 @@ fn lowerUnary(builder: *LirBuilder, node_index: usize) -> usize {
     if kind == lexer.Kind.keyword_try { return lowerTry(builder, node_index, operand) }
     if kind == lexer.Kind.dot_asterisk { return lowerDereference(builder, n.lhs, operand) }
     const value = lowerUnaryValue(builder, kind, operand)
+    if kind == lexer.Kind.minus && operand != lir.NONE { return checkNegation(builder, operand, value, expressionType(builder, n.lhs)) }
     // `~x` of a narrow integer: the complement within the type's width.
     if kind == lexer.Kind.tilde {
         const operand_type = expressionType(builder, n.lhs)
